@@ -141,6 +141,46 @@ DELETE FROM ads WHERE JobStatus = 4;
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`.
 - `JOIN`, `GROUP BY`, `ORDER BY`, and subqueries are rejected with a clear error.
 
+### Loading ads from a collector or schedd
+
+`INSERT` is impractical for real 50-attribute machine/job ads, so the CLI has a
+`load` subcommand that ingests the native `-long` ClassAd stream (ads separated
+by blank lines) straight from a pipe. Each ad is keyed by `-key` (default `Name`),
+and that value is stamped into the row's `Key` attribute so `SELECT`/`UPDATE`/
+`DELETE` can address it.
+
+```sh
+# Machine ads from the collector (keyed by Name):
+condor_status -long | htcondordb-cli load
+
+# Slot ads with an explicit key attribute:
+condor_status -long | htcondordb-cli load -key Name
+
+# Job ads from the local schedd (keyed by GlobalJobId):
+condor_q -long | htcondordb-cli load -key GlobalJobId
+
+# Every job in the pool:
+condor_q -global -long | htcondordb-cli load -key GlobalJobId
+
+# Daemon (master/schedd/collector) ads:
+condor_status -any -long | htcondordb-cli load -key Name
+
+# Into a specific daemon, or through a consistent-mode cluster:
+condor_status -long | htcondordb-cli -addr '<host:port>' load -key Name
+condor_status -long | htcondordb-cli -consistent load -key Name
+```
+
+Then query them:
+
+```sh
+htcondordb-cli -e "SELECT Name, Cpus, Memory FROM ads WHERE Cpus >= 8"
+htcondordb-cli -e "SELECT COUNT(*), AVG(Memory) FROM ads WHERE Arch = 'X86_64'"
+```
+
+Ads without the chosen key attribute are skipped (reported in the summary). The
+load commits in batches; use `-key` to match the ad type (`Name` for machine and
+daemon ads, `GlobalJobId` or another unique attribute for jobs).
+
 ## Building
 
 ```sh
