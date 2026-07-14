@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
@@ -85,12 +86,30 @@ func run() error {
 	}
 	srv := cedarserver.New(sec)
 
-	// Per-command ALLOW_/DENY_ authorization from the configuration.
+	// Per-command ALLOW_/DENY_ authorization from the configuration. The policy
+	// is held behind an atomic pointer and rebuilt on reconfigure (SIGHUP /
+	// condor_reconfig), so an ALLOW_WRITE change takes effect on the next
+	// connection without a daemon restart. The authorize closure reads the
+	// current policy race-free.
+	var policyPtr atomic.Pointer[authz.Policy]
 	policy, err := authz.NewPolicy(d.Config(), "HTCONDORDB")
 	if err != nil {
 		return fmt.Errorf("building authorization policy: %w", err)
 	}
-	srv.Authorizer = policy.Authorize
+	policyPtr.Store(policy)
+	authorize := func(perm, peerAddr, user string) bool {
+		return policyPtr.Load().Authorize(perm, peerAddr, user)
+	}
+	srv.Authorizer = authorize
+	d.OnReconfig(func(newCfg *config.Config) {
+		p, perr := authz.NewPolicy(newCfg, "HTCONDORDB")
+		if perr != nil {
+			log.Error(logging.DestinationGeneral, "reconfigure: keeping old authorization policy", "err", perr.Error())
+			return
+		}
+		policyPtr.Store(p)
+		log.Info(logging.DestinationGeneral, "reloaded authorization policy on reconfigure")
+	})
 
 	// Resolve the HA configuration (standalone / leader-follower / consistent).
 	ha, err := detectHA(cfg)
@@ -102,7 +121,7 @@ func run() error {
 	// read-only: writes go to the leader.
 	svc, err := server.New(server.Config{
 		Dir:           databaseDir(d, cfg),
-		Authorize:     policy.Authorize,
+		Authorize:     authorize,
 		ForceReadOnly: ha.forceReadOnly,
 		Logger:        d.Slog(),
 	})
