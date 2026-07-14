@@ -22,6 +22,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chzyer/readline"
+
 	cedarclient "github.com/bbockelm/cedar/client"
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
@@ -131,24 +133,52 @@ func run() error {
 		return nil
 	}
 
-	// Interactive: Ctrl-C cancels the loop cleanly.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		cancel()
-	}()
-
-	fmt.Printf("Connected to htcondordb at %s. Type .help for help, .quit to exit.\n", addr)
-	prompt := ""
+	// Line input: a readline instance (arrow-key history + editing) on an
+	// interactive terminal, else a plain scanner for piped input.
+	readLine := repl.ScanLines(os.Stdin)
 	if isInteractive() {
-		prompt = "htcondordb> "
+		rl, rlErr := readline.NewEx(&readline.Config{
+			Prompt:          "htcondordb> ",
+			HistoryFile:     historyFile(),
+			InterruptPrompt: "^C",
+			EOFPrompt:       "exit",
+			HistoryLimit:    1000,
+		})
+		if rlErr == nil {
+			defer func() { _ = rl.Close() }()
+			readLine = func() (string, error) {
+				line, err := rl.Readline()
+				if err == readline.ErrInterrupt {
+					// Ctrl-C abandons the current line and keeps the shell open.
+					return "", nil
+				}
+				return line, err // io.EOF on Ctrl-D exits the loop
+			}
+		}
+		fmt.Printf("Connected to htcondordb at %s. Type .help for help, .quit to exit.\n", addr)
+	} else {
+		// Piped input: Ctrl-C / SIGTERM cancels the loop cleanly (a readline
+		// terminal handles Ctrl-C itself via ErrInterrupt).
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() { <-sigCh; cancel() }()
 	}
-	err = repl.Run(ctx, exec, os.Stdin, os.Stdout, prompt)
+
+	err = repl.Run(ctx, exec, readLine, os.Stdout)
 	if err == context.Canceled {
 		return nil
 	}
 	return err
+}
+
+// historyFile is where the interactive shell persists command history
+// ($HOME/.htcondordb_history), or "" if the home directory is unavailable.
+func historyFile() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".htcondordb_history")
 }
 
 type flags struct {

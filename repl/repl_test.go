@@ -1,6 +1,8 @@
 package repl
 
 import (
+	"context"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -200,6 +202,60 @@ func TestGroupByMultiColumn(t *testing.T) {
 	}
 	if got["alice/Run"] != "2" || got["alice/Idle"] != "1" {
 		t.Fatalf("multi-column group = %v", got)
+	}
+}
+
+func TestRunLoop(t *testing.T) {
+	e, cleanup := newTestExec(t)
+	defer cleanup()
+
+	lines := []string{
+		"INSERT INTO ads (Key, Owner) VALUES ('1', 'alice')",
+		".format json",
+		"SELECT COUNT(*) FROM ads",
+		".quit",
+		"SELECT 1", // never reached (after .quit)
+	}
+	i := 0
+	readLine := func() (string, error) {
+		if i >= len(lines) {
+			return "", io.EOF
+		}
+		s := lines[i]
+		i++
+		return s, nil
+	}
+
+	var out strings.Builder
+	if err := Run(context.Background(), e, readLine, &out); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "INSERT 1") {
+		t.Fatalf("missing INSERT note:\n%s", got)
+	}
+	if !strings.Contains(got, "format: json") {
+		t.Fatalf("missing format switch ack:\n%s", got)
+	}
+	// COUNT(*) rendered as JSON (the .format json took effect).
+	if !strings.Contains(got, `"COUNT(*)":"1"`) {
+		t.Fatalf("aggregate not rendered as JSON:\n%s", got)
+	}
+	if strings.Contains(got, "SELECT 1") {
+		t.Fatal(".quit did not stop the loop")
+	}
+}
+
+func TestScanLines(t *testing.T) {
+	rl := ScanLines(strings.NewReader("a\nb\n"))
+	for _, want := range []string{"a", "b"} {
+		got, err := rl()
+		if err != nil || got != want {
+			t.Fatalf("ScanLines = %q,%v want %q", got, err, want)
+		}
+	}
+	if _, err := rl(); err != io.EOF {
+		t.Fatalf("expected io.EOF at end, got %v", err)
 	}
 }
 

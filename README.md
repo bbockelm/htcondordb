@@ -192,6 +192,9 @@ DELETE FROM ads WHERE JobStatus = 4;
 .quit                 exit
 ```
 
+The interactive shell has line editing and command history (arrow keys, Ctrl-A/E,
+Ctrl-R), persisted to `~/.htcondordb_history`.
+
 `.format json` emits one JSON object per ad (JSONL); `.format classad` /
 `classad-new` emit each ad in old / new ClassAd format. In non-table formats a
 `SELECT` serializes whole matched ads (projection is a table-mode feature); an

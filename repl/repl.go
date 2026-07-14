@@ -20,50 +20,71 @@ type session struct {
 	format  Format
 }
 
-// Run reads statements from in and writes results to out until EOF, ctx is
-// cancelled, or a quit meta-command. Each non-empty line is one statement (an
-// optional trailing ';' is allowed). Lines beginning with '.' or '\' are
-// meta-commands (.help, .quit, .format, .output). Errors are printed and do not
-// stop the loop. prompt, if non-empty, is written before each read.
-func Run(ctx context.Context, e *Executor, in io.Reader, out io.Writer, prompt string) error {
-	s := &session{exec: e, base: out, out: out, format: FormatTable}
+// ReadLine reads one input line (without the trailing newline), returning io.EOF
+// at end of input. Implementations own their own prompting and editing: the CLI
+// supplies a readline-backed one (arrow-key history, line editing) for an
+// interactive terminal, and ScanLines for piped input.
+type ReadLine func() (string, error)
+
+// ScanLines returns a ReadLine over r: one line per call, io.EOF at the end, with
+// no prompting or editing. Use it for piped/non-interactive input.
+func ScanLines(r io.Reader) ReadLine {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	return func() (string, error) {
+		if sc.Scan() {
+			return sc.Text(), nil
+		}
+		if err := sc.Err(); err != nil {
+			return "", err
+		}
+		return "", io.EOF
+	}
+}
+
+// Run drives the read/execute/print loop: it reads statements via readLine and
+// writes results to the session output (console by default, redirectable with
+// .output), until io.EOF, ctx cancellation, or a quit meta-command. Each
+// non-empty line is one statement (an optional trailing ';' is allowed); lines
+// beginning with '.' or '\' are meta-commands. Errors are printed to console and
+// do not stop the loop.
+func Run(ctx context.Context, e *Executor, readLine ReadLine, console io.Writer) error {
+	s := &session{exec: e, base: console, out: console, format: FormatTable}
 	defer s.closeOutput()
 
-	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		if prompt != "" {
-			fmt.Fprint(out, prompt) // the prompt always goes to the console
+		raw, err := readLine()
+		if err == io.EOF {
+			return nil
 		}
-		if !sc.Scan() {
-			break
+		if err != nil {
+			return err
 		}
-		line := strings.TrimSpace(sc.Text())
+		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
 		if isMeta(line) {
-			if quit := s.runMeta(out, line); quit {
+			if quit := s.runMeta(console, line); quit {
 				return nil
 			}
 			continue
 		}
-		res, err := e.ExecString(line)
-		if err != nil {
-			fmt.Fprintf(out, "error: %v\n", err) // errors go to the console
-			if h := HintFor(err); h != "" {
-				fmt.Fprintf(out, "  hint: %s\n", h)
+		res, execErr := e.ExecString(line)
+		if execErr != nil {
+			fmt.Fprintf(console, "error: %v\n", execErr) // errors go to the console
+			if h := HintFor(execErr); h != "" {
+				fmt.Fprintf(console, "  hint: %s\n", h)
 			}
 			continue
 		}
 		FormatResult(s.out, res, s.format)
 	}
-	return sc.Err()
 }
 
 func isMeta(line string) bool {
