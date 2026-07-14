@@ -1,0 +1,739 @@
+// Package repl implements a small SQL-like query language over the htcondordb
+// ClassAd store and an interactive client (REPL) for it.
+//
+// The store is a single keyed collection of ClassAds -- there are no tables to
+// join -- so the language is deliberately the join-free subset of SQL: SELECT
+// (with a WHERE filter, column projection, LIMIT, and the COUNT/SUM/AVG/MIN/MAX
+// aggregates), INSERT, UPDATE, and DELETE. JOIN, GROUP BY, and subqueries are
+// intentionally unsupported and rejected with a clear error.
+//
+// The one table every statement addresses is the ClassAd store itself; the FROM
+// / INTO / UPDATE name is accepted for familiarity but is otherwise a label. A
+// row's primary key is carried in a key attribute (default "Key", see
+// ExecConfig): INSERT stamps it into the ad so that SELECT can display it and
+// UPDATE/DELETE can recover the key of every row a WHERE clause matches. WHERE
+// and assignment right-hand sides are translated to ClassAd expressions and
+// evaluated by the store's expression engine, so the full ClassAd operator set
+// is available; the translation only adapts SQL spellings (`=`, `<>`, AND/OR,
+// single-quoted strings).
+package repl
+
+import (
+	"fmt"
+	"strings"
+)
+
+// StmtKind identifies a parsed statement's type.
+type StmtKind int
+
+const (
+	StmtSelect StmtKind = iota
+	StmtInsert
+	StmtUpdate
+	StmtDelete
+)
+
+// Statement is one parsed SQL-like statement.
+type Statement struct {
+	Kind StmtKind
+
+	// Table is the FROM/INTO/UPDATE target (a label; the store is single-table).
+	Table string
+
+	// Select fields.
+	Items []SelectItem // projection; a single {Star:true} means "*"
+	Limit int          // 0 = no limit
+
+	// Insert fields.
+	Columns []string // target columns
+	Values  []string // ClassAd-literal value expressions, aligned with Columns
+
+	// Update fields.
+	Assignments []Assignment
+
+	// Where is the translated ClassAd constraint ("" = match all). Used by
+	// SELECT, UPDATE, DELETE.
+	Where string
+}
+
+// SelectItem is one projected column or aggregate. For "*", Star is set. For a
+// plain column, Agg is "" and Col is the attribute name. For an aggregate,
+// Agg is COUNT/SUM/AVG/MIN/MAX and Col is its argument ("*" for COUNT(*)).
+type SelectItem struct {
+	Star  bool
+	Agg   string // "", "COUNT", "SUM", "AVG", "MIN", "MAX"
+	Col   string
+	Alias string // display header; defaults to the source text
+}
+
+// IsAggregate reports whether this item is an aggregate function.
+func (it SelectItem) IsAggregate() bool { return it.Agg != "" }
+
+// Assignment is one UPDATE ... SET column = expr.
+type Assignment struct {
+	Col  string
+	Expr string // translated ClassAd expression
+}
+
+// header returns the display header for a select item.
+func (it SelectItem) header() string {
+	if it.Alias != "" {
+		return it.Alias
+	}
+	if it.Star {
+		return "*"
+	}
+	if it.Agg != "" {
+		return it.Agg + "(" + it.Col + ")"
+	}
+	return it.Col
+}
+
+// Parse parses one statement. Trailing ';' is allowed. It returns a descriptive
+// error for empty input, unsupported constructs (JOIN, GROUP BY, ...), and
+// syntax errors.
+func Parse(input string) (*Statement, error) {
+	toks, err := lex(input)
+	if err != nil {
+		return nil, err
+	}
+	if len(toks) == 0 {
+		return nil, errEmpty
+	}
+	p := &parser{toks: toks}
+	stmt, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	if !p.atEnd() {
+		return nil, fmt.Errorf("unexpected %q after statement", p.peek().text)
+	}
+	return stmt, nil
+}
+
+var errEmpty = fmt.Errorf("empty statement")
+
+// --- lexer ---
+
+type tokKind int
+
+const (
+	tIdent  tokKind = iota // identifier or keyword (text is as-written)
+	tNumber                // numeric literal
+	tString                // string literal (text is the unquoted content)
+	tOp                    // operator: == = != <> < <= > >= + - * / && || ! .
+	tPunct                 // ( ) ,
+)
+
+type token struct {
+	kind tokKind
+	text string
+}
+
+func lex(s string) ([]token, error) {
+	var toks []token
+	i, n := 0, len(s)
+	for i < n {
+		c := s[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			i++
+		case c == ';':
+			// A single trailing terminator is fine; anything after it is caller error.
+			i++
+		case c == '\'':
+			// Single-quoted string; '' is an escaped quote.
+			j := i + 1
+			var sb strings.Builder
+			for j < n {
+				if s[j] == '\'' {
+					if j+1 < n && s[j+1] == '\'' {
+						sb.WriteByte('\'')
+						j += 2
+						continue
+					}
+					break
+				}
+				sb.WriteByte(s[j])
+				j++
+			}
+			if j >= n {
+				return nil, fmt.Errorf("unterminated string literal")
+			}
+			toks = append(toks, token{tString, sb.String()})
+			i = j + 1
+		case c == '"':
+			// Double-quoted: accepted as a string too (ClassAd-native spelling).
+			j := i + 1
+			for j < n && s[j] != '"' {
+				j++
+			}
+			if j >= n {
+				return nil, fmt.Errorf("unterminated string literal")
+			}
+			toks = append(toks, token{tString, s[i+1 : j]})
+			i = j + 1
+		case isDigit(c) || (c == '.' && i+1 < n && isDigit(s[i+1])):
+			j := i
+			for j < n && (isDigit(s[j]) || s[j] == '.' || s[j] == 'e' || s[j] == 'E' ||
+				((s[j] == '+' || s[j] == '-') && j > i && (s[j-1] == 'e' || s[j-1] == 'E'))) {
+				j++
+			}
+			toks = append(toks, token{tNumber, s[i:j]})
+			i = j
+		case isIdentStart(c):
+			j := i
+			for j < n && isIdentPart(s[j]) {
+				j++
+			}
+			toks = append(toks, token{tIdent, s[i:j]})
+			i = j
+		case c == '(' || c == ')' || c == ',':
+			toks = append(toks, token{tPunct, string(c)})
+			i++
+		default:
+			// Multi-char operators first.
+			two := ""
+			if i+1 < n {
+				two = s[i : i+2]
+			}
+			switch two {
+			case "==", "!=", "<>", "<=", ">=", "&&", "||":
+				toks = append(toks, token{tOp, two})
+				i += 2
+				continue
+			}
+			switch c {
+			case '=', '<', '>', '+', '-', '*', '/', '!', '.':
+				toks = append(toks, token{tOp, string(c)})
+				i++
+			default:
+				return nil, fmt.Errorf("unexpected character %q", string(c))
+			}
+		}
+	}
+	return toks, nil
+}
+
+func isDigit(c byte) bool      { return c >= '0' && c <= '9' }
+func isIdentStart(c byte) bool { return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
+func isIdentPart(c byte) bool  { return isIdentStart(c) || isDigit(c) }
+
+// --- parser ---
+
+type parser struct {
+	toks []token
+	pos  int
+}
+
+func (p *parser) atEnd() bool { return p.pos >= len(p.toks) }
+
+func (p *parser) peek() token {
+	if p.atEnd() {
+		return token{tIdent, ""}
+	}
+	return p.toks[p.pos]
+}
+
+func (p *parser) next() token {
+	t := p.peek()
+	p.pos++
+	return t
+}
+
+// isKeyword reports whether the next token is the given keyword (case-insensitive).
+func (p *parser) isKeyword(kw string) bool {
+	t := p.peek()
+	return t.kind == tIdent && strings.EqualFold(t.text, kw)
+}
+
+// takeKeyword consumes the next token if it is kw; returns whether it did.
+func (p *parser) takeKeyword(kw string) bool {
+	if p.isKeyword(kw) {
+		p.pos++
+		return true
+	}
+	return false
+}
+
+// expectKeyword consumes kw or errors.
+func (p *parser) expectKeyword(kw string) error {
+	if !p.takeKeyword(kw) {
+		return fmt.Errorf("expected %s, got %q", kw, p.peek().text)
+	}
+	return nil
+}
+
+// expectPunct consumes the given punctuation or errors.
+func (p *parser) expectPunct(s string) error {
+	t := p.peek()
+	if t.kind == tPunct && t.text == s {
+		p.pos++
+		return nil
+	}
+	return fmt.Errorf("expected %q, got %q", s, t.text)
+}
+
+func (p *parser) atPunct(s string) bool {
+	t := p.peek()
+	return t.kind == tPunct && t.text == s
+}
+
+func (p *parser) parseStatement() (*Statement, error) {
+	switch {
+	case p.takeKeyword("SELECT"):
+		return p.parseSelect()
+	case p.takeKeyword("INSERT"):
+		return p.parseInsert()
+	case p.takeKeyword("UPDATE"):
+		return p.parseUpdate()
+	case p.takeKeyword("DELETE"):
+		return p.parseDelete()
+	default:
+		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, or DELETE)", p.peek().text)
+	}
+}
+
+func (p *parser) parseSelect() (*Statement, error) {
+	st := &Statement{Kind: StmtSelect}
+	// Projection list.
+	for {
+		it, err := p.parseSelectItem()
+		if err != nil {
+			return nil, err
+		}
+		st.Items = append(st.Items, it)
+		if !p.atPunct(",") {
+			break
+		}
+		p.pos++ // consume comma
+	}
+	if len(st.Items) > 1 {
+		for _, it := range st.Items {
+			if it.Star {
+				return nil, fmt.Errorf("`*` cannot be combined with other columns")
+			}
+		}
+	}
+	// Reject aggregate/plain mixes (no GROUP BY, so this would be ambiguous).
+	if err := validateAggregation(st.Items); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("FROM"); err != nil {
+		return nil, err
+	}
+	table, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	st.Table = table
+	if err := p.rejectJoins(); err != nil {
+		return nil, err
+	}
+	if p.takeKeyword("WHERE") {
+		where, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		st.Where = where
+	}
+	if p.takeKeyword("GROUP") {
+		return nil, fmt.Errorf("GROUP BY is not supported")
+	}
+	if p.takeKeyword("ORDER") {
+		return nil, fmt.Errorf("ORDER BY is not supported (results are unordered)")
+	}
+	if p.takeKeyword("LIMIT") {
+		t := p.next()
+		if t.kind != tNumber {
+			return nil, fmt.Errorf("LIMIT expects a number, got %q", t.text)
+		}
+		var lim int
+		if _, err := fmt.Sscanf(t.text, "%d", &lim); err != nil || lim < 0 {
+			return nil, fmt.Errorf("invalid LIMIT %q", t.text)
+		}
+		st.Limit = lim
+	}
+	return st, nil
+}
+
+func (p *parser) parseSelectItem() (SelectItem, error) {
+	// "*"
+	if t := p.peek(); t.kind == tOp && t.text == "*" {
+		p.pos++
+		return SelectItem{Star: true}, nil
+	}
+	t := p.peek()
+	if t.kind != tIdent {
+		return SelectItem{}, fmt.Errorf("expected a column name, got %q", t.text)
+	}
+	// Aggregate?  IDENT '(' ... ')'
+	if agg := strings.ToUpper(t.text); isAggName(agg) && p.peekAheadPunct(1, "(") {
+		p.pos += 2 // ident + '('
+		var arg string
+		if pk := p.peek(); pk.kind == tOp && pk.text == "*" {
+			arg = "*"
+			p.pos++
+		} else {
+			col, err := p.parseIdent()
+			if err != nil {
+				return SelectItem{}, err
+			}
+			arg = col
+		}
+		if err := p.expectPunct(")"); err != nil {
+			return SelectItem{}, err
+		}
+		if agg == "COUNT" && arg != "*" {
+			// COUNT(col) counts rows where col is defined; we treat it like COUNT(*)
+			// for simplicity but keep the argument for the header.
+		}
+		it := SelectItem{Agg: agg, Col: arg}
+		it.Alias = p.parseOptionalAlias()
+		return it, nil
+	}
+	// Plain column.
+	p.pos++
+	it := SelectItem{Col: t.text}
+	it.Alias = p.parseOptionalAlias()
+	return it, nil
+}
+
+// parseOptionalAlias consumes an optional `AS name` (or bare `name`) alias.
+func (p *parser) parseOptionalAlias() string {
+	if p.takeKeyword("AS") {
+		if t := p.peek(); t.kind == tIdent {
+			p.pos++
+			return t.text
+		}
+	}
+	return ""
+}
+
+func (p *parser) parseInsert() (*Statement, error) {
+	st := &Statement{Kind: StmtInsert}
+	if err := p.expectKeyword("INTO"); err != nil {
+		return nil, err
+	}
+	table, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	st.Table = table
+	if err := p.expectPunct("("); err != nil {
+		return nil, fmt.Errorf("INSERT requires a column list: %w", err)
+	}
+	cols, err := p.parseIdentList()
+	if err != nil {
+		return nil, err
+	}
+	st.Columns = cols
+	if err := p.expectKeyword("VALUES"); err != nil {
+		return nil, err
+	}
+	if err := p.expectPunct("("); err != nil {
+		return nil, err
+	}
+	vals, err := p.parseValueList()
+	if err != nil {
+		return nil, err
+	}
+	st.Values = vals
+	if len(st.Columns) != len(st.Values) {
+		return nil, fmt.Errorf("INSERT has %d columns but %d values", len(st.Columns), len(st.Values))
+	}
+	return st, nil
+}
+
+func (p *parser) parseUpdate() (*Statement, error) {
+	st := &Statement{Kind: StmtUpdate}
+	table, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	st.Table = table
+	if err := p.expectKeyword("SET"); err != nil {
+		return nil, err
+	}
+	for {
+		col, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		if t := p.peek(); !(t.kind == tOp && (t.text == "=" || t.text == "==")) {
+			return nil, fmt.Errorf("expected `=` after %s, got %q", col, t.text)
+		}
+		p.pos++ // '='
+		expr, err := p.parseExprUntil(func() bool {
+			return p.atPunct(",") || p.isKeyword("WHERE") || p.atEnd()
+		})
+		if err != nil {
+			return nil, err
+		}
+		st.Assignments = append(st.Assignments, Assignment{Col: col, Expr: expr})
+		if p.atPunct(",") {
+			p.pos++
+			continue
+		}
+		break
+	}
+	if len(st.Assignments) == 0 {
+		return nil, fmt.Errorf("UPDATE requires at least one assignment")
+	}
+	if p.takeKeyword("WHERE") {
+		where, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		st.Where = where
+	}
+	return st, nil
+}
+
+func (p *parser) parseDelete() (*Statement, error) {
+	st := &Statement{Kind: StmtDelete}
+	if err := p.expectKeyword("FROM"); err != nil {
+		return nil, err
+	}
+	table, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	st.Table = table
+	if p.takeKeyword("WHERE") {
+		where, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		st.Where = where
+	}
+	return st, nil
+}
+
+// parseWhere translates the WHERE clause (up to end/LIMIT/GROUP/ORDER) into a
+// ClassAd constraint expression.
+func (p *parser) parseWhere() (string, error) {
+	return p.parseExprUntil(func() bool {
+		return p.atEnd() || p.isKeyword("LIMIT") || p.isKeyword("GROUP") || p.isKeyword("ORDER")
+	})
+}
+
+// parseExprUntil consumes tokens until stop() is true, translating SQL spellings
+// into ClassAd expression syntax. It errors on unsupported operators (LIKE, IN,
+// subqueries).
+func (p *parser) parseExprUntil(stop func() bool) (string, error) {
+	var sb strings.Builder
+	depth := 0
+	for !p.atEnd() {
+		if depth == 0 && stop() {
+			break
+		}
+		t := p.next()
+		if sb.Len() > 0 {
+			sb.WriteByte(' ')
+		}
+		switch t.kind {
+		case tString:
+			sb.WriteString(quoteClassAd(t.text))
+		case tNumber:
+			sb.WriteString(t.text)
+		case tOp:
+			sb.WriteString(translateOp(t.text))
+		case tPunct:
+			if t.text == "(" {
+				depth++
+			} else if t.text == ")" {
+				depth--
+			}
+			sb.WriteString(t.text)
+		case tIdent:
+			switch up := strings.ToUpper(t.text); up {
+			case "AND":
+				sb.WriteString("&&")
+			case "OR":
+				sb.WriteString("||")
+			case "NOT":
+				sb.WriteString("!")
+			case "TRUE", "FALSE", "UNDEFINED", "ERROR":
+				sb.WriteString(strings.ToLower(t.text))
+			case "NULL":
+				sb.WriteString("undefined")
+			case "LIKE", "IN", "BETWEEN":
+				return "", fmt.Errorf("%s is not supported in WHERE", up)
+			case "IS":
+				// IS NULL / IS NOT NULL -> isUndefined(...) handled loosely: emit ==
+				return "", fmt.Errorf("IS NULL is not supported; test with `attr =?= undefined` semantics via `!(attr >= attr)` is not provided")
+			default:
+				sb.WriteString(t.text) // attribute reference or ClassAd function
+			}
+		}
+	}
+	out := strings.TrimSpace(sb.String())
+	if out == "" {
+		return "", fmt.Errorf("empty expression")
+	}
+	return out, nil
+}
+
+func (p *parser) parseIdent() (string, error) {
+	t := p.peek()
+	if t.kind != tIdent {
+		return "", fmt.Errorf("expected an identifier, got %q", t.text)
+	}
+	p.pos++
+	return t.text, nil
+}
+
+func (p *parser) parseIdentList() ([]string, error) {
+	var out []string
+	for {
+		id, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+		if p.atPunct(",") {
+			p.pos++
+			continue
+		}
+		break
+	}
+	if err := p.expectPunct(")"); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// parseValueList parses a VALUES(...) list into ClassAd-literal expressions.
+func (p *parser) parseValueList() ([]string, error) {
+	var out []string
+	for {
+		v, err := p.parseValue()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+		if p.atPunct(",") {
+			p.pos++
+			continue
+		}
+		break
+	}
+	if err := p.expectPunct(")"); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// parseValue parses a single literal value (string, number, bool, null, or a
+// signed number) into its ClassAd expression text.
+func (p *parser) parseValue() (string, error) {
+	t := p.next()
+	switch t.kind {
+	case tString:
+		return quoteClassAd(t.text), nil
+	case tNumber:
+		return t.text, nil
+	case tOp:
+		if t.text == "-" || t.text == "+" {
+			num := p.next()
+			if num.kind != tNumber {
+				return "", fmt.Errorf("expected a number after %q, got %q", t.text, num.text)
+			}
+			return t.text + num.text, nil
+		}
+		return "", fmt.Errorf("unexpected operator %q in value", t.text)
+	case tIdent:
+		switch up := strings.ToUpper(t.text); up {
+		case "TRUE", "FALSE":
+			return strings.ToLower(t.text), nil
+		case "NULL", "UNDEFINED":
+			return "undefined", nil
+		default:
+			return "", fmt.Errorf("unexpected value %q (quote strings with single quotes)", t.text)
+		}
+	default:
+		return "", fmt.Errorf("unexpected value token %q", t.text)
+	}
+}
+
+// rejectJoins produces a helpful error if a JOIN follows the table name.
+func (p *parser) rejectJoins() error {
+	for _, kw := range []string{"JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL"} {
+		if p.isKeyword(kw) {
+			return fmt.Errorf("JOINs are not supported (the store is a single ClassAd collection)")
+		}
+	}
+	if p.atPunct(",") {
+		return fmt.Errorf("multiple tables / JOINs are not supported")
+	}
+	return nil
+}
+
+func (p *parser) peekAheadPunct(n int, s string) bool {
+	if p.pos+n >= len(p.toks) {
+		return false
+	}
+	t := p.toks[p.pos+n]
+	return t.kind == tPunct && t.text == s
+}
+
+// --- helpers ---
+
+func isAggName(up string) bool {
+	switch up {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		return true
+	}
+	return false
+}
+
+// validateAggregation rejects mixing aggregates with plain columns (no GROUP BY).
+func validateAggregation(items []SelectItem) error {
+	var aggs, plains int
+	for _, it := range items {
+		if it.IsAggregate() {
+			aggs++
+		} else if !it.Star {
+			plains++
+		}
+	}
+	if aggs > 0 && plains > 0 {
+		return fmt.Errorf("cannot mix aggregates with plain columns without GROUP BY")
+	}
+	return nil
+}
+
+// translateOp maps a SQL operator token to its ClassAd spelling.
+func translateOp(op string) string {
+	switch op {
+	case "=":
+		return "==" // SQL equality
+	case "<>":
+		return "!="
+	default:
+		return op
+	}
+}
+
+// quoteClassAd renders s as a ClassAd double-quoted string literal.
+func quoteClassAd(s string) string {
+	var sb strings.Builder
+	sb.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			sb.WriteString("\\\"")
+		case '\\':
+			sb.WriteString("\\\\")
+		case '\n':
+			sb.WriteString("\\n")
+		case '\t':
+			sb.WriteString("\\t")
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	sb.WriteByte('"')
+	return sb.String()
+}

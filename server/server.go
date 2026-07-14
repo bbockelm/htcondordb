@@ -1,0 +1,208 @@
+// Package server is the htcondordb service: it wraps the embedded ClassAd-log
+// database (package db) and its RPC server (package dbrpc) behind an HTCondor
+// CEDAR command, enforcing HTCondor's READ / WRITE / DAEMON authorization on
+// every connection.
+//
+// One authenticated CEDAR connection carries an entire dbrpc multiplex. The
+// access level is decided once, at connection time, from the authenticated
+// identity:
+//
+//   - READ  -> read-only, and every ad returned has its private (secret)
+//     attributes stripped (claim ids, capabilities, transfer keys).
+//   - WRITE -> full read/write, private attributes visible.
+//   - DAEMON -> WRITE plus the HA/replication surface (separate commands).
+//
+// The level is recomputed per connection, so a reconfigure that changes the
+// ALLOW_/DENY_ tables takes effect on the next connection without a restart.
+package server
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/dbrpc"
+	cedarserver "github.com/bbockelm/cedar/server"
+
+	"github.com/bbockelm/htcondordb/command"
+)
+
+// Authorizer reports whether an authenticated peer is allowed at an HTCondor
+// authorization level. It has the same shape as cedarserver.Server.Authorizer
+// (and authz.Policy.Authorize): perm is a DCpermission name ("READ", "WRITE",
+// "DAEMON"), peerAddr is the peer's "host:port", user is the mapped FQU.
+type Authorizer func(perm, peerAddr, user string) bool
+
+// Level is the effective access a connection was authorized at.
+type Level int
+
+const (
+	// LevelRead is read-only access with private attributes stripped.
+	LevelRead Level = iota
+	// LevelWrite is full read/write access.
+	LevelWrite
+	// LevelDaemon is WRITE plus the daemon/HA control surface.
+	LevelDaemon
+)
+
+func (l Level) String() string {
+	switch l {
+	case LevelDaemon:
+		return "DAEMON"
+	case LevelWrite:
+		return "WRITE"
+	default:
+		return "READ"
+	}
+}
+
+// Config configures a Service.
+type Config struct {
+	// Dir is the database directory (the ClassAd log lives here). Empty means
+	// an ephemeral in-memory database.
+	Dir string
+
+	// Authorize escalates an authenticated connection's level: after the CEDAR
+	// server has gated the command at READ, the handler probes WRITE then DAEMON
+	// on the peer's identity. Pass authz.Policy.Authorize. Required.
+	Authorize Authorizer
+
+	// DBConfig, if non-nil, is used verbatim to open the database (ordered
+	// indexes, hot attributes, ...). When nil a default config over Dir is
+	// used. If set, its Dir overrides Config.Dir.
+	DBConfig *db.Config
+
+	// ForceReadOnly makes every client connection read-only regardless of its
+	// authorization level. A leader-follower replica sets this: writes must go
+	// to the leader, and the replica applies them from the commit stream, not
+	// from clients. Private-attribute visibility still follows the level.
+	ForceReadOnly bool
+
+	// Logger receives per-connection diagnostics. Defaults to slog.Default().
+	Logger *slog.Logger
+}
+
+// Service is the htcondordb database service.
+type Service struct {
+	db          *db.DB
+	rpc         *dbrpc.Server
+	authorize   Authorizer
+	forceReadOn bool
+	log         *slog.Logger
+}
+
+// New opens the database and builds the service. The caller owns the returned
+// Service and must Close it.
+func New(cfg Config) (*Service, error) {
+	if cfg.Authorize == nil {
+		return nil, fmt.Errorf("server: an Authorize function is required")
+	}
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+
+	dbCfg := db.Config{Dir: cfg.Dir}
+	if cfg.DBConfig != nil {
+		dbCfg = *cfg.DBConfig
+		if dbCfg.Dir == "" {
+			dbCfg.Dir = cfg.Dir
+		}
+	}
+	d, err := db.OpenConfig(dbCfg)
+	if err != nil {
+		return nil, fmt.Errorf("server: opening database: %w", err)
+	}
+
+	return &Service{
+		db:          d,
+		rpc:         dbrpc.NewServer(d),
+		authorize:   cfg.Authorize,
+		forceReadOn: cfg.ForceReadOnly,
+		log:         log,
+	}, nil
+}
+
+// DB returns the underlying database (for HA layers that stream commits or drive
+// snapshots). The caller must not close it; Service.Close owns its lifetime.
+func (s *Service) DB() *db.DB { return s.db }
+
+// RPC returns the underlying dbrpc server (for HA layers that serve replica
+// connections). Its lifetime is owned by Service.
+func (s *Service) RPC() *dbrpc.Server { return s.rpc }
+
+// RegisterOn wires the DB session command onto a CEDAR command server. It is
+// registered at READ: the server's Authorizer admits any authorized reader, and
+// the handler escalates to WRITE/DAEMON per identity.
+func (s *Service) RegisterOn(srv *cedarserver.Server) {
+	srv.Handle(command.DBSession, s.handleSession, "READ")
+}
+
+// handleSession serves one authenticated CEDAR connection as a dbrpc multiplex,
+// scoped to the connection's effective authorization level.
+func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error {
+	level := s.effectiveLevel(c)
+	opts := serveOptionsFor(level)
+	if s.forceReadOn {
+		opts.ReadOnly = true
+	}
+
+	s.log.Debug("htcondordb session opened",
+		"remote", c.RemoteAddr, "user", peerUser(c), "level", level.String(),
+		"read_only", opts.ReadOnly, "private_visible", opts.IncludePrivate)
+
+	conn := dbrpc.NewCedarConn(ctx, c.Stream)
+	err := s.rpc.ServeConnOpts(conn, opts)
+	s.log.Debug("htcondordb session closed", "remote", c.RemoteAddr, "err", errString(err))
+	return err
+}
+
+// serveOptionsFor maps an access level to the dbrpc serving options.
+func serveOptionsFor(level Level) dbrpc.ServeOptions {
+	switch level {
+	case LevelWrite, LevelDaemon:
+		// Full read/write; the peer is trusted to see private attributes.
+		return dbrpc.ServeOptions{ReadOnly: false, IncludePrivate: true}
+	default: // LevelRead
+		return dbrpc.ServeOptions{ReadOnly: true, IncludePrivate: false}
+	}
+}
+
+// effectiveLevel returns the highest level the authenticated peer holds. The
+// command was already gated at READ by the server's Authorizer, so a peer that
+// reaches here holds at least READ; we escalate by probing WRITE then DAEMON.
+func (s *Service) effectiveLevel(c *cedarserver.Conn) Level {
+	user := peerUser(c)
+	addr := c.RemoteAddr
+	switch {
+	case s.authorize("DAEMON", addr, user):
+		return LevelDaemon
+	case s.authorize("WRITE", addr, user):
+		return LevelWrite
+	default:
+		return LevelRead
+	}
+}
+
+// Close stops background work and closes the database.
+func (s *Service) Close() error {
+	s.rpc.Close()
+	return s.db.Close()
+}
+
+// peerUser is the authenticated fully-qualified user, or "" for an
+// unauthenticated/raw peer.
+func peerUser(c *cedarserver.Conn) string {
+	if c.Negotiation != nil {
+		return c.Negotiation.User
+	}
+	return ""
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}

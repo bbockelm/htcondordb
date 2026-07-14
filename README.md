@@ -1,0 +1,155 @@
+# htcondordb
+
+A full-fledged HTCondor daemon that serves the embedded ClassAd-log database
+(transactional key/ad store with constraint queries, matchmaking, ordered
+indexes, and change watches) over CEDAR, with HTCondor authorization, optional
+high availability, and a SQL-like REPL client.
+
+Built on:
+
+- `github.com/PelicanPlatform/classad/db` — the embedded ClassAd log.
+- `github.com/PelicanPlatform/classad/dbrpc` — the client/server RPC over CEDAR.
+- `github.com/bbockelm/golang-htcondor` — config, security policy, DaemonCore
+  integration (running under `condor_master`, ready/keepalive pings, privilege
+  drop, SIGHUP reconfigure).
+- `github.com/bbockelm/cedar` — authenticated, encrypted transport.
+- `github.com/hashicorp/raft` — consensus for the consistent HA mode, tunneled
+  over CEDAR.
+
+## Components
+
+| Path | What |
+|------|------|
+| `command/` | The CEDAR command integers, from HTCondor's retired `TRANSFERD_BASE` (74000) block — clear of every live command int. |
+| `server/` | The DB service: wraps `db.DB` + `dbrpc.Server` behind one command, enforcing READ / WRITE / DAEMON authorization per connection. |
+| `ha/leaderfollower/` | Asynchronous commit-stream replication (the "leader-follower" mode). |
+| `ha/consistent/` | Quorum-replicated raft state machine, CEDAR raft transport, and leader-routing control protocol (the "consistent" mode). |
+| `repl/` | The SQL-like language (parser + executor + formatter). |
+| `cmd/htcondordb/` | The daemon. |
+| `cmd/htcondordb-cli/` | The interactive shell. |
+
+## Authorization
+
+One authenticated CEDAR connection carries an entire `dbrpc` multiplex. The
+access level is decided once, at connect time, from the authenticated identity
+(re-evaluated per connection, so a reconfigure takes effect on the next
+connection):
+
+- **READ** — read-only, and every returned ad has its private (secret)
+  attributes stripped (claim ids, capabilities, transfer keys).
+- **WRITE** — full read/write; private attributes visible.
+- **DAEMON** — WRITE plus the HA/replication surface (commit stream, raft
+  transport, cluster control).
+
+The command is registered at READ; the handler escalates to WRITE/DAEMON by
+re-checking the `ALLOW_`/`DENY_` policy on the peer. Private stripping and
+read-only enforcement are implemented in `dbrpc` via per-connection
+`ServeOptions`.
+
+### Commands (from the retired transferd block)
+
+| Command | Int | Level | Purpose |
+|---------|-----|-------|---------|
+| `DBSession` | 74000 | READ | The multiplexed DB RPC session. |
+| `DBReplicate` | 74001 | DAEMON | (reserved) dedicated commit stream. |
+| `DBRaft` | 74002 | DAEMON | Raft transport tunneled over CEDAR. |
+| `DBControl` | 74003 | WRITE | Consistent-mode control (leader discovery, peer registration, write-batch apply). |
+
+## HA modes (`HTCONDORDB_HA_MODE`)
+
+### `standalone` (default)
+A single read/write daemon.
+
+### `leader-follower`
+The leader is an ordinary read/write daemon. Each follower opens a DAEMON-level
+session and consumes the leader's commit stream (the store's `Watch` feed),
+applying every upsert/delete to its local database and persisting the stream
+cursor, so a restart resumes without missing a change. If a follower has fallen
+out of the leader's retention, the leader answers with a reset and replays full
+state. Followers serve **read-only** queries from local state (offloading reads);
+writes go to the leader. No transactional/quorum safety — replication is
+asynchronous and best-effort.
+
+Knobs: `HTCONDORDB_ROLE` (`leader`|`follower`), `HTCONDORDB_LEADER` (the leader's
+address, for a follower), `HTCONDORDB_CURSOR_FILE`.
+
+### `consistent`
+Strong consistency via raft. A write is a `Batch` of mutations proposed to the
+raft log; once a quorum durably accepts it, every node's FSM applies the same
+batch, so all replicas converge and no acknowledged write is lost while a quorum
+survives. **The raft transport is tunneled over CEDAR** (not raw TCP), so
+replication inherits HTCondor authentication and encryption. Any node serves
+reads; a write sent to a non-leader is answered with a redirect to the leader
+(`ControlClient` follows it transparently).
+
+Membership bootstraps from the initial leader, which is either given the peer set
+explicitly (`HTCONDORDB_RAFT_PEERS = id1@addr1 id2@addr2 …`) or told the cluster
+size `N` (`HTCONDORDB_RAFT_SIZE`) and adopts the first `N` DAEMON-authenticated
+peers that register.
+
+Knobs: `HTCONDORDB_RAFT_BOOTSTRAP` (bool, the initial leader),
+`HTCONDORDB_RAFT_PEERS`, `HTCONDORDB_RAFT_SIZE`, `HTCONDORDB_NODE_ID`.
+
+> Note: the current build uses in-memory raft log/stable stores with persistent
+> FileSnapshotStore snapshots; a production deployment should swap in a
+> boltdb-backed store for full membership durability across restarts. The
+> daemon-side write path (`DBControl` apply → `coordinator.Apply` → quorum → FSM)
+> and client redirect are complete; routing the REPL's writes through the
+> consistent path is a thin client-side integration on top of
+> `consistent.ControlClient`.
+
+## Configuration knobs
+
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `HTCONDORDB_DIR` | `$(SPOOL)/htcondordb` | On-disk database directory. |
+| `HTCONDORDB_ADDRESS_FILE` | `$(LOG)/.htcondordb_address` | Where the command address is published. |
+| `HTCONDORDB_HOST` | — | Client fallback when no address file is found. |
+| `HTCONDORDB_HA_MODE` | `standalone` | `standalone` / `leader-follower` / `consistent`. |
+| `HTCONDORDB_ROLE` | `leader` | Leader-follower role. |
+| `HTCONDORDB_LEADER` | — | Leader address (follower). |
+| `HTCONDORDB_CURSOR_FILE` | `$(SPOOL)/htcondordb/.replica_cursor` | Follower stream cursor. |
+| `HTCONDORDB_RAFT_BOOTSTRAP` | `false` | This node initializes a fresh raft cluster. |
+| `HTCONDORDB_RAFT_PEERS` | — | Explicit `id@addr` member list. |
+| `HTCONDORDB_RAFT_SIZE` | `0` | Cluster size `N` for first-N-hosts bootstrap. |
+| `HTCONDORDB_NODE_ID` | advertised address | This node's stable raft id. |
+
+Standard `SEC_*` and `ALLOW_`/`DENY_` knobs configure security and authorization.
+
+## REPL
+
+```
+htcondordb-cli                       # interactive, auto-locate the daemon
+htcondordb-cli -addr '<host:port>'   # against a specific daemon
+htcondordb-cli -e "SELECT COUNT(*) FROM ads"   # one-shot
+```
+
+The store is a single ClassAd collection (no tables to join), so the language is
+the join-free subset of SQL. Each row's primary key lives in a key attribute
+(default `Key`): `INSERT` stamps it into the ad so `SELECT` can show it and
+`UPDATE`/`DELETE` can recover the key of every row a `WHERE` clause matches.
+
+```sql
+SELECT * FROM ads WHERE Cpus >= 8 LIMIT 10;
+SELECT Owner, JobPrio FROM ads WHERE Owner = 'alice';
+SELECT COUNT(*), AVG(Cpus), MAX(Memory) FROM ads WHERE JobStatus = 2;
+INSERT INTO ads (Key, Owner, Cpus) VALUES ('1.0', 'alice', 4);
+UPDATE ads SET JobStatus = 2 WHERE Owner = 'alice';
+DELETE FROM ads WHERE JobStatus = 4;
+```
+
+- `WHERE` is translated to a ClassAd expression (`=`→equality, `AND`/`OR`/`NOT`,
+  single-quoted strings), evaluated by the store's engine.
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`.
+- `JOIN`, `GROUP BY`, `ORDER BY`, and subqueries are rejected with a clear error.
+
+## Building
+
+```sh
+export GOWORK=off GOFLAGS=-mod=mod GOPRIVATE=github.com/bbockelm,github.com/PelicanPlatform GOPROXY=direct
+go build ./...
+go test ./...
+```
+
+The `go.mod` `replace` directives point at sibling checkouts for local
+development; resolve them to tagged versions before publishing with CI.
