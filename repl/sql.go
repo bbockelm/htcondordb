@@ -3,9 +3,10 @@
 //
 // The store is a single keyed collection of ClassAds -- there are no tables to
 // join -- so the language is deliberately the join-free subset of SQL: SELECT
-// (with a WHERE filter, column projection, LIMIT, and the COUNT/SUM/AVG/MIN/MAX
-// aggregates), INSERT, UPDATE, and DELETE. JOIN, GROUP BY, and subqueries are
-// intentionally unsupported and rejected with a clear error.
+// (with a WHERE filter, column projection, LIMIT, the COUNT/SUM/AVG/MIN/MAX
+// aggregates, and GROUP BY over one or more columns), INSERT, UPDATE, and DELETE.
+// Aggregation is evaluated server-side (hash-map GROUP BY). JOIN, ORDER BY, and
+// subqueries are intentionally unsupported and rejected with a clear error.
 //
 // The one table every statement addresses is the ClassAd store itself; the FROM
 // / INTO / UPDATE name is accepted for familiarity but is otherwise a label. A
@@ -41,8 +42,9 @@ type Statement struct {
 	Table string
 
 	// Select fields.
-	Items []SelectItem // projection; a single {Star:true} means "*"
-	Limit int          // 0 = no limit
+	Items   []SelectItem // projection; a single {Star:true} means "*"
+	GroupBy []string     // GROUP BY columns ("" = none)
+	Limit   int          // 0 = no limit
 
 	// Insert fields.
 	Columns []string // target columns
@@ -315,10 +317,6 @@ func (p *parser) parseSelect() (*Statement, error) {
 			}
 		}
 	}
-	// Reject aggregate/plain mixes (no GROUP BY, so this would be ambiguous).
-	if err := validateAggregation(st.Items); err != nil {
-		return nil, err
-	}
 	if err := p.expectKeyword("FROM"); err != nil {
 		return nil, err
 	}
@@ -338,7 +336,18 @@ func (p *parser) parseSelect() (*Statement, error) {
 		st.Where = where
 	}
 	if p.takeKeyword("GROUP") {
-		return nil, fmt.Errorf("GROUP BY is not supported")
+		if err := p.expectKeyword("BY"); err != nil {
+			return nil, err
+		}
+		cols, err := p.parseGroupCols()
+		if err != nil {
+			return nil, err
+		}
+		st.GroupBy = cols
+	}
+	// Validate the projection against the (now known) GROUP BY.
+	if err := validateSelect(st); err != nil {
+		return nil, err
 	}
 	if p.takeKeyword("ORDER") {
 		return nil, fmt.Errorf("ORDER BY is not supported (results are unordered)")
@@ -688,18 +697,55 @@ func isAggName(up string) bool {
 	return false
 }
 
-// validateAggregation rejects mixing aggregates with plain columns (no GROUP BY).
-func validateAggregation(items []SelectItem) error {
+// parseGroupCols parses the comma-separated GROUP BY column list.
+func (p *parser) parseGroupCols() ([]string, error) {
+	var cols []string
+	for {
+		id, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, id)
+		if p.atPunct(",") {
+			p.pos++
+			continue
+		}
+		break
+	}
+	return cols, nil
+}
+
+// validateSelect enforces the SELECT/GROUP BY rules: `*` stands alone; without
+// GROUP BY, aggregates cannot mix with plain columns; with GROUP BY, every plain
+// column must appear in the GROUP BY list and `*` is not allowed.
+func validateSelect(st *Statement) error {
 	var aggs, plains int
-	for _, it := range items {
-		if it.IsAggregate() {
+	for _, it := range st.Items {
+		switch {
+		case it.IsAggregate():
 			aggs++
-		} else if !it.Star {
+		case !it.Star:
 			plains++
 		}
 	}
-	if aggs > 0 && plains > 0 {
-		return fmt.Errorf("cannot mix aggregates with plain columns without GROUP BY")
+	if len(st.GroupBy) == 0 {
+		if aggs > 0 && plains > 0 {
+			return fmt.Errorf("cannot mix aggregates with plain columns without GROUP BY")
+		}
+		return nil
+	}
+	// GROUP BY present.
+	inGroup := map[string]bool{}
+	for _, g := range st.GroupBy {
+		inGroup[strings.ToLower(g)] = true
+	}
+	for _, it := range st.Items {
+		if it.Star {
+			return fmt.Errorf("`*` cannot be used with GROUP BY")
+		}
+		if !it.IsAggregate() && !inGroup[strings.ToLower(it.Col)] {
+			return fmt.Errorf("column %q must appear in GROUP BY or be used in an aggregate", it.Col)
+		}
 	}
 	return nil
 }

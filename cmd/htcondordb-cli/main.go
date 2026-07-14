@@ -85,7 +85,14 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		repl.FormatResult(os.Stdout, res)
+		format := repl.FormatTable
+		if fs.format != "" {
+			format, err = repl.ParseFormat(fs.format)
+			if err != nil {
+				return err
+			}
+		}
+		repl.FormatResult(os.Stdout, res, format)
 		return nil
 	}
 
@@ -115,6 +122,7 @@ type flags struct {
 	stmt       string
 	consistent bool
 	loadKey    string // `load`: source attribute used as the primary key
+	format     string // one-shot output format (-format)
 	args       []string
 }
 
@@ -146,6 +154,11 @@ func parseFlags() *flags {
 			i++
 			if i < len(args) {
 				f.loadKey = args[i]
+			}
+		case "-format", "--format":
+			i++
+			if i < len(args) {
+				f.format = args[i]
 			}
 		default:
 			rest = append(rest, args[i])

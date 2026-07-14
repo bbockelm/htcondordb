@@ -1,4 +1,5 @@
 # Build output
+/bin/
 /htcondordb
 /htcondordb-cli
 *.test

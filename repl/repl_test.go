@@ -148,7 +148,8 @@ func TestParseRejectsUnsupported(t *testing.T) {
 	cases := []string{
 		"SELECT * FROM a JOIN b ON a.x = b.x",
 		"SELECT Owner, COUNT(*) FROM ads",           // mix without GROUP BY
-		"SELECT Owner FROM ads GROUP BY Owner",      // group by
+		"SELECT * FROM ads GROUP BY Owner",          // star with GROUP BY
+		"SELECT Cpus FROM ads GROUP BY Owner",       // non-grouped, non-agg column
 		"SELECT * FROM ads ORDER BY Cpus",           // order by
 		"SELECT * FROM a, b",                        // comma join
 		"SELECT * FROM ads WHERE Owner LIKE 'a%'",   // LIKE
@@ -159,6 +160,89 @@ func TestParseRejectsUnsupported(t *testing.T) {
 		if _, err := Parse(c); err == nil {
 			t.Errorf("Parse(%q) should have errored", c)
 		}
+	}
+}
+
+func TestGroupBy(t *testing.T) {
+	e, cleanup := newTestExec(t)
+	defer cleanup()
+	mustExec(t, e, "INSERT INTO ads (Key, Owner, Cpus) VALUES ('1', 'alice', 4)")
+	mustExec(t, e, "INSERT INTO ads (Key, Owner, Cpus) VALUES ('2', 'alice', 8)")
+	mustExec(t, e, "INSERT INTO ads (Key, Owner, Cpus) VALUES ('3', 'bob', 16)")
+
+	r := mustExec(t, e, "SELECT Owner, COUNT(*), SUM(Cpus), MAX(Cpus) FROM ads GROUP BY Owner")
+	if r.Columns[0] != "Owner" || r.Columns[1] != "COUNT(*)" {
+		t.Fatalf("columns = %v", r.Columns)
+	}
+	got := map[string][]string{}
+	for _, row := range r.Rows {
+		got[row[0]] = row[1:]
+	}
+	if a := got["alice"]; len(a) != 3 || a[0] != "2" || a[1] != "12" || a[2] != "8" {
+		t.Fatalf("alice row = %v, want [2 12 8]", a)
+	}
+	if b := got["bob"]; b[0] != "1" || b[1] != "16" || b[2] != "16" {
+		t.Fatalf("bob row = %v", b)
+	}
+}
+
+func TestGroupByMultiColumn(t *testing.T) {
+	e, cleanup := newTestExec(t)
+	defer cleanup()
+	mustExec(t, e, "INSERT INTO ads (Key, Owner, State) VALUES ('1', 'alice', 'Run')")
+	mustExec(t, e, "INSERT INTO ads (Key, Owner, State) VALUES ('2', 'alice', 'Run')")
+	mustExec(t, e, "INSERT INTO ads (Key, Owner, State) VALUES ('3', 'alice', 'Idle')")
+
+	r := mustExec(t, e, "SELECT Owner, State, COUNT(*) FROM ads GROUP BY Owner, State")
+	got := map[string]string{}
+	for _, row := range r.Rows {
+		got[row[0]+"/"+row[1]] = row[2]
+	}
+	if got["alice/Run"] != "2" || got["alice/Idle"] != "1" {
+		t.Fatalf("multi-column group = %v", got)
+	}
+}
+
+func TestOutputFormats(t *testing.T) {
+	e, cleanup := newTestExec(t)
+	defer cleanup()
+	mustExec(t, e, "INSERT INTO ads (Key, Owner, Cpus) VALUES ('1.0', 'alice', 4)")
+	res := mustExec(t, e, "SELECT * FROM ads")
+
+	var buf strings.Builder
+	// JSON (JSONL): each ad is a JSON object.
+	FormatResult(&buf, res, FormatJSON)
+	if !strings.Contains(buf.String(), `"Owner"`) || !strings.Contains(buf.String(), `"alice"`) {
+		t.Fatalf("json output missing fields: %s", buf.String())
+	}
+
+	// Old ClassAd format.
+	buf.Reset()
+	FormatResult(&buf, res, FormatClassAdOld)
+	if !strings.Contains(buf.String(), "Owner = \"alice\"") {
+		t.Fatalf("old-classad output: %s", buf.String())
+	}
+
+	// New ClassAd format (bracketed).
+	buf.Reset()
+	FormatResult(&buf, res, FormatClassAdNew)
+	if !strings.Contains(buf.String(), "[") || !strings.Contains(buf.String(), "Owner = \"alice\"") {
+		t.Fatalf("new-classad output: %s", buf.String())
+	}
+}
+
+func TestParseFormat(t *testing.T) {
+	for in, want := range map[string]Format{
+		"table": FormatTable, "json": FormatJSON,
+		"classad": FormatClassAdOld, "classad-new": FormatClassAdNew,
+	} {
+		got, err := ParseFormat(in)
+		if err != nil || got != want {
+			t.Errorf("ParseFormat(%q) = %v,%v want %v", in, got, err, want)
+		}
+	}
+	if _, err := ParseFormat("yaml"); err == nil {
+		t.Error("ParseFormat(yaml) should error")
 	}
 }
 

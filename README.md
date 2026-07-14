@@ -131,6 +131,7 @@ the join-free subset of SQL. Each row's primary key lives in a key attribute
 SELECT * FROM ads WHERE Cpus >= 8 LIMIT 10;
 SELECT Owner, JobPrio FROM ads WHERE Owner = 'alice';
 SELECT COUNT(*), AVG(Cpus), MAX(Memory) FROM ads WHERE JobStatus = 2;
+SELECT Owner, State, COUNT(*), SUM(Cpus) FROM ads GROUP BY Owner, State;
 INSERT INTO ads (Key, Owner, Cpus) VALUES ('1.0', 'alice', 4);
 UPDATE ads SET JobStatus = 2 WHERE Owner = 'alice';
 DELETE FROM ads WHERE JobStatus = 4;
@@ -138,8 +139,33 @@ DELETE FROM ads WHERE JobStatus = 4;
 
 - `WHERE` is translated to a ClassAd expression (`=`→equality, `AND`/`OR`/`NOT`,
   single-quoted strings), evaluated by the store's engine.
-- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`.
-- `JOIN`, `GROUP BY`, `ORDER BY`, and subqueries are rejected with a clear error.
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, with `GROUP BY` over one or
+  more columns. Aggregation runs **server-side** (hash-map grouping): only the
+  grouped result crosses the wire, not every matched ad. SUM/AVG/MIN/MAX use the
+  ClassAd library's own coercion rules (`classad.Sum`/`Avg`/`Min`/`Max`) — integer
+  sums stay exact, an int+real mix promotes to real, booleans coerce to 0/1,
+  undefined is skipped, an error propagates, and `MIN`/`MAX` are numeric (a string
+  argument yields `error`).
+- `JOIN`, `ORDER BY`, and subqueries are rejected with a clear error.
+
+### Formatting and control commands (interactive)
+
+```
+.help                 show help
+.format <mode>        table (default) | json | classad | classad-new
+.output <file>        redirect query output to a file; .output stdout to restore
+.quit                 exit
+```
+
+`.format json` emits one JSON object per ad (JSONL); `.format classad` /
+`classad-new` emit each ad in old / new ClassAd format. In non-table formats a
+`SELECT` serializes whole matched ads (projection is a table-mode feature); an
+aggregate result serializes its group rows. One-shot mode takes `-format`:
+
+```sh
+htcondordb-cli -format json    -e "SELECT * FROM ads WHERE Cpus >= 8"
+htcondordb-cli -format classad -e "SELECT * FROM ads WHERE Owner = 'alice'"
+```
 
 ### Loading ads from a collector or schedd
 
@@ -184,10 +210,14 @@ daemon ads, `GlobalJobId` or another unique attribute for jobs).
 ## Building
 
 ```sh
-export GOWORK=off GOFLAGS=-mod=mod GOPRIVATE=github.com/bbockelm,github.com/PelicanPlatform GOPROXY=direct
-go build ./...
-go test ./...
+make build     # -> bin/htcondordb and bin/htcondordb-cli
+make test      # run the suite
+make vet
 ```
+
+(The Makefile sets the module-graph environment the sibling `replace` directives
+need. To run `go` directly, export the same:
+`GOWORK=off GOFLAGS=-mod=mod GOPRIVATE=github.com/bbockelm,github.com/PelicanPlatform GOPROXY=direct`.)
 
 The `go.mod` `replace` directives point at sibling checkouts for local
 development; resolve them to tagged versions before publishing with CI.

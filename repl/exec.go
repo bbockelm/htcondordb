@@ -111,6 +111,13 @@ type Result struct {
 	Rows     [][]string // SELECT rows (cells aligned to Columns)
 	Affected int        // rows written by INSERT/UPDATE/DELETE
 	Note     string     // human-readable summary line (e.g. "UPDATE 3")
+
+	// Ads are the matched ads of a plain (non-aggregate) SELECT, in result
+	// order and after LIMIT. They back the JSON / ClassAd output formats, which
+	// serialize whole ads rather than a projected table. Nil for aggregates.
+	Ads []*classad.ClassAd
+	// Star is true when the SELECT was `SELECT *`.
+	Star bool
 }
 
 // Exec executes one statement.
@@ -165,30 +172,30 @@ func (e *Executor) queryAds(where string) ([]*classad.ClassAd, error) {
 }
 
 func (e *Executor) execSelect(st *Statement) (*Result, error) {
+	// GROUP BY, or any aggregate, is computed server-side (hash-map aggregation):
+	// only the grouped result crosses the wire, not every matched ad.
+	if isAggregateQuery(st) {
+		return e.execAggregate(st)
+	}
+
 	ads, err := e.queryAds(st.Where)
 	if err != nil {
 		return nil, err
 	}
 
-	// Aggregate query: one summary row.
-	if len(st.Items) > 0 && st.Items[0].IsAggregate() {
-		return aggregate(st.Items, ads)
-	}
-
-	res := &Result{IsSelect: true}
+	limited := applyLimit(ads, st.Limit)
+	res := &Result{IsSelect: true, Ads: limited}
 	// Determine columns.
 	if len(st.Items) == 1 && st.Items[0].Star {
-		res.Columns = e.starColumns(ads)
+		res.Columns = e.starColumns(limited)
+		res.Star = true
 	} else {
 		for _, it := range st.Items {
 			res.Columns = append(res.Columns, it.header())
 		}
 	}
 
-	for i, ad := range ads {
-		if st.Limit > 0 && i >= st.Limit {
-			break
-		}
+	for _, ad := range limited {
 		row := make([]string, len(res.Columns))
 		for j, col := range res.Columns {
 			row[j] = valueDisplay(ad.EvaluateAttr(col))
@@ -196,6 +203,95 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 		res.Rows = append(res.Rows, row)
 	}
 	return res, nil
+}
+
+// isAggregateQuery reports whether st needs server-side aggregation.
+func isAggregateQuery(st *Statement) bool {
+	if len(st.GroupBy) > 0 {
+		return true
+	}
+	for _, it := range st.Items {
+		if it.IsAggregate() {
+			return true
+		}
+	}
+	return false
+}
+
+// execAggregate runs a GROUP BY / aggregate query on the server and assembles the
+// tabular result in the SELECT's column order.
+func (e *Executor) execAggregate(st *Statement) (*Result, error) {
+	// Build the aggregate specs (in item order) and the group-column index map.
+	var aggs []dbrpc.AggSpec
+	groupIdx := map[string]int{}
+	for i, g := range st.GroupBy {
+		groupIdx[strings.ToLower(g)] = i
+	}
+	for _, it := range st.Items {
+		if it.IsAggregate() {
+			aggs = append(aggs, dbrpc.AggSpec{Func: aggFunc(it.Agg), Arg: it.Col})
+		}
+	}
+
+	rows, err := e.c.Aggregate(constraint(st.Where), st.GroupBy, aggs)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &Result{IsSelect: true}
+	for _, it := range st.Items {
+		res.Columns = append(res.Columns, it.header())
+	}
+	for _, gr := range rows {
+		row := make([]string, 0, len(st.Items))
+		aggN := 0
+		for _, it := range st.Items {
+			if it.IsAggregate() {
+				if aggN < len(gr.Values) {
+					row = append(row, gr.Values[aggN])
+				} else {
+					row = append(row, "")
+				}
+				aggN++
+				continue
+			}
+			// Plain group column: pull from the group tuple by its position.
+			if idx, ok := groupIdx[strings.ToLower(it.Col)]; ok && idx < len(gr.Group) {
+				row = append(row, gr.Group[idx])
+			} else {
+				row = append(row, "")
+			}
+		}
+		res.Rows = append(res.Rows, row)
+	}
+	if st.Limit > 0 && len(res.Rows) > st.Limit {
+		res.Rows = res.Rows[:st.Limit]
+	}
+	return res, nil
+}
+
+// aggFunc maps a SQL aggregate name to the dbrpc function code.
+func aggFunc(name string) dbrpc.AggFunc {
+	switch name {
+	case "SUM":
+		return dbrpc.AggSum
+	case "AVG":
+		return dbrpc.AggAvg
+	case "MIN":
+		return dbrpc.AggMin
+	case "MAX":
+		return dbrpc.AggMax
+	default:
+		return dbrpc.AggCount
+	}
+}
+
+// applyLimit returns the first limit ads (0 = all).
+func applyLimit(ads []*classad.ClassAd, limit int) []*classad.ClassAd {
+	if limit > 0 && len(ads) > limit {
+		return ads[:limit]
+	}
+	return ads
 }
 
 // starColumns computes the column set for SELECT *: the key attribute first,
@@ -306,94 +402,6 @@ func (e *Executor) matchedKeys(where string) ([]string, error) {
 	return keys, nil
 }
 
-// --- aggregates ---
-
-func aggregate(items []SelectItem, ads []*classad.ClassAd) (*Result, error) {
-	res := &Result{IsSelect: true}
-	row := make([]string, len(items))
-	for i, it := range items {
-		res.Columns = append(res.Columns, it.header())
-		v, err := computeAggregate(it, ads)
-		if err != nil {
-			return nil, err
-		}
-		row[i] = v
-	}
-	res.Rows = [][]string{row}
-	return res, nil
-}
-
-func computeAggregate(it SelectItem, ads []*classad.ClassAd) (string, error) {
-	switch it.Agg {
-	case "COUNT":
-		if it.Col == "*" {
-			return strconv.Itoa(len(ads)), nil
-		}
-		n := 0
-		for _, ad := range ads {
-			if v := ad.EvaluateAttr(it.Col); !v.IsUndefined() && !v.IsError() {
-				n++
-			}
-		}
-		return strconv.Itoa(n), nil
-	case "SUM", "AVG":
-		var sum float64
-		var n int
-		for _, ad := range ads {
-			if f, ok := asFloat(ad.EvaluateAttr(it.Col)); ok {
-				sum += f
-				n++
-			}
-		}
-		if it.Agg == "SUM" {
-			return trimFloat(sum), nil
-		}
-		if n == 0 {
-			return "undefined", nil
-		}
-		return trimFloat(sum / float64(n)), nil
-	case "MIN", "MAX":
-		return minMax(it, ads)
-	default:
-		return "", fmt.Errorf("unknown aggregate %s", it.Agg)
-	}
-}
-
-func minMax(it SelectItem, ads []*classad.ClassAd) (string, error) {
-	var (
-		haveNum bool
-		numAcc  float64
-		haveStr bool
-		strAcc  string
-	)
-	want := func(better bool) bool {
-		return (it.Agg == "MIN") == better // MIN wants smaller; MAX wants larger
-	}
-	for _, ad := range ads {
-		v := ad.EvaluateAttr(it.Col)
-		if f, ok := asFloat(v); ok {
-			if !haveNum || want(f < numAcc) {
-				numAcc, haveNum = f, true
-			}
-			continue
-		}
-		if v.IsString() {
-			s, _ := v.StringValue()
-			if !haveStr || want(s < strAcc) {
-				strAcc, haveStr = s, true
-			}
-		}
-	}
-	switch {
-	case haveNum:
-		return trimFloat(numAcc), nil
-	case haveStr:
-		return strAcc, nil
-	default:
-		return "undefined", nil
-	}
-}
-
 // --- value helpers ---
 
 // valueDisplay renders a Value for tabular output.
@@ -459,18 +467,6 @@ func unquoteClassAd(lit string) string {
 		sb.WriteByte(inner[i])
 	}
 	return sb.String()
-}
-
-func asFloat(v classad.Value) (float64, bool) {
-	if v.IsInteger() {
-		i, _ := v.IntValue()
-		return float64(i), true
-	}
-	if v.IsReal() {
-		r, _ := v.RealValue()
-		return r, true
-	}
-	return 0, false
 }
 
 // trimFloat formats a float without a trailing ".0" for whole numbers.

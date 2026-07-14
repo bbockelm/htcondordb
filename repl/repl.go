@@ -5,16 +5,30 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 )
 
+// session holds the mutable REPL state the meta-commands change: the current
+// output target and serialization format.
+type session struct {
+	exec    *Executor
+	base    io.Writer // the original output (restored by `.output stdout`)
+	out     io.Writer // current output target
+	outFile *os.File  // non-nil when output is redirected to a file
+	outPath string
+	format  Format
+}
+
 // Run reads statements from in and writes results to out until EOF, ctx is
-// cancelled, or a quit meta-command. Each non-empty line is one statement
-// (an optional trailing ';' is allowed). Lines beginning with '.' or '\' are
-// meta-commands (.help, .quit). Errors are printed and do not stop the loop.
-//
-// prompt, if non-empty, is written before each read when interactive.
+// cancelled, or a quit meta-command. Each non-empty line is one statement (an
+// optional trailing ';' is allowed). Lines beginning with '.' or '\' are
+// meta-commands (.help, .quit, .format, .output). Errors are printed and do not
+// stop the loop. prompt, if non-empty, is written before each read.
 func Run(ctx context.Context, e *Executor, in io.Reader, out io.Writer, prompt string) error {
+	s := &session{exec: e, base: out, out: out, format: FormatTable}
+	defer s.closeOutput()
+
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	for {
@@ -24,7 +38,7 @@ func Run(ctx context.Context, e *Executor, in io.Reader, out io.Writer, prompt s
 		default:
 		}
 		if prompt != "" {
-			fmt.Fprint(out, prompt)
+			fmt.Fprint(out, prompt) // the prompt always goes to the console
 		}
 		if !sc.Scan() {
 			break
@@ -34,17 +48,17 @@ func Run(ctx context.Context, e *Executor, in io.Reader, out io.Writer, prompt s
 			continue
 		}
 		if isMeta(line) {
-			if quit := runMeta(out, line); quit {
+			if quit := s.runMeta(out, line); quit {
 				return nil
 			}
 			continue
 		}
 		res, err := e.ExecString(line)
 		if err != nil {
-			fmt.Fprintf(out, "error: %v\n", err)
+			fmt.Fprintf(out, "error: %v\n", err) // errors go to the console
 			continue
 		}
-		FormatResult(out, res)
+		FormatResult(s.out, res, s.format)
 	}
 	return sc.Err()
 }
@@ -54,17 +68,80 @@ func isMeta(line string) bool {
 }
 
 // runMeta handles a meta-command; it returns true if the loop should quit.
-func runMeta(out io.Writer, line string) bool {
-	cmd := strings.ToLower(strings.Fields(line)[0])
+// console is where status/help/errors print (always the terminal, even when
+// query output is redirected to a file).
+func (s *session) runMeta(console io.Writer, line string) bool {
+	fields := strings.Fields(line)
+	cmd := strings.ToLower(fields[0])
+	arg := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
 	switch cmd {
 	case ".quit", ".q", "\\q", ".exit":
 		return true
 	case ".help", "\\h", ".h", "\\?":
-		fmt.Fprint(out, helpText)
+		fmt.Fprint(console, helpText)
+	case ".format", ".mode":
+		s.setFormat(console, arg)
+	case ".output", ".out", "\\o":
+		s.setOutput(console, arg)
 	default:
-		fmt.Fprintf(out, "unknown command %q (try .help)\n", cmd)
+		fmt.Fprintf(console, "unknown command %q (try .help)\n", cmd)
 	}
 	return false
+}
+
+// setFormat switches the serialization format, or reports it when no arg given.
+func (s *session) setFormat(console io.Writer, arg string) {
+	if arg == "" {
+		fmt.Fprintf(console, "format: %s\n", s.format)
+		return
+	}
+	f, err := ParseFormat(arg)
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	s.format = f
+	fmt.Fprintf(console, "format: %s\n", s.format)
+}
+
+// setOutput redirects query output to a file, or back to the console with
+// `.output` / `.output stdout`.
+func (s *session) setOutput(console io.Writer, arg string) {
+	s.closeOutput()
+	if arg == "" || strings.EqualFold(arg, "stdout") || strings.EqualFold(arg, "-") {
+		s.out = s.base
+		fmt.Fprintln(console, "output: stdout")
+		return
+	}
+	path := stripQuotes(arg)
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		s.out = s.base
+		return
+	}
+	s.outFile = f
+	s.outPath = path
+	s.out = f
+	fmt.Fprintf(console, "output: %s\n", path)
+}
+
+// closeOutput closes any open output file and resets to the console.
+func (s *session) closeOutput() {
+	if s.outFile != nil {
+		_ = s.outFile.Close()
+		s.outFile = nil
+		s.outPath = ""
+	}
+	s.out = s.base
+}
+
+func stripQuotes(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && (s[0] == '\'' || s[0] == '"') && s[len(s)-1] == s[0] {
+		return s[1 : len(s)-1]
+	}
+	return s
 }
 
 const helpText = `htcondordb SQL-like shell. The store is a single ClassAd collection
@@ -72,17 +149,20 @@ const helpText = `htcondordb SQL-like shell. The store is a single ClassAd colle
 
   SELECT * FROM ads WHERE Cpus >= 8 LIMIT 10;
   SELECT Owner, JobPrio FROM ads WHERE Owner = 'alice';
-  SELECT COUNT(*), AVG(Cpus), MAX(Memory) FROM ads WHERE JobStatus = 2;
+  SELECT Owner, COUNT(*), AVG(Cpus) FROM ads GROUP BY Owner;
   INSERT INTO ads (Key, Owner, Cpus) VALUES ('1.0', 'alice', 4);
   UPDATE ads SET JobStatus = 2 WHERE Owner = 'alice';
   DELETE FROM ads WHERE JobStatus = 4;
 
 Notes:
   - WHERE is a ClassAd expression; '=' means equality, AND/OR/NOT work.
-  - Aggregates: COUNT, SUM, AVG, MIN, MAX (no GROUP BY).
-  - JOIN, GROUP BY, ORDER BY, and subqueries are not supported.
+  - Aggregates: COUNT, SUM, AVG, MIN, MAX, with GROUP BY over one+ columns
+    (evaluated server-side).
+  - JOIN, ORDER BY, and subqueries are not supported.
 
 Meta-commands:
-  .help    show this help
-  .quit    exit
+  .help                 show this help
+  .format <mode>        table (default) | json | classad | classad-new
+  .output <file>        send query output to a file; .output stdout to restore
+  .quit                 exit
 `
