@@ -21,11 +21,14 @@ import (
 	"time"
 
 	cedarclient "github.com/bbockelm/cedar/client"
+	"github.com/bbockelm/cedar/message"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/ha/consistent"
 	"github.com/bbockelm/htcondordb/repl"
 )
 
@@ -73,7 +76,13 @@ func run() error {
 	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()))
 	defer func() { _ = dbc.Close() }()
 
-	exec := repl.NewExecutor(dbc, repl.ExecConfig{KeyAttr: fs.keyAttr})
+	execCfg := repl.ExecConfig{KeyAttr: fs.keyAttr}
+	if fs.consistent {
+		// Consistent mode: route writes through the raft cluster's DBControl
+		// endpoint, following leader redirects. Reads still use the dbrpc session.
+		execCfg.ApplyBatch = consistentWriter(ctx, cfg, addr)
+	}
+	exec := repl.NewExecutor(dbc, execCfg)
 
 	// One-shot mode: -e, or statements passed as arguments.
 	if oneShot := oneShotStatements(fs); oneShot != "" {
@@ -106,10 +115,11 @@ func run() error {
 }
 
 type flags struct {
-	addr    string
-	keyAttr string
-	stmt    string
-	args    []string
+	addr       string
+	keyAttr    string
+	stmt       string
+	consistent bool
+	args       []string
 }
 
 func parseFlags() *flags {
@@ -134,6 +144,8 @@ func parseFlags() *flags {
 			if i < len(args) {
 				f.keyAttr = args[i]
 			}
+		case "-consistent", "--consistent":
+			f.consistent = true
 		default:
 			rest = append(rest, args[i])
 		}
@@ -179,6 +191,44 @@ func locateDaemon(cfg *config.Config) (string, error) {
 func getConfig(cfg *config.Config, key string) string {
 	v, _ := cfg.Get(key)
 	return v
+}
+
+// consistentWriter builds a repl.ApplyBatch that submits write batches to the
+// consistent-mode cluster via the DBControl command, following leader redirects.
+func consistentWriter(ctx context.Context, cfg *config.Config, addr string) func([]repl.WriteOp) error {
+	exchange := func(ectx context.Context, target string, req *classad.ClassAd) (*classad.ClassAd, error) {
+		sec, err := htcondor.GetSecurityConfig(cfg, command.DBControl, "CLIENT")
+		if err != nil {
+			return nil, err
+		}
+		sec.Command = command.DBControl
+		cl, err := cedarclient.ConnectAndAuthenticate(ectx, target, sec)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = cl.Close() }()
+		s := cl.GetStream()
+		if err := message.NewMessageForStream(s).PutClassAd(ectx, req); err != nil {
+			return nil, err
+		}
+		return message.NewMessageFromStream(s).GetClassAd(ectx)
+	}
+
+	cc := consistent.NewControlClient(addr, exchange)
+	return func(ops []repl.WriteOp) error {
+		b := consistent.NewBatch()
+		for _, op := range ops {
+			switch op.Kind {
+			case repl.WNewClassAd:
+				b.NewClassAd(op.Key, op.Value)
+			case repl.WSetAttribute:
+				b.SetAttribute(op.Key, op.Name, op.Value)
+			case repl.WDestroyClassAd:
+				b.DestroyClassAd(op.Key)
+			}
+		}
+		return cc.Apply(ctx, b)
+	}
 }
 
 func isInteractive() bool {

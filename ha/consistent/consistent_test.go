@@ -189,6 +189,61 @@ func TestControlProtocol(t *testing.T) {
 	}
 }
 
+// TestRaftRestartDurability proves the boltdb log survives a restart: a node
+// bootstrapped in a data dir, given a write, then shut down and reopened over the
+// SAME data dir with a fresh (empty) FSM database, replays its durable log and
+// reconstructs the committed state -- without re-bootstrapping.
+func TestRaftRestartDurability(t *testing.T) {
+	dataDir := t.TempDir()
+	noDial := func(context.Context, string, time.Duration) (*stream.Stream, error) {
+		return nil, errors.New("no peers")
+	}
+	open := func(d *db.DB) *Coordinator {
+		c, err := NewCoordinator(CoordinatorConfig{
+			NodeID: "n1", Advertise: "127.0.0.1:1", Local: d, Dial: noDial,
+			DataDir: dataDir, Bootstrap: true, Timeout: 5 * time.Second,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.WaitForLeader(5 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	// First incarnation: bootstrap and commit a write.
+	d1, err := db.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1 := open(d1)
+	if err := c1.Apply(NewBatch().NewClassAd("1.0", "Owner = \"alice\"")); err != nil {
+		t.Fatal(err)
+	}
+	_ = c1.Close()
+	d1.Close()
+
+	// Second incarnation: same data dir, fresh empty FSM DB. The durable log must
+	// replay into it.
+	d2, err := db.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	c2 := open(d2)
+	defer c2.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := d2.LookupClassAd("1.0"); ok {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("restarted node did not replay its durable log into the fresh FSM")
+}
+
 func lookupAttr(t *testing.T, d *db.DB, key, name string) (string, bool) {
 	t.Helper()
 	tx := d.Begin()

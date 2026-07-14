@@ -90,13 +90,11 @@ peers that register.
 Knobs: `HTCONDORDB_RAFT_BOOTSTRAP` (bool, the initial leader),
 `HTCONDORDB_RAFT_PEERS`, `HTCONDORDB_RAFT_SIZE`, `HTCONDORDB_NODE_ID`.
 
-> Note: the current build uses in-memory raft log/stable stores with persistent
-> FileSnapshotStore snapshots; a production deployment should swap in a
-> boltdb-backed store for full membership durability across restarts. The
-> daemon-side write path (`DBControl` apply → `coordinator.Apply` → quorum → FSM)
-> and client redirect are complete; routing the REPL's writes through the
-> consistent path is a thin client-side integration on top of
-> `consistent.ControlClient`.
+> Raft log + stable state are stored durably in boltdb (`<db>/raft/raft.db`) and
+> FSM state in FileSnapshotStore snapshots, so a node's membership and committed
+> log survive restarts (a restarted node replays its log into the FSM rather than
+> re-bootstrapping). The REPL routes writes through the consistent path with
+> `-consistent` (via `consistent.ControlClient`, which follows leader redirects).
 
 ## Configuration knobs
 

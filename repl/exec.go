@@ -25,13 +25,42 @@ type ExecConfig struct {
 	// GenKey generates a key for an INSERT that does not supply the key column.
 	// Defaults to a monotonic "row-<n>" generator.
 	GenKey func() string
+
+	// ApplyBatch, if set, replaces the local dbrpc transaction as the write path:
+	// INSERT/UPDATE/DELETE build a batch of WriteOps and hand it to ApplyBatch
+	// instead of committing over the dbrpc session. This routes writes through a
+	// consistent-mode cluster (the CLI wires it to a consistent.ControlClient that
+	// proposes the batch to raft and follows leader redirects). Reads still use
+	// the dbrpc client. When nil, writes commit locally over dbrpc.
+	ApplyBatch func([]WriteOp) error
+}
+
+// WriteKind identifies a mutation in a write batch.
+type WriteKind int
+
+const (
+	// WNewClassAd stores Value (old-ClassAd text) under Key.
+	WNewClassAd WriteKind = iota
+	// WSetAttribute sets Key's attribute Name to the ClassAd expression Value.
+	WSetAttribute
+	// WDestroyClassAd removes Key.
+	WDestroyClassAd
+)
+
+// WriteOp is one mutation produced by an INSERT/UPDATE/DELETE.
+type WriteOp struct {
+	Kind  WriteKind
+	Key   string
+	Name  string
+	Value string
 }
 
 // Executor runs parsed statements against a dbrpc client.
 type Executor struct {
-	c       *dbrpc.Client
-	keyAttr string
-	genKey  func() string
+	c          *dbrpc.Client
+	keyAttr    string
+	genKey     func() string
+	applyBatch func([]WriteOp) error
 }
 
 // NewExecutor builds an Executor over an established dbrpc client.
@@ -45,7 +74,34 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch}
+}
+
+// commit applies a batch of write ops: through ApplyBatch (consistent mode) if
+// configured, else as one local dbrpc transaction.
+func (e *Executor) commit(ops []WriteOp) error {
+	if e.applyBatch != nil {
+		return e.applyBatch(ops)
+	}
+	tx, err := e.c.Begin()
+	if err != nil {
+		return err
+	}
+	for _, op := range ops {
+		switch op.Kind {
+		case WNewClassAd:
+			err = tx.NewClassAd(op.Key, op.Value)
+		case WSetAttribute:
+			err = tx.SetAttribute(op.Key, op.Name, op.Value)
+		case WDestroyClassAd:
+			err = tx.DestroyClassAd(op.Key)
+		}
+		if err != nil {
+			_ = tx.Abort()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // Result is the outcome of executing a statement.
@@ -181,15 +237,7 @@ func (e *Executor) execInsert(st *Statement) (*Result, error) {
 		return nil, fmt.Errorf("INSERT: empty primary key")
 	}
 
-	tx, err := e.c.Begin()
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.NewClassAd(key, sb.String()); err != nil {
-		_ = tx.Abort()
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
+	if err := e.commit([]WriteOp{{Kind: WNewClassAd, Key: key, Value: sb.String()}}); err != nil {
 		return nil, err
 	}
 	return &Result{Affected: 1, Note: "INSERT 1 (key " + key + ")"}, nil
@@ -209,20 +257,14 @@ func (e *Executor) execUpdate(st *Statement) (*Result, error) {
 		return &Result{Affected: 0, Note: "UPDATE 0"}, nil
 	}
 
-	tx, err := e.c.Begin()
-	if err != nil {
-		return nil, err
-	}
+	var ops []WriteOp
 	for _, key := range keys {
 		for _, a := range st.Assignments {
-			if err := tx.SetAttribute(key, a.Col, a.Expr); err != nil {
-				_ = tx.Abort()
-				return nil, fmt.Errorf("updating %s.%s: %w", key, a.Col, err)
-			}
+			ops = append(ops, WriteOp{Kind: WSetAttribute, Key: key, Name: a.Col, Value: a.Expr})
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
+	if err := e.commit(ops); err != nil {
+		return nil, fmt.Errorf("updating: %w", err)
 	}
 	return &Result{Affected: len(keys), Note: fmt.Sprintf("UPDATE %d", len(keys))}, nil
 }
@@ -235,18 +277,12 @@ func (e *Executor) execDelete(st *Statement) (*Result, error) {
 	if len(keys) == 0 {
 		return &Result{Affected: 0, Note: "DELETE 0"}, nil
 	}
-	tx, err := e.c.Begin()
-	if err != nil {
-		return nil, err
-	}
+	ops := make([]WriteOp, 0, len(keys))
 	for _, key := range keys {
-		if err := tx.DestroyClassAd(key); err != nil {
-			_ = tx.Abort()
-			return nil, fmt.Errorf("deleting %s: %w", key, err)
-		}
+		ops = append(ops, WriteOp{Kind: WDestroyClassAd, Key: key})
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
+	if err := e.commit(ops); err != nil {
+		return nil, fmt.Errorf("deleting: %w", err)
 	}
 	return &Result{Affected: len(keys), Note: fmt.Sprintf("DELETE %d", len(keys))}, nil
 }

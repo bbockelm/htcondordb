@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
 
 // CoordinatorConfig configures a consistent-mode raft node.
@@ -55,6 +57,8 @@ type Coordinator struct {
 	layer *StreamLayer
 	trans *raft.NetworkTransport
 	raft  *raft.Raft
+	store *raftboltdb.BoltStore // durable log + stable store
+	snaps raft.SnapshotStore
 
 	mu      sync.Mutex
 	members map[raft.ServerID]raft.ServerAddress // registered members (bootstrap tracking)
@@ -104,15 +108,21 @@ func NewCoordinator(cfg CoordinatorConfig) (*Coordinator, error) {
 		trans.Close()
 		return nil, fmt.Errorf("consistent: snapshot store: %w", err)
 	}
-	logStore := raft.NewInmemStore()
-	stableStore := raft.NewInmemStore()
+	// Durable log + stable store: membership and the log survive restarts, so a
+	// node rejoins with its state intact rather than re-bootstrapping.
+	store, err := raftboltdb.NewBoltStore(filepath.Join(cfg.DataDir, "raft.db"))
+	if err != nil {
+		trans.Close()
+		return nil, fmt.Errorf("consistent: bolt store: %w", err)
+	}
 
 	rcfg := raft.DefaultConfig()
 	rcfg.LocalID = raft.ServerID(cfg.NodeID)
 	rcfg.Logger = hlog
 
-	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, trans)
+	r, err := raft.NewRaft(rcfg, fsm, store, store, snaps, trans)
 	if err != nil {
+		_ = store.Close()
 		trans.Close()
 		return nil, fmt.Errorf("consistent: creating raft: %w", err)
 	}
@@ -125,10 +135,13 @@ func NewCoordinator(cfg CoordinatorConfig) (*Coordinator, error) {
 		layer:   layer,
 		trans:   trans,
 		raft:    r,
+		store:   store,
+		snaps:   snaps,
 		members: map[raft.ServerID]raft.ServerAddress{},
 	}
 
 	if err := c.maybeBootstrap(); err != nil {
+		_ = c.Close()
 		return nil, err
 	}
 	return c, nil
@@ -137,6 +150,17 @@ func NewCoordinator(cfg CoordinatorConfig) (*Coordinator, error) {
 // maybeBootstrap initializes a fresh cluster from the bootstrap node.
 func (c *Coordinator) maybeBootstrap() error {
 	if !c.cfg.Bootstrap {
+		return nil
+	}
+	// A restart with durable state must not re-bootstrap: the existing
+	// configuration (including any peers added since) is authoritative.
+	if has, err := raft.HasExistingState(c.store, c.store, c.snaps); err == nil && has {
+		c.log.Info("consistent: existing raft state found; skipping bootstrap")
+		if cfg := c.raft.GetConfiguration(); cfg.Error() == nil {
+			for _, s := range cfg.Configuration().Servers {
+				c.members[s.ID] = s.Address
+			}
+		}
 		return nil
 	}
 	servers := c.cfg.Peers
@@ -158,10 +182,8 @@ func (c *Coordinator) maybeBootstrap() error {
 	return nil
 }
 
-// note: with in-memory log/stable stores, raft state does not survive a restart;
-// snapshots (FileSnapshotStore) persist the FSM state, and the bootstrap node
-// re-forms the configuration on start. A production deployment should swap in a
-// boltdb-backed LogStore/StableStore for full membership durability.
+// Log/stable state is stored durably in boltdb (raft.db) and the FSM state in
+// FileSnapshotStore snapshots, so a node's membership and log survive restarts.
 
 // Layer returns the CEDAR stream layer, so the daemon's DBRaft command handler
 // can Deliver accepted peer streams into the transport.
@@ -263,6 +285,11 @@ func (c *Coordinator) Close() error {
 	}
 	if lerr := c.layer.Close(); lerr != nil && err == nil {
 		err = lerr
+	}
+	if c.store != nil {
+		if serr := c.store.Close(); serr != nil && err == nil {
+			err = serr
+		}
 	}
 	return err
 }
