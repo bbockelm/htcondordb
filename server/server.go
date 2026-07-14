@@ -148,7 +148,11 @@ func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error 
 		opts.ReadOnly = true
 	}
 
-	s.log.Debug("htcondordb session opened",
+	// Logged at Info so an operator can see, per connection, the identity that
+	// authenticated and the access level it was granted -- the answer to "why am
+	// I read-only?" (the mapped user was not authorized for WRITE, or the daemon
+	// is a read-only replica).
+	s.log.Info("htcondordb session opened",
 		"remote", c.RemoteAddr, "user", peerUser(c), "level", level.String(),
 		"read_only", opts.ReadOnly, "private_visible", opts.IncludePrivate)
 

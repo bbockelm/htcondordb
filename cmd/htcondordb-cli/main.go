@@ -34,6 +34,33 @@ import (
 	"github.com/bbockelm/htcondordb/repl"
 )
 
+const usageText = `htcondordb-cli - interactive SQL-like shell and loader for an htcondordb daemon.
+
+Usage:
+  htcondordb-cli [flags]                 start an interactive shell
+  htcondordb-cli [flags] -e "<sql>"      run one statement and exit
+  htcondordb-cli [flags] load [-key A]   load a ClassAd stream from stdin
+
+Flags:
+  -addr <host:port>   daemon address (default: HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST)
+  -e <sql>            execute one statement, print the result, and exit
+  -format <mode>      output format for -e: table (default) | json | classad | classad-new
+  -key-attr <name>    attribute holding each row's primary key (default: Key)
+  -consistent         route writes through the raft cluster (consistent HA mode)
+  -h, -help           show this help
+
+load subcommand:
+  condor_status -long | htcondordb-cli load               # machine ads, keyed by Name
+  condor_q -global -long | htcondordb-cli load -key GlobalJobId
+  -key <attr>         source attribute used as the primary key (default: Name)
+
+Interactive meta-commands: .help .format .output .quit  (type .help in the shell)
+
+Language: SELECT / INSERT / UPDATE / DELETE with WHERE, LIMIT, aggregates
+(COUNT/SUM/AVG/MIN/MAX) and GROUP BY. No JOIN / ORDER BY / subqueries.
+Writing (INSERT/UPDATE/DELETE) requires WRITE authorization at the daemon.
+`
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "htcondordb-cli:", err)
@@ -43,6 +70,10 @@ func main() {
 
 func run() error {
 	fs := parseFlags()
+	if fs.help {
+		fmt.Print(usageText)
+		return nil
+	}
 
 	cfg, err := config.New()
 	if err != nil {
@@ -83,6 +114,9 @@ func run() error {
 	if oneShot := oneShotStatements(fs); oneShot != "" {
 		res, err := exec.ExecString(oneShot)
 		if err != nil {
+			if h := repl.HintFor(err); h != "" {
+				fmt.Fprintf(os.Stderr, "hint: %s\n", h)
+			}
 			return err
 		}
 		format := repl.FormatTable
@@ -123,6 +157,7 @@ type flags struct {
 	consistent bool
 	loadKey    string // `load`: source attribute used as the primary key
 	format     string // one-shot output format (-format)
+	help       bool
 	args       []string
 }
 
@@ -160,6 +195,8 @@ func parseFlags() *flags {
 			if i < len(args) {
 				f.format = args[i]
 			}
+		case "-h", "-help", "--help":
+			f.help = true
 		default:
 			rest = append(rest, args[i])
 		}

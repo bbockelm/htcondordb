@@ -56,6 +56,9 @@ func Run(ctx context.Context, e *Executor, in io.Reader, out io.Writer, prompt s
 		res, err := e.ExecString(line)
 		if err != nil {
 			fmt.Fprintf(out, "error: %v\n", err) // errors go to the console
+			if h := HintFor(err); h != "" {
+				fmt.Fprintf(out, "  hint: %s\n", h)
+			}
 			continue
 		}
 		FormatResult(s.out, res, s.format)
@@ -65,6 +68,21 @@ func Run(ctx context.Context, e *Executor, in io.Reader, out io.Writer, prompt s
 
 func isMeta(line string) bool {
 	return strings.HasPrefix(line, ".") || strings.HasPrefix(line, "\\")
+}
+
+// HintFor returns an actionable hint for common, confusing errors, or "".
+func HintFor(err error) string {
+	if err == nil {
+		return ""
+	}
+	if strings.Contains(err.Error(), "read-only connection") {
+		return "the daemon authorized this connection READ-only, so writes are refused. " +
+			"Writing (INSERT/UPDATE/DELETE) needs WRITE authorization: check the daemon's " +
+			"ALLOW_WRITE / DENY_WRITE and that your client authenticated (an anonymous client " +
+			"typically only gets READ). If the daemon is a leader-follower follower or a " +
+			"consistent replica it serves reads only -- direct writes to the leader (or use -consistent)."
+	}
+	return ""
 }
 
 // runMeta handles a meta-command; it returns true if the loop should quit.
