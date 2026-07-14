@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/authz"
@@ -69,6 +70,18 @@ func run() error {
 	sec, err := htcondor.GetServerSecurityConfig(d.Config(), command.DBSession, "DAEMON")
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
+	}
+	// This daemon gates every operation on the peer's authenticated identity
+	// (READ vs WRITE vs DAEMON), so authorization is meaningless without an
+	// identity. HTCondor's default SEC_*_AUTHENTICATION is OPTIONAL, and
+	// OPTIONAL+OPTIONAL negotiates to *no* authentication -- leaving every peer
+	// anonymous and therefore read-only. Prefer authentication instead: it runs
+	// whenever the peer offers a mutually-supported method (so a local client
+	// maps to its user via FS) but still admits a peer with no method (which
+	// stays anonymous/read-only). An admin who really wants OPTIONAL/NEVER can
+	// set SEC_DEFAULT_AUTHENTICATION explicitly and this leaves it untouched.
+	if sec.Authentication == security.SecurityOptional {
+		sec.Authentication = security.SecurityPreferred
 	}
 	srv := cedarserver.New(sec)
 

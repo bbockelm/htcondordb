@@ -24,6 +24,7 @@ import (
 
 	cedarclient "github.com/bbockelm/cedar/client"
 	"github.com/bbockelm/cedar/message"
+	"github.com/bbockelm/cedar/security"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 
@@ -252,6 +253,13 @@ func connectDB(ctx context.Context, cfg *config.Config, addr string) (*dbrpc.Cli
 		return nil, nil, fmt.Errorf("building client security config: %w", err)
 	}
 	sec.Command = command.DBSession
+	// Prefer authentication so the client maps to its user (e.g. via FS) and can
+	// be authorized for WRITE; OPTIONAL on both ends would negotiate to no auth,
+	// leaving the connection anonymous and read-only. PREFERRED still connects
+	// (read-only) when no method is mutually available.
+	if sec.Authentication == security.SecurityOptional {
+		sec.Authentication = security.SecurityPreferred
+	}
 
 	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer connCancel()

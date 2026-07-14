@@ -114,6 +114,41 @@ Knobs: `HTCONDORDB_RAFT_BOOTSTRAP` (bool, the initial leader),
 
 Standard `SEC_*` and `ALLOW_`/`DENY_` knobs configure security and authorization.
 
+## Security & authorization (getting WRITE)
+
+Two independent things must both hold for a client to write (INSERT/UPDATE/DELETE):
+
+1. **The client is authenticated**, so the daemon has an identity to authorize.
+   HTCondor's default `SEC_*_AUTHENTICATION` is `OPTIONAL`, and OPTIONAL on both
+   ends negotiates to *no* authentication — leaving the peer anonymous (`user=""`)
+   and read-only. htcondordb therefore *prefers* authentication by default (it
+   runs whenever a mutually-supported method exists, e.g. `FS` for a local client,
+   and still admits a peer with no method as read-only). You normally don't need
+   to set anything; to force it, `SEC_DEFAULT_AUTHENTICATION = REQUIRED`.
+
+2. **The identity is authorized for WRITE.** With `ALLOW_WRITE` unset, WRITE is
+   fail-closed (denied), even for an authenticated user — so you must grant it.
+
+Quick start for **local development** (anonymous writes, no auth needed):
+
+```
+ALLOW_WRITE  = *
+ALLOW_DAEMON = *          # only if you use an HA mode
+```
+
+**Identity-based** (recommended for real use): let FS/TOKEN/SSL map the user and
+authorize that identity:
+
+```
+SEC_DEFAULT_AUTHENTICATION = PREFERRED      # (htcondordb already prefers it)
+ALLOW_WRITE  = you@your.uid.domain
+ALLOW_DAEMON = other-daemon@your.uid.domain
+```
+
+The daemon logs each connection's outcome at Info —
+`htcondordb session opened … user=<fqu> level=READ|WRITE|DAEMON` — which is the
+quickest way to see the identity you mapped to and the level it was granted.
+
 ## REPL
 
 ```
