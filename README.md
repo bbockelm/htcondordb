@@ -201,7 +201,40 @@ DELETE FROM jobs WHERE JobStatus == 4;
   de-duplication); `DISTINCT *` de-duplicates whole ads.
 - **`ORDER BY`** one or more columns/aggregates, each `ASC` (default) or `DESC`;
   numeric values sort numerically, applied before `LIMIT`.
-- `JOIN` and subqueries are rejected with a clear error.
+- `JOIN` and subqueries are rejected with a clear error — cross-table work is
+  matchmaking (`MATCH`), not a join.
+
+### MATCH — matchmaking between two tables
+
+`MATCH` is HTCondor bilateral matchmaking, not a join: a request (e.g. a job) and
+a resource (e.g. a machine) match when each one's `Requirements` is satisfied with
+the other as `TARGET`, ranked by the request's `Rank`.
+
+```sql
+MATCH <requestTable> TO <resourceTable>
+  [WHERE <request-filter>]        -- which requests to matchmake
+  [WHERE TARGET <resource-filter>] -- pre-filter resources (pushed down once)
+  [LIMIT <k>];                    -- best k resources per request (default 1)
+
+-- single request:
+MATCH KEY '<key>' IN <requestTable> TO <resourceTable> [LIMIT k];
+```
+
+For each request passing the request-side `WHERE`, it returns the top-`k`
+bilaterally-matching resources by the request's `Rank`. The `WHERE TARGET` clause
+(resource side) uses `TARGET`, ClassAd's name for "the other ad," and is pushed
+down as a single indexed query on the resource table, so it filters the candidate
+set once rather than per request. Output columns are `Request`, `Resource`, `Rank`.
+
+```sql
+-- For each of alice's jobs, its best X86_64 machine:
+MATCH jobs TO machines WHERE Owner == "alice" WHERE TARGET Arch == "X86_64" LIMIT 1;
+
+-- Request | Resource   | Rank
+-- 1.0     | slot1@ep7  | 16
+```
+
+It is a dry run: it reports matches, it does not claim/consume resources.
 
 ### Formatting and control commands (interactive)
 

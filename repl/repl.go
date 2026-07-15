@@ -199,13 +199,18 @@ a row's primary key lives in the "Key" attribute.
   DELETE FROM jobs WHERE JobStatus == 4;
   DROP INDEX ON machines (Cpus);   DROP TABLE machines;
 
+  MATCH jobs TO machines WHERE Owner == "alice" WHERE TARGET Arch == "X86_64" LIMIT 1;
+  MATCH KEY '1.0' IN jobs TO machines LIMIT 5;
+
 Notes:
   - WHERE is a ClassAd expression (==, =?=, =!=, undefined, regexp(), ...),
     evaluated by the store; string literals use double quotes.
   - Aggregates: COUNT, SUM, AVG, MIN, MAX, with GROUP BY over one+ columns
     (evaluated server-side); DISTINCT and ORDER BY (ASC/DESC) are supported.
-  - JOIN and subqueries are not supported.
+  - JOIN and subqueries are not supported; matchmaking is MATCH, not a join.
   - CREATE INDEX kind is VALUE (numeric+range) or CATEGORICAL (string eq).
+  - MATCH <requests> TO <resources>: bilateral Requirements/Rank matchmaking.
+    Bare WHERE filters requests; WHERE TARGET filters resources (pushed down).
 
 Meta-commands:
   .help                 show this help

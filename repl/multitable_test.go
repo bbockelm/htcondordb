@@ -1,6 +1,7 @@
 package repl
 
 import (
+	"fmt"
 	"net"
 	"testing"
 
@@ -80,5 +81,43 @@ func TestMultiTableDDLAndRouting(t *testing.T) {
 	names, _ = e.Tables()
 	if len(names) != 2 || names[0] != "ads" || names[1] != "machines" {
 		t.Fatalf("after drop Tables() = %v, want [ads machines]", names)
+	}
+}
+
+func TestMatch(t *testing.T) {
+	e, cleanup := newCatalogExec(t)
+	defer cleanup()
+	mustExec(t, e, "CREATE TABLE machines")
+	mustExec(t, e, "CREATE TABLE jobs")
+
+	// Machines accept any job; the job ranks by Cpus.
+	for _, m := range []struct{ key, cpus, arch string }{
+		{"slot1", "8", "X86_64"}, {"slot2", "4", "X86_64"}, {"slot3", "16", "ARM"},
+	} {
+		mustExec(t, e, fmt.Sprintf(
+			"INSERT INTO machines (Key, Cpus, Arch, Requirements) VALUES ('%s', %s, '%s', true)",
+			m.key, m.cpus, m.arch))
+	}
+	mustExec(t, e, `INSERT INTO jobs (Key, RequestCpus, Requirements, Rank) VALUES ('1.0', 4, TARGET.Cpus >= RequestCpus, TARGET.Cpus)`)
+
+	// Best match overall: slot3 (highest Cpus / Rank).
+	r := mustExec(t, e, "MATCH jobs TO machines LIMIT 1")
+	if r.Columns[0] != "Request" || r.Columns[1] != "Resource" || r.Columns[2] != "Rank" {
+		t.Fatalf("columns = %v", r.Columns)
+	}
+	if len(r.Rows) != 1 || r.Rows[0][1] != "slot3" || r.Rows[0][2] != "16" {
+		t.Fatalf("best match = %v, want slot3 / 16", r.Rows)
+	}
+
+	// Resource-side filter (WHERE TARGET), pushed down: only X86_64 -> best slot1.
+	r = mustExec(t, e, `MATCH jobs TO machines WHERE TARGET Arch == "X86_64" LIMIT 1`)
+	if len(r.Rows) != 1 || r.Rows[0][1] != "slot1" {
+		t.Fatalf("filtered match = %v, want slot1", r.Rows)
+	}
+
+	// Single-request form via KEY.
+	r = mustExec(t, e, "MATCH KEY '1.0' IN jobs TO machines LIMIT 2")
+	if len(r.Rows) != 2 || r.Rows[0][0] != "1.0" || r.Rows[0][1] != "slot3" {
+		t.Fatalf("keyed match = %v, want 1.0 -> slot3 first", r.Rows)
 	}
 }

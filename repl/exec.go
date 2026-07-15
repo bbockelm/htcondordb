@@ -189,12 +189,29 @@ func (e *Executor) execDropIndex(st *Statement) (*Result, error) {
 	return &Result{Note: msg}, nil
 }
 
-// execMatch is not yet implemented: the grammar is in place, but matchmaking
-// (bilateral Requirements/Rank across two tables, with the resource-side filter
-// pushed down) is the next phase.
+// execMatch runs cross-table matchmaking: for each request in st.Table matching
+// the request-side WHERE (or the single KEY), it finds the top-Limit bilaterally
+// matching resources in st.MatchResource, ranked by the request's Rank, with the
+// resource-side filter (WHERE TARGET) pushed down.
 func (e *Executor) execMatch(st *Statement) (*Result, error) {
-	return nil, fmt.Errorf("MATCH is parsed but not yet executed; matchmaking (%s TO %s) is coming in the next phase",
-		st.Table, st.MatchResource)
+	reqWhere := st.Where
+	if st.Key != "" {
+		kf := fmt.Sprintf("%s == %s", e.keyAttr, quoteClassAd(st.Key))
+		if reqWhere == "" {
+			reqWhere = kf
+		} else {
+			reqWhere = "(" + reqWhere + ") && " + kf
+		}
+	}
+	rows, err := e.c.MatchTables(st.Table, st.MatchResource, e.keyAttr, reqWhere, st.TargetWhere, st.Limit)
+	if err != nil {
+		return nil, err
+	}
+	res := &Result{IsSelect: true, Columns: []string{"Request", "Resource", "Rank"}}
+	for _, m := range rows {
+		res.Rows = append(res.Rows, []string{m.Request, m.Resource, m.Rank})
+	}
+	return res, nil
 }
 
 // ExecString parses then executes a single statement, timing the execution

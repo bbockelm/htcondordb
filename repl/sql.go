@@ -5,9 +5,10 @@
 // join -- so the language is deliberately the join-free subset of SQL: SELECT
 // (with a WHERE filter, column projection, DISTINCT, the COUNT/SUM/AVG/MIN/MAX
 // aggregates, GROUP BY over one or more columns, ORDER BY, and LIMIT), INSERT,
-// UPDATE, and DELETE. Aggregation is evaluated server-side (hash-map GROUP BY).
-// JOIN and subqueries are intentionally unsupported and rejected with a clear
-// error.
+// UPDATE, and DELETE, plus CREATE/DROP TABLE, CREATE/DROP INDEX, and MATCH
+// (matchmaking between two tables). Aggregation is evaluated server-side
+// (hash-map GROUP BY). JOIN and subqueries are intentionally unsupported and
+// rejected with a clear error; cross-table work is matchmaking, not a join.
 //
 // A WHERE clause (and an UPDATE assignment's right-hand side) is a *ClassAd*
 // expression, captured verbatim and evaluated by the store's expression engine
@@ -846,34 +847,56 @@ func (p *parser) parseValueList() ([]string, error) {
 
 // parseValue parses a single literal value (string, number, bool, null, or a
 // signed number) into its ClassAd expression text.
+// parseValue parses one INSERT value: a literal (single-quoted strings become
+// ClassAd strings) when it is a lone literal token, else a ClassAd expression
+// captured verbatim -- so an attribute can be assigned an expression such as
+// Requirements = TARGET.Cpus >= RequestCpus or Rank = TARGET.Cpus.
 func (p *parser) parseValue() (string, error) {
+	if lit, ok := p.tryLiteralValue(); ok {
+		return lit, nil
+	}
+	// Not a lone literal: capture a ClassAd expression up to the next top-level
+	// comma or the closing ')'.
+	return p.captureRawExpr(func() bool {
+		return p.atEnd() || p.atPunct(",") || p.atPunct(")")
+	})
+}
+
+// tryLiteralValue consumes a lone literal value (string/number/[+-]number/bool/
+// null) only when it is immediately followed by ',' or ')'; otherwise it consumes
+// nothing and returns ok=false (the value is an expression). Single-quoted (and
+// double-quoted) strings are rendered as ClassAd string literals.
+func (p *parser) tryLiteralValue() (string, bool) {
+	start := p.pos
+	lit, ok := p.literalToken()
+	if !ok || !(p.atPunct(",") || p.atPunct(")")) {
+		p.pos = start // not a lone literal; rewind for expression capture
+		return "", false
+	}
+	return lit, true
+}
+
+// literalToken consumes a single literal token and returns its ClassAd rendering.
+func (p *parser) literalToken() (string, bool) {
 	t := p.next()
 	switch t.kind {
 	case tString:
-		return quoteClassAd(t.text), nil
+		return quoteClassAd(t.text), true
 	case tNumber:
-		return t.text, nil
+		return t.text, true
 	case tOp:
-		if t.text == "-" || t.text == "+" {
-			num := p.next()
-			if num.kind != tNumber {
-				return "", fmt.Errorf("expected a number after %q, got %q", t.text, num.text)
-			}
-			return t.text + num.text, nil
+		if (t.text == "-" || t.text == "+") && p.peek().kind == tNumber {
+			return t.text + p.next().text, true
 		}
-		return "", fmt.Errorf("unexpected operator %q in value", t.text)
 	case tIdent:
-		switch up := strings.ToUpper(t.text); up {
+		switch strings.ToUpper(t.text) {
 		case "TRUE", "FALSE":
-			return strings.ToLower(t.text), nil
+			return strings.ToLower(t.text), true
 		case "NULL", "UNDEFINED":
-			return "undefined", nil
-		default:
-			return "", fmt.Errorf("unexpected value %q (quote strings with single quotes)", t.text)
+			return "undefined", true
 		}
-	default:
-		return "", fmt.Errorf("unexpected value token %q", t.text)
 	}
+	return "", false
 }
 
 // rejectJoins produces a helpful error if a JOIN follows the table name.
