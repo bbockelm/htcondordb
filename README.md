@@ -202,6 +202,48 @@ DELETE FROM ads WHERE JobStatus == 4;
 The interactive shell has line editing and command history (arrow keys, Ctrl-A/E,
 Ctrl-R), persisted to `~/.htcondordb_history`.
 
+### Diagnostics and index tuning
+
+The shell can introspect the store's storage engine — the hot set, indexes, and
+query planner — and manage them:
+
+```
+.stats                storage stats (ads, segments, arena/live/dead bytes)
+.indexes              configured categorical/value indexes + demand suggestions
+.hot                  hot attributes (front-loaded in each ad's hot header)
+.suggest              index add/drop suggestions from observed query demand
+.explain <expr>       how the planner would run a ClassAd constraint
+
+.addindex value|categorical <attr>[, ...]   create an index (needs WRITE)
+.dropindex <attr>[, ...]                     drop an index
+.reindex                                     rebuild indexes
+.addhot <attr>[, ...]                        pin hot attributes
+.refreshhot [<sampleMax> <topN>]             recompute the hot set from sampling
+```
+
+`.explain` shows the chosen access path (`indexed` / `parallel-scan` /
+`serial-scan`), whether evaluation is wire-native (no per-ad ClassAd built), and
+per-probe which conjuncts can prune via an index:
+
+```
+htcondordb> .addindex value Cpus
+value index on Cpus (changed)
+htcondordb> .explain Cpus >= 8 && Owner == "alice"
+plan:         indexed
+wire-native:  true
+index-usable: 1 of 2 probe(s)
+parallelism:  4 worker(s) over 8 shard(s)
+probes:
+  Cpus                 >=   INDEX  (value)
+  Owner                ==   scan   (not indexed)
+```
+
+Index suggestions come from the store's own demand tracker (it records which
+attributes queries filter on) and a sample of live ads, so `.suggest` recommends
+exactly the indexes your workload would benefit from. The management commands
+(and thus `.addindex`/`.dropindex`/`.reindex`/`.addhot`) require WRITE, so a
+read-only connection can observe but not retune.
+
 `.format json` emits one JSON object per ad (JSONL); `.format classad` /
 `classad-new` emit each ad in old / new ClassAd format. In non-table formats a
 `SELECT` serializes whole matched ads (projection is a table-mode feature); an

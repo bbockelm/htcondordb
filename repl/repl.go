@@ -123,7 +123,9 @@ func (s *session) runMeta(console io.Writer, line string) bool {
 	case ".output", ".out", "\\o":
 		s.setOutput(console, arg)
 	default:
-		fmt.Fprintf(console, "unknown command %q (try .help)\n", cmd)
+		if !s.runDiagMeta(console, cmd, arg) {
+			fmt.Fprintf(console, "unknown command %q (try .help)\n", cmd)
+		}
 	}
 	return false
 }
@@ -205,4 +207,18 @@ Meta-commands:
   .format <mode>        table (default) | json | classad | classad-new
   .output <file>        send query output to a file; .output stdout to restore
   .quit                 exit
+
+Diagnostics:
+  .stats                storage stats (ads, segments, bytes)
+  .indexes              configured indexes (+ demand-based suggestions)
+  .hot                  hot attributes (front-loaded in each ad)
+  .suggest              index add/drop suggestions from observed demand
+  .explain <expr>       how the planner would run a ClassAd constraint
+
+Management (needs WRITE):
+  .addindex value|categorical <attr>[, ...]   create an index
+  .dropindex <attr>[, ...]                     drop an index
+  .reindex                                     rebuild indexes
+  .addhot <attr>[, ...]                        pin hot attributes
+  .refreshhot [<sampleMax> <topN>]             recompute the hot set
 `

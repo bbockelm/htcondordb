@@ -244,6 +244,51 @@ func TestRunLoop(t *testing.T) {
 	}
 }
 
+func TestDiagMetaCommands(t *testing.T) {
+	e, cleanup := newTestExec(t)
+	defer cleanup()
+
+	lines := []string{
+		"INSERT INTO ads (Key, Owner, Cpus) VALUES ('1', 'alice', 4)",
+		".addindex value Cpus",
+		".addindex categorical Owner",
+		".addhot Owner, Cpus",
+		".indexes",
+		".hot",
+		".explain Cpus > 2",
+		".stats",
+		".quit",
+	}
+	i := 0
+	readLine := func() (string, error) {
+		if i >= len(lines) {
+			return "", io.EOF
+		}
+		s := lines[i]
+		i++
+		return s, nil
+	}
+	var out strings.Builder
+	if err := Run(context.Background(), e, readLine, &out); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	checks := []string{
+		"value index on Cpus (changed)",
+		"categorical index on Owner (changed)",
+		"hot attributes: Cpus, Owner",
+		"categorical (string eq/membership): Owner",
+		"value       (numeric + range):      Cpus",
+		"plan:         indexed", // Cpus is value-indexed, `>` is usable
+		"ads:        1",
+	}
+	for _, c := range checks {
+		if !strings.Contains(got, c) {
+			t.Errorf("diag output missing %q\n---\n%s", c, got)
+		}
+	}
+}
+
 func TestScanLines(t *testing.T) {
 	rl := ScanLines(strings.NewReader("a\nb\n"))
 	for _, want := range []string{"a", "b"} {

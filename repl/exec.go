@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 )
 
@@ -143,6 +144,20 @@ func (e *Executor) ExecString(s string) (*Result, error) {
 		return nil, err
 	}
 	return e.Exec(st)
+}
+
+// Diagnostics returns the store's storage stats, hot set, indexes, and tuning
+// suggestions (the .stats/.indexes/.hot commands).
+func (e *Executor) Diagnostics() (*dbrpc.Diagnostics, error) { return e.c.Diagnostics() }
+
+// Explain reports how the store would execute a constraint query (.explain).
+func (e *Executor) Explain(constraint string) (*db.QueryExplain, error) {
+	return e.c.Explain(constraint)
+}
+
+// Admin runs an index/hot-set management action, returning the server's message.
+func (e *Executor) Admin(action string, args ...string) (string, error) {
+	return e.c.Admin(action, args...)
 }
 
 // constraint returns the WHERE constraint, defaulting to match-all.
