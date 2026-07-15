@@ -3,10 +3,17 @@
 //
 // The store is a single keyed collection of ClassAds -- there are no tables to
 // join -- so the language is deliberately the join-free subset of SQL: SELECT
-// (with a WHERE filter, column projection, LIMIT, the COUNT/SUM/AVG/MIN/MAX
-// aggregates, and GROUP BY over one or more columns), INSERT, UPDATE, and DELETE.
-// Aggregation is evaluated server-side (hash-map GROUP BY). JOIN, ORDER BY, and
-// subqueries are intentionally unsupported and rejected with a clear error.
+// (with a WHERE filter, column projection, DISTINCT, the COUNT/SUM/AVG/MIN/MAX
+// aggregates, GROUP BY over one or more columns, ORDER BY, and LIMIT), INSERT,
+// UPDATE, and DELETE. Aggregation is evaluated server-side (hash-map GROUP BY).
+// JOIN and subqueries are intentionally unsupported and rejected with a clear
+// error.
+//
+// A WHERE clause (and an UPDATE assignment's right-hand side) is a *ClassAd*
+// expression, captured verbatim and evaluated by the store's expression engine
+// -- the full ClassAd language is available (==, =?=, =!=, undefined, member(),
+// regexp(), the ?: operator, ...), not a SQL dialect. String literals use
+// double quotes as in ClassAd.
 //
 // The one table every statement addresses is the ClassAd store itself; the FROM
 // / INTO / UPDATE name is accepted for familiarity but is otherwise a label. A
@@ -42,9 +49,11 @@ type Statement struct {
 	Table string
 
 	// Select fields.
-	Items   []SelectItem // projection; a single {Star:true} means "*"
-	GroupBy []string     // GROUP BY columns ("" = none)
-	Limit   int          // 0 = no limit
+	Items    []SelectItem // projection; a single {Star:true} means "*"
+	Distinct bool         // SELECT DISTINCT
+	GroupBy  []string     // GROUP BY columns ("" = none)
+	OrderBy  []OrderTerm  // ORDER BY terms ("" = unordered)
+	Limit    int          // 0 = no limit
 
 	// Insert fields.
 	Columns []string // target columns
@@ -74,7 +83,13 @@ func (it SelectItem) IsAggregate() bool { return it.Agg != "" }
 // Assignment is one UPDATE ... SET column = expr.
 type Assignment struct {
 	Col  string
-	Expr string // translated ClassAd expression
+	Expr string // a ClassAd expression (captured verbatim)
+}
+
+// OrderTerm is one ORDER BY key: a column or aggregate, ascending unless Desc.
+type OrderTerm struct {
+	Item SelectItem
+	Desc bool
 }
 
 // header returns the display header for a select item.
@@ -102,7 +117,7 @@ func Parse(input string) (*Statement, error) {
 	if len(toks) == 0 {
 		return nil, errEmpty
 	}
-	p := &parser{toks: toks}
+	p := &parser{toks: toks, src: input}
 	stmt, err := p.parseStatement()
 	if err != nil {
 		return nil, err
@@ -130,11 +145,16 @@ const (
 type token struct {
 	kind tokKind
 	text string
+	pos  int // start byte offset in the source
+	end  int // end byte offset (exclusive), so src[pos:end] is the raw token
 }
 
 func lex(s string) ([]token, error) {
 	var toks []token
 	i, n := 0, len(s)
+	emit := func(kind tokKind, text string, start, end int) {
+		toks = append(toks, token{kind: kind, text: text, pos: start, end: end})
+	}
 	for i < n {
 		c := s[i]
 		switch {
@@ -162,7 +182,7 @@ func lex(s string) ([]token, error) {
 			if j >= n {
 				return nil, fmt.Errorf("unterminated string literal")
 			}
-			toks = append(toks, token{tString, sb.String()})
+			emit(tString, sb.String(), i, j+1)
 			i = j + 1
 		case c == '"':
 			// Double-quoted: accepted as a string too (ClassAd-native spelling).
@@ -173,7 +193,7 @@ func lex(s string) ([]token, error) {
 			if j >= n {
 				return nil, fmt.Errorf("unterminated string literal")
 			}
-			toks = append(toks, token{tString, s[i+1 : j]})
+			emit(tString, s[i+1:j], i, j+1)
 			i = j + 1
 		case isDigit(c) || (c == '.' && i+1 < n && isDigit(s[i+1])):
 			j := i
@@ -181,37 +201,45 @@ func lex(s string) ([]token, error) {
 				((s[j] == '+' || s[j] == '-') && j > i && (s[j-1] == 'e' || s[j-1] == 'E'))) {
 				j++
 			}
-			toks = append(toks, token{tNumber, s[i:j]})
+			emit(tNumber, s[i:j], i, j)
 			i = j
 		case isIdentStart(c):
 			j := i
 			for j < n && isIdentPart(s[j]) {
 				j++
 			}
-			toks = append(toks, token{tIdent, s[i:j]})
+			emit(tIdent, s[i:j], i, j)
 			i = j
 		case c == '(' || c == ')' || c == ',':
-			toks = append(toks, token{tPunct, string(c)})
+			emit(tPunct, string(c), i, i+1)
 			i++
 		default:
-			// Multi-char operators first.
+			// ClassAd is-identical / is-not-identical (three chars) first.
+			if i+2 < n {
+				three := s[i : i+3]
+				if three == "=?=" || three == "=!=" {
+					emit(tOp, three, i, i+3)
+					i += 3
+					continue
+				}
+			}
 			two := ""
 			if i+1 < n {
 				two = s[i : i+2]
 			}
 			switch two {
 			case "==", "!=", "<>", "<=", ">=", "&&", "||":
-				toks = append(toks, token{tOp, two})
+				emit(tOp, two, i, i+2)
 				i += 2
 				continue
 			}
-			switch c {
-			case '=', '<', '>', '+', '-', '*', '/', '!', '.':
-				toks = append(toks, token{tOp, string(c)})
-				i++
-			default:
-				return nil, fmt.Errorf("unexpected character %q", string(c))
-			}
+			// Any remaining operator/punctuation byte is a single-char op. This is
+			// deliberately permissive: WHERE and SET right-hand sides are captured
+			// verbatim from the source and handed to the ClassAd engine, so the
+			// lexer only needs to tokenize the surrounding statement without
+			// choking on the full ClassAd operator set (? : % & | ^ ~ etc.).
+			emit(tOp, string(c), i, i+1)
+			i++
 		}
 	}
 	return toks, nil
@@ -226,13 +254,14 @@ func isIdentPart(c byte) bool  { return isIdentStart(c) || isDigit(c) }
 type parser struct {
 	toks []token
 	pos  int
+	src  string // original source, for verbatim WHERE / SET expression capture
 }
 
 func (p *parser) atEnd() bool { return p.pos >= len(p.toks) }
 
 func (p *parser) peek() token {
 	if p.atEnd() {
-		return token{tIdent, ""}
+		return token{kind: tIdent}
 	}
 	return p.toks[p.pos]
 }
@@ -298,6 +327,9 @@ func (p *parser) parseStatement() (*Statement, error) {
 
 func (p *parser) parseSelect() (*Statement, error) {
 	st := &Statement{Kind: StmtSelect}
+	if p.takeKeyword("DISTINCT") {
+		st.Distinct = true
+	}
 	// Projection list.
 	for {
 		it, err := p.parseSelectItem()
@@ -350,7 +382,14 @@ func (p *parser) parseSelect() (*Statement, error) {
 		return nil, err
 	}
 	if p.takeKeyword("ORDER") {
-		return nil, fmt.Errorf("ORDER BY is not supported (results are unordered)")
+		if err := p.expectKeyword("BY"); err != nil {
+			return nil, err
+		}
+		terms, err := p.parseOrderBy()
+		if err != nil {
+			return nil, err
+		}
+		st.OrderBy = terms
 	}
 	if p.takeKeyword("LIMIT") {
 		t := p.next()
@@ -473,7 +512,7 @@ func (p *parser) parseUpdate() (*Statement, error) {
 			return nil, fmt.Errorf("expected `=` after %s, got %q", col, t.text)
 		}
 		p.pos++ // '='
-		expr, err := p.parseExprUntil(func() bool {
+		expr, err := p.captureRawExpr(func() bool {
 			return p.atPunct(",") || p.isKeyword("WHERE") || p.atEnd()
 		})
 		if err != nil {
@@ -519,69 +558,70 @@ func (p *parser) parseDelete() (*Statement, error) {
 	return st, nil
 }
 
-// parseWhere translates the WHERE clause (up to end/LIMIT/GROUP/ORDER) into a
-// ClassAd constraint expression.
+// parseWhere captures the WHERE clause (up to end/GROUP/ORDER/LIMIT) verbatim as
+// a ClassAd expression, so the full ClassAd language is available (==, =?=, =!=,
+// undefined, member(), regexp(), ?:, ...).
 func (p *parser) parseWhere() (string, error) {
-	return p.parseExprUntil(func() bool {
-		return p.atEnd() || p.isKeyword("LIMIT") || p.isKeyword("GROUP") || p.isKeyword("ORDER")
+	return p.captureRawExpr(func() bool {
+		return p.atEnd() || p.isKeyword("GROUP") || p.isKeyword("ORDER") || p.isKeyword("LIMIT")
 	})
 }
 
-// parseExprUntil consumes tokens until stop() is true, translating SQL spellings
-// into ClassAd expression syntax. It errors on unsupported operators (LIKE, IN,
-// subqueries).
-func (p *parser) parseExprUntil(stop func() bool) (string, error) {
-	var sb strings.Builder
+// captureRawExpr returns the source text of the expression starting at the
+// current token and running until stop() is true at the top paren level (or end
+// of input), advancing past it. The text is handed to the ClassAd engine
+// unchanged -- no SQL-to-ClassAd translation.
+func (p *parser) captureRawExpr(stop func() bool) (string, error) {
+	if p.atEnd() || stop() {
+		return "", fmt.Errorf("empty expression")
+	}
+	start := p.peek().pos
+	end := start
 	depth := 0
 	for !p.atEnd() {
 		if depth == 0 && stop() {
 			break
 		}
 		t := p.next()
-		if sb.Len() > 0 {
-			sb.WriteByte(' ')
-		}
-		switch t.kind {
-		case tString:
-			sb.WriteString(quoteClassAd(t.text))
-		case tNumber:
-			sb.WriteString(t.text)
-		case tOp:
-			sb.WriteString(translateOp(t.text))
-		case tPunct:
+		end = t.end
+		if t.kind == tPunct {
 			if t.text == "(" {
 				depth++
 			} else if t.text == ")" {
 				depth--
 			}
-			sb.WriteString(t.text)
-		case tIdent:
-			switch up := strings.ToUpper(t.text); up {
-			case "AND":
-				sb.WriteString("&&")
-			case "OR":
-				sb.WriteString("||")
-			case "NOT":
-				sb.WriteString("!")
-			case "TRUE", "FALSE", "UNDEFINED", "ERROR":
-				sb.WriteString(strings.ToLower(t.text))
-			case "NULL":
-				sb.WriteString("undefined")
-			case "LIKE", "IN", "BETWEEN":
-				return "", fmt.Errorf("%s is not supported in WHERE", up)
-			case "IS":
-				// IS NULL / IS NOT NULL -> isUndefined(...) handled loosely: emit ==
-				return "", fmt.Errorf("IS NULL is not supported; test with `attr =?= undefined` semantics via `!(attr >= attr)` is not provided")
-			default:
-				sb.WriteString(t.text) // attribute reference or ClassAd function
-			}
 		}
 	}
-	out := strings.TrimSpace(sb.String())
-	if out == "" {
+	raw := strings.TrimSpace(p.src[start:end])
+	if raw == "" {
 		return "", fmt.Errorf("empty expression")
 	}
-	return out, nil
+	return raw, nil
+}
+
+// parseOrderBy parses "term [ASC|DESC] (, term [ASC|DESC])*". Each term is a
+// column or aggregate (reusing the SELECT-item grammar).
+func (p *parser) parseOrderBy() ([]OrderTerm, error) {
+	var terms []OrderTerm
+	for {
+		it, err := p.parseSelectItem()
+		if err != nil {
+			return nil, err
+		}
+		term := OrderTerm{Item: it}
+		if p.takeKeyword("DESC") {
+			term.Desc = true
+		} else {
+			p.takeKeyword("ASC")
+		}
+		terms = append(terms, term)
+		if p.atPunct(",") {
+			p.pos++
+			continue
+		}
+		break
+	}
+	return terms, nil
 }
 
 func (p *parser) parseIdent() (string, error) {
@@ -748,18 +788,6 @@ func validateSelect(st *Statement) error {
 		}
 	}
 	return nil
-}
-
-// translateOp maps a SQL operator token to its ClassAd spelling.
-func translateOp(op string) string {
-	switch op {
-	case "=":
-		return "==" // SQL equality
-	case "<>":
-		return "!="
-	default:
-		return op
-	}
 }
 
 // quoteClassAd renders s as a ClassAd double-quoted string literal.

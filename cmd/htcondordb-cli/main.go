@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -50,6 +51,7 @@ Flags:
   -format <mode>      output format for -e: table (default) | json | classad | classad-new
   -key-attr <name>    attribute holding each row's primary key (default: Key)
   -consistent         route writes through the raft cluster (consistent HA mode)
+  -debug              log at DEBUG (default is WARNING; quiets library chatter)
   -h, -help           show this help
 
 load subcommand:
@@ -59,8 +61,9 @@ load subcommand:
 
 Interactive meta-commands: .help .format .output .quit  (type .help in the shell)
 
-Language: SELECT / INSERT / UPDATE / DELETE with WHERE, LIMIT, aggregates
-(COUNT/SUM/AVG/MIN/MAX) and GROUP BY. No JOIN / ORDER BY / subqueries.
+Language: SELECT / INSERT / UPDATE / DELETE with DISTINCT, aggregates
+(COUNT/SUM/AVG/MIN/MAX), GROUP BY, ORDER BY, and LIMIT. WHERE is a ClassAd
+expression (==, =?=, undefined, regexp(), ...). No JOIN / subqueries.
 Writing (INSERT/UPDATE/DELETE) requires WRITE authorization at the daemon.
 `
 
@@ -77,6 +80,14 @@ func run() error {
 		fmt.Print(usageText)
 		return nil
 	}
+
+	// Default to WARNING so the CLI is quiet; -debug turns on DEBUG. This governs
+	// the slog default the CEDAR client and other libraries log through.
+	level := slog.LevelWarn
+	if fs.debug {
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
 	cfg, err := config.New()
 	if err != nil {
@@ -189,6 +200,7 @@ type flags struct {
 	loadKey    string // `load`: source attribute used as the primary key
 	format     string // one-shot output format (-format)
 	help       bool
+	debug      bool
 	args       []string
 }
 
@@ -216,6 +228,8 @@ func parseFlags() *flags {
 			}
 		case "-consistent", "--consistent":
 			f.consistent = true
+		case "-debug", "--debug":
+			f.debug = true
 		case "-key", "--key":
 			i++
 			if i < len(args) {

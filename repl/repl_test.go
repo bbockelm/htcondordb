@@ -47,7 +47,7 @@ func TestInsertSelectCount(t *testing.T) {
 		t.Fatalf("COUNT(*) = %s, want 3", got)
 	}
 
-	r = mustExec(t, e, "SELECT COUNT(*) FROM ads WHERE Owner = 'alice'")
+	r = mustExec(t, e, `SELECT COUNT(*) FROM ads WHERE Owner == "alice"`)
 	if got := r.Rows[0][0]; got != "2" {
 		t.Fatalf("COUNT(*) WHERE Owner=alice = %s, want 2", got)
 	}
@@ -94,11 +94,11 @@ func TestUpdate(t *testing.T) {
 	mustExec(t, e, "INSERT INTO ads (Key, Owner, JobStatus) VALUES ('2.0', 'alice', 1)")
 	mustExec(t, e, "INSERT INTO ads (Key, Owner, JobStatus) VALUES ('3.0', 'bob', 1)")
 
-	r := mustExec(t, e, "UPDATE ads SET JobStatus = 2 WHERE Owner = 'alice'")
+	r := mustExec(t, e, `UPDATE ads SET JobStatus = 2 WHERE Owner == "alice"`)
 	if r.Affected != 2 {
 		t.Fatalf("UPDATE affected %d, want 2", r.Affected)
 	}
-	r = mustExec(t, e, "SELECT COUNT(*) FROM ads WHERE JobStatus = 2")
+	r = mustExec(t, e, "SELECT COUNT(*) FROM ads WHERE JobStatus == 2")
 	if r.Rows[0][0] != "2" {
 		t.Fatalf("after update COUNT(JobStatus=2) = %s, want 2", r.Rows[0][0])
 	}
@@ -108,7 +108,7 @@ func TestUpdateRejectsKeyAttr(t *testing.T) {
 	e, cleanup := newTestExec(t)
 	defer cleanup()
 	mustExec(t, e, "INSERT INTO ads (Key, Owner) VALUES ('1.0', 'alice')")
-	if _, err := e.ExecString("UPDATE ads SET Key = '9.9' WHERE Owner = 'alice'"); err == nil {
+	if _, err := e.ExecString(`UPDATE ads SET Key = "9.9" WHERE Owner == "alice"`); err == nil {
 		t.Fatal("UPDATE of the key attribute should be rejected")
 	}
 }
@@ -119,7 +119,7 @@ func TestDelete(t *testing.T) {
 	mustExec(t, e, "INSERT INTO ads (Key, JobStatus) VALUES ('1.0', 4)")
 	mustExec(t, e, "INSERT INTO ads (Key, JobStatus) VALUES ('2.0', 2)")
 
-	r := mustExec(t, e, "DELETE FROM ads WHERE JobStatus = 4")
+	r := mustExec(t, e, "DELETE FROM ads WHERE JobStatus == 4")
 	if r.Affected != 1 {
 		t.Fatalf("DELETE affected %d, want 1", r.Affected)
 	}
@@ -152,9 +152,7 @@ func TestParseRejectsUnsupported(t *testing.T) {
 		"SELECT Owner, COUNT(*) FROM ads",           // mix without GROUP BY
 		"SELECT * FROM ads GROUP BY Owner",          // star with GROUP BY
 		"SELECT Cpus FROM ads GROUP BY Owner",       // non-grouped, non-agg column
-		"SELECT * FROM ads ORDER BY Cpus",           // order by
 		"SELECT * FROM a, b",                        // comma join
-		"SELECT * FROM ads WHERE Owner LIKE 'a%'",   // LIKE
 		"SELECT *, Owner FROM ads",                  // star + column
 		"MERGE INTO ads",                            // unknown verb
 	}
@@ -302,13 +300,54 @@ func TestParseFormat(t *testing.T) {
 	}
 }
 
-func TestParseTranslatesWhere(t *testing.T) {
-	st, err := Parse("SELECT * FROM ads WHERE Owner = 'alice' AND Cpus >= 4 OR NOT Held")
-	if err != nil {
-		t.Fatal(err)
+// TestWhereIsVerbatimClassAd confirms the WHERE clause is captured verbatim as a
+// ClassAd expression (no SQL translation), so the full ClassAd language works.
+func TestWhereIsVerbatimClassAd(t *testing.T) {
+	cases := map[string]string{
+		`SELECT * FROM ads WHERE Owner == "alice" && Cpus >= 4`: `Owner == "alice" && Cpus >= 4`,
+		`SELECT * FROM ads WHERE foo =?= undefined`:             `foo =?= undefined`,
+		`SELECT * FROM ads WHERE regexp("a.*", Name) LIMIT 5`:   `regexp("a.*", Name)`,
+		`SELECT Owner FROM ads WHERE (A || B) && !C GROUP BY Owner`: `(A || B) && !C`,
 	}
-	want := `Owner == "alice" && Cpus >= 4 || ! Held`
-	if st.Where != want {
-		t.Fatalf("translated WHERE = %q, want %q", st.Where, want)
+	for in, wantWhere := range cases {
+		st, err := Parse(in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", in, err)
+		}
+		if st.Where != wantWhere {
+			t.Errorf("Parse(%q).Where = %q, want %q", in, st.Where, wantWhere)
+		}
+	}
+}
+
+// TestOrderByAndDistinct exercises DISTINCT and ORDER BY (asc/desc), including
+// over an aggregate.
+func TestOrderByAndDistinct(t *testing.T) {
+	e, cleanup := newTestExec(t)
+	defer cleanup()
+	mustExec(t, e, `INSERT INTO ads (Key, Owner, Cpus) VALUES ('1', 'alice', 4)`)
+	mustExec(t, e, `INSERT INTO ads (Key, Owner, Cpus) VALUES ('2', 'bob', 16)`)
+	mustExec(t, e, `INSERT INTO ads (Key, Owner, Cpus) VALUES ('3', 'alice', 8)`)
+
+	// ORDER BY numeric, ascending then descending.
+	r := mustExec(t, e, "SELECT Owner, Cpus FROM ads ORDER BY Cpus")
+	if r.Rows[0][1] != "4" || r.Rows[2][1] != "16" {
+		t.Fatalf("ORDER BY Cpus asc = %v", r.Rows)
+	}
+	r = mustExec(t, e, "SELECT Owner, Cpus FROM ads ORDER BY Cpus DESC")
+	if r.Rows[0][1] != "16" || r.Rows[2][1] != "4" {
+		t.Fatalf("ORDER BY Cpus desc = %v", r.Rows)
+	}
+
+	// DISTINCT owners.
+	r = mustExec(t, e, "SELECT DISTINCT Owner FROM ads ORDER BY Owner")
+	if len(r.Rows) != 2 || r.Rows[0][0] != "alice" || r.Rows[1][0] != "bob" {
+		t.Fatalf("DISTINCT Owner = %v", r.Rows)
+	}
+
+	// ORDER BY an aggregate, descending: bob(16) before alice(12).
+	r = mustExec(t, e, "SELECT Owner, SUM(Cpus) FROM ads GROUP BY Owner ORDER BY SUM(Cpus) DESC")
+	if r.Rows[0][0] != "bob" || r.Rows[1][0] != "alice" {
+		t.Fatalf("ORDER BY SUM(Cpus) desc = %v", r.Rows)
 	}
 }

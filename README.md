@@ -163,25 +163,32 @@ the join-free subset of SQL. Each row's primary key lives in a key attribute
 `UPDATE`/`DELETE` can recover the key of every row a `WHERE` clause matches.
 
 ```sql
-SELECT * FROM ads WHERE Cpus >= 8 LIMIT 10;
-SELECT Owner, JobPrio FROM ads WHERE Owner = 'alice';
-SELECT COUNT(*), AVG(Cpus), MAX(Memory) FROM ads WHERE JobStatus = 2;
-SELECT Owner, State, COUNT(*), SUM(Cpus) FROM ads GROUP BY Owner, State;
+SELECT * FROM ads WHERE Cpus >= 8 ORDER BY Cpus DESC LIMIT 10;
+SELECT DISTINCT Owner FROM ads ORDER BY Owner;
+SELECT COUNT(*), AVG(Cpus), MAX(Memory) FROM ads WHERE JobStatus == 2;
+SELECT Owner, State, COUNT(*), SUM(Cpus) FROM ads GROUP BY Owner, State ORDER BY COUNT(*) DESC;
 INSERT INTO ads (Key, Owner, Cpus) VALUES ('1.0', 'alice', 4);
-UPDATE ads SET JobStatus = 2 WHERE Owner = 'alice';
-DELETE FROM ads WHERE JobStatus = 4;
+UPDATE ads SET JobStatus = 2 WHERE Owner == "alice";
+DELETE FROM ads WHERE JobStatus == 4;
 ```
 
-- `WHERE` is translated to a ClassAd expression (`=`→equality, `AND`/`OR`/`NOT`,
-  single-quoted strings), evaluated by the store's engine.
-- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, with `GROUP BY` over one or
+- **`WHERE` is a ClassAd expression**, captured verbatim and evaluated by the
+  store's engine — the full ClassAd language is available (`==`, `=?=`, `=!=`,
+  `undefined`, `member()`, `regexp()`, `?:`, …), not a SQL dialect. String
+  literals use double quotes (`Owner == "alice"`). The right-hand side of an
+  `UPDATE … SET` is likewise a ClassAd expression.
+- **Aggregates**: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, with `GROUP BY` over one or
   more columns. Aggregation runs **server-side** (hash-map grouping): only the
   grouped result crosses the wire, not every matched ad. SUM/AVG/MIN/MAX use the
   ClassAd library's own coercion rules (`classad.Sum`/`Avg`/`Min`/`Max`) — integer
   sums stay exact, an int+real mix promotes to real, booleans coerce to 0/1,
   undefined is skipped, an error propagates, and `MIN`/`MAX` are numeric (a string
   argument yields `error`).
-- `JOIN`, `ORDER BY`, and subqueries are rejected with a clear error.
+- **`DISTINCT`** over explicit columns is `GROUP BY` those columns (server-side
+  de-duplication); `DISTINCT *` de-duplicates whole ads.
+- **`ORDER BY`** one or more columns/aggregates, each `ASC` (default) or `DESC`;
+  numeric values sort numerically, applied before `LIMIT`.
+- `JOIN` and subqueries are rejected with a clear error.
 
 ### Formatting and control commands (interactive)
 

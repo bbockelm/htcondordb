@@ -60,7 +60,7 @@ func TestApplyBatchRouting(t *testing.T) {
 	// UPDATE discovers the two alice keys (via a dbrpc read) and routes two
 	// WSetAttribute ops.
 	captured = nil
-	r, err := e.ExecString("UPDATE ads SET JobStatus = 2 WHERE Owner = 'alice'")
+	r, err := e.ExecString(`UPDATE ads SET JobStatus = 2 WHERE Owner == "alice"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestApplyBatchRouting(t *testing.T) {
 
 	// DELETE routes one WDestroyClassAd for the bob row.
 	captured = nil
-	if _, err := e.ExecString("DELETE FROM ads WHERE Owner = 'bob'"); err != nil {
+	if _, err := e.ExecString(`DELETE FROM ads WHERE Owner == "bob"`); err != nil {
 		t.Fatal(err)
 	}
 	if len(captured) != 1 || len(captured[0]) != 1 || captured[0][0].Kind != WDestroyClassAd || captured[0][0].Key != "3.0" {

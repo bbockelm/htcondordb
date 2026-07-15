@@ -172,15 +172,25 @@ func (e *Executor) queryAds(where string) ([]*classad.ClassAd, error) {
 }
 
 func (e *Executor) execSelect(st *Statement) (*Result, error) {
-	// GROUP BY, or any aggregate, is computed server-side (hash-map aggregation):
+	// GROUP BY / aggregates -- and DISTINCT over explicit columns, which is just
+	// GROUP BY those columns -- are computed server-side (hash-map aggregation):
 	// only the grouped result crosses the wire, not every matched ad.
-	if isAggregateQuery(st) {
-		return e.execAggregate(st)
+	groupBy := effectiveGroupBy(st)
+	if len(groupBy) > 0 || hasAggregate(st) {
+		return e.execAggregate(st, groupBy)
 	}
 
 	ads, err := e.queryAds(st.Where)
 	if err != nil {
 		return nil, err
+	}
+	if st.Distinct { // DISTINCT * : de-duplicate whole ads
+		ads = dedupeAds(ads)
+	}
+	if len(st.OrderBy) > 0 {
+		if err := sortAds(ads, st.OrderBy); err != nil {
+			return nil, err
+		}
 	}
 
 	limited := applyLimit(ads, st.Limit)
@@ -205,11 +215,8 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	return res, nil
 }
 
-// isAggregateQuery reports whether st needs server-side aggregation.
-func isAggregateQuery(st *Statement) bool {
-	if len(st.GroupBy) > 0 {
-		return true
-	}
+// hasAggregate reports whether any selected item is an aggregate.
+func hasAggregate(st *Statement) bool {
 	for _, it := range st.Items {
 		if it.IsAggregate() {
 			return true
@@ -218,13 +225,29 @@ func isAggregateQuery(st *Statement) bool {
 	return false
 }
 
+// effectiveGroupBy is st.GroupBy, or -- for a DISTINCT over explicit columns --
+// the projected column names (DISTINCT a, b == GROUP BY a, b).
+func effectiveGroupBy(st *Statement) []string {
+	if len(st.GroupBy) > 0 {
+		return st.GroupBy
+	}
+	if st.Distinct && !hasAggregate(st) && !(len(st.Items) == 1 && st.Items[0].Star) {
+		cols := make([]string, 0, len(st.Items))
+		for _, it := range st.Items {
+			cols = append(cols, it.Col)
+		}
+		return cols
+	}
+	return nil
+}
+
 // execAggregate runs a GROUP BY / aggregate query on the server and assembles the
-// tabular result in the SELECT's column order.
-func (e *Executor) execAggregate(st *Statement) (*Result, error) {
+// tabular result in the SELECT's column order, then applies ORDER BY and LIMIT.
+func (e *Executor) execAggregate(st *Statement, groupBy []string) (*Result, error) {
 	// Build the aggregate specs (in item order) and the group-column index map.
 	var aggs []dbrpc.AggSpec
 	groupIdx := map[string]int{}
-	for i, g := range st.GroupBy {
+	for i, g := range groupBy {
 		groupIdx[strings.ToLower(g)] = i
 	}
 	for _, it := range st.Items {
@@ -233,7 +256,7 @@ func (e *Executor) execAggregate(st *Statement) (*Result, error) {
 		}
 	}
 
-	rows, err := e.c.Aggregate(constraint(st.Where), st.GroupBy, aggs)
+	rows, err := e.c.Aggregate(constraint(st.Where), groupBy, aggs)
 	if err != nil {
 		return nil, err
 	}
@@ -264,6 +287,11 @@ func (e *Executor) execAggregate(st *Statement) (*Result, error) {
 		}
 		res.Rows = append(res.Rows, row)
 	}
+	if len(st.OrderBy) > 0 {
+		if err := sortRows(res, st.OrderBy); err != nil {
+			return nil, err
+		}
+	}
 	if st.Limit > 0 && len(res.Rows) > st.Limit {
 		res.Rows = res.Rows[:st.Limit]
 	}
@@ -292,6 +320,166 @@ func applyLimit(ads []*classad.ClassAd, limit int) []*classad.ClassAd {
 		return ads[:limit]
 	}
 	return ads
+}
+
+// dedupeAds returns ads with duplicate whole-ad values removed (SELECT DISTINCT *),
+// preserving first-seen order.
+func dedupeAds(ads []*classad.ClassAd) []*classad.ClassAd {
+	seen := make(map[string]struct{}, len(ads))
+	out := ads[:0:0]
+	for _, ad := range ads {
+		k := ad.StringWithPrivate()
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, ad)
+	}
+	return out
+}
+
+// sortAds sorts ads by the ORDER BY terms (which must be plain columns for a
+// non-aggregate query). Undefined/error values sort after concrete values.
+func sortAds(ads []*classad.ClassAd, terms []OrderTerm) error {
+	for _, t := range terms {
+		if t.Item.IsAggregate() {
+			return fmt.Errorf("cannot ORDER BY the aggregate %s in a non-aggregate query", t.Item.header())
+		}
+	}
+	sort.SliceStable(ads, func(i, j int) bool {
+		for _, t := range terms {
+			c := compareValues(ads[i].EvaluateAttr(t.Item.Col), ads[j].EvaluateAttr(t.Item.Col))
+			if c != 0 {
+				if t.Desc {
+					return c > 0
+				}
+				return c < 0
+			}
+		}
+		return false
+	})
+	return nil
+}
+
+// sortRows sorts an aggregate result's rows by the ORDER BY terms, each of which
+// must reference an output column (a group column or an aggregate).
+func sortRows(res *Result, terms []OrderTerm) error {
+	idxs := make([]int, len(terms))
+	for k, t := range terms {
+		idx := columnIndex(res.Columns, t.Item.header())
+		if idx < 0 {
+			return fmt.Errorf("ORDER BY %s is not a selected column", t.Item.header())
+		}
+		idxs[k] = idx
+	}
+	sort.SliceStable(res.Rows, func(i, j int) bool {
+		for k, t := range terms {
+			c := compareCells(res.Rows[i][idxs[k]], res.Rows[j][idxs[k]])
+			if c != 0 {
+				if t.Desc {
+					return c > 0
+				}
+				return c < 0
+			}
+		}
+		return false
+	})
+	return nil
+}
+
+func columnIndex(cols []string, name string) int {
+	for i, c := range cols {
+		if strings.EqualFold(c, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// compareValues orders two ClassAd values: numbers before strings before other
+// (undefined/error/bool), then by natural order within a kind.
+func compareValues(a, b classad.Value) int {
+	ra, rb := valueRank(a), valueRank(b)
+	if ra != rb {
+		return sign(ra - rb)
+	}
+	switch ra {
+	case rankNumber:
+		fa, _ := numOf(a)
+		fb, _ := numOf(b)
+		switch {
+		case fa < fb:
+			return -1
+		case fa > fb:
+			return 1
+		default:
+			return 0
+		}
+	case rankString:
+		sa, _ := a.StringValue()
+		sb, _ := b.StringValue()
+		return strings.Compare(sa, sb)
+	default:
+		return 0
+	}
+}
+
+const (
+	rankNumber = 0
+	rankString = 1
+	rankOther  = 2
+)
+
+func valueRank(v classad.Value) int {
+	switch {
+	case v.IsNumber():
+		return rankNumber
+	case v.IsString():
+		return rankString
+	default:
+		return rankOther
+	}
+}
+
+func numOf(v classad.Value) (float64, bool) {
+	if v.IsInteger() {
+		i, _ := v.IntValue()
+		return float64(i), true
+	}
+	if v.IsReal() {
+		r, _ := v.RealValue()
+		return r, true
+	}
+	return 0, false
+}
+
+// compareCells orders two rendered cells: numerically when both parse as numbers,
+// else lexically.
+func compareCells(a, b string) int {
+	fa, ea := strconv.ParseFloat(a, 64)
+	fb, eb := strconv.ParseFloat(b, 64)
+	if ea == nil && eb == nil {
+		switch {
+		case fa < fb:
+			return -1
+		case fa > fb:
+			return 1
+		default:
+			return 0
+		}
+	}
+	return strings.Compare(a, b)
+}
+
+func sign(n int) int {
+	switch {
+	case n < 0:
+		return -1
+	case n > 0:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // starColumns computes the column set for SELECT *: the key attribute first,

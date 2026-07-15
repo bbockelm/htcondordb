@@ -186,18 +186,19 @@ func stripQuotes(s string) string {
 const helpText = `htcondordb SQL-like shell. The store is a single ClassAd collection
 (no tables to join). Each row's primary key lives in the "Key" attribute.
 
-  SELECT * FROM ads WHERE Cpus >= 8 LIMIT 10;
-  SELECT Owner, JobPrio FROM ads WHERE Owner = 'alice';
-  SELECT Owner, COUNT(*), AVG(Cpus) FROM ads GROUP BY Owner;
+  SELECT * FROM ads WHERE Cpus >= 8 ORDER BY Cpus DESC LIMIT 10;
+  SELECT DISTINCT Owner FROM ads ORDER BY Owner;
+  SELECT Owner, COUNT(*), AVG(Cpus) FROM ads GROUP BY Owner ORDER BY COUNT(*) DESC;
   INSERT INTO ads (Key, Owner, Cpus) VALUES ('1.0', 'alice', 4);
-  UPDATE ads SET JobStatus = 2 WHERE Owner = 'alice';
-  DELETE FROM ads WHERE JobStatus = 4;
+  UPDATE ads SET JobStatus = 2 WHERE Owner == "alice";
+  DELETE FROM ads WHERE JobStatus == 4;
 
 Notes:
-  - WHERE is a ClassAd expression; '=' means equality, AND/OR/NOT work.
+  - WHERE is a ClassAd expression (==, =?=, =!=, undefined, regexp(), ...),
+    evaluated by the store; string literals use double quotes.
   - Aggregates: COUNT, SUM, AVG, MIN, MAX, with GROUP BY over one+ columns
-    (evaluated server-side).
-  - JOIN, ORDER BY, and subqueries are not supported.
+    (evaluated server-side); DISTINCT and ORDER BY (ASC/DESC) are supported.
+  - JOIN and subqueries are not supported.
 
 Meta-commands:
   .help                 show this help
