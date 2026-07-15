@@ -110,6 +110,10 @@ func (s *session) showIndexes(w io.Writer, d *dbrpc.Diagnostics) {
 }
 
 func (s *session) showHot(w io.Writer, d *dbrpc.Diagnostics) {
+	if len(d.Hot) == 0 {
+		fmt.Fprintln(w, "hot attributes: (none; run .refreshhot to compute the hot set from a sample)")
+		return
+	}
 	fmt.Fprintf(w, "hot attributes: %s\n", orNone(d.Hot))
 }
 
