@@ -274,8 +274,8 @@ func TestDiagMetaCommands(t *testing.T) {
 	}
 	got := out.String()
 	checks := []string{
-		"value index on Cpus (changed)",
-		"categorical index on Owner (changed)",
+		"value index on Cpus (changed",
+		"categorical index on Owner (changed",
 		"hot attributes: Cpus, Owner",
 		"categorical (string eq/membership): Owner",
 		"value       (numeric + range):      Cpus",

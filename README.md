@@ -251,6 +251,12 @@ exactly the indexes your workload would benefit from. The management commands
 (and thus `.addindex`/`.dropindex`/`.reindex`/`.addhot`) require WRITE, so a
 read-only connection can observe but not retune.
 
+`.addindex` builds the new index over the existing ads immediately (it reindexes),
+so it prunes and reports selectivity right away — not only for future writes. The
+index configuration and hot set are **persisted** in the database directory
+(`indexcfg.json`), so runtime `.addindex`/`.dropindex`/`.addhot` changes survive a
+daemon restart (and the indexes are rebuilt over the loaded ads on open).
+
 `.format json` emits one JSON object per ad (JSONL); `.format classad` /
 `classad-new` emit each ad in old / new ClassAd format. In non-table formats a
 `SELECT` serializes whole matched ads (projection is a table-mode feature); an
