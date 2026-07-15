@@ -212,8 +212,9 @@ the other as `TARGET`, ranked by the request's `Rank`.
 
 ```sql
 MATCH <requestTable> TO <resourceTable>
+  [USING (attr, ...)]             -- significant attrs: autocluster identical requests
   [WHERE <request-filter>]        -- which requests to matchmake
-  [WHERE TARGET <resource-filter>] -- pre-filter resources (pushed down once)
+  [WHERE TARGET <resource-filter>] -- filter resources (resource side)
   [LIMIT <k>];                    -- best k resources per request (default 1)
 
 -- single request:
@@ -221,10 +222,23 @@ MATCH KEY '<key>' IN <requestTable> TO <resourceTable> [LIMIT k];
 ```
 
 For each request passing the request-side `WHERE`, it returns the top-`k`
-bilaterally-matching resources by the request's `Rank`. The `WHERE TARGET` clause
-(resource side) uses `TARGET`, ClassAd's name for "the other ad," and is pushed
-down as a single indexed query on the resource table, so it filters the candidate
-set once rather than per request. Output columns are `Request`, `Resource`, `Rank`.
+bilaterally-matching resources by the request's `Rank`. Output columns are
+`Request`, `Resource`, `Rank`.
+
+Two things make it cheap on real (repetitive) workloads:
+
+- **Requirements pushdown.** The request's `Requirements` prunes candidate
+  resources through any covering index (the same index-aware match the negotiator
+  uses), so a match visits index candidates, not every resource. The `WHERE
+  TARGET` clause (resource side, using `TARGET` — ClassAd's name for "the other
+  ad") further filters the ranked matches.
+- **Autoclustering (`USING`).** Real pools have thousands of *identical* jobs.
+  `USING (attrs)` lists the attributes significant to matchmaking (the request's
+  `Requirements`/`Rank` and the request attributes resources examine); requests
+  whose significant attributes are textually equal share **one** candidate
+  computation — the match runs once per distinct signature and is reused for every
+  identical request (HTCondor autocluster semantics, via the store's
+  `ProjectionChecksum`). Omit `USING` to match each request individually.
 
 ```sql
 -- For each of alice's jobs, its best X86_64 machine:

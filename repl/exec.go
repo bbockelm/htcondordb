@@ -203,7 +203,7 @@ func (e *Executor) execMatch(st *Statement) (*Result, error) {
 			reqWhere = "(" + reqWhere + ") && " + kf
 		}
 	}
-	rows, err := e.c.MatchTables(st.Table, st.MatchResource, e.keyAttr, reqWhere, st.TargetWhere, st.Limit)
+	rows, err := e.c.MatchTables(st.Table, st.MatchResource, e.keyAttr, reqWhere, st.TargetWhere, st.Limit, st.MatchUsing)
 	if err != nil {
 		return nil, err
 	}

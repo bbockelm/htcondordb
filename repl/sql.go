@@ -60,10 +60,13 @@ type Statement struct {
 
 	// MatchResource is the resource table for a MATCH statement (Table is the
 	// request table); TargetWhere is the pushed-down resource-side filter; Key,
-	// if set, matches only that single request key.
+	// if set, matches only that single request key; MatchUsing lists the
+	// significant matchmaking attributes for autoclustering (identical requests
+	// share one candidate computation).
 	MatchResource string
 	TargetWhere   string
 	Key           string
+	MatchUsing    []string
 
 	// Select fields.
 	Items    []SelectItem // projection; a single {Star:true} means "*"
@@ -439,6 +442,17 @@ func (p *parser) parseMatch() (*Statement, error) {
 		return nil, err
 	}
 	st.MatchResource = res
+	// Optional USING (attrs): significant attributes for autoclustering.
+	if p.takeKeyword("USING") {
+		if err := p.expectPunct("("); err != nil {
+			return nil, err
+		}
+		cols, err := p.parseIdentList()
+		if err != nil {
+			return nil, err
+		}
+		st.MatchUsing = cols
+	}
 	// Zero, one, or two WHERE clauses: bare = request-side, WHERE TARGET =
 	// resource-side (pushed down).
 	for p.takeKeyword("WHERE") {

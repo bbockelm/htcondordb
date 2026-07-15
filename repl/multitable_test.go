@@ -120,4 +120,15 @@ func TestMatch(t *testing.T) {
 	if len(r.Rows) != 2 || r.Rows[0][0] != "1.0" || r.Rows[0][1] != "slot3" {
 		t.Fatalf("keyed match = %v, want 1.0 -> slot3 first", r.Rows)
 	}
+
+	// Autocluster via USING: a second identical job reuses the candidate list.
+	mustExec(t, e, `INSERT INTO jobs (Key, RequestCpus, Requirements, Rank) VALUES ('2.0', 4, TARGET.Cpus >= RequestCpus, TARGET.Cpus)`)
+	r = mustExec(t, e, "MATCH jobs TO machines USING (RequestCpus, Requirements, Rank) LIMIT 1")
+	best := map[string]string{}
+	for _, row := range r.Rows {
+		best[row[0]] = row[1]
+	}
+	if best["1.0"] != "slot3" || best["2.0"] != "slot3" {
+		t.Fatalf("USING autocluster = %v, want 1.0 and 2.0 -> slot3", best)
+	}
 }

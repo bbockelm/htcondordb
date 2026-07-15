@@ -200,6 +200,7 @@ a row's primary key lives in the "Key" attribute.
   DROP INDEX ON machines (Cpus);   DROP TABLE machines;
 
   MATCH jobs TO machines WHERE Owner == "alice" WHERE TARGET Arch == "X86_64" LIMIT 1;
+  MATCH jobs TO machines USING (RequestCpus, RequestMemory, Requirements, Rank) LIMIT 1;
   MATCH KEY '1.0' IN jobs TO machines LIMIT 5;
 
 Notes:
@@ -211,6 +212,7 @@ Notes:
   - CREATE INDEX kind is VALUE (numeric+range) or CATEGORICAL (string eq).
   - MATCH <requests> TO <resources>: bilateral Requirements/Rank matchmaking.
     Bare WHERE filters requests; WHERE TARGET filters resources (pushed down).
+    USING (attrs) autoclusters identical requests (match once, reuse candidates).
 
 Meta-commands:
   .help                 show this help
