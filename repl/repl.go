@@ -232,6 +232,7 @@ Diagnostics (current table, or an explicit one where noted):
   .hot [table]          hot attributes (front-loaded in each ad)
   .suggest [table]      index add/drop suggestions from observed demand
   .explain <expr>       how the current table's planner would run a constraint
+  .explain MATCH KEY '<k>' IN <req> TO <res>   how matchmaking one request would run
 
 Management (needs WRITE):
   .addindex value|categorical <attr>[, ...]   create an index
