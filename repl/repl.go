@@ -199,9 +199,9 @@ a row's primary key lives in the "Key" attribute.
   DELETE FROM jobs WHERE JobStatus == 4;
   DROP INDEX ON machines (Cpus);   DROP TABLE machines;
 
-  MATCH jobs TO machines WHERE Owner == "alice" WHERE TARGET Arch == "X86_64" LIMIT 1;
-  MATCH jobs TO machines USING (RequestCpus, RequestMemory, Requirements, Rank) LIMIT 1;
-  MATCH KEY '1.0' IN jobs TO machines LIMIT 5;
+  MATCH jobs TO machines WHERE Owner == "alice" WHERE TARGET Arch == "X86_64" LIMIT 10;
+  MATCH jobs TO machines USING (RequestCpus, RequestMemory, Requirements, Rank) LIMIT 100;
+  MATCH KEY '1.0' IN jobs TO machines;
 
 Notes:
   - WHERE is a ClassAd expression (==, =?=, =!=, undefined, regexp(), ...),
@@ -210,9 +210,13 @@ Notes:
     (evaluated server-side); DISTINCT and ORDER BY (ASC/DESC) are supported.
   - JOIN and subqueries are not supported; matchmaking is MATCH, not a join.
   - CREATE INDEX kind is VALUE (numeric+range) or CATEGORICAL (string eq).
-  - MATCH <requests> TO <resources>: bilateral Requirements/Rank matchmaking.
+  - MATCH <requests> TO <resources>: greedy assignment, one resource per request.
+    Each request (in table order) takes its best-ranked bilaterally-matching
+    resource not already claimed; the resource is then removed from the pool.
+    LIMIT bounds the number of REQUESTS assigned (the first N), not resources per
+    request; one row per request (Resource blank when it could not be placed).
     Bare WHERE filters requests; WHERE TARGET filters resources (pushed down).
-    USING (attrs) autoclusters identical requests (match once, reuse candidates).
+    USING (attrs) autoclusters identical requests (rank once, reuse; still consumed).
 
 Meta-commands:
   .help                 show this help

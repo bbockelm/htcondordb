@@ -115,20 +115,24 @@ func TestMatch(t *testing.T) {
 		t.Fatalf("filtered match = %v, want slot1", r.Rows)
 	}
 
-	// Single-request form via KEY.
-	r = mustExec(t, e, "MATCH KEY '1.0' IN jobs TO machines LIMIT 2")
-	if len(r.Rows) != 2 || r.Rows[0][0] != "1.0" || r.Rows[0][1] != "slot3" {
-		t.Fatalf("keyed match = %v, want 1.0 -> slot3 first", r.Rows)
+	// Single-request form via KEY: that one job is assigned its best machine.
+	r = mustExec(t, e, "MATCH KEY '1.0' IN jobs TO machines")
+	if len(r.Rows) != 1 || r.Rows[0][0] != "1.0" || r.Rows[0][1] != "slot3" {
+		t.Fatalf("keyed match = %v, want 1.0 -> slot3", r.Rows)
 	}
 
-	// Autocluster via USING: a second identical job reuses the candidate list.
+	// Autocluster via USING under assignment: a second identical job reuses the
+	// candidate list but is assigned a distinct machine (slot3 is consumed by the
+	// first, so the second takes the next best, slot1).
 	mustExec(t, e, `INSERT INTO jobs (Key, RequestCpus, Requirements, Rank) VALUES ('2.0', 4, TARGET.Cpus >= RequestCpus, TARGET.Cpus)`)
-	r = mustExec(t, e, "MATCH jobs TO machines USING (RequestCpus, Requirements, Rank) LIMIT 1")
+	r = mustExec(t, e, "MATCH jobs TO machines USING (RequestCpus, Requirements, Rank) LIMIT 5")
 	best := map[string]string{}
 	for _, row := range r.Rows {
 		best[row[0]] = row[1]
 	}
-	if best["1.0"] != "slot3" || best["2.0"] != "slot3" {
-		t.Fatalf("USING autocluster = %v, want 1.0 and 2.0 -> slot3", best)
+	if len(best) != 2 || best["1.0"] == best["2.0"] ||
+		(best["1.0"] != "slot3" && best["1.0"] != "slot1") ||
+		(best["2.0"] != "slot3" && best["2.0"] != "slot1") {
+		t.Fatalf("USING assignment = %v, want 1.0 and 2.0 -> distinct {slot3,slot1}", best)
 	}
 }

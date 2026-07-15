@@ -189,10 +189,12 @@ func (e *Executor) execDropIndex(st *Statement) (*Result, error) {
 	return &Result{Note: msg}, nil
 }
 
-// execMatch runs cross-table matchmaking: for each request in st.Table matching
-// the request-side WHERE (or the single KEY), it finds the top-Limit bilaterally
-// matching resources in st.MatchResource, ranked by the request's Rank, with the
-// resource-side filter (WHERE TARGET) pushed down.
+// execMatch runs cross-table matchmaking as a greedy assignment: walking the
+// requests in st.Table matching the request-side WHERE (or the single KEY), it
+// gives each one the best-ranked bilaterally-matching resource in st.MatchResource
+// that no earlier request has claimed, with the resource-side filter (WHERE TARGET)
+// pushed down. LIMIT bounds the number of requests assigned. One row per request
+// (Resource empty when it could not be placed).
 func (e *Executor) execMatch(st *Statement) (*Result, error) {
 	reqWhere := st.Where
 	if st.Key != "" {
