@@ -24,7 +24,7 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 	case ".hot":
 		s.withDiag(console, s.tableArg(arg), s.showHot)
 	case ".suggest":
-		s.withDiag(console, s.tableArg(arg), s.showSuggest)
+		s.suggest(console, arg)
 	case ".explain":
 		s.explain(console, arg)
 	case ".addindex":
@@ -115,6 +115,98 @@ func (s *session) showHot(w io.Writer, d *dbrpc.Diagnostics) {
 		return
 	}
 	fmt.Fprintf(w, "hot attributes: %s\n", orNone(d.Hot))
+}
+
+// suggest shows index suggestions, or -- with a leading -i / apply -- reviews them
+// interactively, prompting to accept each and applying the accepted ones. Usage:
+// `.suggest [table]` or `.suggest -i [table]`.
+func (s *session) suggest(console io.Writer, arg string) {
+	fields := strings.Fields(arg)
+	interactive := false
+	if len(fields) > 0 && (fields[0] == "-i" || strings.EqualFold(fields[0], "apply")) {
+		interactive = true
+		fields = fields[1:]
+	}
+	table := s.table
+	if len(fields) > 0 {
+		table = fields[0]
+	}
+	if !interactive {
+		s.withDiag(console, table, s.showSuggest)
+		return
+	}
+	s.suggestInteractive(console, table)
+}
+
+// suggestInteractive prompts to accept each add/drop suggestion and applies the ones
+// accepted (via the same index management the daemon exposes). It needs an input
+// source; without one it falls back to just printing.
+func (s *session) suggestInteractive(console io.Writer, table string) {
+	d, err := s.exec.Diagnostics(table)
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	if len(d.Suggestions) == 0 && len(d.DropSuggestions) == 0 {
+		fmt.Fprintln(console, "no index suggestions (need observed query demand)")
+		return
+	}
+	if s.readLine == nil {
+		s.showSuggest(console, d) // no input to prompt on: just show them
+		return
+	}
+	fmt.Fprintf(console, "reviewing suggestions for %q: [y]es apply / [N]o skip / [a]ll / [q]uit\n", table)
+	applied, all := 0, false
+	for _, sg := range d.Suggestions {
+		if !all {
+			fmt.Fprintf(console, "  add %s index on %s? (eq=%d range=%d distinct=%d) [y/N/a/q] ",
+				sg.Kind, sg.Attr, sg.QueriesEq, sg.QueriesRange, sg.DistinctValues)
+			ans, err := s.readLine()
+			if err != nil {
+				return
+			}
+			switch strings.ToLower(strings.TrimSpace(ans)) {
+			case "q", "quit":
+				fmt.Fprintf(console, "%d index(es) applied.\n", applied)
+				return
+			case "a", "all":
+				all = true
+			case "y", "yes":
+			default:
+				continue
+			}
+		}
+		action := "index.add.value"
+		if sg.Kind == "categorical" {
+			action = "index.add.categorical"
+		}
+		if msg, err := s.exec.Admin(table, action, sg.Attr); err != nil {
+			fmt.Fprintf(console, "    error: %v\n", err)
+		} else {
+			applied++
+			fmt.Fprintf(console, "    %s\n", msg)
+		}
+	}
+	for _, ds := range d.DropSuggestions {
+		fmt.Fprintf(console, "  drop the %s index on %s (%s)? [y/N/q] ", ds.Kind, ds.Attr, ds.Reason)
+		ans, err := s.readLine()
+		if err != nil {
+			return
+		}
+		switch strings.ToLower(strings.TrimSpace(ans)) {
+		case "q", "quit":
+			fmt.Fprintf(console, "%d change(s) applied.\n", applied)
+			return
+		case "y", "yes":
+			if msg, err := s.exec.Admin(table, "index.drop", ds.Attr); err != nil {
+				fmt.Fprintf(console, "    error: %v\n", err)
+			} else {
+				applied++
+				fmt.Fprintf(console, "    %s\n", msg)
+			}
+		}
+	}
+	fmt.Fprintf(console, "%d change(s) applied.\n", applied)
 }
 
 func (s *session) showSuggest(w io.Writer, d *dbrpc.Diagnostics) {

@@ -205,7 +205,18 @@ func (e *Executor) execMatch(st *Statement) (*Result, error) {
 			reqWhere = "(" + reqWhere + ") && " + kf
 		}
 	}
-	rows, err := e.c.MatchTables(st.Table, st.MatchResource, e.keyAttr, reqWhere, st.TargetWhere, st.Limit, st.MatchUsing)
+	// NOPREEMPT excludes resources already claimed by a job (so a placement never
+	// requires preempting a running job), as an extra resource-side filter.
+	targetWhere := st.TargetWhere
+	if st.NoPreempt {
+		const free = `State =!= "Claimed"`
+		if targetWhere == "" {
+			targetWhere = free
+		} else {
+			targetWhere = "(" + targetWhere + ") && (" + free + ")"
+		}
+	}
+	rows, err := e.c.MatchTables(st.Table, st.MatchResource, e.keyAttr, reqWhere, targetWhere, st.Limit, st.MatchUsing)
 	if err != nil {
 		return nil, err
 	}

@@ -136,3 +136,35 @@ func TestMatch(t *testing.T) {
 		t.Fatalf("USING assignment = %v, want 1.0 and 2.0 -> distinct {slot3,slot1}", best)
 	}
 }
+
+func TestParseMatchNoPreempt(t *testing.T) {
+	cases := []struct {
+		sql       string
+		noPreempt bool
+		key       string
+		target    string
+	}{
+		{`MATCH jobs TO machines`, false, "", ""},
+		{`MATCH jobs TO machines NOPREEMPT`, true, "", ""},
+		{`MATCH KEY '1.0' IN jobs TO machines NOPREEMPT LIMIT 4`, true, "1.0", ""},
+		{`MATCH jobs TO machines USING (Requirements) NOPREEMPT WHERE TARGET Arch == "X86_64"`, true, "", `Arch == "X86_64"`},
+	}
+	for _, tc := range cases {
+		st, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.sql, err)
+		}
+		if st.Kind != StmtMatch {
+			t.Errorf("%q: kind = %v, want StmtMatch", tc.sql, st.Kind)
+		}
+		if st.NoPreempt != tc.noPreempt {
+			t.Errorf("%q: NoPreempt = %v, want %v", tc.sql, st.NoPreempt, tc.noPreempt)
+		}
+		if st.Key != tc.key {
+			t.Errorf("%q: Key = %q, want %q", tc.sql, st.Key, tc.key)
+		}
+		if st.TargetWhere != tc.target {
+			t.Errorf("%q: TargetWhere = %q, want %q", tc.sql, st.TargetWhere, tc.target)
+		}
+	}
+}

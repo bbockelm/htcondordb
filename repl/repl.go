@@ -12,13 +12,14 @@ import (
 // session holds the mutable REPL state the meta-commands change: the current
 // output target and serialization format.
 type session struct {
-	exec    *Executor
-	base    io.Writer // the original output (restored by `.output stdout`)
-	out     io.Writer // current output target
-	outFile *os.File  // non-nil when output is redirected to a file
-	outPath string
-	format  Format
-	table   string // current table for meta-commands (.use changes it)
+	exec     *Executor
+	base     io.Writer // the original output (restored by `.output stdout`)
+	out      io.Writer // current output target
+	outFile  *os.File  // non-nil when output is redirected to a file
+	outPath  string
+	format   Format
+	table    string   // current table for meta-commands (.use changes it)
+	readLine ReadLine // input source, for interactive prompts (e.g. .suggest -i)
 }
 
 // ReadLine reads one input line (without the trailing newline), returning io.EOF
@@ -50,7 +51,7 @@ func ScanLines(r io.Reader) ReadLine {
 // beginning with '.' or '\' are meta-commands. Errors are printed to console and
 // do not stop the loop.
 func Run(ctx context.Context, e *Executor, readLine ReadLine, console io.Writer) error {
-	s := &session{exec: e, base: console, out: console, format: FormatTable, table: DefaultTable}
+	s := &session{exec: e, base: console, out: console, format: FormatTable, table: DefaultTable, readLine: readLine}
 	defer s.closeOutput()
 
 	for {
@@ -217,6 +218,7 @@ Notes:
     request; one row per request (Resource blank when it could not be placed).
     Bare WHERE filters requests; WHERE TARGET filters resources (pushed down).
     USING (attrs) autoclusters identical requests (rank once, reuse; still consumed).
+    NOPREEMPT excludes already-claimed resources (State =!= "Claimed").
 
 Meta-commands:
   .help                 show this help
@@ -231,6 +233,7 @@ Diagnostics (current table, or an explicit one where noted):
   .indexes [table]      configured indexes (+ demand-based suggestions)
   .hot [table]          hot attributes (front-loaded in each ad)
   .suggest [table]      index add/drop suggestions from observed demand
+  .suggest -i [table]   review suggestions interactively and apply the accepted ones
   .explain <expr>       how the current table's planner would run a constraint
   .explain MATCH KEY '<k>' IN <req> TO <res>   how matchmaking one request would run
 

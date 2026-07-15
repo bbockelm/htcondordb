@@ -67,6 +67,7 @@ type Statement struct {
 	TargetWhere   string
 	Key           string
 	MatchUsing    []string
+	NoPreempt     bool // MATCH ... NOPREEMPT: exclude already-claimed resources
 
 	// Select fields.
 	Items    []SelectItem // projection; a single {Star:true} means "*"
@@ -452,6 +453,10 @@ func (p *parser) parseMatch() (*Statement, error) {
 			return nil, err
 		}
 		st.MatchUsing = cols
+	}
+	// NOPREEMPT: only match resources that are not already claimed by a job.
+	if p.takeKeyword("NOPREEMPT") {
+		st.NoPreempt = true
 	}
 	// Zero, one, or two WHERE clauses: bare = request-side, WHERE TARGET =
 	// resource-side (pushed down).
