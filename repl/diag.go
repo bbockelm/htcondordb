@@ -140,6 +140,12 @@ func (s *session) explain(console io.Writer, arg string) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
 		fmt.Fprintln(console, "usage: .explain <ClassAd constraint>")
+		fmt.Fprintln(console, "       .explain MATCH KEY '<key>' IN <requests> TO <resources>")
+		return
+	}
+	// A matchmaking form: .explain MATCH KEY '1.0' IN jobs TO machines
+	if fields := strings.Fields(arg); len(fields) > 0 && strings.EqualFold(fields[0], "MATCH") {
+		s.explainMatch(console, arg)
 		return
 	}
 	ex, err := s.exec.Explain(s.table, arg)
@@ -169,6 +175,57 @@ func (s *session) explain(console io.Writer, arg string) {
 				// estimated fraction of ads the index visits (lower = more selective)
 				sel = fmt.Sprintf("  est ~%.1f%% (~%d of %d)",
 					p.Selectivity*100, p.EstCandidates, ex.TotalAds)
+			}
+			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s\n", p.Attr, p.Op, state, kind, sel)
+		}
+	}
+}
+
+// explainMatch handles `.explain MATCH ... TO ...`: it parses the MATCH statement and
+// reports how matchmaking the identified request against the resource table would run
+// -- the job's Requirements rewritten over the slot (constants baked in) and which
+// probes prune via a resource-table index.
+func (s *session) explainMatch(console io.Writer, arg string) {
+	st, err := Parse(arg)
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	if st.Kind != StmtMatch {
+		fmt.Fprintln(console, "usage: .explain MATCH KEY '<key>' IN <requests> TO <resources>")
+		return
+	}
+	ex, err := s.exec.MatchExplain(st)
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	fmt.Fprintf(console, "request:       %s\n", st.Table)
+	fmt.Fprintf(console, "resource:      %s\n", st.MatchResource)
+	if !ex.HasRequirements {
+		fmt.Fprintln(console, "the request has no Requirements: every resource is a candidate (full scan)")
+	} else {
+		fmt.Fprintf(console, "slot predicate: %s\n", ex.SlotPredicate)
+	}
+	fmt.Fprintf(console, "plan:          %s\n", ex.Plan)
+	fmt.Fprintf(console, "index-usable:  %d of %d probe(s)\n", ex.IndexUsable, len(ex.Probes))
+	fmt.Fprintf(console, "parallelism:   %d worker(s) over %d shard(s)\n", ex.Parallelism, ex.Shards)
+	fmt.Fprintf(console, "resources:     %d\n", ex.TotalResources)
+	if len(ex.Probes) > 0 {
+		fmt.Fprintln(console, "probes (job Requirements over the slot):")
+		for _, p := range ex.Probes {
+			kind := p.Kind
+			if kind == "" {
+				kind = "not indexed"
+			}
+			state := "scan"
+			if p.Indexed {
+				state = "INDEX"
+			}
+			sel := ""
+			if p.HasSelectivity {
+				sel = fmt.Sprintf("  est ~%.1f%% (~%d of %d)",
+					p.Selectivity*100, p.EstCandidates, ex.TotalResources)
 			}
 			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s\n", p.Attr, p.Op, state, kind, sel)
 		}

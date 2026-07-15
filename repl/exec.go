@@ -242,6 +242,22 @@ func (e *Executor) Explain(table, constraint string) (*db.QueryExplain, error) {
 	return e.c.ExplainTable(table, constraint)
 }
 
+// MatchExplain reports the matchmaking plan for the request st identifies (its KEY,
+// or the first ad matching its WHERE) in st.Table against st.MatchResource: how the
+// job's Requirements rewrite over the slot and which probes an index prunes.
+func (e *Executor) MatchExplain(st *Statement) (*db.MatchExplain, error) {
+	selector := st.Where
+	if st.Key != "" {
+		kf := fmt.Sprintf("%s == %s", e.keyAttr, quoteClassAd(st.Key))
+		if selector == "" {
+			selector = kf
+		} else {
+			selector = "(" + selector + ") && " + kf
+		}
+	}
+	return e.c.MatchExplain(st.Table, selector, st.MatchResource)
+}
+
 // Admin runs an index/hot-set management action on a table, returning the
 // server's message.
 func (e *Executor) Admin(table, action string, args ...string) (string, error) {
