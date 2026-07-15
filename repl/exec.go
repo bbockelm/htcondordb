@@ -177,9 +177,10 @@ func constraint(where string) string {
 	return where
 }
 
-// queryAds runs the WHERE query and parses each returned ad.
-func (e *Executor) queryAds(where string) ([]*classad.ClassAd, error) {
-	texts, err := e.c.Query(constraint(where))
+// queryAds runs the WHERE query and parses each returned ad. limit > 0 pushes a
+// row cap to the server so it stops the scan early (0 = all).
+func (e *Executor) queryAds(where string, limit int) ([]*classad.ClassAd, error) {
+	texts, err := e.c.QueryLimit(constraint(where), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +205,14 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 		return e.execAggregate(st, groupBy)
 	}
 
-	ads, err := e.queryAds(st.Where)
+	// Push LIMIT to the server only when the final row set is a prefix of the scan
+	// order -- i.e. no client-side reordering (ORDER BY) or row-reduction
+	// (DISTINCT) happens after the fetch. Otherwise fetch all and cap last.
+	pushLimit := 0
+	if st.Limit > 0 && len(st.OrderBy) == 0 && !st.Distinct {
+		pushLimit = st.Limit
+	}
+	ads, err := e.queryAds(st.Where, pushLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -599,7 +607,7 @@ func (e *Executor) execDelete(st *Statement) (*Result, error) {
 // from the key attribute. It errors if a matched row lacks the key attribute
 // (UPDATE/DELETE cannot address it).
 func (e *Executor) matchedKeys(where string) ([]string, error) {
-	ads, err := e.queryAds(where)
+	ads, err := e.queryAds(where, 0) // UPDATE/DELETE act on every matching row
 	if err != nil {
 		return nil, err
 	}
