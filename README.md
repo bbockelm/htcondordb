@@ -157,21 +157,34 @@ htcondordb-cli -addr '<host:port>'   # against a specific daemon
 htcondordb-cli -e "SELECT COUNT(*) FROM ads"   # one-shot
 ```
 
-The store is a single ClassAd collection (no tables to join), so the language is
-the join-free subset of SQL. Each row's primary key lives in a key attribute
-(default `Key`): `INSERT` stamps it into the ad so `SELECT` can show it and
-`UPDATE`/`DELETE` can recover the key of every row a `WHERE` clause matches.
+The database holds one or more **tables**, each an independent ClassAd
+collection (no joins) with its own indexes, hot set, and persisted config. The
+default table is `ads`; create more with DDL. Each row's primary key lives in a
+key attribute (default `Key`): `INSERT` stamps it into the ad so `SELECT` can
+show it and `UPDATE`/`DELETE` can recover the key of every matched row.
 
 ```sql
-SELECT * FROM ads WHERE Cpus >= 8 ORDER BY Cpus DESC LIMIT 10;
-SELECT DISTINCT Owner FROM ads ORDER BY Owner;
-SELECT COUNT(*), AVG(Cpus), MAX(Memory) FROM ads WHERE JobStatus == 2;
-SELECT Owner, State, COUNT(*), SUM(Cpus) FROM ads GROUP BY Owner, State ORDER BY COUNT(*) DESC;
-INSERT INTO ads (Key, Owner, Cpus) VALUES ('1.0', 'alice', 4);
-UPDATE ads SET JobStatus = 2 WHERE Owner == "alice";
-DELETE FROM ads WHERE JobStatus == 4;
+CREATE TABLE machines;
+CREATE VALUE INDEX ON machines (Cpus);          -- or CATEGORICAL for string eq
+DROP INDEX ON machines (Cpus);   DROP TABLE machines;
+
+SELECT * FROM machines WHERE Cpus >= 8 ORDER BY Cpus DESC LIMIT 10;
+SELECT DISTINCT Owner FROM jobs ORDER BY Owner;
+SELECT COUNT(*), AVG(Cpus), MAX(Memory) FROM machines WHERE State == "Unclaimed";
+SELECT Owner, COUNT(*), SUM(RequestCpus) FROM jobs GROUP BY Owner ORDER BY COUNT(*) DESC;
+INSERT INTO jobs (Key, Owner, RequestCpus) VALUES ('1.0', 'alice', 4);
+UPDATE jobs SET JobStatus = 2 WHERE Owner == "alice";
+DELETE FROM jobs WHERE JobStatus == 4;
 ```
 
+- **Tables**: `CREATE TABLE t` / `DROP TABLE t`; `FROM`/`INTO`/`UPDATE`/`DELETE`
+  route to the named table. Each table is isolated on disk under
+  `<db>/tables/<name>` and persists across restarts. In the shell, `.tables`
+  lists them and `.use <t>` sets the table the diagnostic/management commands act
+  on.
+- **Indexes as DDL**: `CREATE [VALUE|CATEGORICAL] INDEX ON t (a, b)` /
+  `DROP INDEX ON t (a)`. `CREATE INDEX` builds over existing rows immediately and
+  persists.
 - **`WHERE` is a ClassAd expression**, captured verbatim and evaluated by the
   store's engine — the full ClassAd language is available (`==`, `=?=`, `=!=`,
   `undefined`, `member()`, `regexp()`, `?:`, …), not a SQL dialect. String
@@ -263,8 +276,8 @@ daemon restart (and the indexes are rebuilt over the loaded ads on open).
 aggregate result serializes its group rows. One-shot mode takes `-format`:
 
 ```sh
-htcondordb-cli -format json    -e "SELECT * FROM ads WHERE Cpus >= 8"
-htcondordb-cli -format classad -e "SELECT * FROM ads WHERE Owner = 'alice'"
+htcondordb-cli -format json    -e "SELECT * FROM machines WHERE Cpus >= 8"
+htcondordb-cli -format classad -e 'SELECT * FROM jobs WHERE Owner == "alice"'
 ```
 
 ### Loading ads from a collector or schedd
@@ -276,36 +289,30 @@ and that value is stamped into the row's `Key` attribute so `SELECT`/`UPDATE`/
 `DELETE` can address it.
 
 ```sh
-# Machine ads from the collector (keyed by Name):
-condor_status -long | htcondordb-cli load
+# Machine ads from the collector into the "machines" table (keyed by Name):
+condor_status -long | htcondordb-cli load -table machines
 
-# Slot ads with an explicit key attribute:
-condor_status -long | htcondordb-cli load -key Name
+# Job ads from the schedd into "jobs" (keyed by GlobalJobId):
+condor_q -global -long | htcondordb-cli load -table jobs -key GlobalJobId
 
-# Job ads from the local schedd (keyed by GlobalJobId):
-condor_q -long | htcondordb-cli load -key GlobalJobId
-
-# Every job in the pool:
-condor_q -global -long | htcondordb-cli load -key GlobalJobId
-
-# Daemon (master/schedd/collector) ads:
-condor_status -any -long | htcondordb-cli load -key Name
-
-# Into a specific daemon, or through a consistent-mode cluster:
-condor_status -long | htcondordb-cli -addr '<host:port>' load -key Name
-condor_status -long | htcondordb-cli -consistent load -key Name
+# A mixed stream, auto-routed to a table per MyType (Machine->machines,
+# Job->jobs, Scheduler->schedulers, ...), auto-creating tables:
+condor_status -any -long | htcondordb-cli load -auto
 ```
 
-Then query them:
+`-table <name>` sends every ad to one table (created if absent); `-auto` routes
+each ad to a table named for its `MyType` (lowercased and pluralized). With
+neither, ads go to the default `ads` table. The summary reports the per-table
+counts. Then query:
 
 ```sh
-htcondordb-cli -e "SELECT Name, Cpus, Memory FROM ads WHERE Cpus >= 8"
-htcondordb-cli -e "SELECT COUNT(*), AVG(Memory) FROM ads WHERE Arch = 'X86_64'"
+htcondordb-cli -e "SELECT Name, Cpus, Memory FROM machines WHERE Cpus >= 8"
+htcondordb-cli -e 'SELECT COUNT(*), AVG(Memory) FROM machines WHERE Arch == "X86_64"'
 ```
 
 Ads without the chosen key attribute are skipped (reported in the summary). The
-load commits in batches; use `-key` to match the ad type (`Name` for machine and
-daemon ads, `GlobalJobId` or another unique attribute for jobs).
+load commits per table in batches; use `-key` to match the ad type (`Name` for
+machine/daemon ads, `GlobalJobId` or another unique attribute for jobs).
 
 ## Building
 

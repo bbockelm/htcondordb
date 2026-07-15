@@ -32,6 +32,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/config"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/htcondordb/command"
 	"github.com/bbockelm/htcondordb/ha/consistent"
@@ -55,16 +56,20 @@ Flags:
   -h, -help           show this help
 
 load subcommand:
-  condor_status -long | htcondordb-cli load               # machine ads, keyed by Name
-  condor_q -global -long | htcondordb-cli load -key GlobalJobId
+  condor_status -long        | htcondordb-cli load -table machines
+  condor_status -any -long   | htcondordb-cli load -auto        # route by MyType
+  condor_q -global -long     | htcondordb-cli load -table jobs -key GlobalJobId
+  -table <name>       target table (default: ads); created if absent
+  -auto               route each ad to a table named for its MyType
   -key <attr>         source attribute used as the primary key (default: Name)
 
-Interactive meta-commands: .help .format .output .quit  (type .help in the shell)
+Interactive meta-commands: .tables .use .help .format .output .quit
+  (type .help in the shell)
 
-Language: SELECT / INSERT / UPDATE / DELETE with DISTINCT, aggregates
-(COUNT/SUM/AVG/MIN/MAX), GROUP BY, ORDER BY, and LIMIT. WHERE is a ClassAd
-expression (==, =?=, undefined, regexp(), ...). No JOIN / subqueries.
-Writing (INSERT/UPDATE/DELETE) requires WRITE authorization at the daemon.
+Language: multiple tables (no joins). SELECT / INSERT / UPDATE / DELETE with
+DISTINCT, aggregates (COUNT/SUM/AVG/MIN/MAX), GROUP BY, ORDER BY, LIMIT;
+CREATE/DROP TABLE and CREATE/DROP INDEX. WHERE is a ClassAd expression
+(==, =?=, undefined, regexp(), ...). Writing requires WRITE at the daemon.
 `
 
 func main() {
@@ -199,6 +204,8 @@ type flags struct {
 	consistent bool
 	loadKey    string // `load`: source attribute used as the primary key
 	format     string // one-shot output format (-format)
+	loadTable  string // `load`: target table (default "ads")
+	loadAuto   bool   // `load`: route each ad to a table named for its MyType
 	help       bool
 	debug      bool
 	args       []string
@@ -240,6 +247,13 @@ func parseFlags() *flags {
 			if i < len(args) {
 				f.format = args[i]
 			}
+		case "-table", "--table":
+			i++
+			if i < len(args) {
+				f.loadTable = args[i]
+			}
+		case "-auto", "--auto":
+			f.loadAuto = true
 		case "-h", "-help", "--help":
 			f.help = true
 		default:
@@ -327,17 +341,26 @@ func runLoad(ctx context.Context, cfg *config.Config, addr string, fs *flags) er
 	}
 	defer closeConn()
 
-	// Write sink: consistent mode routes batches through raft; otherwise commit
-	// locally over dbrpc.
-	var apply func([]repl.WriteOp) error
-	if fs.consistent {
-		apply = consistentWriter(ctx, cfg, addr)
+	defaultTable := fs.loadTable
+	if defaultTable == "" {
+		defaultTable = dbrpc.DefaultTable
 	}
-	commitOps := func(ops []repl.WriteOp) error {
-		if apply != nil {
-			return apply(ops)
+	// tableFor decides each ad's table: by MyType with -auto, else the fixed table.
+	tableFor := func(ad *classad.ClassAd) string { return defaultTable }
+	if fs.loadAuto {
+		tableFor = func(ad *classad.ClassAd) string { return tableForType(ad, defaultTable) }
+	}
+
+	// Per-table batch commit: ensure the table exists (once), then commit the ads.
+	created := map[string]bool{}
+	commit := func(table string, ops []repl.WriteOp) error {
+		if !created[table] {
+			if err := dbc.CreateTable(table); err != nil {
+				return err
+			}
+			created[table] = true
 		}
-		tx, err := dbc.Begin()
+		tx, err := dbc.BeginTable(table)
 		if err != nil {
 			return err
 		}
@@ -354,29 +377,69 @@ func runLoad(ctx context.Context, cfg *config.Config, addr string, fs *flags) er
 	if srcKey == "" {
 		srcKey = "Name"
 	}
-	loaded, skipped, err := loadAds(os.Stdin, srcKey, 200, commitOps)
+	loaded, skipped, perTable, err := loadAds(os.Stdin, srcKey, tableFor, 200, commit)
 	fmt.Printf("loaded %d ads (%d skipped for a missing %s key)\n", loaded, skipped, srcKey)
+	if fs.loadAuto || fs.loadTable != "" {
+		for t, n := range perTable {
+			fmt.Printf("  %s: %d\n", t, n)
+		}
+	}
 	return err
 }
 
+// tableForType maps an ad's MyType to a table name (lowercased and pluralized:
+// Machine -> machines, Job -> jobs), falling back to fallback for a missing or
+// unusable type.
+func tableForType(ad *classad.ClassAd, fallback string) string {
+	v := ad.EvaluateAttr("MyType")
+	if !v.IsString() {
+		return fallback
+	}
+	mt, _ := v.StringValue()
+	if mt == "" {
+		return fallback
+	}
+	name := strings.ToLower(mt)
+	if !strings.HasSuffix(name, "s") {
+		name += "s"
+	}
+	if !db.ValidTableName(name) {
+		return fallback
+	}
+	return name
+}
+
 // loadAds reads blank-line-separated old-ClassAd blocks, keys each by srcKey,
-// stamps a matching Key attribute, and commits them in batches of batchSize.
-func loadAds(in io.Reader, srcKey string, batchSize int, commit func([]repl.WriteOp) error) (loaded, skipped int, err error) {
+// stamps a matching Key attribute, routes it to tableFor(ad), and commits per
+// table in batches of batchSize. perTable counts loaded ads per table.
+func loadAds(in io.Reader, srcKey string, tableFor func(*classad.ClassAd) string, batchSize int,
+	commit func(table string, ops []repl.WriteOp) error) (loaded, skipped int, perTable map[string]int, err error) {
+
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-
+	perTable = map[string]int{}
+	batches := map[string][]repl.WriteOp{}
 	var block strings.Builder
-	var batch []repl.WriteOp
 
-	flush := func() error {
-		if len(batch) == 0 {
+	flush := func(table string) error {
+		ops := batches[table]
+		if len(ops) == 0 {
 			return nil
 		}
-		if err := commit(batch); err != nil {
+		if err := commit(table, ops); err != nil {
 			return err
 		}
-		loaded += len(batch)
-		batch = batch[:0]
+		loaded += len(ops)
+		perTable[table] += len(ops)
+		batches[table] = ops[:0]
+		return nil
+	}
+	flushAll := func() error {
+		for table := range batches {
+			if err := flush(table); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 
@@ -398,9 +461,10 @@ func loadAds(in io.Reader, srcKey string, batchSize int, commit func([]repl.Writ
 		if _, ok := ad.Lookup("Key"); !ok {
 			adText = strings.TrimRight(text, "\n") + "\nKey = " + quoteClassAd(key) + "\n"
 		}
-		batch = append(batch, repl.WriteOp{Kind: repl.WNewClassAd, Key: key, Value: adText})
-		if len(batch) >= batchSize {
-			return flush()
+		table := tableFor(ad)
+		batches[table] = append(batches[table], repl.WriteOp{Kind: repl.WNewClassAd, Key: key, Value: adText})
+		if len(batches[table]) >= batchSize {
+			return flush(table)
 		}
 		return nil
 	}
@@ -409,7 +473,7 @@ func loadAds(in io.Reader, srcKey string, batchSize int, commit func([]repl.Writ
 		line := sc.Text()
 		if strings.TrimSpace(line) == "" { // blank line terminates an ad
 			if e := emit(block.String()); e != nil {
-				return loaded, skipped, e
+				return loaded, skipped, perTable, e
 			}
 			block.Reset()
 			continue
@@ -418,12 +482,12 @@ func loadAds(in io.Reader, srcKey string, batchSize int, commit func([]repl.Writ
 		block.WriteByte('\n')
 	}
 	if e := sc.Err(); e != nil {
-		return loaded, skipped, e
+		return loaded, skipped, perTable, e
 	}
 	if e := emit(block.String()); e != nil { // trailing ad with no final blank line
-		return loaded, skipped, e
+		return loaded, skipped, perTable, e
 	}
-	return loaded, skipped, flush()
+	return loaded, skipped, perTable, flushAll()
 }
 
 // keyString renders a key attribute value as a db key string.

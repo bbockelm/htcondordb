@@ -13,14 +13,18 @@ import (
 // It returns false if cmd is not one of them (so the caller can report "unknown").
 func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 	switch cmd {
+	case ".tables":
+		s.showTables(console)
+	case ".use":
+		s.useTable(console, arg)
 	case ".stats":
-		s.withDiag(console, s.showStats)
+		s.withDiag(console, s.tableArg(arg), s.showStats)
 	case ".indexes", ".index":
-		s.withDiag(console, s.showIndexes)
+		s.withDiag(console, s.tableArg(arg), s.showIndexes)
 	case ".hot":
-		s.withDiag(console, s.showHot)
+		s.withDiag(console, s.tableArg(arg), s.showHot)
 	case ".suggest":
-		s.withDiag(console, s.showSuggest)
+		s.withDiag(console, s.tableArg(arg), s.showSuggest)
 	case ".explain":
 		s.explain(console, arg)
 	case ".addindex":
@@ -43,9 +47,42 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 	return true
 }
 
-// withDiag fetches diagnostics once and hands them to fn (reporting a fetch error).
-func (s *session) withDiag(console io.Writer, fn func(io.Writer, *dbrpc.Diagnostics)) {
-	d, err := s.exec.Diagnostics()
+// tableArg returns arg as the target table if given, else the current table.
+func (s *session) tableArg(arg string) string {
+	if t := strings.TrimSpace(arg); t != "" {
+		return t
+	}
+	return s.table
+}
+
+func (s *session) showTables(console io.Writer) {
+	names, err := s.exec.Tables()
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	for _, n := range names {
+		marker := "  "
+		if n == s.table {
+			marker = "* " // the current table
+		}
+		fmt.Fprintf(console, "%s%s\n", marker, n)
+	}
+}
+
+func (s *session) useTable(console io.Writer, arg string) {
+	t := strings.TrimSpace(arg)
+	if t == "" {
+		fmt.Fprintf(console, "current table: %s\n", s.table)
+		return
+	}
+	s.table = t
+	fmt.Fprintf(console, "using table: %s\n", s.table)
+}
+
+// withDiag fetches a table's diagnostics and hands them to fn (reporting errors).
+func (s *session) withDiag(console io.Writer, table string, fn func(io.Writer, *dbrpc.Diagnostics)) {
+	d, err := s.exec.Diagnostics(table)
 	if err != nil {
 		fmt.Fprintf(console, "error: %v\n", err)
 		return
@@ -101,11 +138,12 @@ func (s *session) explain(console io.Writer, arg string) {
 		fmt.Fprintln(console, "usage: .explain <ClassAd constraint>")
 		return
 	}
-	ex, err := s.exec.Explain(arg)
+	ex, err := s.exec.Explain(s.table, arg)
 	if err != nil {
 		fmt.Fprintf(console, "error: %v\n", err)
 		return
 	}
+	fmt.Fprintf(console, "table:        %s\n", s.table)
 	fmt.Fprintf(console, "plan:         %s\n", ex.Plan)
 	fmt.Fprintf(console, "wire-native:  %v\n", ex.Native)
 	fmt.Fprintf(console, "index-usable: %d of %d probe(s)\n", ex.IndexUsable, len(ex.Probes))
@@ -164,9 +202,9 @@ func (s *session) refreshHot(console io.Writer, arg string) {
 	s.admin(console, "hot.refresh", sampleMax, topN)
 }
 
-// admin runs a management action and prints the server's message (or error).
+// admin runs a management action on the current table and prints the result.
 func (s *session) admin(console io.Writer, action string, args ...string) {
-	msg, err := s.exec.Admin(action, args...)
+	msg, err := s.exec.Admin(s.table, action, args...)
 	if err != nil {
 		fmt.Fprintf(console, "error: %v\n", err)
 		if h := HintFor(err); h != "" {

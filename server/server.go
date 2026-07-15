@@ -68,32 +68,33 @@ type Config struct {
 	// on the peer's identity. Pass authz.Policy.Authorize. Required.
 	Authorize Authorizer
 
-	// DBConfig, if non-nil, is used verbatim to open the database (ordered
-	// indexes, hot attributes, ...). When nil a default config over Dir is
-	// used. If set, its Dir overrides Config.Dir.
-	DBConfig *db.Config
-
 	// ForceReadOnly makes every client connection read-only regardless of its
 	// authorization level. A leader-follower replica sets this: writes must go
 	// to the leader, and the replica applies them from the commit stream, not
 	// from clients. Private-attribute visibility still follows the level.
 	ForceReadOnly bool
 
+	// DefaultTable is the table ensured to exist at startup and targeted by
+	// clients that do not name a table. Defaults to "ads".
+	DefaultTable string
+
 	// Logger receives per-connection diagnostics. Defaults to slog.Default().
 	Logger *slog.Logger
 }
 
-// Service is the htcondordb database service.
+// Service is the htcondordb database service. It serves a catalog of named
+// tables; the default table always exists.
 type Service struct {
-	db          *db.DB
-	rpc         *dbrpc.Server
-	authorize   Authorizer
-	forceReadOn bool
-	log         *slog.Logger
+	cat          *db.Catalog
+	rpc          *dbrpc.Server
+	defaultTable string
+	authorize    Authorizer
+	forceReadOn  bool
+	log          *slog.Logger
 }
 
-// New opens the database and builds the service. The caller owns the returned
-// Service and must Close it.
+// New opens the table catalog and builds the service. The caller owns the
+// returned Service and must Close it.
 func New(cfg Config) (*Service, error) {
 	if cfg.Authorize == nil {
 		return nil, fmt.Errorf("server: an Authorize function is required")
@@ -102,31 +103,40 @@ func New(cfg Config) (*Service, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-
-	dbCfg := db.Config{Dir: cfg.Dir}
-	if cfg.DBConfig != nil {
-		dbCfg = *cfg.DBConfig
-		if dbCfg.Dir == "" {
-			dbCfg.Dir = cfg.Dir
-		}
+	defaultTable := cfg.DefaultTable
+	if defaultTable == "" {
+		defaultTable = dbrpc.DefaultTable
 	}
-	d, err := db.OpenConfig(dbCfg)
+
+	cat, err := db.OpenCatalog(cfg.Dir)
 	if err != nil {
-		return nil, fmt.Errorf("server: opening database: %w", err)
+		return nil, fmt.Errorf("server: opening catalog: %w", err)
+	}
+	if _, err := cat.EnsureTable(defaultTable); err != nil {
+		_ = cat.Close()
+		return nil, fmt.Errorf("server: ensuring default table: %w", err)
 	}
 
 	return &Service{
-		db:          d,
-		rpc:         dbrpc.NewServer(d),
-		authorize:   cfg.Authorize,
-		forceReadOn: cfg.ForceReadOnly,
-		log:         log,
+		cat:          cat,
+		rpc:          dbrpc.NewServerCatalog(cat),
+		defaultTable: defaultTable,
+		authorize:    cfg.Authorize,
+		forceReadOn:  cfg.ForceReadOnly,
+		log:          log,
 	}, nil
 }
 
-// DB returns the underlying database (for HA layers that stream commits or drive
-// snapshots). The caller must not close it; Service.Close owns its lifetime.
-func (s *Service) DB() *db.DB { return s.db }
+// Catalog returns the table catalog.
+func (s *Service) Catalog() *db.Catalog { return s.cat }
+
+// DB returns the default table's database (for HA layers that stream commits or
+// drive snapshots). Multi-table HA is not yet wired; HA operates on the default
+// table. The caller must not close it; Service.Close owns its lifetime.
+func (s *Service) DB() *db.DB {
+	d, _ := s.cat.Table(s.defaultTable)
+	return d
+}
 
 // RPC returns the underlying dbrpc server (for HA layers that serve replica
 // connections). Its lifetime is owned by Service.
@@ -192,7 +202,7 @@ func (s *Service) effectiveLevel(c *cedarserver.Conn) Level {
 // Close stops background work and closes the database.
 func (s *Service) Close() error {
 	s.rpc.Close()
-	return s.db.Close()
+	return s.cat.Close()
 }
 
 // peerUser is the authenticated fully-qualified user, or "" for an

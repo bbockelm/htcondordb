@@ -39,14 +39,30 @@ const (
 	StmtInsert
 	StmtUpdate
 	StmtDelete
+	StmtCreateTable
+	StmtDropTable
+	StmtCreateIndex
+	StmtDropIndex
+	StmtMatch
 )
 
 // Statement is one parsed SQL-like statement.
 type Statement struct {
 	Kind StmtKind
 
-	// Table is the FROM/INTO/UPDATE target (a label; the store is single-table).
+	// Table is the FROM/INTO/UPDATE target table, or the table a DDL statement
+	// acts on.
 	Table string
+
+	// IndexKind is "value" or "categorical" for CREATE INDEX.
+	IndexKind string
+
+	// MatchResource is the resource table for a MATCH statement (Table is the
+	// request table); TargetWhere is the pushed-down resource-side filter; Key,
+	// if set, matches only that single request key.
+	MatchResource string
+	TargetWhere   string
+	Key           string
 
 	// Select fields.
 	Items    []SelectItem // projection; a single {Star:true} means "*"
@@ -320,9 +336,163 @@ func (p *parser) parseStatement() (*Statement, error) {
 		return p.parseUpdate()
 	case p.takeKeyword("DELETE"):
 		return p.parseDelete()
+	case p.takeKeyword("CREATE"):
+		return p.parseCreate()
+	case p.takeKeyword("DROP"):
+		return p.parseDrop()
+	case p.takeKeyword("MATCH"):
+		return p.parseMatch()
 	default:
-		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, or DELETE)", p.peek().text)
+		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, or MATCH)", p.peek().text)
 	}
+}
+
+// parseCreate parses CREATE TABLE <name> or
+// CREATE [VALUE|CATEGORICAL] INDEX ON <table> (<attr>, ...).
+func (p *parser) parseCreate() (*Statement, error) {
+	if p.takeKeyword("TABLE") {
+		name, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &Statement{Kind: StmtCreateTable, Table: name}, nil
+	}
+	// Optional index kind before INDEX; default value.
+	kind := "value"
+	if p.takeKeyword("VALUE") {
+		kind = "value"
+	} else if p.takeKeyword("CATEGORICAL") {
+		kind = "categorical"
+	}
+	if err := p.expectKeyword("INDEX"); err != nil {
+		return nil, fmt.Errorf("expected TABLE or [VALUE|CATEGORICAL] INDEX after CREATE")
+	}
+	table, cols, err := p.parseIndexTarget()
+	if err != nil {
+		return nil, err
+	}
+	return &Statement{Kind: StmtCreateIndex, Table: table, IndexKind: kind, Columns: cols}, nil
+}
+
+// parseDrop parses DROP TABLE <name> or DROP INDEX ON <table> (<attr>, ...).
+func (p *parser) parseDrop() (*Statement, error) {
+	if p.takeKeyword("TABLE") {
+		name, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &Statement{Kind: StmtDropTable, Table: name}, nil
+	}
+	if err := p.expectKeyword("INDEX"); err != nil {
+		return nil, fmt.Errorf("expected TABLE or INDEX after DROP")
+	}
+	table, cols, err := p.parseIndexTarget()
+	if err != nil {
+		return nil, err
+	}
+	return &Statement{Kind: StmtDropIndex, Table: table, Columns: cols}, nil
+}
+
+// parseIndexTarget parses "ON <table> (<attr>, ...)".
+func (p *parser) parseIndexTarget() (table string, cols []string, err error) {
+	if err = p.expectKeyword("ON"); err != nil {
+		return "", nil, err
+	}
+	if table, err = p.parseIdent(); err != nil {
+		return "", nil, err
+	}
+	if err = p.expectPunct("("); err != nil {
+		return "", nil, err
+	}
+	if cols, err = p.parseIdentList(); err != nil {
+		return "", nil, err
+	}
+	return table, cols, nil
+}
+
+// parseMatch parses MATCH <requestTable> TO <resourceTable>
+// [WHERE <request-filter>] [WHERE TARGET <resource-filter>] [LIMIT k], and the
+// single-request form MATCH KEY '<key>' IN <requestTable> TO <resourceTable> ...
+func (p *parser) parseMatch() (*Statement, error) {
+	st := &Statement{Kind: StmtMatch, Limit: 1}
+	if p.takeKeyword("KEY") {
+		key, err := p.parseStringLiteral()
+		if err != nil {
+			return nil, err
+		}
+		st.Key = key
+		if err := p.expectKeyword("IN"); err != nil {
+			return nil, err
+		}
+	}
+	req, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	st.Table = req
+	if err := p.expectKeyword("TO"); err != nil {
+		return nil, err
+	}
+	res, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	st.MatchResource = res
+	// Zero, one, or two WHERE clauses: bare = request-side, WHERE TARGET =
+	// resource-side (pushed down).
+	for p.takeKeyword("WHERE") {
+		if p.takeKeyword("TARGET") {
+			expr, err := p.captureRawExpr(matchExprStop(p))
+			if err != nil {
+				return nil, err
+			}
+			st.TargetWhere = expr
+		} else {
+			expr, err := p.captureRawExpr(matchExprStop(p))
+			if err != nil {
+				return nil, err
+			}
+			st.Where = expr
+		}
+	}
+	if p.takeKeyword("LIMIT") {
+		lim, err := p.parseLimitValue()
+		if err != nil {
+			return nil, err
+		}
+		st.Limit = lim
+	}
+	return st, nil
+}
+
+// matchExprStop stops a captured MATCH filter at the next WHERE/LIMIT or end.
+func matchExprStop(p *parser) func() bool {
+	return func() bool {
+		return p.atEnd() || p.isKeyword("WHERE") || p.isKeyword("LIMIT")
+	}
+}
+
+// parseStringLiteral consumes a string literal, returning its content.
+func (p *parser) parseStringLiteral() (string, error) {
+	t := p.peek()
+	if t.kind != tString {
+		return "", fmt.Errorf("expected a quoted string, got %q", t.text)
+	}
+	p.pos++
+	return t.text, nil
+}
+
+// parseLimitValue parses a non-negative integer LIMIT value.
+func (p *parser) parseLimitValue() (int, error) {
+	t := p.next()
+	if t.kind != tNumber {
+		return 0, fmt.Errorf("LIMIT expects a number, got %q", t.text)
+	}
+	var lim int
+	if _, err := fmt.Sscanf(t.text, "%d", &lim); err != nil || lim < 0 {
+		return 0, fmt.Errorf("invalid LIMIT %q", t.text)
+	}
+	return lim, nil
 }
 
 func (p *parser) parseSelect() (*Statement, error) {

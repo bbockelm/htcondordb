@@ -18,6 +18,7 @@ type session struct {
 	outFile *os.File  // non-nil when output is redirected to a file
 	outPath string
 	format  Format
+	table   string // current table for meta-commands (.use changes it)
 }
 
 // ReadLine reads one input line (without the trailing newline), returning io.EOF
@@ -49,7 +50,7 @@ func ScanLines(r io.Reader) ReadLine {
 // beginning with '.' or '\' are meta-commands. Errors are printed to console and
 // do not stop the loop.
 func Run(ctx context.Context, e *Executor, readLine ReadLine, console io.Writer) error {
-	s := &session{exec: e, base: console, out: console, format: FormatTable}
+	s := &session{exec: e, base: console, out: console, format: FormatTable, table: DefaultTable}
 	defer s.closeOutput()
 
 	for {
@@ -185,15 +186,18 @@ func stripQuotes(s string) string {
 	return s
 }
 
-const helpText = `htcondordb SQL-like shell. The store is a single ClassAd collection
-(no tables to join). Each row's primary key lives in the "Key" attribute.
+const helpText = `htcondordb SQL-like shell. Each table is a ClassAd collection (no joins);
+a row's primary key lives in the "Key" attribute.
 
-  SELECT * FROM ads WHERE Cpus >= 8 ORDER BY Cpus DESC LIMIT 10;
-  SELECT DISTINCT Owner FROM ads ORDER BY Owner;
-  SELECT Owner, COUNT(*), AVG(Cpus) FROM ads GROUP BY Owner ORDER BY COUNT(*) DESC;
-  INSERT INTO ads (Key, Owner, Cpus) VALUES ('1.0', 'alice', 4);
-  UPDATE ads SET JobStatus = 2 WHERE Owner == "alice";
-  DELETE FROM ads WHERE JobStatus == 4;
+  CREATE TABLE machines;
+  CREATE VALUE INDEX ON machines (Cpus);
+  SELECT * FROM machines WHERE Cpus >= 8 ORDER BY Cpus DESC LIMIT 10;
+  SELECT DISTINCT Owner FROM jobs ORDER BY Owner;
+  SELECT Owner, COUNT(*), AVG(Cpus) FROM jobs GROUP BY Owner ORDER BY COUNT(*) DESC;
+  INSERT INTO machines (Key, Name, Cpus) VALUES ('slot1', 'slot1@ep', 8);
+  UPDATE jobs SET JobStatus = 2 WHERE Owner == "alice";
+  DELETE FROM jobs WHERE JobStatus == 4;
+  DROP INDEX ON machines (Cpus);   DROP TABLE machines;
 
 Notes:
   - WHERE is a ClassAd expression (==, =?=, =!=, undefined, regexp(), ...),
@@ -201,19 +205,22 @@ Notes:
   - Aggregates: COUNT, SUM, AVG, MIN, MAX, with GROUP BY over one+ columns
     (evaluated server-side); DISTINCT and ORDER BY (ASC/DESC) are supported.
   - JOIN and subqueries are not supported.
+  - CREATE INDEX kind is VALUE (numeric+range) or CATEGORICAL (string eq).
 
 Meta-commands:
   .help                 show this help
+  .tables               list tables (* marks the current one)
+  .use <table>          set the current table for the commands below
   .format <mode>        table (default) | json | classad | classad-new
   .output <file>        send query output to a file; .output stdout to restore
   .quit                 exit
 
-Diagnostics:
-  .stats                storage stats (ads, segments, bytes)
-  .indexes              configured indexes (+ demand-based suggestions)
-  .hot                  hot attributes (front-loaded in each ad)
-  .suggest              index add/drop suggestions from observed demand
-  .explain <expr>       how the planner would run a ClassAd constraint
+Diagnostics (current table, or an explicit one where noted):
+  .stats [table]        storage stats (ads, segments, bytes)
+  .indexes [table]      configured indexes (+ demand-based suggestions)
+  .hot [table]          hot attributes (front-loaded in each ad)
+  .suggest [table]      index add/drop suggestions from observed demand
+  .explain <expr>       how the current table's planner would run a constraint
 
 Management (needs WRITE):
   .addindex value|categorical <attr>[, ...]   create an index

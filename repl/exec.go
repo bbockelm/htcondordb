@@ -17,6 +17,9 @@ import (
 // is configured.
 const DefaultKeyAttr = "Key"
 
+// DefaultTable is the table the shell starts on and targets when none is named.
+const DefaultTable = dbrpc.DefaultTable
+
 // ExecConfig configures an Executor.
 type ExecConfig struct {
 	// KeyAttr is the ad attribute that carries a row's primary key (the db key).
@@ -79,13 +82,13 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch}
 }
 
-// commit applies a batch of write ops: through ApplyBatch (consistent mode) if
-// configured, else as one local dbrpc transaction.
-func (e *Executor) commit(ops []WriteOp) error {
+// commit applies a batch of write ops to table: through ApplyBatch (consistent
+// mode) if configured, else as one local dbrpc transaction on that table.
+func (e *Executor) commit(table string, ops []WriteOp) error {
 	if e.applyBatch != nil {
 		return e.applyBatch(ops)
 	}
-	tx, err := e.c.Begin()
+	tx, err := e.c.BeginTable(table)
 	if err != nil {
 		return err
 	}
@@ -135,9 +138,63 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 		return e.execUpdate(st)
 	case StmtDelete:
 		return e.execDelete(st)
+	case StmtCreateTable:
+		return e.execCreateTable(st)
+	case StmtDropTable:
+		return e.execDropTable(st)
+	case StmtCreateIndex:
+		return e.execCreateIndex(st)
+	case StmtDropIndex:
+		return e.execDropIndex(st)
+	case StmtMatch:
+		return e.execMatch(st)
 	default:
 		return nil, fmt.Errorf("unknown statement kind")
 	}
+}
+
+// --- DDL ---
+
+func (e *Executor) execCreateTable(st *Statement) (*Result, error) {
+	if err := e.c.CreateTable(st.Table); err != nil {
+		return nil, err
+	}
+	return &Result{Note: "CREATE TABLE " + st.Table}, nil
+}
+
+func (e *Executor) execDropTable(st *Statement) (*Result, error) {
+	if err := e.c.DropTable(st.Table); err != nil {
+		return nil, err
+	}
+	return &Result{Note: "DROP TABLE " + st.Table}, nil
+}
+
+func (e *Executor) execCreateIndex(st *Statement) (*Result, error) {
+	action := "index.add.value"
+	if st.IndexKind == "categorical" {
+		action = "index.add.categorical"
+	}
+	msg, err := e.c.AdminTable(st.Table, action, st.Columns...)
+	if err != nil {
+		return nil, err
+	}
+	return &Result{Note: msg}, nil
+}
+
+func (e *Executor) execDropIndex(st *Statement) (*Result, error) {
+	msg, err := e.c.AdminTable(st.Table, "index.drop", st.Columns...)
+	if err != nil {
+		return nil, err
+	}
+	return &Result{Note: msg}, nil
+}
+
+// execMatch is not yet implemented: the grammar is in place, but matchmaking
+// (bilateral Requirements/Rank across two tables, with the resource-side filter
+// pushed down) is the next phase.
+func (e *Executor) execMatch(st *Statement) (*Result, error) {
+	return nil, fmt.Errorf("MATCH is parsed but not yet executed; matchmaking (%s TO %s) is coming in the next phase",
+		st.Table, st.MatchResource)
 }
 
 // ExecString parses then executes a single statement, timing the execution
@@ -155,19 +212,28 @@ func (e *Executor) ExecString(s string) (*Result, error) {
 	return res, err
 }
 
-// Diagnostics returns the store's storage stats, hot set, indexes, and tuning
+// Diagnostics returns a table's storage stats, hot set, indexes, and tuning
 // suggestions (the .stats/.indexes/.hot commands).
-func (e *Executor) Diagnostics() (*dbrpc.Diagnostics, error) { return e.c.Diagnostics() }
-
-// Explain reports how the store would execute a constraint query (.explain).
-func (e *Executor) Explain(constraint string) (*db.QueryExplain, error) {
-	return e.c.Explain(constraint)
+func (e *Executor) Diagnostics(table string) (*dbrpc.Diagnostics, error) {
+	return e.c.DiagnosticsTable(table)
 }
 
-// Admin runs an index/hot-set management action, returning the server's message.
-func (e *Executor) Admin(action string, args ...string) (string, error) {
-	return e.c.Admin(action, args...)
+// Explain reports how a table would execute a constraint query (.explain).
+func (e *Executor) Explain(table, constraint string) (*db.QueryExplain, error) {
+	return e.c.ExplainTable(table, constraint)
 }
+
+// Admin runs an index/hot-set management action on a table, returning the
+// server's message.
+func (e *Executor) Admin(table, action string, args ...string) (string, error) {
+	return e.c.AdminTable(table, action, args...)
+}
+
+// Tables lists the catalog's table names.
+func (e *Executor) Tables() ([]string, error) { return e.c.Tables() }
+
+// CreateTable creates a table (used by load auto-routing).
+func (e *Executor) CreateTable(name string) error { return e.c.CreateTable(name) }
 
 // constraint returns the WHERE constraint, defaulting to match-all.
 func constraint(where string) string {
@@ -177,10 +243,10 @@ func constraint(where string) string {
 	return where
 }
 
-// queryAds runs the WHERE query and parses each returned ad. limit > 0 pushes a
-// row cap to the server so it stops the scan early (0 = all).
-func (e *Executor) queryAds(where string, limit int) ([]*classad.ClassAd, error) {
-	texts, err := e.c.QueryLimit(constraint(where), limit)
+// queryAds runs the WHERE query against table and parses each returned ad.
+// limit > 0 pushes a row cap to the server so it stops the scan early (0 = all).
+func (e *Executor) queryAds(table, where string, limit int) ([]*classad.ClassAd, error) {
+	texts, err := e.c.QueryTable(table, constraint(where), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +278,7 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	if st.Limit > 0 && len(st.OrderBy) == 0 && !st.Distinct {
 		pushLimit = st.Limit
 	}
-	ads, err := e.queryAds(st.Where, pushLimit)
+	ads, err := e.queryAds(st.Table, st.Where, pushLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +354,7 @@ func (e *Executor) execAggregate(st *Statement, groupBy []string) (*Result, erro
 		}
 	}
 
-	rows, err := e.c.Aggregate(constraint(st.Where), groupBy, aggs)
+	rows, err := e.c.AggregateTable(st.Table, constraint(st.Where), groupBy, aggs)
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +619,7 @@ func (e *Executor) execInsert(st *Statement) (*Result, error) {
 		return nil, fmt.Errorf("INSERT: empty primary key")
 	}
 
-	if err := e.commit([]WriteOp{{Kind: WNewClassAd, Key: key, Value: sb.String()}}); err != nil {
+	if err := e.commit(st.Table, []WriteOp{{Kind: WNewClassAd, Key: key, Value: sb.String()}}); err != nil {
 		return nil, err
 	}
 	return &Result{Affected: 1, Note: "INSERT 1 (key " + key + ")"}, nil
@@ -565,7 +631,7 @@ func (e *Executor) execUpdate(st *Statement) (*Result, error) {
 			return nil, fmt.Errorf("cannot UPDATE the key attribute %q", e.keyAttr)
 		}
 	}
-	keys, err := e.matchedKeys(st.Where)
+	keys, err := e.matchedKeys(st.Table, st.Where)
 	if err != nil {
 		return nil, err
 	}
@@ -579,14 +645,14 @@ func (e *Executor) execUpdate(st *Statement) (*Result, error) {
 			ops = append(ops, WriteOp{Kind: WSetAttribute, Key: key, Name: a.Col, Value: a.Expr})
 		}
 	}
-	if err := e.commit(ops); err != nil {
+	if err := e.commit(st.Table, ops); err != nil {
 		return nil, fmt.Errorf("updating: %w", err)
 	}
 	return &Result{Affected: len(keys), Note: fmt.Sprintf("UPDATE %d", len(keys))}, nil
 }
 
 func (e *Executor) execDelete(st *Statement) (*Result, error) {
-	keys, err := e.matchedKeys(st.Where)
+	keys, err := e.matchedKeys(st.Table, st.Where)
 	if err != nil {
 		return nil, err
 	}
@@ -597,7 +663,7 @@ func (e *Executor) execDelete(st *Statement) (*Result, error) {
 	for _, key := range keys {
 		ops = append(ops, WriteOp{Kind: WDestroyClassAd, Key: key})
 	}
-	if err := e.commit(ops); err != nil {
+	if err := e.commit(st.Table, ops); err != nil {
 		return nil, fmt.Errorf("deleting: %w", err)
 	}
 	return &Result{Affected: len(keys), Note: fmt.Sprintf("DELETE %d", len(keys))}, nil
@@ -606,8 +672,8 @@ func (e *Executor) execDelete(st *Statement) (*Result, error) {
 // matchedKeys returns the primary keys of every row matching where, recovered
 // from the key attribute. It errors if a matched row lacks the key attribute
 // (UPDATE/DELETE cannot address it).
-func (e *Executor) matchedKeys(where string) ([]string, error) {
-	ads, err := e.queryAds(where, 0) // UPDATE/DELETE act on every matching row
+func (e *Executor) matchedKeys(table, where string) ([]string, error) {
+	ads, err := e.queryAds(table, where, 0) // UPDATE/DELETE act on every matching row
 	if err != nil {
 		return nil, err
 	}
