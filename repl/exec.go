@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
@@ -119,6 +120,8 @@ type Result struct {
 	Ads []*classad.ClassAd
 	// Star is true when the SELECT was `SELECT *`.
 	Star bool
+	// Duration is the wall-clock time to execute the statement (set by ExecString).
+	Duration time.Duration
 }
 
 // Exec executes one statement.
@@ -137,13 +140,19 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 	}
 }
 
-// ExecString parses then executes a single statement.
+// ExecString parses then executes a single statement, timing the execution
+// (Result.Duration).
 func (e *Executor) ExecString(s string) (*Result, error) {
 	st, err := Parse(s)
 	if err != nil {
 		return nil, err
 	}
-	return e.Exec(st)
+	start := time.Now()
+	res, err := e.Exec(st)
+	if res != nil {
+		res.Duration = time.Since(start)
+	}
+	return res, err
 }
 
 // Diagnostics returns the store's storage stats, hot set, indexes, and tuning

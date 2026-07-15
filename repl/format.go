@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 )
@@ -58,7 +59,11 @@ func (f Format) String() string {
 // falls back to serializing its computed rows.
 func FormatResult(w io.Writer, r *Result, f Format) {
 	if !r.IsSelect {
-		fmt.Fprintln(w, r.Note)
+		if r.Duration > 0 {
+			fmt.Fprintf(w, "%s (%s)\n", r.Note, fmtDuration(r.Duration))
+		} else {
+			fmt.Fprintln(w, r.Note)
+		}
 		return
 	}
 	switch f {
@@ -172,7 +177,25 @@ func formatTable(w io.Writer, r *Result) {
 	if n == 1 {
 		unit = "row"
 	}
-	fmt.Fprintf(w, "(%d %s)\n", n, unit)
+	if r.Duration > 0 {
+		fmt.Fprintf(w, "(%d %s in %s)\n", n, unit, fmtDuration(r.Duration))
+	} else {
+		fmt.Fprintf(w, "(%d %s)\n", n, unit)
+	}
+}
+
+// fmtDuration renders an execution time at a sensible precision.
+func fmtDuration(d time.Duration) string {
+	switch {
+	case d < time.Microsecond:
+		return d.String()
+	case d < time.Millisecond:
+		return d.Round(time.Microsecond).String()
+	case d < time.Second:
+		return d.Round(10 * time.Microsecond).String()
+	default:
+		return d.Round(time.Millisecond).String()
+	}
 }
 
 func pad(s string, w int) string {

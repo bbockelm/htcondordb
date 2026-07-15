@@ -221,4 +221,6 @@ Management (needs WRITE):
   .reindex                                     rebuild indexes
   .addhot <attr>[, ...]                        pin hot attributes
   .refreshhot [<sampleMax> <topN>]             recompute the hot set
+  .rewrite                                     re-encode all ads with the hot set
+  .compact                                     reclaim dead space
 `

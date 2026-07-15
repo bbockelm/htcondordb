@@ -33,6 +33,10 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.admin(console, "hot.add", splitAttrs(arg)...)
 	case ".refreshhot":
 		s.refreshHot(console, arg)
+	case ".compact":
+		s.admin(console, "compact")
+	case ".rewrite":
+		s.admin(console, "rewrite")
 	default:
 		return false
 	}
