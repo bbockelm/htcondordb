@@ -110,6 +110,7 @@ func (s *session) explain(console io.Writer, arg string) {
 	fmt.Fprintf(console, "wire-native:  %v\n", ex.Native)
 	fmt.Fprintf(console, "index-usable: %d of %d probe(s)\n", ex.IndexUsable, len(ex.Probes))
 	fmt.Fprintf(console, "parallelism:  %d worker(s) over %d shard(s)\n", ex.Parallelism, ex.Shards)
+	fmt.Fprintf(console, "ads:          %d\n", ex.TotalAds)
 	if len(ex.Probes) > 0 {
 		fmt.Fprintln(console, "probes:")
 		for _, p := range ex.Probes {
@@ -121,7 +122,13 @@ func (s *session) explain(console io.Writer, arg string) {
 			if p.Indexed {
 				state = "INDEX"
 			}
-			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)\n", p.Attr, p.Op, state, kind)
+			sel := ""
+			if p.HasSelectivity {
+				// estimated fraction of ads the index visits (lower = more selective)
+				sel = fmt.Sprintf("  est ~%.1f%% (~%d of %d)",
+					p.Selectivity*100, p.EstCandidates, ex.TotalAds)
+			}
+			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s\n", p.Attr, p.Op, state, kind, sel)
 		}
 	}
 }

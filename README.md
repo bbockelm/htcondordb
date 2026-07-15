@@ -233,10 +233,17 @@ plan:         indexed
 wire-native:  true
 index-usable: 1 of 2 probe(s)
 parallelism:  4 worker(s) over 8 shard(s)
+ads:          120000
 probes:
-  Cpus                 >=   INDEX  (value)
+  Cpus                 >=   INDEX  (value)  est ~38.0% (~45600 of 120000)
   Owner                ==   scan   (not indexed)
 ```
+
+For an index-usable probe, `.explain` also shows the planner's **selectivity
+estimate** — how many ads the index expects to visit (from the segment indexes'
+per-value stats), so you can see which conjunct actually prunes. (It appears once
+the relevant segments have built indexes; a brand-new/tiny store may not have
+stats yet.)
 
 Index suggestions come from the store's own demand tracker (it records which
 attributes queries filter on) and a sample of live ads, so `.suggest` recommends
