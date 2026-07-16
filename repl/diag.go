@@ -41,6 +41,12 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.admin(console, "compact")
 	case ".rewrite":
 		s.admin(console, "rewrite")
+	case ".retrain":
+		if a := strings.TrimSpace(arg); a != "" {
+			s.admin(console, "codec.retrain", a)
+		} else {
+			s.admin(console, "codec.retrain")
+		}
 	default:
 		return false
 	}
@@ -98,6 +104,22 @@ func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 	fmt.Fprintf(w, "used:       %s\n", humanBytes(st.UsedBytes))
 	fmt.Fprintf(w, "live:       %s\n", humanBytes(st.LiveBytes()))
 	fmt.Fprintf(w, "dead:       %s (reclaimable by compaction)\n", humanBytes(st.DeadBytes))
+	cs := d.Codec
+	retrain := "never (compression not retrained this run)"
+	if !cs.LastRetrain.IsZero() {
+		retrain = cs.LastRetrain.Format("2006-01-02 15:04:05")
+	}
+	fmt.Fprintf(w, "codec:      %s", cs.Codec)
+	if cs.DictBytes > 0 {
+		fmt.Fprintf(w, " (dict %s)", humanBytes(cs.DictBytes))
+	}
+	if cs.SampleRecords > 0 {
+		fmt.Fprintf(w, ", %.2fx compression (sampled %d recs)", cs.Ratio, cs.SampleRecords)
+	}
+	fmt.Fprintf(w, "\nretrained:  %s\n", retrain)
+	if cs.Codec == "identity" {
+		fmt.Fprintln(w, "  (no compression configured; enable ZSTD or run .retrain to train a dictionary)")
+	}
 }
 
 func (s *session) showIndexes(w io.Writer, d *dbrpc.Diagnostics) {
