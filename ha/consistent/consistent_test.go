@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -296,6 +299,91 @@ func TestRaftRestartDurability(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("restarted node did not replay its durable log into the fresh catalog")
+}
+
+// TestThreeNodeMultiTableReplication runs a real 3-node raft cluster entirely in-process
+// (nodes' CEDAR raft transports are wired together over net.Pipe streams) and verifies a
+// multi-table write on the leader replicates to BOTH tables on all three nodes.
+func TestThreeNodeMultiTableReplication(t *testing.T) {
+	var mu sync.Mutex
+	reg := map[string]*Coordinator{} // advertise addr -> node, for the in-process dialer
+
+	dial := func(_ context.Context, addr string, _ time.Duration) (*stream.Stream, error) {
+		mu.Lock()
+		target := reg[addr]
+		mu.Unlock()
+		if target == nil {
+			return nil, fmt.Errorf("no peer %q", addr)
+		}
+		a, b := net.Pipe()
+		go func() { _, _ = target.Layer().DeliverWait(stream.NewStream(b)) }()
+		return stream.NewStream(a), nil
+	}
+
+	mkNode := func(id string, bootstrap bool) (*Coordinator, *db.Catalog) {
+		cat := newCat(t)
+		c, err := NewCoordinator(CoordinatorConfig{
+			NodeID: id, Advertise: id, Catalog: cat, Dial: dial,
+			DataDir: t.TempDir(), Bootstrap: bootstrap, Timeout: 10 * time.Second,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		reg[id] = c
+		mu.Unlock()
+		return c, cat
+	}
+
+	c1, cat1 := mkNode("n1", true) // bootstrap leader (single-node, grows via RegisterPeer)
+	c2, cat2 := mkNode("n2", false)
+	c3, cat3 := mkNode("n3", false)
+	defer c1.Close()
+	defer c2.Close()
+	defer c3.Close()
+	defer cat1.Close()
+	defer cat2.Close()
+	defer cat3.Close()
+
+	if _, err := c1.WaitForLeader(10 * time.Second); err != nil {
+		t.Fatalf("no leader: %v", err)
+	}
+	if err := c1.RegisterPeer("n2", "n2"); err != nil {
+		t.Fatalf("register n2: %v", err)
+	}
+	if err := c1.RegisterPeer("n3", "n3"); err != nil {
+		t.Fatalf("register n3: %v", err)
+	}
+
+	// A multi-table write on the leader.
+	batch := NewBatch().
+		NewClassAd("1.0", "Owner = \"alice\"").
+		NewClassAdIn("machines", "slot1", "Cpus = 8")
+	if err := c1.Apply(batch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	// Every node converges on both tables (replication is asynchronous).
+	for i, cat := range []*db.Catalog{cat1, cat2, cat3} {
+		waitForKey(t, cat, "ads", "1.0", i+1)
+		waitForKey(t, cat, "machines", "slot1", i+1)
+	}
+}
+
+// waitForKey polls a node's catalog until table/key appears (replicated), failing after a
+// timeout.
+func waitForKey(t *testing.T, cat *db.Catalog, table, key string, node int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if d, ok := cat.Table(table); ok {
+			if _, ok := d.LookupClassAd(key); ok {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("node n%d: key %s.%s never replicated", node, table, key)
 }
 
 func lookupAttr(t *testing.T, d *db.DB, key, name string) (string, bool) {
