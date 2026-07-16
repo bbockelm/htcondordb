@@ -10,8 +10,8 @@ import (
 )
 
 // TestServeOptionsFor locks the level -> (read-only, private) mapping that is the
-// crux of the security model: READ is read-only and strips secrets; WRITE and
-// DAEMON are full read/write with secrets visible.
+// crux of the security model: READ is read-only and strips secrets; WRITE is full
+// read/write but STILL strips secrets; only DAEMON sees private (secret) attributes.
 func TestServeOptionsFor(t *testing.T) {
 	cases := []struct {
 		level        Level
@@ -19,7 +19,7 @@ func TestServeOptionsFor(t *testing.T) {
 		wantPrivate  bool
 	}{
 		{LevelRead, true, false},
-		{LevelWrite, false, true},
+		{LevelWrite, false, false},
 		{LevelDaemon, false, true},
 	}
 	for _, tc := range cases {
@@ -42,9 +42,9 @@ func TestEffectiveLevel(t *testing.T) {
 		"READ":   {"READ"},
 	}
 	grants := map[string]string{
-		"root@pool":  "DAEMON",
-		"admin@pool": "WRITE",
-		"alice@pool": "READ",
+		"root@pool":   "DAEMON",
+		"admin@pool":  "WRITE",
+		"alice@pool":  "READ",
 		"nobody@pool": "",
 	}
 	fake := func(perm, _ /*addr*/, user string) bool {

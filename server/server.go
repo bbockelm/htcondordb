@@ -195,9 +195,14 @@ func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error 
 // serveOptionsFor maps an access level to the dbrpc serving options.
 func serveOptionsFor(level Level) dbrpc.ServeOptions {
 	switch level {
-	case LevelWrite, LevelDaemon:
-		// Full read/write; the peer is trusted to see private attributes.
+	case LevelDaemon:
+		// Only a DAEMON-authorized peer sees private (secret) attributes -- matching the
+		// HTCondor daemons, where secret material is a DAEMON-level capability, not WRITE.
 		return dbrpc.ServeOptions{ReadOnly: false, IncludePrivate: true}
+	case LevelWrite:
+		// WRITE may read and write ads but does NOT see private attributes: a submitter
+		// can add/update jobs without gaining visibility into other principals' secrets.
+		return dbrpc.ServeOptions{ReadOnly: false, IncludePrivate: false}
 	default: // LevelRead
 		return dbrpc.ServeOptions{ReadOnly: true, IncludePrivate: false}
 	}
