@@ -322,6 +322,23 @@ func (s *session) explainMatch(console io.Writer, arg string) {
 			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s\n", p.Attr, p.Op, state, kind, sel)
 		}
 	}
+	if len(ex.EvalOrder) > 0 {
+		fmt.Fprintln(console, "evaluation order (bilateral re-verify, short-circuits left to right):")
+		for _, ce := range ex.EvalOrder {
+			role := "re-check"
+			switch {
+			case ce.Probed:
+				role = "PROBE" // prunes candidates before re-verify
+			case ce.Indexed:
+				role = "re-check (indexed)" // estimable but not a pushdown probe (e.g. a bool flag)
+			}
+			sel := ""
+			if ce.HasSelectivity {
+				sel = fmt.Sprintf("  ~%.1f%% true", ce.TrueFrac*100)
+			}
+			fmt.Fprintf(console, "  %-18s %s%s\n", role, ce.Text, sel)
+		}
+	}
 }
 
 func (s *session) addIndex(console io.Writer, arg string) {
