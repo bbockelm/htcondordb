@@ -292,6 +292,14 @@ func (e *Executor) Tables() ([]string, error) { return e.c.Tables() }
 // CreateTable creates a table (used by load auto-routing).
 func (e *Executor) CreateTable(name string) error { return e.c.CreateTable(name) }
 
+// WatchStream opens a live change stream on a table, returning the event channel and a
+// stop function (which cancels the server-side watch; also called on connection close).
+// The cursor is nil (a full replay from the current contents, ending at the synced
+// marker, then live) -- the WATCH runner drops the replay for SINCE NOW.
+func (e *Executor) WatchStream(table string) (<-chan dbrpc.WatchEvent, func(), error) {
+	return e.c.WatchTable(table, nil)
+}
+
 // constraint returns the WHERE constraint, defaulting to match-all.
 func constraint(where string) string {
 	if strings.TrimSpace(where) == "" {

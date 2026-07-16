@@ -77,6 +77,12 @@ func Run(ctx context.Context, e *Executor, readLine ReadLine, console io.Writer)
 			}
 			continue
 		}
+		// WATCH is a long-lived stream, not a one-shot result: run it directly so it can
+		// stream rows and be interrupted with Ctrl+C back to the prompt.
+		if st, perr := Parse(line); perr == nil && st.Kind == StmtWatch {
+			s.runWatch(ctx, console, st)
+			continue
+		}
 		res, execErr := e.ExecString(line)
 		if execErr != nil {
 			fmt.Fprintf(console, "error: %v\n", execErr) // errors go to the console
@@ -204,6 +210,10 @@ a row's primary key lives in the "Key" attribute.
   MATCH jobs TO machines USING (RequestCpus, RequestMemory, Requirements, Rank) LIMIT 100;
   MATCH KEY '1.0' IN jobs TO machines;
 
+  WATCH * FROM jobs;                                    -- live tail of all changes
+  WATCH Owner, JobStatus FROM jobs WHERE Owner == "alice";
+  WATCH Key, State FROM machines SINCE BEGINNING LIMIT 20;
+
 Notes:
   - WHERE is a ClassAd expression (==, =?=, =!=, undefined, regexp(), ...),
     evaluated by the store; string literals use double quotes.
@@ -219,6 +229,9 @@ Notes:
     Bare WHERE filters requests; WHERE TARGET filters resources (pushed down).
     USING (attrs) autoclusters identical requests (rank once, reuse; still consumed).
     NOPREEMPT excludes already-claimed resources (State =!= "Claimed").
+  - WATCH <projection> FROM <table> [WHERE ...] [SINCE {NOW|BEGINNING}] [LIMIT n]:
+    live-tails changes; Ctrl+C returns to the prompt. WHERE filters upserts (deletes
+    are always shown); SINCE BEGINNING first replays current contents (default NOW).
 
 Meta-commands:
   .help                 show this help

@@ -45,6 +45,7 @@ const (
 	StmtCreateIndex
 	StmtDropIndex
 	StmtMatch
+	StmtWatch
 )
 
 // Statement is one parsed SQL-like statement.
@@ -86,6 +87,10 @@ type Statement struct {
 	// Where is the translated ClassAd constraint ("" = match all). Used by
 	// SELECT, UPDATE, DELETE.
 	Where string
+
+	// Since is the WATCH start point: "now" (default; live changes only) or
+	// "beginning" (replay the current contents, then live).
+	Since string
 }
 
 // SelectItem is one projected column or aggregate. For "*", Star is set. For a
@@ -347,9 +352,81 @@ func (p *parser) parseStatement() (*Statement, error) {
 		return p.parseDrop()
 	case p.takeKeyword("MATCH"):
 		return p.parseMatch()
+	case p.takeKeyword("WATCH"):
+		return p.parseWatch()
 	default:
-		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, or MATCH)", p.peek().text)
+		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, MATCH, or WATCH)", p.peek().text)
 	}
+}
+
+// parseWatch parses:
+//
+//	WATCH {* | <attr>[, <attr>...]} FROM <table>
+//	     [WHERE <constraint>] [SINCE {NOW | BEGINNING}] [LIMIT <n>]
+//
+// It streams live changes to the table, projecting the named attributes and filtering
+// upserts by the WHERE constraint (deletes are always shown). SINCE BEGINNING first
+// replays the current contents; the default (NOW) shows only changes from now on.
+func (p *parser) parseWatch() (*Statement, error) {
+	st := &Statement{Kind: StmtWatch, Since: "now"}
+	for { // projection list (mirrors SELECT)
+		it, err := p.parseSelectItem()
+		if err != nil {
+			return nil, err
+		}
+		if it.IsAggregate() {
+			return nil, fmt.Errorf("WATCH does not support aggregates")
+		}
+		st.Items = append(st.Items, it)
+		if !p.atPunct(",") {
+			break
+		}
+		p.pos++ // consume comma
+	}
+	if len(st.Items) > 1 {
+		for _, it := range st.Items {
+			if it.Star {
+				return nil, fmt.Errorf("`*` cannot be combined with other columns")
+			}
+		}
+	}
+	if err := p.expectKeyword("FROM"); err != nil {
+		return nil, err
+	}
+	table, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	st.Table = table
+	if p.takeKeyword("WHERE") {
+		where, err := p.parseWhere()
+		if err != nil {
+			return nil, err
+		}
+		st.Where = where
+	}
+	if p.takeKeyword("SINCE") {
+		switch {
+		case p.takeKeyword("NOW"):
+			st.Since = "now"
+		case p.takeKeyword("BEGINNING"):
+			st.Since = "beginning"
+		default:
+			return nil, fmt.Errorf("SINCE expects NOW or BEGINNING, got %q", p.peek().text)
+		}
+	}
+	if p.takeKeyword("LIMIT") {
+		t := p.next()
+		if t.kind != tNumber {
+			return nil, fmt.Errorf("LIMIT expects a number, got %q", t.text)
+		}
+		var lim int
+		if _, err := fmt.Sscanf(t.text, "%d", &lim); err != nil || lim < 0 {
+			return nil, fmt.Errorf("invalid LIMIT %q", t.text)
+		}
+		st.Limit = lim
+	}
+	return st, nil
 }
 
 // parseCreate parses CREATE TABLE <name> or
@@ -748,12 +825,14 @@ func (p *parser) parseDelete() (*Statement, error) {
 	return st, nil
 }
 
-// parseWhere captures the WHERE clause (up to end/GROUP/ORDER/LIMIT) verbatim as
+// parseWhere captures the WHERE clause (up to end/GROUP/ORDER/LIMIT/SINCE) verbatim as
 // a ClassAd expression, so the full ClassAd language is available (==, =?=, =!=,
-// undefined, member(), regexp(), ?:, ...).
+// undefined, member(), regexp(), ?:, ...). SINCE is a WATCH-only terminator; the other
+// statements never use it, so listing it here is harmless for them.
 func (p *parser) parseWhere() (string, error) {
 	return p.captureRawExpr(func() bool {
-		return p.atEnd() || p.isKeyword("GROUP") || p.isKeyword("ORDER") || p.isKeyword("LIMIT")
+		return p.atEnd() || p.isKeyword("GROUP") || p.isKeyword("ORDER") ||
+			p.isKeyword("LIMIT") || p.isKeyword("SINCE")
 	})
 }
 
