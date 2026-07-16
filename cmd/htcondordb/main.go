@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/bbockelm/cedar/security"
@@ -143,6 +144,18 @@ func run() error {
 		return err
 	}
 	defer func() { _ = svc.Close() }()
+
+	// Restore-on-startup (disaster recovery): if HTCONDORDB_RESTORE_FILE names an existing
+	// snapshot, load it before serving, then the file is moved aside so a restart serves
+	// live data. An encrypted snapshot is opened with this daemon's pool keys.
+	if restoreFile := getStr(cfg, "HTCONDORDB_RESTORE_FILE"); restoreFile != "" {
+		if restored, rerr := svc.RestoreOnStartup(restoreFile); rerr != nil {
+			return fmt.Errorf("restore-on-startup from %s: %w", restoreFile, rerr)
+		} else if restored {
+			log.Info(logging.DestinationGeneral, "restored database from snapshot", "file", restoreFile)
+		}
+	}
+
 	svc.RegisterOn(srv)
 
 	// DC_NOP / DC_RECONFIG / DC_OFF so condor_ping, condor_reconfig -daemon and
@@ -167,6 +180,20 @@ func run() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Periodic encrypted backups: every HTCONDORDB_SNAPSHOT_INTERVAL seconds, write a
+	// timestamped snapshot to HTCONDORDB_SNAPSHOT_DIR, keeping the most recent
+	// HTCONDORDB_SNAPSHOT_KEEP (default 7). Disabled when either is unset/zero. A
+	// follower snapshots its own (independently encrypted) copy.
+	if snapDir := getStr(cfg, "HTCONDORDB_SNAPSHOT_DIR"); snapDir != "" {
+		if secs := configInt(cfg, "HTCONDORDB_SNAPSHOT_INTERVAL"); secs > 0 {
+			keep := configInt(cfg, "HTCONDORDB_SNAPSHOT_KEEP")
+			if keep <= 0 {
+				keep = 7
+			}
+			go svc.RunPeriodicSnapshots(ctx, snapDir, time.Duration(secs)*time.Second, keep)
+		}
+	}
 
 	// Start any background HA machinery (a follower's replicator, or the raft
 	// coordinator and its command handlers in consistent mode).
