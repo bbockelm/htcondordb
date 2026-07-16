@@ -35,7 +35,22 @@ func (s *session) runWatch(ctx context.Context, console io.Writer, st *Statement
 		}
 		filter = f
 	}
-	events, stop, err := s.exec.WatchStream(st.Table)
+	beginning := st.Since == "beginning"
+	// SINCE NOW starts from the current head so the server streams no replay of the
+	// current contents; SINCE BEGINNING passes a nil cursor to replay them first.
+	var cursor []byte
+	if !beginning {
+		head, err := s.exec.WatchHead(st.Table)
+		if err != nil {
+			fmt.Fprintf(console, "error: %v\n", err)
+			if h := HintFor(err); h != "" {
+				fmt.Fprintf(console, "  hint: %s\n", h)
+			}
+			return
+		}
+		cursor = head
+	}
+	events, stop, err := s.exec.WatchStream(st.Table, cursor)
 	if err != nil {
 		fmt.Fprintf(console, "error: %v\n", err)
 		if h := HintFor(err); h != "" {
@@ -50,7 +65,6 @@ func (s *session) runWatch(ctx context.Context, console io.Writer, st *Statement
 	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
 
-	beginning := st.Since == "beginning"
 	if beginning {
 		fmt.Fprintf(console, "# replaying %s from the beginning, then watching for changes (Ctrl+C to stop)\n", st.Table)
 	} else {
@@ -58,7 +72,6 @@ func (s *session) runWatch(ctx context.Context, console io.Writer, st *Statement
 	}
 	s.watchHeader(console, st)
 
-	live := beginning // NOW (false): drop events until the initial replay's synced marker
 	count := 0
 	start := time.Now()
 	finish := func(why string) {
@@ -78,21 +91,15 @@ func (s *session) runWatch(ctx context.Context, console io.Writer, st *Statement
 				return
 			}
 			// The synced marker (an upsert with no key, carrying the cursor) ends the
-			// initial replay: after it, everything is a live change.
+			// initial replay; only BEGINNING has a replay worth announcing.
 			if ev.Kind == watchUpsert && ev.Key == "" {
-				if !live {
-					live = true
-					if beginning {
-						fmt.Fprintln(console, "# --- now live ---")
-					}
+				if beginning {
+					fmt.Fprintln(console, "# --- now live ---")
 				}
 				continue
 			}
 			if ev.Kind == watchReset {
-				continue // handled by the SINCE semantics above; nothing to print
-			}
-			if !live {
-				continue // NOW mode: still in the replay we are dropping
+				continue // BEGINNING already announced its replay above
 			}
 			if !s.watchEmit(console, st, filter, ev) {
 				continue // filtered out

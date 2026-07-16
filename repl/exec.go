@@ -292,12 +292,17 @@ func (e *Executor) Tables() ([]string, error) { return e.c.Tables() }
 // CreateTable creates a table (used by load auto-routing).
 func (e *Executor) CreateTable(name string) error { return e.c.CreateTable(name) }
 
-// WatchStream opens a live change stream on a table, returning the event channel and a
-// stop function (which cancels the server-side watch; also called on connection close).
-// The cursor is nil (a full replay from the current contents, ending at the synced
-// marker, then live) -- the WATCH runner drops the replay for SINCE NOW.
-func (e *Executor) WatchStream(table string) (<-chan dbrpc.WatchEvent, func(), error) {
-	return e.c.WatchTable(table, nil)
+// WatchStream opens a live change stream on a table from cursor (nil ⇒ replay the current
+// contents first), returning the event channel and a stop function (which cancels the
+// server-side watch; also called on connection close).
+func (e *Executor) WatchStream(table string, cursor []byte) (<-chan dbrpc.WatchEvent, func(), error) {
+	return e.c.WatchTable(table, cursor)
+}
+
+// WatchHead returns an opaque cursor at the table's current change-log head, so a watch
+// from it streams only subsequent changes (SINCE NOW) with no replay of current contents.
+func (e *Executor) WatchHead(table string) ([]byte, error) {
+	return e.c.WatchHead(table)
 }
 
 // constraint returns the WHERE constraint, defaulting to match-all.
