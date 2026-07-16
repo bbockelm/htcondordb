@@ -103,6 +103,20 @@ func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 func (s *session) showIndexes(w io.Writer, d *dbrpc.Diagnostics) {
 	fmt.Fprintf(w, "categorical (string eq/membership): %s\n", orNone(d.CategoricalIndexes))
 	fmt.Fprintf(w, "value       (numeric + range):      %s\n", orNone(d.ValueIndexes))
+	sz := d.IndexSizes
+	if len(sz.PerIndex) > 0 {
+		fmt.Fprintf(w, "index memory: %s total, %.1f%% of %s live data\n",
+			humanBytes(sz.TotalBytes), sz.Frac*100, humanBytes(sz.DataBytes))
+		fmt.Fprintln(w, "  attribute                 kind         owner  size        pct-data")
+		for _, s := range sz.PerIndex {
+			owner := "human"
+			if s.Auto {
+				owner = "auto"
+			}
+			fmt.Fprintf(w, "  %-25s %-12s %-6s %-11s %.1f%%\n",
+				s.Attr, s.Kind, owner, humanBytes(s.Bytes), s.Frac*100)
+		}
+	}
 	if len(d.Suggestions) > 0 {
 		fmt.Fprintln(w, "suggested indexes (by observed demand):")
 		printSuggestions(w, d.Suggestions)
