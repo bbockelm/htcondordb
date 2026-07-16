@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
@@ -80,6 +81,15 @@ type Config struct {
 
 	// Logger receives per-connection diagnostics. Defaults to slog.Default().
 	Logger *slog.Logger
+
+	// DisableMaintenance turns off the background self-tuning loop (index auto-tune,
+	// hot-set refresh, dictionary retrain). Off by default: maintenance runs.
+	DisableMaintenance bool
+	// MaintenanceInterval is the cadence of the maintenance loop. Default 15 minutes.
+	MaintenanceInterval time.Duration
+	// Maintenance overrides the maintenance pass options. The zero value uses sensible
+	// defaults (hot-set refresh + dictionary retrain + a 10%-of-data index budget).
+	Maintenance *db.MaintainOptions
 }
 
 // Service is the htcondordb database service. It serves a catalog of named
@@ -117,14 +127,24 @@ func New(cfg Config) (*Service, error) {
 		return nil, fmt.Errorf("server: ensuring default table: %w", err)
 	}
 
-	return &Service{
+	svc := &Service{
 		cat:          cat,
 		rpc:          dbrpc.NewServerCatalog(cat),
 		defaultTable: defaultTable,
 		authorize:    cfg.Authorize,
 		forceReadOn:  cfg.ForceReadOnly,
 		log:          log,
-	}, nil
+	}
+	// Background self-tuning (index auto-tune + hot-set refresh + dictionary retrain),
+	// unless disabled. Stopped by Close (via rpc.Close).
+	if !cfg.DisableMaintenance {
+		opts := db.MaintainOptions{HotTopN: 32, Retrain: true, MinIndexDemand: 10, IndexBudgetHighFrac: 0.10}
+		if cfg.Maintenance != nil {
+			opts = *cfg.Maintenance
+		}
+		svc.rpc.StartMaintenance(cfg.MaintenanceInterval, opts)
+	}
+	return svc, nil
 }
 
 // Catalog returns the table catalog.
