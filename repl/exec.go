@@ -266,7 +266,18 @@ func (e *Executor) MatchExplain(st *Statement) (*db.MatchExplain, error) {
 			selector = "(" + selector + ") && " + kf
 		}
 	}
-	return e.c.MatchExplain(st.Table, selector, st.MatchResource)
+	// The resource-side filter shown in the explain must match execMatch: WHERE TARGET
+	// plus NOPREEMPT's `State =!= "Claimed"`.
+	targetWhere := st.TargetWhere
+	if st.NoPreempt {
+		const free = `State =!= "Claimed"`
+		if targetWhere == "" {
+			targetWhere = free
+		} else {
+			targetWhere = "(" + targetWhere + ") && (" + free + ")"
+		}
+	}
+	return e.c.MatchExplain(st.Table, selector, st.MatchResource, targetWhere)
 }
 
 // Admin runs an index/hot-set management action on a table, returning the

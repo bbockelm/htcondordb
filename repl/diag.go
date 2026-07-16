@@ -341,6 +341,10 @@ func (s *session) explainMatch(console io.Writer, arg string) {
 		for _, ce := range ex.EvalOrder {
 			role := "re-check"
 			switch {
+			case ce.ResourceSide && ce.Indexed:
+				role = "filter (indexed)" // WHERE TARGET / NOPREEMPT: post-filter, index-coverable
+			case ce.ResourceSide:
+				role = "filter" // WHERE TARGET / NOPREEMPT: post-filter, not indexed
 			case ce.Probed:
 				role = "PROBE" // prunes candidates before re-verify
 			case ce.Indexed:
@@ -350,7 +354,11 @@ func (s *session) explainMatch(console io.Writer, arg string) {
 			if ce.HasSelectivity {
 				sel = fmt.Sprintf("  ~%.1f%% true", ce.TrueFrac*100)
 			}
-			fmt.Fprintf(console, "  %-18s %s%s\n", role, ce.Text, sel)
+			src := ""
+			if ce.ResourceSide {
+				src = "  [WHERE TARGET]" // from NOPREEMPT / WHERE TARGET, applied as a post-filter
+			}
+			fmt.Fprintf(console, "  %-18s %s%s%s\n", role, ce.Text, sel, src)
 		}
 	}
 }
