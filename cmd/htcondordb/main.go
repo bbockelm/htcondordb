@@ -104,6 +104,23 @@ func run() error {
 		return policyPtr.Load().Authorize(perm, peerAddr, user)
 	}
 	srv.Authorizer = authorize
+
+	// Fully-qualify a bare authenticated identity with the local domain, mirroring
+	// the C++ FS authenticator (condor_auth_fs.cpp setRemoteDomain(getLocalDomain())):
+	// FS auth yields a bare username, but ALLOW_<PERM> entries of the form "user@host"
+	// are matched against the *fully-qualified* user ("user@domain"), so without this
+	// a local FS-authenticated peer could never match a user rule and would fall back
+	// to read-only. An anonymous peer (empty identity) and an already-qualified
+	// identity (one containing '@', e.g. from token/SSL auth) are left untouched.
+	if dom := localUIDDomain(cfg); dom != "" {
+		srv.FQUMapper = func(authUser, _ string) string {
+			if authUser == "" || strings.ContainsRune(authUser, '@') {
+				return "" // keep as-is: anonymous, or already fully-qualified
+			}
+			return authUser + "@" + dom
+		}
+	}
+
 	d.OnReconfig(func(newCfg *config.Config) {
 		p, perr := authz.NewPolicy(newCfg, "HTCONDORDB")
 		if perr != nil {
@@ -231,6 +248,16 @@ func run() error {
 
 // databaseDir resolves the on-disk database directory: HTCONDORDB_DIR if set,
 // else $(SPOOL)/htcondordb. Empty (in-memory) only when neither is configured.
+// localUIDDomain returns the domain used to fully-qualify a bare authenticated
+// identity, mirroring the C++ Condor_Auth_Base local domain (param("UID_DOMAIN")).
+// Empty when UID_DOMAIN is unset, in which case the identity is left bare.
+func localUIDDomain(cfg *config.Config) string {
+	if v, ok := cfg.Get("UID_DOMAIN"); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
 func databaseDir(d *daemon.Daemon, cfg *config.Config) string {
 	if v, ok := cfg.Get("HTCONDORDB_DIR"); ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
