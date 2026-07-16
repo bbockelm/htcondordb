@@ -535,7 +535,11 @@ func consistentWriter(ctx context.Context, cfg *config.Config, addr string) func
 		}
 		defer func() { _ = cl.Close() }()
 		s := cl.GetStream()
-		if err := message.NewMessageForStream(s).PutClassAd(ectx, req); err != nil {
+		out := message.NewMessageForStream(s)
+		if err := out.PutClassAd(ectx, req); err != nil {
+			return nil, err
+		}
+		if err := out.FinishMessage(ectx); err != nil { // flush the frame (EOM); PutClassAd only buffers
 			return nil, err
 		}
 		return message.NewMessageFromStream(s).GetClassAd(ectx)

@@ -17,6 +17,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/logging"
 	"github.com/hashicorp/raft"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/htcondordb/command"
 	"github.com/bbockelm/htcondordb/ha/consistent"
@@ -250,13 +251,80 @@ func (h *haRuntime) startConsistent(ctx context.Context, d *daemon.Daemon, cfg *
 		}
 		respAd := coord.HandleControl(reqAd)
 		resp := message.NewMessageForStream(c.Stream)
-		return resp.PutClassAd(hctx, respAd)
+		if err := resp.PutClassAd(hctx, respAd); err != nil {
+			return err
+		}
+		return resp.FinishMessage(hctx) // flush the frame (EOM); PutClassAd only buffers
 	}, "WRITE")
+
+	// Self-join: a non-bootstrap node that is given a seed member address registers
+	// itself with the cluster instead of requiring the admin to register each peer by
+	// hand. It contacts the seed (any existing member; the ControlClient follows a
+	// redirect to the current leader) and asks to be admitted as a voter, retrying
+	// until it succeeds (the seed may not be up or elected yet). The leader admits the
+	// first HTCONDORDB_RAFT_SIZE-1 peers that register and refuses the rest, so the
+	// admin configures only the quorum size on the leader and a seed address on each
+	// joiner. Explicit out-of-band registration (DBControl "register") still works and
+	// is complementary. Skipped on the bootstrap node and when no seed is configured
+	// (e.g. an explicit-Peers cluster, where membership is fixed at bootstrap).
+	if !configBool(cfg, "HTCONDORDB_RAFT_BOOTSTRAP") {
+		if seed := strings.TrimSpace(getStr(cfg, "HTCONDORDB_RAFT_SEED")); seed != "" {
+			h.startSelfJoin(ctx, d, cfg, nodeID, advertise, seed)
+		}
+	}
 
 	d.Logger().Info(logging.DestinationGeneral, "consistent HA (raft over CEDAR) started",
 		"node_id", nodeID, "advertise", advertise, "bootstrap", configBool(cfg, "HTCONDORDB_RAFT_BOOTSTRAP"),
 		"cluster_size", configInt(cfg, "HTCONDORDB_RAFT_SIZE"), "peers", len(peers))
 	return nil
+}
+
+// startSelfJoin launches a background goroutine that registers this node as a raft
+// voter by contacting the configured seed member over the DBControl protocol. It
+// retries with a fixed backoff until admitted (RegisterPeer is idempotent, so a
+// repeat after a leader change or restart is harmless) or ctx is cancelled.
+func (h *haRuntime) startSelfJoin(ctx context.Context, d *daemon.Daemon, cfg *config.Config, nodeID, advertise, seed string) {
+	exchange := func(ectx context.Context, target string, req *classad.ClassAd) (*classad.ClassAd, error) {
+		sec, err := htcondor.GetSecurityConfig(cfg, command.DBControl, "CLIENT")
+		if err != nil {
+			return nil, err
+		}
+		sec.Command = command.DBControl
+		cl, err := cedarclient.ConnectAndAuthenticate(ectx, target, sec)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = cl.Close() }()
+		s := cl.GetStream()
+		out := message.NewMessageForStream(s)
+		if err := out.PutClassAd(ectx, req); err != nil {
+			return nil, err
+		}
+		if err := out.FinishMessage(ectx); err != nil { // flush the frame (EOM)
+			return nil, err
+		}
+		return message.NewMessageFromStream(s).GetClassAd(ectx)
+	}
+	cc := consistent.NewControlClient(seed, exchange)
+	d.Logger().Info(logging.DestinationGeneral, "consistent HA: self-joining cluster",
+		"seed", seed, "node_id", nodeID, "advertise", advertise)
+	go func() {
+		for {
+			if err := cc.Register(ctx, nodeID, advertise); err == nil {
+				d.Logger().Info(logging.DestinationGeneral, "consistent HA: joined cluster",
+					"seed", seed, "node_id", nodeID)
+				return
+			} else if ctx.Err() == nil {
+				d.Logger().Info(logging.DestinationGeneral, "consistent HA: waiting to join cluster",
+					"seed", seed, "err", err.Error())
+			}
+			select {
+			case <-time.After(time.Second):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 // parsePeers parses "id1@addr1 id2@addr2 ..." into raft servers.
