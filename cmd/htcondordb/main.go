@@ -35,6 +35,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/scheddsync"
 	"github.com/bbockelm/htcondordb/server"
 )
 
@@ -205,6 +206,14 @@ func run() error {
 		go svc.RunPeriodicArchiveRotation(ctx, time.Duration(rotSecs)*time.Second)
 	}
 
+	// Schedd-sync mode: mirror a schedd's job_queue.log into a "jobs" table and its
+	// history file into a "history" archive table (a read model of the schedd's state).
+	if configBool(cfg, "HTCONDORDB_SYNC_SCHEDD") {
+		if err := startScheddSync(ctx, svc, cfg, d.Slog()); err != nil {
+			return err
+		}
+	}
+
 	// Start any background HA machinery (a follower's replicator, or the raft
 	// coordinator and its command handlers in consistent mode).
 	defer ha.close()
@@ -254,6 +263,48 @@ func encryptionConfig(cfg *config.Config) (poolKeys []db.KEK, attrs []string, er
 		poolKeys = append(poolKeys, db.KEK{ID: id, Material: material})
 	}
 	return poolKeys, splitAttrs(getStr(cfg, "HTCONDORDB_ENCRYPT_ATTRS")), nil
+}
+
+// startScheddSync launches the schedd-sync goroutines: a job_queue.log mirror into the
+// "jobs" mutable table and a history-file tail into the "history" archive table. Paths
+// come from HTCONDORDB_JOB_QUEUE_LOG / HTCONDORDB_HISTORY, falling back to HTCondor's
+// standard JOB_QUEUE_LOG / HISTORY params. At least one source must be configured. The
+// goroutines stop when ctx is cancelled (daemon shutdown).
+func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Config, logger *slog.Logger) error {
+	jobLog := firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG"))
+	histFile := firstNonEmpty(getStr(cfg, "HTCONDORDB_HISTORY"), getStr(cfg, "HISTORY"))
+	if jobLog == "" && histFile == "" {
+		return fmt.Errorf("HTCONDORDB_SYNC_SCHEDD is set but neither JOB_QUEUE_LOG nor HISTORY is configured")
+	}
+	if jobLog != "" {
+		jobs, err := svc.Catalog().CreateTable("jobs")
+		if err != nil {
+			return fmt.Errorf("schedd-sync: creating jobs table: %w", err)
+		}
+		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{Filename: jobLog, Logger: logger})
+		go func() { _ = js.Run(ctx) }()
+		logger.Info("schedd-sync: mirroring job_queue.log", "file", jobLog, "table", "jobs")
+	}
+	if histFile != "" {
+		hist, err := svc.Catalog().CreateArchiveTable("history", db.ArchiveConfig{
+			ValueAttrs: []string{"ClusterId"},
+			ZoneAttrs:  []string{"CompletionDate"},
+		})
+		if err != nil {
+			return fmt.Errorf("schedd-sync: creating history archive: %w", err)
+		}
+		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{Filename: histFile, Logger: logger})
+		go func() { _ = hs.Run(ctx) }()
+		logger.Info("schedd-sync: tailing history file", "file", histFile, "archive", "history")
+	}
+	return nil
+}
+
+func firstNonEmpty(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
 }
 
 // splitAttrs splits a comma/whitespace-separated attribute list from configuration.
