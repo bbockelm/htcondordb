@@ -79,6 +79,18 @@ type Config struct {
 	// clients that do not name a table. Defaults to "ads".
 	DefaultTable string
 
+	// PoolKeys enables encryption at rest: every table's master key is wrapped under
+	// these HTCondor pool/signing keys (any one opens the DB; a rotated-in key is added
+	// on the next start). Built from htcondor.LoadSigningKeys. Empty disables encryption.
+	// Each replica holds its OWN keys -- encryption is node-local and never replicated
+	// (the commit stream ships decrypted, privilege-stripped ads), so a follower's keys
+	// need not match the leader's.
+	PoolKeys []db.KEK
+	// EncryptedAttrs is the default set of attributes encrypted at rest, in addition to
+	// HTCondor private attributes (which are always encrypted when PoolKeys is set).
+	// Adjustable at runtime by a DAEMON via the encrypt.set meta-command.
+	EncryptedAttrs []string
+
 	// Logger receives per-connection diagnostics. Defaults to slog.Default().
 	Logger *slog.Logger
 
@@ -118,7 +130,11 @@ func New(cfg Config) (*Service, error) {
 		defaultTable = dbrpc.DefaultTable
 	}
 
-	cat, err := db.OpenCatalog(cfg.Dir)
+	cat, err := db.OpenCatalogConfig(db.CatalogConfig{
+		Dir:            cfg.Dir,
+		PoolKeys:       cfg.PoolKeys,
+		EncryptedAttrs: cfg.EncryptedAttrs,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("server: opening catalog: %w", err)
 	}
@@ -198,7 +214,8 @@ func serveOptionsFor(level Level) dbrpc.ServeOptions {
 	case LevelDaemon:
 		// Only a DAEMON-authorized peer sees private (secret) attributes -- matching the
 		// HTCondor daemons, where secret material is a DAEMON-level capability, not WRITE.
-		return dbrpc.ServeOptions{ReadOnly: false, IncludePrivate: true}
+		// DAEMON also carries the privileged admin surface (e.g. the encryption toggle).
+		return dbrpc.ServeOptions{ReadOnly: false, IncludePrivate: true, Privileged: true}
 	case LevelWrite:
 		// WRITE may read and write ads but does NOT see private attributes: a submitter
 		// can add/update jobs without gaining visibility into other principals' secrets.

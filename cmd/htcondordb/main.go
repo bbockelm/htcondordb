@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/PelicanPlatform/classad/db"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	htcondor "github.com/bbockelm/golang-htcondor"
@@ -117,13 +118,26 @@ func run() error {
 		return err
 	}
 
+	// Encryption at rest (opt-in via HTCONDORDB_ENCRYPT_AT_REST): wrap each table's
+	// master key under the pool signing keys. Node-local -- a follower uses its own keys.
+	poolKeys, encAttrs, err := encryptionConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if len(poolKeys) > 0 {
+		log.Info(logging.DestinationGeneral, "encryption at rest enabled",
+			"pool_keys", len(poolKeys), "extra_encrypted_attrs", len(encAttrs))
+	}
+
 	// The database service. A follower (or a non-leader raft node) serves
 	// read-only: writes go to the leader.
 	svc, err := server.New(server.Config{
-		Dir:           databaseDir(d, cfg),
-		Authorize:     authorize,
-		ForceReadOnly: ha.forceReadOnly,
-		Logger:        d.Slog(),
+		Dir:            databaseDir(d, cfg),
+		Authorize:      authorize,
+		ForceReadOnly:  ha.forceReadOnly,
+		Logger:         d.Slog(),
+		PoolKeys:       poolKeys,
+		EncryptedAttrs: encAttrs,
 	})
 	if err != nil {
 		return err
@@ -180,6 +194,40 @@ func databaseDir(d *daemon.Daemon, cfg *config.Config) string {
 	}
 	d.Logger().Warn(logging.DestinationGeneral, "no HTCONDORDB_DIR or SPOOL configured; database is in-memory only")
 	return ""
+}
+
+// encryptionConfig resolves encryption at rest from configuration. It is opt-in via
+// HTCONDORDB_ENCRYPT_AT_REST; when enabled it loads the pool signing keys (the same
+// SEC_PASSWORD_DIRECTORY keys used for token signing) as the KEKs that wrap each
+// table's master key, and reads any extra attributes to encrypt beyond the always-on
+// private attributes. Disabled ⇒ (nil, nil, nil). Enabled with no signing keys is an
+// error: encryption was asked for but cannot be keyed.
+func encryptionConfig(cfg *config.Config) (poolKeys []db.KEK, attrs []string, err error) {
+	if !configBool(cfg, "HTCONDORDB_ENCRYPT_AT_REST") {
+		return nil, nil, nil
+	}
+	keyMap, err := htcondor.LoadSigningKeys(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encryption at rest: loading pool signing keys: %w", err)
+	}
+	if len(keyMap) == 0 {
+		return nil, nil, fmt.Errorf("encryption at rest: HTCONDORDB_ENCRYPT_AT_REST is set but no signing keys found (configure SEC_PASSWORD_DIRECTORY)")
+	}
+	for id, material := range keyMap {
+		poolKeys = append(poolKeys, db.KEK{ID: id, Material: material})
+	}
+	return poolKeys, splitAttrs(getStr(cfg, "HTCONDORDB_ENCRYPT_ATTRS")), nil
+}
+
+// splitAttrs splits a comma/whitespace-separated attribute list from configuration.
+func splitAttrs(s string) []string {
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+	if len(fields) == 0 {
+		return nil
+	}
+	return fields
 }
 
 // advertisedAddr is the daemon's externally reachable command address: the

@@ -14,19 +14,20 @@ import (
 // read/write but STILL strips secrets; only DAEMON sees private (secret) attributes.
 func TestServeOptionsFor(t *testing.T) {
 	cases := []struct {
-		level        Level
-		wantReadOnly bool
-		wantPrivate  bool
+		level          Level
+		wantReadOnly   bool
+		wantPrivate    bool
+		wantPrivileged bool
 	}{
-		{LevelRead, true, false},
-		{LevelWrite, false, false},
-		{LevelDaemon, false, true},
+		{LevelRead, true, false, false},
+		{LevelWrite, false, false, false},
+		{LevelDaemon, false, true, true},
 	}
 	for _, tc := range cases {
 		got := serveOptionsFor(tc.level)
-		if got.ReadOnly != tc.wantReadOnly || got.IncludePrivate != tc.wantPrivate {
-			t.Errorf("serveOptionsFor(%s) = {ReadOnly:%v, IncludePrivate:%v}, want {%v, %v}",
-				tc.level, got.ReadOnly, got.IncludePrivate, tc.wantReadOnly, tc.wantPrivate)
+		if got.ReadOnly != tc.wantReadOnly || got.IncludePrivate != tc.wantPrivate || got.Privileged != tc.wantPrivileged {
+			t.Errorf("serveOptionsFor(%s) = {ReadOnly:%v, IncludePrivate:%v, Privileged:%v}, want {%v, %v, %v}",
+				tc.level, got.ReadOnly, got.IncludePrivate, got.Privileged, tc.wantReadOnly, tc.wantPrivate, tc.wantPrivileged)
 		}
 	}
 }
