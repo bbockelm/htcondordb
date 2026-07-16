@@ -123,10 +123,10 @@ func (h *haRuntime) startFollower(ctx context.Context, d *daemon.Daemon, cfg *co
 	}
 
 	repl, err := leaderfollower.NewReplicator(leaderfollower.ReplicatorConfig{
-		Local:      svc.DB(),
-		Dial:       dial,
-		CursorFile: followerCursorFile(cfg),
-		Logger:     d.Slog(),
+		Catalog:   svc.Catalog(),
+		Dial:      dial,
+		CursorDir: followerCursorFile(cfg),
+		Logger:    d.Slog(),
 	})
 	if err != nil {
 		return err
@@ -140,14 +140,17 @@ func (h *haRuntime) startFollower(ctx context.Context, d *daemon.Daemon, cfg *co
 	return nil
 }
 
-// followerCursorFile is where the follower persists its stream cursor
-// (HTCONDORDB_CURSOR_FILE, default $(SPOOL)/htcondordb/.replica_cursor).
+// followerCursorFile is the directory where the follower persists its per-table stream
+// cursors (HTCONDORDB_CURSOR_DIR, default $(SPOOL)/htcondordb/replica_cursors).
 func followerCursorFile(cfg *config.Config) string {
-	if v := strings.TrimSpace(getStr(cfg, "HTCONDORDB_CURSOR_FILE")); v != "" {
+	if v := strings.TrimSpace(getStr(cfg, "HTCONDORDB_CURSOR_DIR")); v != "" {
 		return v
 	}
+	if v := strings.TrimSpace(getStr(cfg, "HTCONDORDB_CURSOR_FILE")); v != "" {
+		return v // legacy name; treated as a directory now
+	}
 	if spool := strings.TrimSpace(getStr(cfg, "SPOOL")); spool != "" {
-		return filepath.Join(spool, "htcondordb", ".replica_cursor")
+		return filepath.Join(spool, "htcondordb", "replica_cursors")
 	}
 	return ""
 }
