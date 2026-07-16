@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/cedar/stream"
 )
 
@@ -384,6 +385,104 @@ func waitForKey(t *testing.T, cat *db.Catalog, table, key string, node int) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("node n%d: key %s.%s never replicated", node, table, key)
+}
+
+// proposeHook builds the same dbrpc propose hook the daemon wires in consistent mode:
+// translate a committing transaction's ops into a table-qualified raft batch and Apply it.
+func proposeHook(c *Coordinator) dbrpc.ProposeFunc {
+	return func(table string, ops []dbrpc.WriteOp) error {
+		b := NewBatch()
+		for _, op := range ops {
+			switch op.Kind {
+			case dbrpc.WriteNewClassAd:
+				b.NewClassAdIn(table, op.Key, op.Value)
+			case dbrpc.WriteDestroyClassAd:
+				b.DestroyClassAdIn(table, op.Key)
+			case dbrpc.WriteSetAttribute:
+				b.SetAttributeIn(table, op.Key, op.Name, op.Value)
+			case dbrpc.WriteDeleteAttribute:
+				b.DeleteAttributeIn(table, op.Key, op.Name)
+			}
+		}
+		if b.Empty() {
+			return nil
+		}
+		return c.Apply(b)
+	}
+}
+
+// TestClientWriteThroughRaft drives the full consistent-mode write path: a dbrpc client
+// opens a transaction and commits mutations, which the server's propose hook routes through
+// raft (not a local commit); the FSM lands them in the catalog, on multiple tables.
+func TestClientWriteThroughRaft(t *testing.T) {
+	cat := newCat(t)
+	defer cat.Close()
+	if _, err := cat.CreateTable("ads"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateTable("machines"); err != nil {
+		t.Fatal(err)
+	}
+
+	noDial := func(context.Context, string, time.Duration) (*stream.Stream, error) {
+		return nil, errors.New("single-node")
+	}
+	c, err := NewCoordinator(CoordinatorConfig{
+		NodeID: "n1", Advertise: "127.0.0.1:1", Catalog: cat, Dial: noDial,
+		DataDir: t.TempDir(), Bootstrap: true, Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.WaitForLeader(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := dbrpc.NewServerCatalog(cat)
+	defer srv.Close()
+	srv.SetProposeHook(proposeHook(c))
+	cconn, sconn := net.Pipe()
+	go func() { _ = srv.ServeConn(dbrpc.NewStreamConn(sconn)) }()
+	client := dbrpc.NewClient(dbrpc.NewStreamConn(cconn))
+	defer client.Close()
+
+	// Write to the default table via a normal client transaction.
+	tx, err := client.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.NewClassAd("1.0", "Owner = \"alice\""); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.SetAttribute("1.0", "JobStatus", "2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	ad, ok := tbl(t, cat, "ads").LookupClassAd("1.0")
+	if !ok {
+		t.Fatal("write did not reach the catalog via raft")
+	}
+	if v, _ := ad.EvaluateAttrInt("JobStatus"); v != 2 {
+		t.Fatalf("JobStatus = %d, want 2 (SetAttribute not applied through raft)", v)
+	}
+
+	// Write to a second table via the same client.
+	tx2, err := client.BeginTable("machines")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx2.NewClassAd("slot1", "Cpus = 8"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tbl(t, cat, "machines").LookupClassAd("slot1"); !ok {
+		t.Fatal("second-table write did not reach the catalog via raft")
+	}
 }
 
 func lookupAttr(t *testing.T, d *db.DB, key, name string) (string, bool) {

@@ -72,9 +72,11 @@ func detectHA(cfg *config.Config) (*haRuntime, error) {
 			return nil, fmt.Errorf("invalid HTCONDORDB_ROLE %q (want leader or follower)", h.role)
 		}
 	case modeConsistent:
-		// The raft-backed consistent mode is coordinated in ha/consistent; a
-		// non-leader node serves reads and redirects writes to the raft leader.
-		h.forceReadOnly = true
+		// The raft-backed consistent mode is coordinated in ha/consistent. Writes are NOT
+		// server-side read-only here: they reach the store's commit path, where a propose
+		// hook (set in startConsistent) routes them through raft instead of committing
+		// locally -- the leader applies them by quorum; a non-leader's proposal returns a
+		// not-leader error the client sees. Reads are served locally on every node.
 		return h, nil
 	default:
 		return nil, fmt.Errorf("invalid HTCONDORDB_HA_MODE %q (want standalone, leader-follower, or consistent)", mode)
@@ -199,6 +201,30 @@ func (h *haRuntime) startConsistent(ctx context.Context, d *daemon.Daemon, cfg *
 		return err
 	}
 	h.coord = coord
+
+	// Route client writes through raft: every committing transaction's ops become a
+	// table-qualified raft batch, applied by the FSM (the store's sole writer) once a
+	// quorum commits. A proposal on a non-leader returns a not-leader error to the client.
+	// Set before serving begins (start runs before d.Serve).
+	svc.RPC().SetProposeHook(func(table string, ops []dbrpc.WriteOp) error {
+		b := consistent.NewBatch()
+		for _, op := range ops {
+			switch op.Kind {
+			case dbrpc.WriteNewClassAd:
+				b.NewClassAdIn(table, op.Key, op.Value)
+			case dbrpc.WriteDestroyClassAd:
+				b.DestroyClassAdIn(table, op.Key)
+			case dbrpc.WriteSetAttribute:
+				b.SetAttributeIn(table, op.Key, op.Name, op.Value)
+			case dbrpc.WriteDeleteAttribute:
+				b.DeleteAttributeIn(table, op.Key, op.Name)
+			}
+		}
+		if b.Empty() {
+			return nil
+		}
+		return coord.Apply(b)
+	})
 
 	// DBRaft carries the raft transport: hand each accepted CEDAR stream to raft
 	// and block until raft is done with it (so the server keeps the socket open).
