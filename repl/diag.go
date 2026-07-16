@@ -337,7 +337,7 @@ func (s *session) explainMatch(console io.Writer, arg string) {
 		}
 	}
 	if len(ex.EvalOrder) > 0 {
-		fmt.Fprintln(console, "evaluation order (bilateral re-verify, short-circuits left to right):")
+		fmt.Fprintln(console, "evaluation order (index probes prune first, most-selective; then per-candidate re-checks):")
 		for _, ce := range ex.EvalOrder {
 			role := "re-check"
 			switch {
