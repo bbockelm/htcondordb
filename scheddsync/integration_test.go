@@ -2,6 +2,7 @@ package scheddsync
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -106,43 +107,47 @@ func TestJobSyncIntegration(t *testing.T) {
 	}
 }
 
-// TestHistorySyncIntegration submits a short job, waits for it to leave the queue
-// (complete), and verifies HistorySync archives it from the real history file. It is more
-// timing-dependent (needs the full match+execute pipeline), so completion has a generous
-// timeout after which the archive assertion is skipped rather than failed.
+// TestHistorySyncIntegration submits a job, runs it to completion on a real schedd, and
+// verifies HistorySync archives it from the real history file.
 func TestHistorySyncIntegration(t *testing.T) {
-	h, schedd, _, histFile := resolveSchedd(t)
-	// Give the execute side a head start so the short job can actually be matched + run.
-	if err := h.WaitForStartd(30 * time.Second); err != nil {
-		t.Skipf("no startd available to run the job: %v", err)
-	}
+	_, schedd, _, histFile := resolveSchedd(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	clusterID, err := schedd.Submit(ctx, "universe = vanilla\nexecutable = /bin/true\nqueue\n")
+	// transfer_executable=false (the executable is a system binary already present on the
+	// execute node) + output/log files + an initialdir: without these the job holds or never
+	// runs on a personal condor. This mirrors golang-htcondor's own history integration test.
+	jobDir := t.TempDir()
+	submit := fmt.Sprintf("universe = vanilla\nexecutable = /bin/echo\narguments = hi\n"+
+		"output = h.out\nerror = h.err\nlog = h.log\ntransfer_executable = false\ninitialdir = %s\nqueue\n", jobDir)
+	clusterID, err := schedd.Submit(ctx, submit)
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	t.Logf("submitted short cluster %s", clusterID)
-	// Nudge the negotiator: a fresh job otherwise waits a full negotiation cycle for the
-	// submitter ad to propagate (see Schedd.Reschedule).
-	_ = schedd.Reschedule(ctx)
+	t.Logf("submitted cluster %s", clusterID)
+	_ = schedd.Reschedule(ctx) // nudge the negotiator so the fresh job matches promptly
 
-	// Wait for the job to leave the queue (JobStatus Completed removes it; a query returns
-	// nothing once it is gone to history).
-	gone := false
+	// Wait for the job to reach a terminal state (Completed=4 / Removed=3) or leave the queue
+	// -- at which point it has been written to the history file.
+	done := false
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		ads, err := schedd.Query(ctx, "ClusterId == "+clusterID, []string{"JobStatus"})
-		if err == nil && len(ads) == 0 {
-			gone = true
-			break
+		ads, qerr := schedd.Query(ctx, "ClusterId == "+clusterID, []string{"JobStatus"})
+		if qerr == nil {
+			if len(ads) == 0 {
+				done = true
+				break
+			}
+			if s, ok := ads[0].EvaluateAttrInt("JobStatus"); ok && (s == 3 || s == 4) {
+				done = true
+				break
+			}
 		}
-		_ = schedd.Reschedule(ctx) // rate-limited internally; keeps the submitter ad fresh
-		time.Sleep(2 * time.Second)
+		_ = schedd.Reschedule(ctx)
+		time.Sleep(1 * time.Second)
 	}
-	if !gone {
-		t.Skip("job did not complete in time (no execute slot?); skipping history assertion")
+	if !done {
+		t.Fatal("job did not reach a terminal state in time")
 	}
 
 	cat, err := db.OpenCatalog(t.TempDir())
