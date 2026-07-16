@@ -271,6 +271,15 @@ func encryptionConfig(cfg *config.Config) (poolKeys []db.KEK, attrs []string, er
 // standard JOB_QUEUE_LOG / HISTORY params. At least one source must be configured. The
 // goroutines stop when ctx is cancelled (daemon shutdown).
 func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Config, logger *slog.Logger) error {
+	// Never read a schedd's job_queue.log / history as root: those files are owned by the
+	// condor user, and following them as root risks reading through an attacker-planted
+	// symlink to a privileged file. The daemon drops privilege in daemon.New before this
+	// runs; if it is still root here (e.g. DROP_PRIVILEGES=false), refuse rather than read
+	// schedd files privileged.
+	if os.Geteuid() == 0 {
+		return fmt.Errorf("schedd-sync refuses to run as root: it would read the schedd's job_queue.log/history privileged; " +
+			"ensure the daemon drops to the condor user (do not set DROP_PRIVILEGES=false with HTCONDORDB_SYNC_SCHEDD)")
+	}
 	jobLog := firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG"))
 	histFile := firstNonEmpty(getStr(cfg, "HTCONDORDB_HISTORY"), getStr(cfg, "HISTORY"))
 	if jobLog == "" && histFile == "" {
