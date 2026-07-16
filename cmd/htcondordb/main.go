@@ -195,6 +195,16 @@ func run() error {
 		}
 	}
 
+	// Enforce archive (history) table retention periodically (default hourly; 0 disables).
+	// A no-op until an archive table exists.
+	rotSecs := configInt(cfg, "HTCONDORDB_ARCHIVE_ROTATE_INTERVAL")
+	if _, set := cfg.Get("HTCONDORDB_ARCHIVE_ROTATE_INTERVAL"); !set {
+		rotSecs = 3600
+	}
+	if rotSecs > 0 {
+		go svc.RunPeriodicArchiveRotation(ctx, time.Duration(rotSecs)*time.Second)
+	}
+
 	// Start any background HA machinery (a follower's replicator, or the raft
 	// coordinator and its command handlers in consistent mode).
 	defer ha.close()
