@@ -3,9 +3,9 @@ module github.com/bbockelm/htcondordb
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.5.1
-	github.com/PelicanPlatform/classad/db v0.0.0
-	github.com/PelicanPlatform/classad/dbrpc v0.0.0
+	github.com/PelicanPlatform/classad v0.7.1
+	github.com/PelicanPlatform/classad/db v0.7.1
+	github.com/PelicanPlatform/classad/dbrpc v0.7.1
 	github.com/bbockelm/cedar v0.5.3
 	github.com/bbockelm/golang-htcondor v0.5.0
 	github.com/chzyer/readline v1.5.1
@@ -15,7 +15,7 @@ require (
 )
 
 require (
-	github.com/PelicanPlatform/classad/collections v0.4.0 // indirect
+	github.com/PelicanPlatform/classad/collections v0.7.1 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
@@ -39,18 +39,8 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 )
 
-// In-development sibling modules: built from the local checkouts. These replaces
-// are for local development only and must be resolved to tagged versions before
-// this module is published with CI. cedar (v0.5.3) is now tagged and consumed
-// directly. classad is tagged (v0.7.0) but its nested-module go.mods still pin
-// siblings at v0.0.0 (unfetchable externally), so it stays on the local replace
-// until a v0.7.x with corrected sibling requires is cut.
-replace github.com/PelicanPlatform/classad => ../golang-classads
-
-replace github.com/PelicanPlatform/classad/collections => ../golang-classads/collections
-
-replace github.com/PelicanPlatform/classad/db => ../golang-classads/db
-
-replace github.com/PelicanPlatform/classad/dbrpc => ../golang-classads/dbrpc
-
+// In-development sibling module: built from the local checkout. This replace is
+// for local development only and must be resolved to a tagged version before this
+// module is published with CI. classad (v0.7.1) and cedar (v0.5.3) are tagged and
+// consumed directly.
 replace github.com/bbockelm/golang-htcondor => ../golang-htcondor

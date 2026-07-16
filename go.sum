@@ -1,5 +1,13 @@
 cloud.google.com/go v0.34.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
 github.com/DataDog/datadog-go v3.2.0+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
+github.com/PelicanPlatform/classad v0.7.1 h1:97eFkWTIoxc/FjzXkHdMatM5oBaxarz3z3xCnhPOz6M=
+github.com/PelicanPlatform/classad v0.7.1/go.mod h1:z1d5dXdX+1pxBi8f8Ab/yCX8zKyiLam9CtQHSykMlWQ=
+github.com/PelicanPlatform/classad/collections v0.7.1 h1:oSfb3T9FyGfympqta/1M9RkmKyYa8MrxogSsaIB88yc=
+github.com/PelicanPlatform/classad/collections v0.7.1/go.mod h1:S9P22nDJf1OamG4QlU+7hJ0wtK7Yl6W9Ai416ILv4Jo=
+github.com/PelicanPlatform/classad/db v0.7.1 h1:5w8bBH+iMn+kTo1l4m3mkbXAXwG/eZ3SWtHBIPdL5go=
+github.com/PelicanPlatform/classad/db v0.7.1/go.mod h1:ObuAJlYwa6WFiJJ0fWr0Vk/KBQIDVIst978wU8Ykv28=
+github.com/PelicanPlatform/classad/dbrpc v0.7.1 h1:GFbOkM6ypdaD0PlDJ/U33xXE6Q7xphSbbAOVJA2W/7E=
+github.com/PelicanPlatform/classad/dbrpc v0.7.1/go.mod h1:iaf06TmXF7fn4JHzXOldD3fUHx034vndy0toN4HaJA4=
 github.com/RoaringBitmap/roaring/v2 v2.19.0 h1:zsWtVE+biht4eVl0YDLvykUqGkftR3Qc5UCbeKB4UQ4=
 github.com/RoaringBitmap/roaring/v2 v2.19.0/go.mod h1:SfT3of9nYh3vis1dIbCj4Yw6KQGujTN+f345nrN/0JA=
 github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
