@@ -41,6 +41,14 @@ func TestServiceSnapshotRestoreFile(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
+	// A second table proves the backup covers the whole catalog, not just the default.
+	other, err := svc.Catalog().CreateTable("machines")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otx := other.Begin()
+	otx.NewClassAd("m1", mustAd(t, "Cpus = 8"))
+	otx.Commit()
 
 	backup := filepath.Join(t.TempDir(), "backup.cadb")
 	if err := svc.SnapshotToFile(backup); err != nil {
@@ -56,14 +64,19 @@ func TestServiceSnapshotRestoreFile(t *testing.T) {
 	}
 
 	svc.DB().Truncate()
-	if svc.DB().Len() != 0 {
-		t.Fatal("truncate did not empty the DB")
+	other.Truncate()
+	if svc.DB().Len() != 0 || other.Len() != 0 {
+		t.Fatal("truncate did not empty the tables")
 	}
 	if err := svc.RestoreFromFile(backup); err != nil {
 		t.Fatalf("RestoreFromFile: %v", err)
 	}
 	if svc.DB().Len() != 3 {
-		t.Fatalf("after restore Len = %d, want 3", svc.DB().Len())
+		t.Fatalf("after restore default table Len = %d, want 3", svc.DB().Len())
+	}
+	machines, _ := svc.Catalog().Table("machines")
+	if machines.Len() != 1 {
+		t.Fatalf("after restore machines Len = %d, want 1", machines.Len())
 	}
 }
 

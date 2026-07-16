@@ -17,16 +17,17 @@ const (
 	snapshotStamp  = "20060102T150405Z"
 )
 
-// SnapshotToFile writes a consistent backup of the default table to path (atomically via
-// a temp file + rename). The backup is encrypted at rest when the database is; decrypting
-// it later needs a pool key (embedded envelope) or the escrowed backup key.
+// SnapshotToFile writes a consistent backup of the WHOLE catalog (every table) to path
+// (atomically via a temp file + rename). The backup is encrypted at rest when the database
+// is; decrypting it later needs a pool key (embedded per-table envelopes) or the escrowed
+// backup key. It streams table by table, so a large multi-table DB is never buffered whole.
 func (s *Service) SnapshotToFile(path string) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	if err := s.DB().Snapshot(f); err != nil {
+	if err := s.Catalog().Snapshot(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err
@@ -38,15 +39,16 @@ func (s *Service) SnapshotToFile(path string) error {
 	return os.Rename(tmp, path)
 }
 
-// RestoreFromFile replaces the default table with the snapshot in path (truncate + reload
-// under the DB-wide lock). An encrypted snapshot is opened with the database's pool keys.
+// RestoreFromFile replaces the catalog's tables with those in the snapshot at path (each
+// table truncated + reloaded under its DB-wide lock; missing tables created). An encrypted
+// snapshot is opened with the catalog's pool keys.
 func (s *Service) RestoreFromFile(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	return s.DB().Restore(f)
+	return s.Catalog().Restore(f)
 }
 
 // RunPeriodicSnapshots writes a timestamped backup to dir every interval until ctx is
