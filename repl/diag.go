@@ -341,12 +341,10 @@ func (s *session) explainMatch(console io.Writer, arg string) {
 		for _, ce := range ex.EvalOrder {
 			role := "re-check"
 			switch {
-			case ce.ResourceSide && ce.Indexed:
-				role = "filter (indexed)" // WHERE TARGET / NOPREEMPT: post-filter, index-coverable
-			case ce.ResourceSide:
-				role = "filter" // WHERE TARGET / NOPREEMPT: post-filter, not indexed
 			case ce.Probed:
-				role = "PROBE" // prunes candidates before re-verify
+				role = "PROBE" // prunes candidates (job Requirements or pushed-down WHERE TARGET)
+			case ce.ResourceSide:
+				role = "filter" // WHERE TARGET / NOPREEMPT that no index covers: re-checked only
 			case ce.Indexed:
 				role = "re-check (indexed)" // estimable but not a pushdown probe (e.g. a bool flag)
 			}
