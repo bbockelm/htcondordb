@@ -6,7 +6,7 @@ require (
 	github.com/PelicanPlatform/classad v0.5.1
 	github.com/PelicanPlatform/classad/db v0.0.0
 	github.com/PelicanPlatform/classad/dbrpc v0.0.0
-	github.com/bbockelm/cedar v0.5.2
+	github.com/bbockelm/cedar v0.5.3
 	github.com/bbockelm/golang-htcondor v0.5.0
 	github.com/chzyer/readline v1.5.1
 	github.com/hashicorp/go-hclog v1.6.3
@@ -41,7 +41,10 @@ require (
 
 // In-development sibling modules: built from the local checkouts. These replaces
 // are for local development only and must be resolved to tagged versions before
-// this module is published with CI.
+// this module is published with CI. cedar (v0.5.3) is now tagged and consumed
+// directly. classad is tagged (v0.7.0) but its nested-module go.mods still pin
+// siblings at v0.0.0 (unfetchable externally), so it stays on the local replace
+// until a v0.7.x with corrected sibling requires is cut.
 replace github.com/PelicanPlatform/classad => ../golang-classads
 
 replace github.com/PelicanPlatform/classad/collections => ../golang-classads/collections
@@ -49,7 +52,5 @@ replace github.com/PelicanPlatform/classad/collections => ../golang-classads/col
 replace github.com/PelicanPlatform/classad/db => ../golang-classads/db
 
 replace github.com/PelicanPlatform/classad/dbrpc => ../golang-classads/dbrpc
-
-replace github.com/bbockelm/cedar => ../golang-cedar
 
 replace github.com/bbockelm/golang-htcondor => ../golang-htcondor
