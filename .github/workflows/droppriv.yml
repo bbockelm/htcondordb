@@ -1,0 +1,54 @@
+name: drop-privilege
+
+# Runs the run-as-root privilege-drop integration test. condor_master starts htcondordb
+# as root and expects it to drop to the condor user; this proves it does. The test is
+# FATAL if it cannot run as root (HTCONDORDB_REQUIRE_ROOT_TEST=1), so a misconfigured
+# runner fails loudly instead of silently skipping the security check.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  droppriv:
+    name: Drop privilege as root
+    runs-on: ubuntu-latest
+    steps:
+      # htcondordb and its in-development sibling modules are checked out as siblings so
+      # go.mod's `replace ../<module>` directives resolve. Adjust the sibling refs if the
+      # required features live on a non-default branch.
+      - name: Checkout htcondordb
+        uses: actions/checkout@v4
+        with: { path: htcondordb }
+      - name: Checkout classad
+        uses: actions/checkout@v4
+        with: { repository: PelicanPlatform/classad, path: golang-classads }
+      - name: Checkout cedar
+        uses: actions/checkout@v4
+        with: { repository: bbockelm/cedar, path: golang-cedar }
+      - name: Checkout golang-htcondor
+        uses: actions/checkout@v4
+        with: { repository: bbockelm/golang-htcondor, path: golang-htcondor }
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with: { go-version: '1.25' }
+
+      - name: Create the drop target user
+        run: sudo useradd --system --no-create-home condortest
+
+      # Compile the test binary as the normal user (so the Go/module cache is used
+      # normally), then run ONLY that binary as root -- go itself never runs privileged.
+      - name: Build the drop-privilege test binary
+        working-directory: htcondordb
+        env:
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+        run: go test -c -o /tmp/droppriv.test ./cmd/htcondordb/
+
+      - name: Run the drop-privilege test AS ROOT (fatal if skipped)
+        run: |
+          sudo \
+            HTCONDORDB_REQUIRE_ROOT_TEST=1 \
+            HTCONDORDB_DROPPRIV_USER=condortest \
+            /tmp/droppriv.test -test.run '^TestDaemonDropsPrivilege$' -test.v

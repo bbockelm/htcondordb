@@ -276,9 +276,8 @@ func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Confi
 	// symlink to a privileged file. The daemon drops privilege in daemon.New before this
 	// runs; if it is still root here (e.g. DROP_PRIVILEGES=false), refuse rather than read
 	// schedd files privileged.
-	if os.Geteuid() == 0 {
-		return fmt.Errorf("schedd-sync refuses to run as root: it would read the schedd's job_queue.log/history privileged; " +
-			"ensure the daemon drops to the condor user (do not set DROP_PRIVILEGES=false with HTCONDORDB_SYNC_SCHEDD)")
+	if err := scheddSyncGuardEUID(os.Geteuid()); err != nil {
+		return err
 	}
 	jobLog := firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG"))
 	histFile := firstNonEmpty(getStr(cfg, "HTCONDORDB_HISTORY"), getStr(cfg, "HISTORY"))
@@ -305,6 +304,17 @@ func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Confi
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{Filename: histFile, Logger: logger})
 		go func() { _ = hs.Run(ctx) }()
 		logger.Info("schedd-sync: tailing history file", "file", histFile, "archive", "history")
+	}
+	return nil
+}
+
+// scheddSyncGuardEUID enforces that schedd-sync never runs as root: reading the schedd's
+// job_queue.log/history privileged is a symlink-following risk. Separated from os.Geteuid
+// so it is unit-testable at any privilege level.
+func scheddSyncGuardEUID(euid int) error {
+	if euid == 0 {
+		return fmt.Errorf("schedd-sync refuses to run as root: it would read the schedd's job_queue.log/history privileged; " +
+			"ensure the daemon drops to the condor user (do not set DROP_PRIVILEGES=false with HTCONDORDB_SYNC_SCHEDD)")
 	}
 	return nil
 }

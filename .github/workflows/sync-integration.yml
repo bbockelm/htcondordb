@@ -1,0 +1,47 @@
+name: sync-integration
+
+# Runs the schedd-sync integration tests against a real mini-HTCondor: submit jobs to a
+# real schedd and verify the syncers mirror the actual job_queue.log / history file. Runs
+# unprivileged (the sync must never read schedd files as root).
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  integration:
+    name: Schedd-sync integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout htcondordb
+        uses: actions/checkout@v4
+        with: { path: htcondordb }
+      - name: Checkout classad
+        uses: actions/checkout@v4
+        with: { repository: PelicanPlatform/classad, path: golang-classads }
+      - name: Checkout cedar
+        uses: actions/checkout@v4
+        with: { repository: bbockelm/cedar, path: golang-cedar }
+      - name: Checkout golang-htcondor
+        uses: actions/checkout@v4
+        with: { repository: bbockelm/golang-htcondor, path: golang-htcondor }
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with: { go-version: '1.25' }
+
+      - name: Install HTCondor
+        run: |
+          wget -qO - https://research.cs.wisc.edu/htcondor/repo/keys/HTCondor-25.x-Key | sudo gpg --dearmor -o /usr/share/keyrings/htcondor-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/htcondor-archive-keyring.gpg] http://research.cs.wisc.edu/htcondor/repo/ubuntu/25.x $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/htcondor.list
+          sudo apt-get update
+          sudo apt-get install -y condor
+
+      - name: Run schedd-sync integration tests
+        working-directory: htcondordb
+        env:
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+        # -count=1 defeats the test cache so the real HTCondor is always exercised; a long
+        # timeout accommodates the match+execute pipeline for the history test.
+        run: go test -run Integration -v -count=1 -timeout 20m ./scheddsync/
