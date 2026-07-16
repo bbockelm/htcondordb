@@ -184,7 +184,7 @@ func (h *haRuntime) startConsistent(ctx context.Context, d *daemon.Daemon, cfg *
 	coord, err := consistent.NewCoordinator(consistent.CoordinatorConfig{
 		NodeID:      nodeID,
 		Advertise:   advertise,
-		Local:       svc.DB(),
+		Catalog:     svc.Catalog(),
 		Dial:        dial,
 		DataDir:     filepath.Join(databaseDir(d, cfg), "raft"),
 		Bootstrap:   configBool(cfg, "HTCONDORDB_RAFT_BOOTSTRAP"),

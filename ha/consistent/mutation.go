@@ -34,9 +34,12 @@ const (
 	OpDeleteAttribute
 )
 
-// Op is one mutation. Fields not relevant to a kind are empty.
+// Op is one mutation. Fields not relevant to a kind are empty. Table names the target
+// table; empty means the catalog's default table, so a single-table batch (and every
+// pre-multi-table log entry) applies there unchanged.
 type Op struct {
 	Kind  OpKind `json:"k"`
+	Table string `json:"t,omitempty"`
 	Key   string `json:"key"`
 	Name  string `json:"n,omitempty"`
 	Value string `json:"v,omitempty"`
@@ -73,6 +76,29 @@ func (b *Batch) SetAttribute(key, name, expr string) *Batch {
 // DeleteAttribute appends a delete-attribute mutation.
 func (b *Batch) DeleteAttribute(key, name string) *Batch {
 	b.Ops = append(b.Ops, Op{Kind: OpDeleteAttribute, Key: key, Name: name})
+	return b
+}
+
+// Table-qualified variants: the same mutations against a named table (empty = default).
+// A batch may mix tables; the FSM groups by table and applies each table's ops together.
+
+func (b *Batch) NewClassAdIn(table, key, adText string) *Batch {
+	b.Ops = append(b.Ops, Op{Kind: OpNewClassAd, Table: table, Key: key, Value: adText})
+	return b
+}
+
+func (b *Batch) DestroyClassAdIn(table, key string) *Batch {
+	b.Ops = append(b.Ops, Op{Kind: OpDestroyClassAd, Table: table, Key: key})
+	return b
+}
+
+func (b *Batch) SetAttributeIn(table, key, name, expr string) *Batch {
+	b.Ops = append(b.Ops, Op{Kind: OpSetAttribute, Table: table, Key: key, Name: name, Value: expr})
+	return b
+}
+
+func (b *Batch) DeleteAttributeIn(table, key, name string) *Batch {
+	b.Ops = append(b.Ops, Op{Kind: OpDeleteAttribute, Table: table, Key: key, Name: name})
 	return b
 }
 

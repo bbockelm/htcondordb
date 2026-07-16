@@ -13,21 +13,21 @@ import (
 //
 //   - "leader":   discover the current leader (for client redirect).
 //   - "register": a DAEMON peer asks the leader to admit it as a raft voter
-//                 (the "first N hosts" bootstrap).
+//     (the "first N hosts" bootstrap).
 //   - "apply":    submit an encoded write Batch for quorum commit.
 //
 // Every response carries Result (bool). A write/register sent to a non-leader
 // sets Redirect=true and LeaderAddress so the client retries against the leader.
 const (
-	AttrControlOp    = "ControlOp"
-	AttrResult       = "Result"
-	AttrErrorString  = "ErrorString"
-	AttrRedirect     = "Redirect"
-	AttrLeaderAddr   = "LeaderAddress"
-	AttrLeaderID     = "LeaderID"
-	AttrPeerID       = "PeerID"
-	AttrPeerAddress  = "PeerAddress"
-	AttrBatch        = "Batch" // JSON-encoded Batch, as a string
+	AttrControlOp   = "ControlOp"
+	AttrResult      = "Result"
+	AttrErrorString = "ErrorString"
+	AttrRedirect    = "Redirect"
+	AttrLeaderAddr  = "LeaderAddress"
+	AttrLeaderID    = "LeaderID"
+	AttrPeerID      = "PeerID"
+	AttrPeerAddress = "PeerAddress"
+	AttrBatch       = "Batch" // JSON-encoded Batch, as a string
 
 	OpLeader   = "leader"
 	OpRegister = "register"

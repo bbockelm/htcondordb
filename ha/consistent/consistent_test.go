@@ -12,12 +12,32 @@ import (
 	"github.com/bbockelm/cedar/stream"
 )
 
+func newCat(t *testing.T) *db.Catalog {
+	t.Helper()
+	cat, err := db.OpenCatalog("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cat
+}
+
+// tbl returns a catalog table, failing if it does not exist yet.
+func tbl(t *testing.T, cat *db.Catalog, name string) *db.DB {
+	t.Helper()
+	d, ok := cat.Table(name)
+	if !ok {
+		t.Fatalf("table %q missing", name)
+	}
+	return d
+}
+
 func TestBatchRoundTrip(t *testing.T) {
 	b := NewBatch().
 		NewClassAd("1.0", "Owner = \"alice\"").
 		SetAttribute("1.0", "JobStatus", "2").
 		DeleteAttribute("1.0", "Held").
-		DestroyClassAd("2.0")
+		DestroyClassAd("2.0").
+		NewClassAdIn("machines", "slot1", "Cpus = 4")
 	data, err := b.Encode()
 	if err != nil {
 		t.Fatal(err)
@@ -26,18 +46,18 @@ func TestBatchRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Ops) != 4 || got.Ops[0].Kind != OpNewClassAd || got.Ops[3].Kind != OpDestroyClassAd {
+	if len(got.Ops) != 5 || got.Ops[0].Kind != OpNewClassAd || got.Ops[3].Kind != OpDestroyClassAd {
 		t.Fatalf("decoded batch mismatch: %+v", got.Ops)
+	}
+	if got.Ops[4].Table != "machines" {
+		t.Errorf("table-qualified op lost its table: %+v", got.Ops[4])
 	}
 }
 
 func TestFSMApplyAndSnapshot(t *testing.T) {
-	src, err := db.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
+	src := newCat(t)
 	defer src.Close()
-	f := NewFSM(src)
+	f := NewFSM(src, "ads")
 
 	batch := NewBatch().
 		NewClassAd("1.0", "Owner = \"alice\"\nCpus = 4").
@@ -46,10 +66,11 @@ func TestFSMApplyAndSnapshot(t *testing.T) {
 	if err := f.applyBatch(batch); err != nil {
 		t.Fatal(err)
 	}
-	if src.Len() != 2 {
-		t.Fatalf("after apply Len = %d, want 2", src.Len())
+	ads := tbl(t, src, "ads")
+	if ads.Len() != 2 {
+		t.Fatalf("after apply Len = %d, want 2", ads.Len())
 	}
-	if v, ok := lookupAttr(t, src, "1.0", "JobStatus"); !ok || v != "2" {
+	if v, ok := lookupAttr(t, ads, "1.0", "JobStatus"); !ok || v != "2" {
 		t.Fatalf("JobStatus = %q,%v want 2", v, ok)
 	}
 
@@ -57,11 +78,11 @@ func TestFSMApplyAndSnapshot(t *testing.T) {
 	if err := f.applyBatch(NewBatch().DestroyClassAd("2.0")); err != nil {
 		t.Fatal(err)
 	}
-	if src.Len() != 1 {
-		t.Fatalf("after destroy Len = %d, want 1", src.Len())
+	if ads.Len() != 1 {
+		t.Fatalf("after destroy Len = %d, want 1", ads.Len())
 	}
 
-	// Snapshot -> Persist -> Restore into a fresh DB reproduces the state.
+	// Snapshot -> Persist -> Restore into a fresh catalog reproduces the state.
 	snap, err := f.Snapshot()
 	if err != nil {
 		t.Fatal(err)
@@ -71,38 +92,80 @@ func TestFSMApplyAndSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dst, err := db.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
+	dst := newCat(t)
 	defer dst.Close()
 	// Seed dst with junk that Restore must clear.
-	seed := NewFSM(dst)
+	seed := NewFSM(dst, "ads")
 	_ = seed.applyBatch(NewBatch().NewClassAd("9.9", "Owner = \"stale\""))
-
 	if err := seed.Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))); err != nil {
 		t.Fatal(err)
 	}
-	if dst.Len() != 1 {
-		t.Fatalf("restored Len = %d, want 1", dst.Len())
+	dads := tbl(t, dst, "ads")
+	if dads.Len() != 1 {
+		t.Fatalf("restored Len = %d, want 1", dads.Len())
 	}
-	if _, ok := dst.LookupClassAd("1.0"); !ok {
-		t.Fatal("restored DB missing key 1.0")
+	if _, ok := dads.LookupClassAd("1.0"); !ok {
+		t.Fatal("restored table missing key 1.0")
 	}
-	if _, ok := dst.LookupClassAd("9.9"); ok {
+	if _, ok := dads.LookupClassAd("9.9"); ok {
 		t.Fatal("restore did not clear stale key 9.9")
 	}
 }
 
-// TestSingleNodeRaftApply drives a real (single-node) raft cluster: an Apply on
-// the leader must commit and reach the FSM, proving Batch -> raft log -> FSM ->
-// database works end to end.
-func TestSingleNodeRaftApply(t *testing.T) {
-	d, err := db.Open("")
+// TestFSMMultiTable proves replication covers EVERY table: a batch touching two tables
+// applies to both, and a snapshot/restore reproduces both tables' state.
+func TestFSMMultiTable(t *testing.T) {
+	src := newCat(t)
+	defer src.Close()
+	f := NewFSM(src, "ads")
+
+	batch := NewBatch().
+		NewClassAd("1.0", "Owner = \"alice\"").         // default table "ads"
+		NewClassAdIn("machines", "slot1", "Cpus = 8").  // another table
+		NewClassAdIn("machines", "slot2", "Cpus = 16"). //
+		SetAttributeIn("machines", "slot1", "State", "\"Idle\"")
+	if err := f.applyBatch(batch); err != nil {
+		t.Fatal(err)
+	}
+	if got := tbl(t, src, "ads").Len(); got != 1 {
+		t.Fatalf("ads Len = %d, want 1", got)
+	}
+	machines := tbl(t, src, "machines")
+	if machines.Len() != 2 {
+		t.Fatalf("machines Len = %d, want 2", machines.Len())
+	}
+	if v, ok := lookupAttr(t, machines, "slot1", "State"); !ok || v != "\"Idle\"" {
+		t.Fatalf("machines slot1 State = %q,%v want \"Idle\"", v, ok)
+	}
+
+	// Snapshot both tables, restore into a fresh catalog.
+	snap, err := f.Snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Close()
+	sink := &memSink{}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatal(err)
+	}
+	dst := newCat(t)
+	defer dst.Close()
+	if err := NewFSM(dst, "ads").Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	if got := tbl(t, dst, "ads").Len(); got != 1 {
+		t.Errorf("restored ads Len = %d, want 1", got)
+	}
+	if got := tbl(t, dst, "machines").Len(); got != 2 {
+		t.Errorf("restored machines Len = %d, want 2", got)
+	}
+}
+
+// TestSingleNodeRaftApply drives a real (single-node) raft cluster: an Apply on the leader
+// must commit and reach the FSM, proving Batch -> raft log -> FSM -> catalog works end to
+// end, including a table-qualified op.
+func TestSingleNodeRaftApply(t *testing.T) {
+	cat := newCat(t)
+	defer cat.Close()
 
 	noDial := func(context.Context, string, time.Duration) (*stream.Stream, error) {
 		return nil, errors.New("single-node: no peers")
@@ -110,7 +173,7 @@ func TestSingleNodeRaftApply(t *testing.T) {
 	c, err := NewCoordinator(CoordinatorConfig{
 		NodeID:    "node1",
 		Advertise: "127.0.0.1:1",
-		Local:     d,
+		Catalog:   cat,
 		Dial:      noDial,
 		DataDir:   t.TempDir(),
 		Bootstrap: true,
@@ -128,12 +191,17 @@ func TestSingleNodeRaftApply(t *testing.T) {
 		t.Fatal("single node should be the leader")
 	}
 
-	batch := NewBatch().NewClassAd("1.0", "Owner = \"alice\"\nCpus = 4")
+	batch := NewBatch().
+		NewClassAd("1.0", "Owner = \"alice\"\nCpus = 4").
+		NewClassAdIn("machines", "slot1", "Cpus = 4")
 	if err := c.Apply(batch); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if _, ok := d.LookupClassAd("1.0"); !ok {
-		t.Fatal("committed batch did not reach the FSM/database")
+	if _, ok := tbl(t, cat, "ads").LookupClassAd("1.0"); !ok {
+		t.Fatal("committed batch did not reach the ads table")
+	}
+	if _, ok := tbl(t, cat, "machines").LookupClassAd("slot1"); !ok {
+		t.Fatal("committed batch did not reach the machines table")
 	}
 
 	// A malformed op surfaces the FSM error to the caller.
@@ -143,19 +211,15 @@ func TestSingleNodeRaftApply(t *testing.T) {
 	}
 }
 
-// TestControlProtocol drives the ClassAd control protocol against a single-node
-// leader: leader-discovery reports self, and an apply commits through raft.
+// TestControlProtocol drives the ClassAd control protocol against a single-node leader.
 func TestControlProtocol(t *testing.T) {
-	d, err := db.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer d.Close()
+	cat := newCat(t)
+	defer cat.Close()
 	noDial := func(context.Context, string, time.Duration) (*stream.Stream, error) {
 		return nil, errors.New("no peers")
 	}
 	c, err := NewCoordinator(CoordinatorConfig{
-		NodeID: "n1", Advertise: "127.0.0.1:1", Local: d, Dial: noDial,
+		NodeID: "n1", Advertise: "127.0.0.1:1", Catalog: cat, Dial: noDial,
 		DataDir: t.TempDir(), Bootstrap: true, Timeout: 5 * time.Second,
 	})
 	if err != nil {
@@ -166,7 +230,6 @@ func TestControlProtocol(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// leader-discovery
 	resp := c.HandleControl(BuildLeaderRequest())
 	if ok, _ := resp.EvaluateAttr(AttrResult).BoolValue(); !ok {
 		t.Fatal("leader discovery Result should be true")
@@ -175,7 +238,6 @@ func TestControlProtocol(t *testing.T) {
 		t.Fatalf("leader address = %q, want 127.0.0.1:1", addr)
 	}
 
-	// apply a batch through the control protocol
 	req, err := BuildApplyRequest(NewBatch().NewClassAd("1.0", "Owner = \"alice\""))
 	if err != nil {
 		t.Fatal(err)
@@ -184,23 +246,22 @@ func TestControlProtocol(t *testing.T) {
 	if ok, _ := resp.EvaluateAttr(AttrResult).BoolValue(); !ok {
 		t.Fatalf("apply Result should be true; err=%q", attrString(resp, AttrErrorString))
 	}
-	if _, ok := d.LookupClassAd("1.0"); !ok {
-		t.Fatal("apply via control protocol did not reach the database")
+	if _, ok := tbl(t, cat, "ads").LookupClassAd("1.0"); !ok {
+		t.Fatal("apply via control protocol did not reach the catalog")
 	}
 }
 
-// TestRaftRestartDurability proves the boltdb log survives a restart: a node
-// bootstrapped in a data dir, given a write, then shut down and reopened over the
-// SAME data dir with a fresh (empty) FSM database, replays its durable log and
-// reconstructs the committed state -- without re-bootstrapping.
+// TestRaftRestartDurability proves the boltdb log survives a restart: a node bootstrapped
+// in a data dir, given a write, then reopened over the SAME data dir with a fresh (empty)
+// catalog, replays its durable log and reconstructs the committed state.
 func TestRaftRestartDurability(t *testing.T) {
 	dataDir := t.TempDir()
 	noDial := func(context.Context, string, time.Duration) (*stream.Stream, error) {
 		return nil, errors.New("no peers")
 	}
-	open := func(d *db.DB) *Coordinator {
+	open := func(cat *db.Catalog) *Coordinator {
 		c, err := NewCoordinator(CoordinatorConfig{
-			NodeID: "n1", Advertise: "127.0.0.1:1", Local: d, Dial: noDial,
+			NodeID: "n1", Advertise: "127.0.0.1:1", Catalog: cat, Dial: noDial,
 			DataDir: dataDir, Bootstrap: true, Timeout: 5 * time.Second,
 		})
 		if err != nil {
@@ -212,36 +273,29 @@ func TestRaftRestartDurability(t *testing.T) {
 		return c
 	}
 
-	// First incarnation: bootstrap and commit a write.
-	d1, err := db.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	c1 := open(d1)
+	cat1 := newCat(t)
+	c1 := open(cat1)
 	if err := c1.Apply(NewBatch().NewClassAd("1.0", "Owner = \"alice\"")); err != nil {
 		t.Fatal(err)
 	}
 	_ = c1.Close()
-	d1.Close()
+	cat1.Close()
 
-	// Second incarnation: same data dir, fresh empty FSM DB. The durable log must
-	// replay into it.
-	d2, err := db.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer d2.Close()
-	c2 := open(d2)
+	cat2 := newCat(t)
+	defer cat2.Close()
+	c2 := open(cat2)
 	defer c2.Close()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, ok := d2.LookupClassAd("1.0"); ok {
-			return
+		if d, ok := cat2.Table("ads"); ok {
+			if _, ok := d.LookupClassAd("1.0"); ok {
+				return
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("restarted node did not replay its durable log into the fresh FSM")
+	t.Fatal("restarted node did not replay its durable log into the fresh catalog")
 }
 
 func lookupAttr(t *testing.T, d *db.DB, key, name string) (string, bool) {
@@ -254,6 +308,6 @@ func lookupAttr(t *testing.T, d *db.DB, key, name string) (string, bool) {
 // memSink is an in-memory raft.SnapshotSink for tests.
 type memSink struct{ bytes.Buffer }
 
-func (m *memSink) ID() string     { return "test-snapshot" }
-func (m *memSink) Cancel() error  { return nil }
-func (m *memSink) Close() error   { return nil }
+func (m *memSink) ID() string    { return "test-snapshot" }
+func (m *memSink) Cancel() error { return nil }
+func (m *memSink) Close() error  { return nil }

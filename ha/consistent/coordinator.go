@@ -20,8 +20,11 @@ type CoordinatorConfig struct {
 	NodeID string
 	// Advertise is this node's raft address other nodes dial (a CEDAR sinful).
 	Advertise string
-	// Local is the database the FSM applies to (the FSM is its sole writer).
-	Local *db.DB
+	// Catalog is the table catalog the FSM applies to (its sole writer). Replication
+	// covers every table, not just the default one.
+	Catalog *db.Catalog
+	// DefaultTable is where a table-unqualified op applies (default "ads").
+	DefaultTable string
 	// Dial opens a CEDAR raft connection to a peer. Required.
 	Dial DialFunc
 	// DataDir holds persistent raft snapshots. Required.
@@ -67,8 +70,11 @@ type Coordinator struct {
 // NewCoordinator constructs the raft node, its CEDAR transport, and (on the
 // bootstrap node of a fresh cluster) the initial configuration.
 func NewCoordinator(cfg CoordinatorConfig) (*Coordinator, error) {
-	if cfg.Local == nil {
-		return nil, fmt.Errorf("consistent: Local database is required")
+	if cfg.Catalog == nil {
+		return nil, fmt.Errorf("consistent: Catalog is required")
+	}
+	if cfg.DefaultTable == "" {
+		cfg.DefaultTable = "ads"
 	}
 	if cfg.Dial == nil {
 		return nil, fmt.Errorf("consistent: Dial is required")
@@ -94,7 +100,7 @@ func NewCoordinator(cfg CoordinatorConfig) (*Coordinator, error) {
 
 	hlog := hclog.New(&hclog.LoggerOptions{Name: "raft", Level: hclog.Warn, Output: os.Stderr})
 
-	fsm := NewFSM(cfg.Local)
+	fsm := NewFSM(cfg.Catalog, cfg.DefaultTable)
 	layer := NewStreamLayer(cfg.Advertise, cfg.Dial)
 	trans := raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
 		Stream:  layer,

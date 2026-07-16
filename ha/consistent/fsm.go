@@ -1,7 +1,7 @@
 package consistent
 
 import (
-	"encoding/json"
+	"bytes"
 	"fmt"
 	"io"
 
@@ -10,15 +10,21 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// FSM is the raft finite state machine: it applies committed mutation batches to
-// a local ClassAd database. Every replica runs an identical FSM over identical
-// log entries, so all converge on the same state.
+// FSM is the raft finite state machine: it applies committed mutation batches to a local
+// ClassAd catalog (every table), so all replicas converge on identical multi-table state.
+// A batch may touch several tables; the FSM groups its ops by table and applies each
+// table's ops in that table's own transaction (deterministically on every replica).
 type FSM struct {
-	db *db.DB
+	cat          *db.Catalog
+	defaultTable string // table an op with an empty Table name targets
 }
 
-// NewFSM builds an FSM over d. The FSM is d's sole writer in consistent mode.
-func NewFSM(d *db.DB) *FSM { return &FSM{db: d} }
+// NewFSM builds an FSM over cat. defaultTable is where table-unqualified ops apply
+// (pre-multi-table log entries and single-table batches). The FSM is the catalog's sole
+// writer in consistent mode.
+func NewFSM(cat *db.Catalog, defaultTable string) *FSM {
+	return &FSM{cat: cat, defaultTable: defaultTable}
+}
 
 // Apply applies one committed log entry. The returned value becomes the
 // ApplyFuture.Response on the leader (an error on failure, nil on success).
@@ -33,10 +39,38 @@ func (f *FSM) Apply(l *raft.Log) interface{} {
 	return f.applyBatch(batch)
 }
 
-// applyBatch applies a batch in one transaction (all-or-nothing per replica).
+// applyBatch applies a batch, grouping ops by table (each table's ops in one transaction).
+// Order within a table is preserved; a batch that touches only one table is one atomic
+// transaction, as before.
 func (f *FSM) applyBatch(b *Batch) error {
-	tx := f.db.Begin()
+	byTable := map[string][]Op{}
+	var order []string
 	for _, op := range b.Ops {
+		t := op.Table
+		if t == "" {
+			t = f.defaultTable
+		}
+		if _, seen := byTable[t]; !seen {
+			order = append(order, t)
+		}
+		byTable[t] = append(byTable[t], op)
+	}
+	for _, t := range order {
+		d, err := f.cat.EnsureTable(t)
+		if err != nil {
+			return fmt.Errorf("consistent: ensuring table %q: %w", t, err)
+		}
+		if err := applyOps(d, byTable[t]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyOps applies one table's ops in a single transaction.
+func applyOps(d *db.DB, ops []Op) error {
+	tx := d.Begin()
+	for _, op := range ops {
 		switch op.Kind {
 		case OpNewClassAd:
 			ad, err := classad.ParseOld(op.Value)
@@ -62,74 +96,42 @@ func (f *FSM) applyBatch(b *Batch) error {
 	return tx.Commit()
 }
 
-// snapshotRow is one ad captured in a snapshot.
-type snapshotRow struct {
-	Key    string `json:"key"`
-	AdText string `json:"ad"` // new-ClassAd text, including private attributes
-}
-
-// Snapshot captures the whole database state for log compaction / catch-up.
+// Snapshot captures the whole catalog (every table) for log compaction / catch-up. raft
+// calls this without a concurrent Apply, so the buffered capture is a consistent point in
+// time; Persist (which may run concurrently with later Applies) just writes the buffer.
+// The capture reuses the catalog's own multi-table, encryption-aware snapshot format --
+// so an encrypted node's raft snapshots are encrypted at rest too (a peer restores it via
+// the shared pool keys, exactly like a backup).
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
-	keys := f.db.Keys()
-	rows := make([]snapshotRow, 0, len(keys))
-	for _, k := range keys {
-		ad, ok := f.db.LookupClassAd(k)
-		if !ok {
-			continue
-		}
-		rows = append(rows, snapshotRow{Key: k, AdText: ad.StringWithPrivate()})
+	var buf bytes.Buffer
+	if err := f.cat.Snapshot(&buf); err != nil {
+		return nil, fmt.Errorf("consistent: capturing snapshot: %w", err)
 	}
-	return &fsmSnapshot{rows: rows}, nil
+	return &fsmSnapshot{data: buf.Bytes()}, nil
 }
 
-// Restore replaces the FSM state from a snapshot: it clears the database and
-// loads every captured ad.
+// Restore replaces the whole catalog from a snapshot (each table truncated + reloaded).
 func (f *FSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
-	var rows []snapshotRow
-	if err := json.NewDecoder(rc).Decode(&rows); err != nil {
-		return fmt.Errorf("consistent: decoding snapshot: %w", err)
+	if err := f.cat.Restore(rc); err != nil {
+		return fmt.Errorf("consistent: restoring snapshot: %w", err)
 	}
-	// Clear the existing keyspace.
-	if keys := f.db.Keys(); len(keys) > 0 {
-		tx := f.db.Begin()
-		for _, k := range keys {
-			tx.DestroyClassAd(k)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("consistent: clearing before restore: %w", err)
-		}
-	}
-	// Load the snapshot.
-	tx := f.db.Begin()
-	for _, r := range rows {
-		ad, err := classad.Parse(r.AdText)
-		if err != nil {
-			tx.Abort()
-			return fmt.Errorf("consistent: restoring %s: %w", r.Key, err)
-		}
-		tx.NewClassAd(r.Key, ad)
-	}
-	return tx.Commit()
+	return nil
 }
 
-// fsmSnapshot is a point-in-time capture that raft persists asynchronously.
+// fsmSnapshot is a point-in-time capture (a serialized catalog snapshot) that raft
+// persists asynchronously.
 type fsmSnapshot struct {
-	rows []snapshotRow
+	data []byte
 }
 
-// Persist writes the snapshot to sink as JSON.
+// Persist writes the captured snapshot bytes to sink.
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	err := func() error {
-		if err := json.NewEncoder(sink).Encode(s.rows); err != nil {
-			return err
-		}
-		return sink.Close()
-	}()
-	if err != nil {
+	if _, err := sink.Write(s.data); err != nil {
 		_ = sink.Cancel()
+		return err
 	}
-	return err
+	return sink.Close()
 }
 
 // Release is a no-op: the snapshot holds only an in-memory copy.
