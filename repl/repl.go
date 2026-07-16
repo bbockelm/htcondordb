@@ -240,10 +240,11 @@ Diagnostics (current table, or an explicit one where noted):
 Management (needs WRITE):
   .addindex value|categorical <attr>[, ...]   create an index
   .dropindex <attr>[, ...]                     drop an index
-  .reindex                                     rebuild indexes
+  .reindex [-all]                              rebuild indexes
   .addhot <attr>[, ...]                        pin hot attributes
-  .refreshhot [<sampleMax> <topN>]             recompute the hot set
-  .rewrite                                     re-encode all ads with the hot set
-  .compact                                     reclaim dead space
-  .retrain [<sampleMax>]                        train/refresh ZSTD compression
+  .refreshhot [-all] [<sampleMax> <topN>]      recompute the hot set
+  .rewrite [-all]                              re-encode all ads with the hot set
+  .compact [-all]                              reclaim dead space
+  .retrain [-all] [<sampleMax>]                train/refresh ZSTD compression
+  (-all runs the command on every table)
 `

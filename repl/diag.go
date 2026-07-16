@@ -32,21 +32,17 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 	case ".dropindex":
 		s.admin(console, "index.drop", splitAttrs(arg)...)
 	case ".reindex":
-		s.admin(console, "index.reindex")
+		s.maintenance(console, arg, "index.reindex")
 	case ".addhot":
 		s.admin(console, "hot.add", splitAttrs(arg)...)
 	case ".refreshhot":
 		s.refreshHot(console, arg)
 	case ".compact":
-		s.admin(console, "compact")
+		s.maintenance(console, arg, "compact")
 	case ".rewrite":
-		s.admin(console, "rewrite")
+		s.maintenance(console, arg, "rewrite")
 	case ".retrain":
-		if a := strings.TrimSpace(arg); a != "" {
-			s.admin(console, "codec.retrain", a)
-		} else {
-			s.admin(console, "codec.retrain")
-		}
+		s.maintenance(console, arg, "codec.retrain")
 	default:
 		return false
 	}
@@ -404,11 +400,28 @@ func (s *session) addIndex(console io.Writer, arg string) {
 }
 
 func (s *session) refreshHot(console io.Writer, arg string) {
+	fields := strings.Fields(arg)
+	all := false
+	if len(fields) > 0 && (fields[0] == "-all" || strings.EqualFold(fields[0], "all")) {
+		all, fields = true, fields[1:]
+	}
 	sampleMax, topN := "2000", "32"
-	if f := strings.Fields(arg); len(f) == 2 {
-		sampleMax, topN = f[0], f[1]
-	} else if len(f) != 0 {
-		fmt.Fprintln(console, "usage: .refreshhot [<sampleMax> <topN>]")
+	if len(fields) == 2 {
+		sampleMax, topN = fields[0], fields[1]
+	} else if len(fields) != 0 {
+		fmt.Fprintln(console, "usage: .refreshhot [-all] [<sampleMax> <topN>]")
+		return
+	}
+	if all {
+		tables, err := s.exec.Tables()
+		if err != nil {
+			fmt.Fprintf(console, "error: %v\n", err)
+			return
+		}
+		for _, tbl := range tables {
+			fmt.Fprintf(console, "[%s] ", tbl)
+			s.adminTable(console, tbl, "hot.refresh", sampleMax, topN)
+		}
 		return
 	}
 	s.admin(console, "hot.refresh", sampleMax, topN)
@@ -416,7 +429,12 @@ func (s *session) refreshHot(console io.Writer, arg string) {
 
 // admin runs a management action on the current table and prints the result.
 func (s *session) admin(console io.Writer, action string, args ...string) {
-	msg, err := s.exec.Admin(s.table, action, args...)
+	s.adminTable(console, s.table, action, args...)
+}
+
+// adminTable runs a management action on a named table and prints the result.
+func (s *session) adminTable(console io.Writer, table, action string, args ...string) {
+	msg, err := s.exec.Admin(table, action, args...)
 	if err != nil {
 		fmt.Fprintf(console, "error: %v\n", err)
 		if h := HintFor(err); h != "" {
@@ -425,6 +443,31 @@ func (s *session) admin(console io.Writer, action string, args ...string) {
 		return
 	}
 	fmt.Fprintln(console, msg)
+}
+
+// maintenance runs a maintenance action on the current table, or on every table when the
+// argument leads with "-all" (or "all"); the remaining tokens are passed as action args.
+// It is used by .reindex/.retrain/.compact/.rewrite so a whole store can be maintained
+// without enumerating tables by hand.
+func (s *session) maintenance(console io.Writer, arg, action string) {
+	fields := strings.Fields(arg)
+	if len(fields) > 0 && (fields[0] == "-all" || strings.EqualFold(fields[0], "all")) {
+		tables, err := s.exec.Tables()
+		if err != nil {
+			fmt.Fprintf(console, "error: %v\n", err)
+			return
+		}
+		if len(tables) == 0 {
+			fmt.Fprintln(console, "no tables")
+			return
+		}
+		for _, tbl := range tables {
+			fmt.Fprintf(console, "[%s] ", tbl)
+			s.adminTable(console, tbl, action, fields[1:]...)
+		}
+		return
+	}
+	s.admin(console, action, fields...)
 }
 
 // splitAttrs splits a comma/space-separated attribute list, dropping empties.
