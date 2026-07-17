@@ -96,6 +96,33 @@ Knobs: `HTCONDORDB_RAFT_BOOTSTRAP` (bool, the initial leader),
 > re-bootstrapping). The REPL routes writes through the consistent path with
 > `-consistent` (via `consistent.ControlClient`, which follows leader redirects).
 
+## Schedd sync mode (`HTCONDORDB_SYNC_SCHEDD`)
+
+A read model of a local `condor_schedd`: htcondordb tails the schedd's on-disk
+files and mirrors them into its own tables, so the live queue and the job history
+become queryable through the REPL / dbrpc without polling `condor_q`/`condor_history`.
+Two independent tailers run, and **both** are active when their source is present
+— sync mode covers *both* the live queue and the history archive:
+
+- **Live jobs** — tails `JOB_QUEUE_LOG` (the schedd's transaction log, via the
+  `classadlog` reader) and mirrors the active queue into the mutable **`jobs`**
+  table, applying each new / modified / deleted job as the log grows and following
+  a log rotation.
+- **History** — tails the `HISTORY` file and appends each completed job into the
+  **`history`** *archive* table (append-only, zone-mapped on `CompletionDate` for
+  fast time-range queries). Retention is enforced by the periodic archive rotation
+  (`HTCONDORDB_ARCHIVE_ROTATE_INTERVAL`, default hourly).
+
+At least one of the two sources must be configured; enable either or both. Paths
+default to HTCondor's standard `JOB_QUEUE_LOG` / `HISTORY` and can be overridden
+with `HTCONDORDB_JOB_QUEUE_LOG` / `HTCONDORDB_HISTORY`.
+
+> **Never runs as root.** The schedd's `job_queue.log` / `history` are owned by the
+> condor user; following them as root risks reading through an attacker-planted
+> symlink to a privileged file. Sync refuses to start while still root — the daemon
+> must have dropped to the condor user first (do not combine `HTCONDORDB_SYNC_SCHEDD`
+> with `DROP_PRIVILEGES=false`).
+
 ## Configuration knobs
 
 | Knob | Default | Meaning |
@@ -111,6 +138,10 @@ Knobs: `HTCONDORDB_RAFT_BOOTSTRAP` (bool, the initial leader),
 | `HTCONDORDB_RAFT_PEERS` | — | Explicit `id@addr` member list. |
 | `HTCONDORDB_RAFT_SIZE` | `0` | Cluster size `N` for first-N-hosts bootstrap. |
 | `HTCONDORDB_NODE_ID` | advertised address | This node's stable raft id. |
+| `HTCONDORDB_SYNC_SCHEDD` | `false` | Mirror a local schedd: `job_queue.log`→`jobs` table + `history`→`history` archive. |
+| `HTCONDORDB_JOB_QUEUE_LOG` | `$(JOB_QUEUE_LOG)` | Schedd job-queue log to tail (live `jobs`). |
+| `HTCONDORDB_HISTORY` | `$(HISTORY)` | Schedd history file to tail (`history` archive). |
+| `HTCONDORDB_ARCHIVE_ROTATE_INTERVAL` | `3600` | Archive-table retention sweep interval (seconds; `0` disables). |
 
 Standard `SEC_*` and `ALLOW_`/`DENY_` knobs configure security and authorization.
 
