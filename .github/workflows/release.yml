@@ -1,0 +1,82 @@
+name: release
+
+# Builds the htcondordb daemon and CLI for linux/darwin (amd64 + arm64) and attaches the
+# archives to the GitHub release when a v* tag is pushed. htcondordb consumes its sibling
+# modules (classad, cedar, golang-htcondor) from published tags, so no sibling checkout is
+# needed -- GOPRIVATE makes `go build` fetch them directly from GitHub.
+#
+# A manual run (workflow_dispatch) builds and uploads the archives as workflow artifacts
+# WITHOUT publishing a release, so the build can be exercised without cutting a tag.
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create the release and upload its assets
+
+jobs:
+  release:
+    name: Build binaries and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build release archives (linux/darwin, amd64/arm64)
+        env:
+          CGO_ENABLED: '0'
+          GOFLAGS: -mod=mod
+          # Fetch the bbockelm/PelicanPlatform module tags directly from GitHub (bypass the
+          # module proxy + checksum DB) so a just-pushed dependency tag resolves immediately.
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            name="htcondordb_${version}_${os}_${arch}"
+            echo "==> building ${name}"
+            stage="dist/${name}"
+            mkdir -p "${stage}"
+            GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w" \
+              -o "${stage}/" ./cmd/htcondordb ./cmd/htcondordb-cli
+            cp README.md "${stage}/" 2>/dev/null || true
+            tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+            rm -rf "${stage}"
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS.txt)
+          echo "Built archives:"; ls -l dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: htcondordb-binaries
+          path: dist/*
+          if-no-files-found: error
+
+      # Only on a v* tag: create the GitHub release (if absent) and attach the archives and
+      # checksums. Uses the runner's built-in gh CLI -- no third-party action. A tag with a
+      # pre-release suffix (v1.0.0-rc1) is marked as a pre-release.
+      - name: Publish release with binaries
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in
+            *-*) prerelease="--prerelease" ;;
+          esac
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz dist/SHA256SUMS.txt \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            ${prerelease}
