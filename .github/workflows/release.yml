@@ -71,12 +71,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          prerelease=""
-          case "${GITHUB_REF_NAME}" in
-            *-*) prerelease="--prerelease" ;;
-          esac
-          gh release create "${GITHUB_REF_NAME}" \
-            dist/*.tar.gz dist/SHA256SUMS.txt \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes \
-            ${prerelease}
+          tag="${GITHUB_REF_NAME}"
+          assets=(dist/*.tar.gz dist/SHA256SUMS.txt)
+          # Idempotent: attach to an existing release (e.g. one created by hand or a
+          # re-run) instead of failing; otherwise create it. --clobber replaces assets
+          # so re-runs are safe.
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Release ${tag} exists; uploading assets (clobbering any existing)."
+            gh release upload "${tag}" "${assets[@]}" --clobber
+          else
+            prerelease=""
+            case "${tag}" in
+              *-*) prerelease="--prerelease" ;;
+            esac
+            gh release create "${tag}" "${assets[@]}" \
+              --title "${tag}" \
+              --generate-notes \
+              ${prerelease}
+          fi
