@@ -176,7 +176,7 @@ func (r *Replicator) session(parent context.Context) error {
 		}()
 	}
 
-	tables, err := client.Tables()
+	tables, err := client.Tables(ctx)
 	if err != nil {
 		return err
 	}
@@ -193,7 +193,7 @@ func (r *Replicator) session(parent context.Context) error {
 			wg.Wait()
 			return sessionErr(errOnce, parent)
 		case <-ticker.C:
-			more, terr := client.Tables()
+			more, terr := client.Tables(ctx)
 			if terr != nil {
 				cancel()
 				wg.Wait()
@@ -222,7 +222,7 @@ func (r *Replicator) watchTable(ctx context.Context, client *dbrpc.Client, table
 	if err != nil {
 		return err
 	}
-	events, stop, err := client.WatchTable(table, r.cursorFor(table))
+	events, stop, err := client.WatchTable(ctx, table, r.cursorFor(table))
 	if err != nil {
 		return err
 	}

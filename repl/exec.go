@@ -1,6 +1,7 @@
 package repl
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -88,25 +89,25 @@ func (e *Executor) commit(table string, ops []WriteOp) error {
 	if e.applyBatch != nil {
 		return e.applyBatch(ops)
 	}
-	tx, err := e.c.BeginTable(table)
+	tx, err := e.c.BeginTable(context.Background(), table)
 	if err != nil {
 		return err
 	}
 	for _, op := range ops {
 		switch op.Kind {
 		case WNewClassAd:
-			err = tx.NewClassAd(op.Key, op.Value)
+			err = tx.NewClassAd(context.Background(), op.Key, op.Value)
 		case WSetAttribute:
-			err = tx.SetAttribute(op.Key, op.Name, op.Value)
+			err = tx.SetAttribute(context.Background(), op.Key, op.Name, op.Value)
 		case WDestroyClassAd:
-			err = tx.DestroyClassAd(op.Key)
+			err = tx.DestroyClassAd(context.Background(), op.Key)
 		}
 		if err != nil {
-			_ = tx.Abort()
+			_ = tx.Abort(context.Background())
 			return err
 		}
 	}
-	return tx.Commit()
+	return tx.Commit(context.Background())
 }
 
 // Result is the outcome of executing a statement.
@@ -156,14 +157,14 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 // --- DDL ---
 
 func (e *Executor) execCreateTable(st *Statement) (*Result, error) {
-	if err := e.c.CreateTable(st.Table); err != nil {
+	if err := e.c.CreateTable(context.Background(), st.Table); err != nil {
 		return nil, err
 	}
 	return &Result{Note: "CREATE TABLE " + st.Table}, nil
 }
 
 func (e *Executor) execDropTable(st *Statement) (*Result, error) {
-	if err := e.c.DropTable(st.Table); err != nil {
+	if err := e.c.DropTable(context.Background(), st.Table); err != nil {
 		return nil, err
 	}
 	return &Result{Note: "DROP TABLE " + st.Table}, nil
@@ -174,7 +175,7 @@ func (e *Executor) execCreateIndex(st *Statement) (*Result, error) {
 	if st.IndexKind == "categorical" {
 		action = "index.add.categorical"
 	}
-	msg, err := e.c.AdminTable(st.Table, action, st.Columns...)
+	msg, err := e.c.AdminTable(context.Background(), st.Table, action, st.Columns...)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +183,7 @@ func (e *Executor) execCreateIndex(st *Statement) (*Result, error) {
 }
 
 func (e *Executor) execDropIndex(st *Statement) (*Result, error) {
-	msg, err := e.c.AdminTable(st.Table, "index.drop", st.Columns...)
+	msg, err := e.c.AdminTable(context.Background(), st.Table, "index.drop", st.Columns...)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +217,7 @@ func (e *Executor) execMatch(st *Statement) (*Result, error) {
 			targetWhere = "(" + targetWhere + ") && (" + free + ")"
 		}
 	}
-	rows, err := e.c.MatchTables(st.Table, st.MatchResource, e.keyAttr, reqWhere, targetWhere, st.Limit, st.MatchUsing)
+	rows, err := e.c.MatchTables(context.Background(), st.Table, st.MatchResource, e.keyAttr, reqWhere, targetWhere, st.Limit, st.MatchUsing)
 	if err != nil {
 		return nil, err
 	}
@@ -245,12 +246,12 @@ func (e *Executor) ExecString(s string) (*Result, error) {
 // Diagnostics returns a table's storage stats, hot set, indexes, and tuning
 // suggestions (the .stats/.indexes/.hot commands).
 func (e *Executor) Diagnostics(table string) (*dbrpc.Diagnostics, error) {
-	return e.c.DiagnosticsTable(table)
+	return e.c.DiagnosticsTable(context.Background(), table)
 }
 
 // Explain reports how a table would execute a constraint query (.explain).
 func (e *Executor) Explain(table, constraint string) (*db.QueryExplain, error) {
-	return e.c.ExplainTable(table, constraint)
+	return e.c.ExplainTable(context.Background(), table, constraint)
 }
 
 // MatchExplain reports the matchmaking plan for the request st identifies (its KEY,
@@ -277,32 +278,32 @@ func (e *Executor) MatchExplain(st *Statement) (*db.MatchExplain, error) {
 			targetWhere = "(" + targetWhere + ") && (" + free + ")"
 		}
 	}
-	return e.c.MatchExplain(st.Table, selector, st.MatchResource, targetWhere)
+	return e.c.MatchExplain(context.Background(), st.Table, selector, st.MatchResource, targetWhere)
 }
 
 // Admin runs an index/hot-set management action on a table, returning the
 // server's message.
 func (e *Executor) Admin(table, action string, args ...string) (string, error) {
-	return e.c.AdminTable(table, action, args...)
+	return e.c.AdminTable(context.Background(), table, action, args...)
 }
 
 // Tables lists the catalog's table names.
-func (e *Executor) Tables() ([]string, error) { return e.c.Tables() }
+func (e *Executor) Tables() ([]string, error) { return e.c.Tables(context.Background()) }
 
 // CreateTable creates a table (used by load auto-routing).
-func (e *Executor) CreateTable(name string) error { return e.c.CreateTable(name) }
+func (e *Executor) CreateTable(name string) error { return e.c.CreateTable(context.Background(), name) }
 
 // WatchStream opens a live change stream on a table from cursor (nil ⇒ replay the current
 // contents first), returning the event channel and a stop function (which cancels the
 // server-side watch; also called on connection close).
 func (e *Executor) WatchStream(table string, cursor []byte) (<-chan dbrpc.WatchEvent, func(), error) {
-	return e.c.WatchTable(table, cursor)
+	return e.c.WatchTable(context.Background(), table, cursor)
 }
 
 // WatchHead returns an opaque cursor at the table's current change-log head, so a watch
 // from it streams only subsequent changes (SINCE NOW) with no replay of current contents.
 func (e *Executor) WatchHead(table string) ([]byte, error) {
-	return e.c.WatchHead(table)
+	return e.c.WatchHead(context.Background(), table)
 }
 
 // constraint returns the WHERE constraint, defaulting to match-all.
@@ -316,7 +317,7 @@ func constraint(where string) string {
 // queryAds runs the WHERE query against table and parses each returned ad.
 // limit > 0 pushes a row cap to the server so it stops the scan early (0 = all).
 func (e *Executor) queryAds(table, where string, limit int) ([]*classad.ClassAd, error) {
-	texts, err := e.c.QueryTable(table, constraint(where), limit)
+	texts, err := e.c.QueryTable(context.Background(), table, constraint(where), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -424,7 +425,7 @@ func (e *Executor) execAggregate(st *Statement, groupBy []string) (*Result, erro
 		}
 	}
 
-	rows, err := e.c.AggregateTable(st.Table, constraint(st.Where), groupBy, aggs)
+	rows, err := e.c.AggregateTable(context.Background(), st.Table, constraint(st.Where), groupBy, aggs)
 	if err != nil {
 		return nil, err
 	}
