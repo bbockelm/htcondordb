@@ -13,6 +13,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -334,12 +337,18 @@ func connectDB(ctx context.Context, cfg *config.Config, addr string) (*dbrpc.Cli
 // -long` output, ads separated by blank lines) from stdin into the store. Each
 // ad is keyed by the -key attribute (default "Name"); that value is also stamped
 // into the row's "Key" attribute so the REPL can address it.
+// maxLoadReconnects bounds how many times a load batch reconnects and replays after
+// a dropped connection before giving up.
+const maxLoadReconnects = 8
+
 func runLoad(ctx context.Context, cfg *config.Config, addr string, fs *flags) error {
 	dbc, closeConn, err := connectDB(ctx, cfg, addr)
 	if err != nil {
 		return err
 	}
-	defer closeConn()
+	// closeConn is reassigned when a batch reconnects below, so defer through the
+	// variable rather than capturing the original.
+	defer func() { closeConn() }()
 
 	defaultTable := fs.loadTable
 	if defaultTable == "" {
@@ -351,26 +360,61 @@ func runLoad(ctx context.Context, cfg *config.Config, addr string, fs *flags) er
 		tableFor = func(ad *classad.ClassAd) string { return tableForType(ad, defaultTable) }
 	}
 
-	// Per-table batch commit: ensure the table exists (once), then commit the ads.
+	// Each batch commits idempotently: a per-run id plus a batch counter form a
+	// stable idempotency key, so a batch replayed after a mid-load connection drop
+	// applies exactly once (the server deduplicates it). This is the general-purpose
+	// CommitIdempotent path -- a bulk load's inserts are not idempotent-by-key, so
+	// exactly-once matters here, unlike the collector's ad store (which opts out).
+	var runID [8]byte
+	_, _ = rand.Read(runID[:])
+	runTag := hex.EncodeToString(runID[:])
+	batchSeq := 0
+
+	// Per-table batch commit: ensure the table exists (once), then commit the ads,
+	// reconnecting and replaying the batch (same idempotency key) on a dropped
+	// connection.
 	created := map[string]bool{}
 	commit := func(table string, ops []repl.WriteOp) error {
-		if !created[table] {
-			if err := dbc.CreateTable(table); err != nil {
+		batchSeq++
+		idemKey := fmt.Sprintf("cli-load-%s-%d", runTag, batchSeq)
+		backoff := 100 * time.Millisecond
+		for attempt := 0; ; attempt++ {
+			err := func() error {
+				if !created[table] {
+					if e := dbc.CreateTable(ctx, table); e != nil {
+						return e
+					}
+					created[table] = true
+				}
+				tx, e := dbc.BeginTable(ctx, table)
+				if e != nil {
+					return e
+				}
+				for _, op := range ops {
+					if e := tx.NewClassAd(ctx, op.Key, op.Value); e != nil {
+						_ = tx.Abort(ctx)
+						return e
+					}
+				}
+				return tx.CommitIdempotent(ctx, idemKey)
+			}()
+			if err == nil {
+				return nil
+			}
+			// Retry only a dropped connection: replaying the batch under the same
+			// idempotency key is exactly-once. Reconnect and try again, bounded.
+			if !errors.Is(err, dbrpc.ErrConnClosed) || attempt >= maxLoadReconnects {
 				return err
 			}
-			created[table] = true
-		}
-		tx, err := dbc.BeginTable(table)
-		if err != nil {
-			return err
-		}
-		for _, op := range ops {
-			if err := tx.NewClassAd(op.Key, op.Value); err != nil {
-				_ = tx.Abort()
-				return err
+			closeConn()
+			if ndbc, nclose, derr := connectDB(ctx, cfg, addr); derr == nil {
+				dbc, closeConn = ndbc, nclose
+			}
+			time.Sleep(backoff)
+			if backoff *= 2; backoff > 2*time.Second {
+				backoff = 2 * time.Second
 			}
 		}
-		return tx.Commit()
 	}
 
 	srcKey := fs.loadKey

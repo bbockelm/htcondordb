@@ -448,17 +448,17 @@ func TestClientWriteThroughRaft(t *testing.T) {
 	defer client.Close()
 
 	// Write to the default table via a normal client transaction.
-	tx, err := client.Begin()
+	tx, err := client.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.NewClassAd("1.0", "Owner = \"alice\""); err != nil {
+	if err := tx.NewClassAd(context.Background(), "1.0", "Owner = \"alice\""); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.SetAttribute("1.0", "JobStatus", "2"); err != nil {
+	if err := tx.SetAttribute(context.Background(), "1.0", "JobStatus", "2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	ad, ok := tbl(t, cat, "ads").LookupClassAd("1.0")
@@ -470,14 +470,14 @@ func TestClientWriteThroughRaft(t *testing.T) {
 	}
 
 	// Write to a second table via the same client.
-	tx2, err := client.BeginTable("machines")
+	tx2, err := client.BeginTable(context.Background(), "machines")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tx2.NewClassAd("slot1", "Cpus = 8"); err != nil {
+	if err := tx2.NewClassAd(context.Background(), "slot1", "Cpus = 8"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx2.Commit(); err != nil {
+	if err := tx2.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := tbl(t, cat, "machines").LookupClassAd("slot1"); !ok {

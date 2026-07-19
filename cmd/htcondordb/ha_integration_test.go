@@ -192,14 +192,14 @@ func TestLeaderFollowerClusterIntegration(t *testing.T) {
 
 	// Write an ad to the leader.
 	lc := dbClient(t, leaderAddr)
-	tx, err := lc.Begin()
+	tx, err := lc.Begin(context.Background())
 	if err != nil {
 		t.Fatalf("begin on leader: %v", err)
 	}
-	if err := tx.NewClassAd("1.0", "Owner = \"alice\"\nJobStatus = 2"); err != nil {
+	if err := tx.NewClassAd(context.Background(), "1.0", "Owner = \"alice\"\nJobStatus = 2"); err != nil {
 		t.Fatalf("new ad: %v", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatalf("commit on leader: %v", err)
 	}
 
@@ -214,7 +214,7 @@ func TestLeaderFollowerClusterIntegration(t *testing.T) {
 	fc := dbClient(t, followerAddr)
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		ads, err := fc.QueryTable("ads", "true", 0)
+		ads, err := fc.QueryTable(context.Background(), "ads", "true", 0)
 		if err == nil {
 			for _, a := range ads {
 				if strings.Contains(a, "1.0") || strings.Contains(a, "alice") {
@@ -332,14 +332,14 @@ func TestConsistentClusterIntegration(t *testing.T) {
 	// Write an ad to the leader. The dbrpc write routes through the propose hook ->
 	// raft Apply -> quorum commit (the leader is n1, the bootstrap node).
 	lc := dbClient(t, "<"+nodes[0].addr+">")
-	tx, err := lc.Begin()
+	tx, err := lc.Begin(context.Background())
 	if err != nil {
 		t.Fatalf("begin on leader: %v", err)
 	}
-	if err := tx.NewClassAd("7.0", "Owner = \"carol\"\nJobStatus = 2"); err != nil {
+	if err := tx.NewClassAd(context.Background(), "7.0", "Owner = \"carol\"\nJobStatus = 2"); err != nil {
 		t.Fatalf("new ad: %v", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatalf("commit on leader (raft apply): %v", err)
 	}
 
@@ -350,7 +350,7 @@ func TestConsistentClusterIntegration(t *testing.T) {
 		deadline := time.Now().Add(25 * time.Second)
 		found := false
 		for time.Now().Before(deadline) {
-			ads, qerr := fc.QueryTable("ads", "true", 0)
+			ads, qerr := fc.QueryTable(context.Background(), "ads", "true", 0)
 			if qerr == nil {
 				for _, a := range ads {
 					if strings.Contains(a, "carol") || strings.Contains(a, "7.0") {
