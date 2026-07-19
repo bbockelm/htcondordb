@@ -75,6 +75,13 @@ type Config struct {
 	// from clients. Private-attribute visibility still follows the level.
 	ForceReadOnly bool
 
+	// LogQueries turns on a per-query log: every streamed query is logged (op,
+	// table, constraint, LIMIT, rows returned, duration). It is opt-in and off by
+	// default. Useful for spotting an expensive query pattern -- e.g. a client
+	// that fetches every attribute of every ad (a full scan with a large row
+	// count) instead of pushing a projection/limit down.
+	LogQueries bool
+
 	// DefaultTable is the table ensured to exist at startup and targeted by
 	// clients that do not name a table. Defaults to "ads".
 	DefaultTable string
@@ -120,6 +127,7 @@ type Service struct {
 	defaultTable string
 	authorize    Authorizer
 	forceReadOn  bool
+	logQueries   bool
 	log          *slog.Logger
 }
 
@@ -163,6 +171,7 @@ func New(cfg Config) (*Service, error) {
 		defaultTable: defaultTable,
 		authorize:    cfg.Authorize,
 		forceReadOn:  cfg.ForceReadOnly,
+		logQueries:   cfg.LogQueries,
 		log:          log,
 	}
 	// Background self-tuning (index auto-tune + hot-set refresh + dictionary retrain),
@@ -206,6 +215,16 @@ func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error 
 	opts := serveOptionsFor(level)
 	if s.forceReadOn {
 		opts.ReadOnly = true
+	}
+	if s.logQueries {
+		user := peerUser(c)
+		remote := c.RemoteAddr
+		opts.QueryLog = func(q dbrpc.QueryLog) {
+			s.log.Info("htcondordb query",
+				"op", q.Op, "table", q.Table, "constraint", q.Constraint,
+				"limit", q.Limit, "rows", q.Rows, "duration", q.Duration,
+				"user", user, "remote", remote)
+		}
 	}
 
 	// Logged at Info so an operator can see, per connection, the identity that
