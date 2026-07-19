@@ -36,7 +36,8 @@ func TestApplyBatchRouting(t *testing.T) {
 
 	s := dbrpc.NewServer(d)
 	cp, sp := net.Pipe()
-	go func() { _ = s.ServeConn(dbrpc.NewStreamConn(sp)) }()
+	// Privileged: the repl is an admin tool; its tests exercise DAEMON-gated admin DDL.
+	go func() { _ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{Privileged: true}) }()
 	c := dbrpc.NewClient(dbrpc.NewStreamConn(cp))
 	defer func() { c.Close(); s.Close() }()
 

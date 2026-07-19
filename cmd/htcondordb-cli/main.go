@@ -97,7 +97,10 @@ func run() error {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	cfg, err := config.New()
+	// Run as subsystem TOOL (like C++ command-line tools) so operator config scoped with
+	// a TOOL. prefix -- e.g. TOOL.SEC_CLIENT_AUTHENTICATION_METHODS -- is honored. A bare
+	// config.New() leaves the subsystem empty, which disables all <SUBSYS>.PARAM resolution.
+	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "TOOL"})
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
