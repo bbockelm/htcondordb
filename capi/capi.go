@@ -50,6 +50,7 @@ const (
 type conn struct {
 	cl     *cedarclient.HTCondorClient
 	dbc    *dbrpc.Client
+	ctx    context.Context
 	cancel context.CancelFunc
 }
 
@@ -86,7 +87,7 @@ func hcdb_connect(addr *C.char) C.uintptr_t {
 		return 0
 	}
 	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()))
-	return C.uintptr_t(cgo.NewHandle(&conn{cl: cl, dbc: dbc, cancel: cancel}))
+	return C.uintptr_t(cgo.NewHandle(&conn{cl: cl, dbc: dbc, ctx: ctx, cancel: cancel}))
 }
 
 // rows is a materialized query result the C side drains with hcdb_query_next.
@@ -108,9 +109,9 @@ func hcdb_query(h C.uintptr_t, table, constraint *C.char) C.uintptr_t {
 		err error
 	)
 	if t := C.GoString(table); t == "" {
-		ads, err = c.dbc.Query(C.GoString(constraint))
+		ads, err = c.dbc.Query(c.ctx, C.GoString(constraint))
 	} else {
-		ads, err = c.dbc.QueryTable(t, C.GoString(constraint), 0)
+		ads, err = c.dbc.QueryTable(c.ctx, t, C.GoString(constraint), 0)
 	}
 	if err != nil {
 		return 0

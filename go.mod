@@ -6,8 +6,8 @@ require (
 	github.com/PelicanPlatform/classad v0.9.0
 	github.com/PelicanPlatform/classad/db v0.9.0
 	github.com/PelicanPlatform/classad/dbrpc v0.9.0
-	github.com/bbockelm/cedar v0.5.3
-	github.com/bbockelm/golang-htcondor v0.6.2
+	github.com/bbockelm/cedar v0.5.6
+	github.com/bbockelm/golang-htcondor v0.7.0
 	github.com/chzyer/readline v1.5.1
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/raft v1.7.3
