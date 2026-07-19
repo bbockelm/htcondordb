@@ -75,6 +75,13 @@ type Config struct {
 	// from clients. Private-attribute visibility still follows the level.
 	ForceReadOnly bool
 
+	// LogQueries turns on a per-query log: every streamed query is logged (op,
+	// table, constraint, LIMIT, rows returned, duration). It is opt-in and off by
+	// default. Useful for spotting an expensive query pattern -- e.g. a client
+	// that fetches every attribute of every ad (a full scan with a large row
+	// count) instead of pushing a projection/limit down.
+	LogQueries bool
+
 	// DefaultTable is the table ensured to exist at startup and targeted by
 	// clients that do not name a table. Defaults to "ads".
 	DefaultTable string
@@ -120,6 +127,7 @@ type Service struct {
 	defaultTable string
 	authorize    Authorizer
 	forceReadOn  bool
+	logQueries   bool
 	log          *slog.Logger
 }
 
@@ -163,6 +171,7 @@ func New(cfg Config) (*Service, error) {
 		defaultTable: defaultTable,
 		authorize:    cfg.Authorize,
 		forceReadOn:  cfg.ForceReadOnly,
+		logQueries:   cfg.LogQueries,
 		log:          log,
 	}
 	// Background self-tuning (index auto-tune + hot-set refresh + dictionary retrain),
@@ -207,6 +216,9 @@ func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error 
 	if s.forceReadOn {
 		opts.ReadOnly = true
 	}
+	if hook := s.queryLogHook(peerUser(c), c.RemoteAddr); hook != nil {
+		opts.QueryLog = hook
+	}
 
 	// Logged at Info so an operator can see, per connection, the identity that
 	// authenticated and the access level it was granted -- the answer to "why am
@@ -220,6 +232,25 @@ func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error 
 	err := s.rpc.ServeConnOpts(conn, opts)
 	s.log.Debug("htcondordb session closed", "remote", c.RemoteAddr, "err", errString(err))
 	return err
+}
+
+// queryLogHook returns the dbrpc per-query log callback for a connection, or nil
+// when per-query logging is disabled (HTCONDORDB_LOG_QUERIES off). When enabled it
+// logs each streamed query -- op, table, constraint, LIMIT, rows returned, and
+// duration, plus the peer identity -- through the condor logger (s.log bridges
+// slog into it). It surfaces expensive query patterns operationally, e.g. a
+// client pulling every attribute of every ad (a full scan with a large row count)
+// instead of pushing a projection or LIMIT down.
+func (s *Service) queryLogHook(user, remote string) func(dbrpc.QueryLog) {
+	if !s.logQueries {
+		return nil
+	}
+	return func(q dbrpc.QueryLog) {
+		s.log.Info("htcondordb query",
+			"op", q.Op, "table", q.Table, "constraint", q.Constraint,
+			"limit", q.Limit, "rows", q.Rows, "duration", q.Duration,
+			"user", user, "remote", remote)
+	}
 }
 
 // serveOptionsFor maps an access level to the dbrpc serving options.
