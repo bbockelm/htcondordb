@@ -150,11 +150,13 @@ func run() error {
 
 	// The database service. A follower (or a non-leader raft node) serves
 	// read-only: writes go to the leader.
+	memoryTables := splitAttrs(getStr(cfg, "HTCONDORDB_MEMORY_TABLES"))
 	svc, err := server.New(server.Config{
 		Dir:            databaseDir(d, cfg),
 		Authorize:      authorize,
 		ForceReadOnly:  ha.forceReadOnly,
 		Logger:         d.Slog(),
+		MemoryTables:   memoryTables,
 		PoolKeys:       poolKeys,
 		EncryptedAttrs: encAttrs,
 	})
@@ -162,6 +164,10 @@ func run() error {
 		return err
 	}
 	defer func() { _ = svc.Close() }()
+	if len(memoryTables) > 0 {
+		log.Info(logging.DestinationGeneral, "in-memory (non-persistent) tables configured",
+			"tables", strings.Join(memoryTables, ","))
+	}
 
 	// Restore-on-startup (disaster recovery): if HTCONDORDB_RESTORE_FILE names an existing
 	// snapshot, load it before serving, then the file is moved aside so a restart serves

@@ -79,6 +79,14 @@ type Config struct {
 	// clients that do not name a table. Defaults to "ads".
 	DefaultTable string
 
+	// MemoryTables are tables ensured to exist at startup as RAM-only even when
+	// the catalog is persistent (Dir set): their data is never written to disk and
+	// is gone after a restart (the table reappears empty). Intended for high-churn,
+	// reconstructible data -- e.g. frequently-replaced ads that are re-advertised
+	// every cycle -- where persistence is pure write amplification. Names already
+	// present (e.g. the default table) keep their existing on-disk backing.
+	MemoryTables []string
+
 	// PoolKeys enables encryption at rest: every table's master key is wrapped under
 	// these HTCondor pool/signing keys (any one opens the DB; a rotated-in key is added
 	// on the next start). Built from htcondor.LoadSigningKeys. Empty disables encryption.
@@ -141,6 +149,12 @@ func New(cfg Config) (*Service, error) {
 	if _, err := cat.EnsureTable(defaultTable); err != nil {
 		_ = cat.Close()
 		return nil, fmt.Errorf("server: ensuring default table: %w", err)
+	}
+	for _, name := range cfg.MemoryTables {
+		if _, err := cat.CreateTableOpts(name, db.TableOptions{InMemory: true}); err != nil {
+			_ = cat.Close()
+			return nil, fmt.Errorf("server: ensuring in-memory table %q: %w", name, err)
+		}
 	}
 
 	svc := &Service{
