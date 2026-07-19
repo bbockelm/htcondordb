@@ -62,7 +62,10 @@ type conn struct {
 //
 //export hcdb_connect
 func hcdb_connect(addr *C.char) C.uintptr_t {
-	cfg, err := config.New()
+	// Run as subsystem TOOL (like C++ command-line clients) so operator config scoped with
+	// a TOOL. prefix (e.g. TOOL.SEC_CLIENT_AUTHENTICATION_METHODS) is honored; a bare
+	// config.New() leaves the subsystem empty and disables <SUBSYS>.PARAM resolution.
+	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "TOOL"})
 	if err != nil {
 		return 0
 	}
