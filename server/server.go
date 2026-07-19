@@ -216,15 +216,8 @@ func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error 
 	if s.forceReadOn {
 		opts.ReadOnly = true
 	}
-	if s.logQueries {
-		user := peerUser(c)
-		remote := c.RemoteAddr
-		opts.QueryLog = func(q dbrpc.QueryLog) {
-			s.log.Info("htcondordb query",
-				"op", q.Op, "table", q.Table, "constraint", q.Constraint,
-				"limit", q.Limit, "rows", q.Rows, "duration", q.Duration,
-				"user", user, "remote", remote)
-		}
+	if hook := s.queryLogHook(peerUser(c), c.RemoteAddr); hook != nil {
+		opts.QueryLog = hook
 	}
 
 	// Logged at Info so an operator can see, per connection, the identity that
@@ -239,6 +232,25 @@ func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error 
 	err := s.rpc.ServeConnOpts(conn, opts)
 	s.log.Debug("htcondordb session closed", "remote", c.RemoteAddr, "err", errString(err))
 	return err
+}
+
+// queryLogHook returns the dbrpc per-query log callback for a connection, or nil
+// when per-query logging is disabled (HTCONDORDB_LOG_QUERIES off). When enabled it
+// logs each streamed query -- op, table, constraint, LIMIT, rows returned, and
+// duration, plus the peer identity -- through the condor logger (s.log bridges
+// slog into it). It surfaces expensive query patterns operationally, e.g. a
+// client pulling every attribute of every ad (a full scan with a large row count)
+// instead of pushing a projection or LIMIT down.
+func (s *Service) queryLogHook(user, remote string) func(dbrpc.QueryLog) {
+	if !s.logQueries {
+		return nil
+	}
+	return func(q dbrpc.QueryLog) {
+		s.log.Info("htcondordb query",
+			"op", q.Op, "table", q.Table, "constraint", q.Constraint,
+			"limit", q.Limit, "rows", q.Rows, "duration", q.Duration,
+			"user", user, "remote", remote)
+	}
 }
 
 // serveOptionsFor maps an access level to the dbrpc serving options.

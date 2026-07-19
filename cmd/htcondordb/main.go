@@ -150,12 +150,14 @@ func run() error {
 
 	// The database service. A follower (or a non-leader raft node) serves
 	// read-only: writes go to the leader.
+	logQueries := configBool(cfg, "HTCONDORDB_LOG_QUERIES")
 	memoryTables := splitAttrs(getStr(cfg, "HTCONDORDB_MEMORY_TABLES"))
 	svc, err := server.New(server.Config{
 		Dir:            databaseDir(d, cfg),
 		Authorize:      authorize,
 		ForceReadOnly:  ha.forceReadOnly,
 		Logger:         d.Slog(),
+		LogQueries:     logQueries,
 		MemoryTables:   memoryTables,
 		PoolKeys:       poolKeys,
 		EncryptedAttrs: encAttrs,
@@ -164,6 +166,9 @@ func run() error {
 		return err
 	}
 	defer func() { _ = svc.Close() }()
+	if logQueries {
+		log.Info(logging.DestinationGeneral, "per-query logging enabled (HTCONDORDB_LOG_QUERIES)")
+	}
 	if len(memoryTables) > 0 {
 		log.Info(logging.DestinationGeneral, "in-memory (non-persistent) tables configured",
 			"tables", strings.Join(memoryTables, ","))
