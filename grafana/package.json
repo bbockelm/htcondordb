@@ -1,0 +1,41 @@
+{
+  "name": "htcondordb-datasource",
+  "version": "0.1.0",
+  "description": "Grafana datasource plugin for htcondordb (HTCondor job/machine/history data via its SQL engine).",
+  "license": "Apache-2.0",
+  "author": "Brian Bockelman",
+  "scripts": {
+    "build": "webpack --mode production",
+    "dev": "webpack --mode development --watch",
+    "typecheck": "tsc --noEmit",
+    "e2e:build": "./e2e/build-dist.sh",
+    "e2e:up": "docker compose -f e2e/docker-compose.e2e.yaml up -d --build --wait",
+    "e2e:down": "docker compose -f e2e/docker-compose.e2e.yaml down -v",
+    "e2e:test": "playwright test",
+    "e2e": "npm run e2e:build && npm run e2e:up && npm run e2e:test"
+  },
+  "dependencies": {
+    "@grafana/data": "^11.3.0",
+    "@grafana/runtime": "^11.3.0",
+    "@grafana/schema": "^11.3.0",
+    "@grafana/ui": "^11.3.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tslib": "^2.6.0"
+  },
+  "devDependencies": {
+    "@grafana/plugin-e2e": "^1.19.9",
+    "@playwright/test": "^1.61.1",
+    "@types/node": "^20.11.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "copy-webpack-plugin": "^12.0.2",
+    "ts-loader": "^9.5.1",
+    "typescript": "^5.5.0",
+    "webpack": "^5.94.0",
+    "webpack-cli": "^5.1.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

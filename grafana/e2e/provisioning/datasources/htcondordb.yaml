@@ -1,0 +1,11 @@
+# Provisions an htcondordb datasource for the dashboard E2E test (the config-editor
+# test creates its own instance via the UI). Points at the compose service.
+apiVersion: 1
+datasources:
+  - name: htcondordb
+    uid: htcondordb-e2e
+    type: bbockelm-htcondordb-datasource
+    access: proxy
+    isDefault: true
+    jsonData:
+      address: htcondordb:9630

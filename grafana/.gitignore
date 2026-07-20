@@ -1,0 +1,13 @@
+# Frontend build output + deps
+/dist
+/node_modules
+/.config
+coverage
+# Go
+/pkg/**/*.test
+# Playwright / e2e
+/playwright
+/playwright-report
+/test-results
+/e2e/demo-output
+/e2e/*.webm

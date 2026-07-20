@@ -1,0 +1,23 @@
+# Build the htcondordb server + CLI (standalone, tagged deps) and run them with a
+# permissive config + sample data, for the Grafana plugin E2E test.
+# Build context is the repo root (see docker-compose.e2e.yaml).
+FROM golang:1.25.7-bookworm AS build
+WORKDIR /src
+COPY . .
+ENV GOWORK=off CGO_ENABLED=0
+RUN go build -trimpath -o /out/htcondordb ./cmd/htcondordb \
+ && go build -trimpath -o /out/htcondordb-cli ./cmd/htcondordb-cli
+
+FROM debian:bookworm-slim
+# Run as non-root: htcondordb's daemon refuses to run privileged (it would try to
+# drop to the condor user), so a plain unprivileged user sidesteps that entirely.
+RUN useradd -m -u 1000 condor \
+ && mkdir -p /etc/htcondordb /var/lib/htcondordb \
+ && chown -R condor:condor /etc/htcondordb /var/lib/htcondordb
+COPY --from=build /out/htcondordb /out/htcondordb-cli /usr/local/bin/
+COPY grafana/e2e/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY grafana/e2e/sample-data.sql /etc/htcondordb/sample-data.sql
+RUN chmod +x /usr/local/bin/entrypoint.sh
+USER condor
+EXPOSE 9630
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
