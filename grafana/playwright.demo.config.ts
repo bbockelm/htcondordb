@@ -18,7 +18,8 @@ export default defineConfig<PluginOptions>({
     provisioningRootDir: join(process.cwd(), 'e2e/provisioning'),
     viewport: { width: 1280, height: 800 },
     video: { mode: 'on', size: { width: 1280, height: 800 } },
-    launchOptions: { slowMo: 400 },
+    // No slowMo: pacing comes from the cursor glides (mouse.move steps + per-step
+    // waits) and explicit pauses; slowMo would multiply every glide step.
   },
   projects: [
     // No video for the login-setup step; only the demo walkthrough is recorded.
