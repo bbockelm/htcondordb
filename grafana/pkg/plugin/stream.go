@@ -146,7 +146,16 @@ func (d *Datasource) RunStream(ctx context.Context, req *backend.RunStreamReques
 	defer sess.cleanup()
 
 	exec := repl.NewExecutor(sess.client, repl.ExecConfig{})
-	events, stop, err := exec.WatchStream(spec.Table, nil) // nil cursor = changes from now
+	// Watch from "now": get the current head cursor and stream only changes committed
+	// after it. A nil cursor instead replays the whole table (a reset + every
+	// existing ad), which floods a live panel with current state; a live tail should
+	// show changes as they happen. Fall back to nil (replay) only if the head is
+	// unavailable.
+	cursor, herr := exec.WatchHead(spec.Table)
+	if herr != nil {
+		cursor = nil
+	}
+	events, stop, err := exec.WatchStream(spec.Table, cursor)
 	if err != nil {
 		return fmt.Errorf("watch %s: %w", spec.Table, err)
 	}

@@ -26,7 +26,8 @@ Grafana ──gRPC──> plugin backend (Go) ──dbrpc/CEDAR──> htcondord
     **discover schema** for its dropdowns.
   - `StreamHandler` implements a **live source** over htcondordb WATCH: a streaming
     query returns a Grafana live channel; `RunStream` tails the table's change
-    stream and pushes one frame per change (time / key / kind / selected attrs).
+    stream **from now** (new changes only, not a full replay of current state) and
+    pushes one frame per change (time / key / kind / selected attrs).
   - `CheckHealth` connects and runs a probe query.
 - **Frontend** (`src/`): a query editor with two modes — a **Builder**
   (table / metrics / group-by / filters / time field / limit, with dropdowns
@@ -81,11 +82,13 @@ steps for all platforms and uploads the combined bundle as an artifact.
 
 ## End-to-end test
 
-`e2e/` contains a browser-level test (Playwright + `@grafana/plugin-e2e`) that runs
+`e2e/` contains browser-level tests (Playwright + `@grafana/plugin-e2e`) that run
 the whole stack in docker-compose — a real htcondordb server preloaded with sample
-ads (`e2e/sample-data.sql`) plus Grafana with this plugin — and drives the UI to
-**configure the datasource** (and pass its health check) and **build a dashboard
-panel** that queries the data.
+ads (`e2e/sample-data.sql`) plus Grafana with this plugin — and drive the UI to
+**configure the datasource** (and pass its health check), **build a dashboard
+panel** that queries the data, and verify the **live WATCH stream**: a Live panel
+is opened, the test mutates htcondordb (via `docker compose exec … htcondordb-cli`),
+and the new row is asserted to appear in the panel without re-running the query.
 
 ```sh
 npm run e2e        # build dist -> compose up --wait -> playwright test
