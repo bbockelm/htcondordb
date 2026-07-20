@@ -39,6 +39,10 @@ import (
 	"github.com/bbockelm/htcondordb/server"
 )
 
+// version is stamped at build time via `-ldflags "-X main.version=..."` (see the
+// Makefile); it is "dev" for a plain `go build`.
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "htcondordb:", err)
@@ -48,12 +52,18 @@ func main() {
 
 func run() error {
 	listen := flag.String("listen", ":0", "fallback TCP listen address when not inheriting a shared-port endpoint")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	// condor_master appends these standard DaemonCore flags for a daemon not in
 	// its built-in list; accept them so flag.Parse does not reject our launch.
 	// -local-name additionally scopes config lookups (HTCONDORDB.<key> beats <key>).
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; accepted for compatibility (fd inherited via CONDOR_INHERIT)")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("htcondordb", version)
+		return nil
+	}
 
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "HTCONDORDB", LocalName: *localName})
 	if err != nil {
