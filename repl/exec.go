@@ -157,6 +157,12 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 // --- DDL ---
 
 func (e *Executor) execCreateTable(st *Statement) (*Result, error) {
+	if st.InMemory {
+		if err := e.c.CreateTableInMemory(context.Background(), st.Table); err != nil {
+			return nil, err
+		}
+		return &Result{Note: "CREATE TABLE " + st.Table + " MEMORY"}, nil
+	}
 	if err := e.c.CreateTable(context.Background(), st.Table); err != nil {
 		return nil, err
 	}
@@ -292,6 +298,17 @@ func (e *Executor) Tables() ([]string, error) { return e.c.Tables(context.Backgr
 
 // CreateTable creates a table (used by load auto-routing).
 func (e *Executor) CreateTable(name string) error { return e.c.CreateTable(context.Background(), name) }
+
+// CreateTableInMemory creates a RAM-only table (data not persisted across a server restart).
+func (e *Executor) CreateTableInMemory(name string) error {
+	return e.c.CreateTableInMemory(context.Background(), name)
+}
+
+// ConvertTableToMemory drops an existing table's on-disk backing (DAEMON-only), keeping its
+// current contents in RAM only.
+func (e *Executor) ConvertTableToMemory(name string) error {
+	return e.c.ConvertTableToMemory(context.Background(), name)
+}
 
 // WatchStream opens a live change stream on a table from cursor (nil ⇒ replay the current
 // contents first), returning the event channel and a stop function (which cancels the

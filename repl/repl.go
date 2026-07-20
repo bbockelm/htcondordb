@@ -196,7 +196,7 @@ func stripQuotes(s string) string {
 const helpText = `htcondordb SQL-like shell. Each table is a ClassAd collection (no joins);
 a row's primary key lives in the "Key" attribute.
 
-  CREATE TABLE machines;
+  CREATE TABLE machines;   CREATE TABLE scratch MEMORY;   -- MEMORY = RAM-only, not persisted
   CREATE VALUE INDEX ON machines (Cpus);
   SELECT * FROM machines WHERE Cpus >= 8 ORDER BY Cpus DESC LIMIT 10;
   SELECT DISTINCT Owner FROM jobs ORDER BY Owner;
@@ -259,5 +259,7 @@ Management (needs WRITE):
   .rewrite [-all]                              re-encode all ads with the hot set
   .compact [-all]                              reclaim dead space
   .retrain [-all] [<sampleMax>]                train/refresh ZSTD compression
+  .memory [table]                              drop a table's on-disk backing, keeping
+                                               its data in RAM only (needs DAEMON)
   (-all runs the command on every table)
 `
