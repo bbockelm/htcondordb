@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/grafana/grafana/main/docs/sources/developers/plugins/plugin.schema.json",
+  "type": "datasource",
+  "name": "HTCondorDB",
+  "id": "bbockelm-htcondordb-datasource",
+  "metrics": true,
+  "backend": true,
+  "executable": "gpx_htcondordb",
+  "info": {
+    "description": "Query HTCondor job, machine, and history data stored in htcondordb using its SQL engine.",
+    "author": {
+      "name": "Brian Bockelman"
+    },
+    "keywords": ["htcondor", "condor", "sql", "batch"],
+    "logos": {
+      "small": "img/logo.svg",
+      "large": "img/logo.svg"
+    },
+    "links": [],
+    "screenshots": [],
+    "version": "%VERSION%",
+    "updated": "%TODAY%"
+  },
+  "dependencies": {
+    "grafanaDependency": ">=10.4.0",
+    "plugins": []
+  }
+}

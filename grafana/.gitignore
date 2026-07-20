@@ -1,0 +1,7 @@
+# Frontend build output + deps
+/dist
+/node_modules
+/.config
+coverage
+# Go
+/pkg/**/*.test

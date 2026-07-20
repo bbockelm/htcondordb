@@ -1,0 +1,38 @@
+{
+  "name": "htcondordb-datasource",
+  "version": "0.1.0",
+  "description": "Grafana datasource plugin for htcondordb (HTCondor job/machine/history data via its SQL engine).",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "webpack -c ./.config/webpack/webpack.config.ts --env production",
+    "dev": "webpack -w -c ./.config/webpack/webpack.config.ts --env development",
+    "test": "jest --watch --onlyChanged",
+    "test:ci": "jest --passWithNoTests --maxWorkers 4",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint --cache --ignore-path ./.gitignore --ext .js,.jsx,.ts,.tsx .",
+    "lint:fix": "npm run lint -- --fix",
+    "update-config": "npx @grafana/create-plugin@latest update"
+  },
+  "author": "Brian Bockelman",
+  "dependencies": {
+    "@grafana/data": "^11.3.0",
+    "@grafana/runtime": "^11.3.0",
+    "@grafana/schema": "^11.3.0",
+    "@grafana/ui": "^11.3.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tslib": "^2.6.0"
+  },
+  "devDependencies": {
+    "@grafana/create-plugin": "^5.0.0",
+    "@grafana/eslint-config": "^7.0.0",
+    "@grafana/tsconfig": "^2.0.0",
+    "@types/jest": "^29.5.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
