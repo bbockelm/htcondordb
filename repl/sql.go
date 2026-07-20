@@ -46,6 +46,8 @@ const (
 	StmtDropIndex
 	StmtMatch
 	StmtWatch
+	StmtCreateView
+	StmtDropView
 )
 
 // Statement is one parsed SQL-like statement.
@@ -62,6 +64,13 @@ type Statement struct {
 	// InMemory is set by CREATE TABLE <name> MEMORY: create the table as RAM-only
 	// (data not persisted across a server restart).
 	InMemory bool
+
+	// View fields (CREATE MATERIALIZED VIEW <ViewName> [MAXSERIES n] AS <ViewSelect>).
+	// ViewSelect is the embedded SELECT (a StmtSelect) whose GROUP BY + aggregates define
+	// the view; ViewMaxSeries is the hard cardinality limit (0 = use the default).
+	ViewName      string
+	ViewSelect    *Statement
+	ViewMaxSeries int
 
 	// MatchResource is the resource table for a MATCH statement (Table is the
 	// request table); TargetWhere is the pushed-down resource-side filter; Key,
@@ -436,6 +445,36 @@ func (p *parser) parseWatch() (*Statement, error) {
 // parseCreate parses CREATE TABLE <name> or
 // CREATE [VALUE|CATEGORICAL] INDEX ON <table> (<attr>, ...).
 func (p *parser) parseCreate() (*Statement, error) {
+	if p.takeKeyword("MATERIALIZED") {
+		if err := p.expectKeyword("VIEW"); err != nil {
+			return nil, fmt.Errorf("expected VIEW after MATERIALIZED")
+		}
+		name, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		maxSeries := 0 // 0 => the server's default cardinality
+		if p.takeKeyword("MAXSERIES") {
+			t := p.next()
+			if t.kind != tNumber {
+				return nil, fmt.Errorf("MAXSERIES expects a number, got %q", t.text)
+			}
+			if _, err := fmt.Sscanf(t.text, "%d", &maxSeries); err != nil || maxSeries <= 0 {
+				return nil, fmt.Errorf("invalid MAXSERIES %q", t.text)
+			}
+		}
+		if err := p.expectKeyword("AS"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("SELECT"); err != nil {
+			return nil, fmt.Errorf("a materialized view must be defined by a SELECT")
+		}
+		sel, err := p.parseSelect() // reuses GROUP BY / aggregate / alias parsing
+		if err != nil {
+			return nil, err
+		}
+		return &Statement{Kind: StmtCreateView, ViewName: name, ViewSelect: sel, ViewMaxSeries: maxSeries}, nil
+	}
 	if p.takeKeyword("TABLE") {
 		name, err := p.parseIdent()
 		if err != nil {
@@ -464,6 +503,16 @@ func (p *parser) parseCreate() (*Statement, error) {
 
 // parseDrop parses DROP TABLE <name> or DROP INDEX ON <table> (<attr>, ...).
 func (p *parser) parseDrop() (*Statement, error) {
+	if p.takeKeyword("MATERIALIZED") {
+		if err := p.expectKeyword("VIEW"); err != nil {
+			return nil, fmt.Errorf("expected VIEW after MATERIALIZED")
+		}
+		name, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &Statement{Kind: StmtDropView, ViewName: name}, nil
+	}
 	if p.takeKeyword("TABLE") {
 		name, err := p.parseIdent()
 		if err != nil {

@@ -206,6 +206,12 @@ a row's primary key lives in the "Key" attribute.
   DELETE FROM jobs WHERE JobStatus == 4;
   DROP INDEX ON machines (Cpus);   DROP TABLE machines;
 
+  CREATE MATERIALIZED VIEW cluster_usage AS
+    SELECT Owner AS label_owner, JobStatus AS label_status,
+           COUNT(*) AS metric_jobs, SUM(RequestMemory) AS metric_memory
+    FROM jobs GROUP BY Owner, JobStatus;   -- live, in-memory, Prometheus-oriented
+  DROP MATERIALIZED VIEW cluster_usage;
+
   MATCH jobs TO machines WHERE Owner == "alice" WHERE TARGET Arch == "X86_64" LIMIT 10;
   MATCH jobs TO machines USING (RequestCpus, RequestMemory, Requirements, Rank) LIMIT 100;
   MATCH KEY '1.0' IN jobs TO machines;
@@ -232,6 +238,12 @@ Notes:
   - WATCH <projection> FROM <table> [WHERE ...] [SINCE {NOW|BEGINNING}] [LIMIT n]:
     live-tails changes; Ctrl+C returns to the prompt. WHERE filters upserts (deletes
     are always shown); SINCE BEGINNING first replays current contents (default NOW).
+  - CREATE MATERIALIZED VIEW <name> [MAXSERIES n] AS <grouped SELECT>: a cardinality-
+    limited, in-memory aggregate kept live from the base table's change stream. Only
+    COUNT/SUM/AVG (delta-maintainable; MIN/MAX rejected). Column aliases label_<x> become
+    a Prometheus label <x>; metric_<y> becomes a sample of the metric <name>_<y>; a
+    column with neither prefix is not exported. Exceeding MAXSERIES is a hard error.
+    Query it like a table (SELECT ... FROM <name>); it is read-only.
 
 Meta-commands:
   .help                 show this help
@@ -239,6 +251,8 @@ Meta-commands:
   .use <table>          set the current table for the commands below
   .format <mode>        table (default) | json | classad | classad-new
   .output <file>        send query output to a file; .output stdout to restore
+  .views                list materialized views
+  .export [view]        Prometheus text exposition for a view (all views if omitted)
   .quit                 exit
 
 Diagnostics (current table, or an explicit one where noted):

@@ -6,16 +6,27 @@
 package metrics
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 )
 
 const namespace = "htcondordb"
+
+// Prometheus column-alias prefixes for materialized views: a group column aliased
+// label_<x> becomes a Prometheus label <x>; a metric column aliased metric_<y> becomes a
+// sample of the metric <view>_<y>. Columns without either prefix are not exported.
+const (
+	viewLabelPrefix  = "label_"
+	viewMetricPrefix = "metric_"
+)
 
 // catalogCollector implements prometheus.Collector over a db.Catalog, emitting
 // per-table storage gauges and operational timing counters. Reading on Collect
@@ -116,14 +127,93 @@ func opStatList(o db.OpStats) []struct {
 	}
 }
 
+// viewCollector implements prometheus.Collector over a catalog's materialized views. Each
+// view exports one sample per group: its label_* columns become Prometheus labels and its
+// metric_* columns become gauges named <view>_<suffix>. Views (and their label sets) are
+// dynamic, so Descs are built per scrape rather than up front, and this behaves as an
+// unchecked collector (Describe emits nothing).
+type viewCollector struct {
+	cat *db.Catalog
+}
+
+func (c *viewCollector) Describe(chan<- *prometheus.Desc) {}
+
+func (c *viewCollector) Collect(ch chan<- prometheus.Metric) {
+	for _, name := range c.cat.Views() {
+		backing, ok := c.cat.ViewBacking(name)
+		if !ok {
+			continue // a stale/failed view has no backing to scrape
+		}
+		v, ok := c.cat.View(name)
+		if !ok {
+			continue
+		}
+		spec := v.Spec()
+
+		// Label columns: group columns whose alias carries the label_ prefix.
+		type labelCol struct{ attr, key string }
+		var labels []labelCol
+		for _, g := range spec.Groups {
+			if key, ok := strings.CutPrefix(g.Alias, viewLabelPrefix); ok {
+				labels = append(labels, labelCol{attr: g.Alias, key: key})
+			}
+		}
+		labelNames := make([]string, len(labels))
+		for i, l := range labels {
+			labelNames[i] = l.key
+		}
+
+		// Metric columns: aggregate columns whose alias carries the metric_ prefix.
+		type metricCol struct {
+			attr string
+			desc *prometheus.Desc
+		}
+		var metricCols []metricCol
+		for _, m := range spec.Metrics {
+			if suffix, ok := strings.CutPrefix(m.Alias, viewMetricPrefix); ok {
+				desc := prometheus.NewDesc(name+"_"+suffix,
+					fmt.Sprintf("Materialized view %q metric %q.", name, suffix), labelNames, nil)
+				metricCols = append(metricCols, metricCol{attr: m.Alias, desc: desc})
+			}
+		}
+		if len(metricCols) == 0 {
+			continue
+		}
+
+		backing.ForEach(func(ad *classad.ClassAd) bool {
+			labelValues := make([]string, len(labels))
+			for i, l := range labels {
+				s, ok := ad.EvaluateAttrString(l.attr)
+				if !ok {
+					s = ad.EvaluateAttr(l.attr).String()
+				}
+				labelValues[i] = s
+			}
+			for _, mc := range metricCols {
+				val, ok := ad.EvaluateAttrNumber(mc.attr)
+				if !ok {
+					continue
+				}
+				// NewConstMetric (not Must*) so an operator's invalid alias skips the
+				// sample instead of aborting the whole scrape.
+				if metric, err := prometheus.NewConstMetric(mc.desc, prometheus.GaugeValue, val, labelValues...); err == nil {
+					ch <- metric
+				}
+			}
+			return true
+		})
+	}
+}
+
 // Handler returns an http.Handler serving Prometheus metrics for the catalog: the
-// per-table storage gauges and operational timing counters above, plus the standard Go
-// runtime and process (RSS, open FDs, ...) collectors. It uses a private registry so
-// it can be mounted without global-registry collisions.
+// per-table storage gauges and operational timing counters above, the materialized-view
+// gauges, plus the standard Go runtime and process (RSS, open FDs, ...) collectors. It uses
+// a private registry so it can be mounted without global-registry collisions.
 func Handler(cat *db.Catalog) http.Handler {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		newCatalogCollector(cat),
+		&viewCollector{cat: cat},
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)

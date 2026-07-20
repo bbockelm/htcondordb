@@ -147,6 +147,10 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 		return e.execCreateIndex(st)
 	case StmtDropIndex:
 		return e.execDropIndex(st)
+	case StmtCreateView:
+		return e.execCreateView(st)
+	case StmtDropView:
+		return e.execDropView(st)
 	case StmtMatch:
 		return e.execMatch(st)
 	default:
@@ -174,6 +178,130 @@ func (e *Executor) execDropTable(st *Statement) (*Result, error) {
 		return nil, err
 	}
 	return &Result{Note: "DROP TABLE " + st.Table}, nil
+}
+
+// defaultViewCardinality caps the number of distinct groups (label combinations) a
+// materialized view may hold when the definition omits an explicit MAXSERIES clause.
+const defaultViewCardinality = 10000
+
+func (e *Executor) execCreateView(st *Statement) (*Result, error) {
+	spec, err := viewSpecFromSelect(st)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.c.CreateView(context.Background(), st.ViewName, spec); err != nil {
+		return nil, err
+	}
+	return &Result{Note: "CREATE MATERIALIZED VIEW " + st.ViewName}, nil
+}
+
+func (e *Executor) execDropView(st *Statement) (*Result, error) {
+	if err := e.c.DropView(context.Background(), st.ViewName); err != nil {
+		return nil, err
+	}
+	return &Result{Note: "DROP MATERIALIZED VIEW " + st.ViewName}, nil
+}
+
+// viewSpecFromSelect turns the embedded SELECT of a CREATE MATERIALIZED VIEW into a
+// db.ViewSpec. Non-aggregate projected columns become the grouping labels and must match the
+// GROUP BY set; aggregate columns (COUNT/SUM/AVG only) become the maintained metrics. The
+// column names carry their aliases (e.g. label_owner, metric_jobs), which the Prometheus
+// exporter interprets by prefix.
+func viewSpecFromSelect(st *Statement) (db.ViewSpec, error) {
+	sel := st.ViewSelect
+	if sel == nil || sel.Kind != StmtSelect {
+		return db.ViewSpec{}, fmt.Errorf("a materialized view must be defined by a SELECT")
+	}
+	if sel.Table == "" {
+		return db.ViewSpec{}, fmt.Errorf("a materialized view requires a FROM table")
+	}
+	if len(sel.GroupBy) == 0 {
+		return db.ViewSpec{}, fmt.Errorf("a materialized view requires GROUP BY")
+	}
+	if sel.Where != "" || len(sel.OrderBy) != 0 || sel.Limit != 0 {
+		return db.ViewSpec{}, fmt.Errorf("a materialized view SELECT may not use WHERE, ORDER BY, or LIMIT")
+	}
+
+	var groups []db.ViewGroupCol
+	var metrics []db.ViewMetric
+	for _, it := range sel.Items {
+		if it.Star {
+			return db.ViewSpec{}, fmt.Errorf("SELECT * is not allowed in a materialized view; project explicit columns")
+		}
+		if it.IsAggregate() {
+			fn, err := viewAggFunc(it.Agg)
+			if err != nil {
+				return db.ViewSpec{}, err
+			}
+			metrics = append(metrics, db.ViewMetric{Func: fn, Arg: it.Col, Alias: it.header()})
+			continue
+		}
+		groups = append(groups, db.ViewGroupCol{Attr: it.Col, Alias: it.header()})
+	}
+	if len(metrics) == 0 {
+		return db.ViewSpec{}, fmt.Errorf("a materialized view requires at least one aggregate (COUNT, SUM, or AVG)")
+	}
+	// Every non-aggregate projected column must be a GROUP BY column, and vice versa, so the
+	// view's grouping and its labels agree.
+	if err := groupsMatchGroupBy(groups, sel.GroupBy); err != nil {
+		return db.ViewSpec{}, err
+	}
+
+	card := st.ViewMaxSeries
+	if card <= 0 {
+		card = defaultViewCardinality
+	}
+	return db.ViewSpec{
+		BaseTable:   sel.Table,
+		Groups:      groups,
+		Metrics:     metrics,
+		Cardinality: card,
+		SelectText:  renderViewSelect(sel),
+	}, nil
+}
+
+// groupsMatchGroupBy verifies the projected non-aggregate columns are exactly the GROUP BY
+// columns (order-independent).
+func groupsMatchGroupBy(groups []db.ViewGroupCol, groupBy []string) error {
+	if len(groups) != len(groupBy) {
+		return fmt.Errorf("every non-aggregate column must appear in GROUP BY and vice versa")
+	}
+	want := make(map[string]bool, len(groupBy))
+	for _, g := range groupBy {
+		want[g] = true
+	}
+	for _, g := range groups {
+		if !want[g.Attr] {
+			return fmt.Errorf("column %q is projected but not in GROUP BY", g.Attr)
+		}
+	}
+	return nil
+}
+
+func viewAggFunc(name string) (db.ViewAggFunc, error) {
+	switch strings.ToUpper(name) {
+	case "COUNT":
+		return db.ViewCount, nil
+	case "SUM":
+		return db.ViewSum, nil
+	case "AVG":
+		return db.ViewAvg, nil
+	case "MIN", "MAX":
+		return "", fmt.Errorf("%s is not supported in a materialized view: the change stream has no before-image, so it cannot be maintained on delete; use COUNT, SUM, or AVG", strings.ToUpper(name))
+	default:
+		return "", fmt.Errorf("unsupported aggregate %q in a materialized view", name)
+	}
+}
+
+// renderViewSelect reconstructs a readable form of the view's defining SELECT for display
+// (the parser does not retain the raw source text).
+func renderViewSelect(sel *Statement) string {
+	items := make([]string, 0, len(sel.Items))
+	for _, it := range sel.Items {
+		items = append(items, it.header())
+	}
+	return fmt.Sprintf("SELECT %s FROM %s GROUP BY %s",
+		strings.Join(items, ", "), sel.Table, strings.Join(sel.GroupBy, ", "))
 }
 
 func (e *Executor) execCreateIndex(st *Statement) (*Result, error) {
@@ -295,6 +423,15 @@ func (e *Executor) Admin(table, action string, args ...string) (string, error) {
 
 // Tables lists the catalog's table names.
 func (e *Executor) Tables() ([]string, error) { return e.c.Tables(context.Background()) }
+
+// ListViews returns the materialized view names.
+func (e *Executor) ListViews() ([]string, error) { return e.c.ListViews(context.Background()) }
+
+// ViewRows returns the current rows of a materialized view (one ad per group). Views are
+// read like tables, so this reuses the ordinary query path against the view's backing.
+func (e *Executor) ViewRows(name string) ([]*classad.ClassAd, error) {
+	return e.queryAds(name, "", 0)
+}
 
 // CreateTable creates a table (used by load auto-routing).
 func (e *Executor) CreateTable(name string) error { return e.c.CreateTable(context.Background(), name) }
