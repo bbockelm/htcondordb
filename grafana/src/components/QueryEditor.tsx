@@ -1,4 +1,4 @@
-import React, { ChangeEvent } from 'react';
+import React, { ChangeEvent, useEffect, useState } from 'react';
 
 import { QueryEditorProps, SelectableValue } from '@grafana/data';
 import {
@@ -8,6 +8,7 @@ import {
   InlineField,
   InlineFieldRow,
   Input,
+  MultiSelect,
   RadioButtonGroup,
   Select,
 } from '@grafana/ui';
@@ -32,21 +33,46 @@ const MODE_OPTIONS: Array<SelectableValue<EditorMode>> = [
   { label: 'Builder', value: 'builder' },
   { label: 'SQL', value: 'code' },
 ];
-
+const SOURCE_OPTIONS: Array<SelectableValue<boolean>> = [
+  { label: 'Query', value: false },
+  { label: 'Live (WATCH)', value: true },
+];
 const FORMAT_OPTIONS: Array<SelectableValue<'table' | 'timeseries'>> = [
   { label: 'Table', value: 'table' },
   { label: 'Time series', value: 'timeseries' },
 ];
 
-const toList = (s: string): string[] =>
-  s
-    .split(',')
-    .map((x) => x.trim())
-    .filter((x) => x.length > 0);
+const opt = (s: string): SelectableValue<string> => ({ label: s, value: s });
 
-export function QueryEditor({ query, onChange, onRunQuery }: Props) {
+export function QueryEditor({ datasource, query, onChange, onRunQuery }: Props) {
   const q = { ...DEFAULT_QUERY, ...query };
   const mode: EditorMode = q.editorMode ?? 'builder';
+
+  const [tables, setTables] = useState<string[]>([]);
+  const [attrs, setAttrs] = useState<string[]>([]);
+
+  useEffect(() => {
+    let live = true;
+    datasource.getTables().then((t) => live && setTables(t));
+    return () => {
+      live = false;
+    };
+  }, [datasource]);
+
+  useEffect(() => {
+    let live = true;
+    if (q.table) {
+      datasource.getAttributes(q.table).then((a) => live && setAttrs(a));
+    } else {
+      setAttrs([]);
+    }
+    return () => {
+      live = false;
+    };
+  }, [datasource, q.table]);
+
+  const tableOptions = tables.map(opt);
+  const attrOptions = attrs.map(opt);
 
   const set = (patch: Partial<HtcondordbQuery>) => onChange({ ...q, ...patch });
   const setAndRun = (patch: Partial<HtcondordbQuery>) => {
@@ -56,38 +82,43 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
 
   const metrics = q.metrics ?? [];
   const filters = q.filters ?? [];
+  const updateMetric = (i: number, patch: Partial<MetricDef>) =>
+    set({ metrics: metrics.map((m, j) => (j === i ? { ...m, ...patch } : m)) });
+  const updateFilter = (i: number, patch: Partial<FilterDef>) =>
+    set({ filters: filters.map((f, j) => (j === i ? { ...f, ...patch } : f)) });
 
-  const updateMetric = (i: number, patch: Partial<MetricDef>) => {
-    const next = metrics.slice();
-    next[i] = { ...next[i], ...patch };
-    set({ metrics: next });
-  };
-  const updateFilter = (i: number, patch: Partial<FilterDef>) => {
-    const next = filters.slice();
-    next[i] = { ...next[i], ...patch };
-    set({ filters: next });
-  };
+  const tableSelect = (
+    <InlineField label="Table" labelWidth={LABEL_WIDTH} tooltip="Discovered from the server; type to add a custom name.">
+      <Select
+        width={28}
+        options={tableOptions}
+        value={q.table ? opt(q.table) : null}
+        allowCustomValue
+        placeholder="jobs"
+        onChange={(v) => setAndRun({ table: v?.value ?? '' })}
+      />
+    </InlineField>
+  );
 
   return (
     <div>
       <InlineFieldRow>
         <InlineField label="Editor" labelWidth={LABEL_WIDTH}>
-          <RadioButtonGroup
-            options={MODE_OPTIONS}
-            value={mode}
-            onChange={(v) => set({ editorMode: v })}
-          />
+          <RadioButtonGroup options={MODE_OPTIONS} value={mode} onChange={(v) => set({ editorMode: v })} />
         </InlineField>
-        <InlineField label="Format" labelWidth={LABEL_WIDTH}>
-          <RadioButtonGroup
-            options={FORMAT_OPTIONS}
-            value={q.format ?? 'table'}
-            onChange={(v) => setAndRun({ format: v })}
-          />
-        </InlineField>
+        {mode === 'builder' && (
+          <InlineField label="Source" labelWidth={LABEL_WIDTH} tooltip="Query runs once; Live tails the table's change stream (WATCH).">
+            <RadioButtonGroup options={SOURCE_OPTIONS} value={q.stream ?? false} onChange={(v) => setAndRun({ stream: v })} />
+          </InlineField>
+        )}
+        {mode === 'builder' && !q.stream && (
+          <InlineField label="Format" labelWidth={LABEL_WIDTH}>
+            <RadioButtonGroup options={FORMAT_OPTIONS} value={q.format ?? 'table'} onChange={(v) => setAndRun({ format: v })} />
+          </InlineField>
+        )}
       </InlineFieldRow>
 
-      {mode === 'code' ? (
+      {mode === 'code' && (
         <CodeEditor
           language="sql"
           height={180}
@@ -96,106 +127,113 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
           showLineNumbers
           onBlur={(value) => setAndRun({ rawSql: value })}
         />
-      ) : (
+      )}
+
+      {mode === 'builder' && q.stream && (
+        <>
+          <InlineFieldRow>{tableSelect}</InlineFieldRow>
+          <InlineFieldRow>
+            <InlineField label="Columns" labelWidth={LABEL_WIDTH} tooltip="Attributes to include in each streamed change (besides key + kind).">
+              <MultiSelect
+                width={48}
+                options={attrOptions}
+                value={(q.columns ?? []).map(opt)}
+                allowCustomValue
+                placeholder="Owner, JobStatus"
+                onChange={(vs) => setAndRun({ columns: vs.map((v) => v.value!).filter(Boolean) })}
+              />
+            </InlineField>
+          </InlineFieldRow>
+        </>
+      )}
+
+      {mode === 'builder' && !q.stream && (
         <>
           <InlineFieldRow>
-            <InlineField label="Table" labelWidth={LABEL_WIDTH} tooltip="e.g. jobs, machines, history">
-              <Input
-                width={24}
-                value={q.table ?? ''}
-                placeholder="jobs"
-                onChange={(e: ChangeEvent<HTMLInputElement>) => set({ table: e.currentTarget.value })}
-                onBlur={() => onRunQuery()}
-              />
-            </InlineField>
+            {tableSelect}
             <InlineField label="Time field" labelWidth={LABEL_WIDTH} tooltip="Attribute constrained to the dashboard time range (unix epoch), e.g. QDate.">
-              <Input
+              <Select
                 width={24}
-                value={q.timeField ?? ''}
+                options={attrOptions}
+                value={q.timeField ? opt(q.timeField) : null}
+                allowCustomValue
+                isClearable
                 placeholder="QDate"
-                onChange={(e: ChangeEvent<HTMLInputElement>) => set({ timeField: e.currentTarget.value })}
-                onBlur={() => onRunQuery()}
+                onChange={(v) => setAndRun({ timeField: v?.value ?? '' })}
               />
             </InlineField>
           </InlineFieldRow>
 
           <InlineFieldRow>
-            <InlineField label="Columns" labelWidth={LABEL_WIDTH} tooltip="Comma-separated plain attributes to select (ignored when using aggregates only).">
-              <Input
+            <InlineField label="Columns" labelWidth={LABEL_WIDTH} tooltip="Plain attributes to select (omit when using only aggregates).">
+              <MultiSelect
                 width={48}
-                value={(q.columns ?? []).join(', ')}
+                options={attrOptions}
+                value={(q.columns ?? []).map(opt)}
+                allowCustomValue
                 placeholder="Owner, JobStatus"
-                onChange={(e: ChangeEvent<HTMLInputElement>) => set({ columns: toList(e.currentTarget.value) })}
-                onBlur={() => onRunQuery()}
+                onChange={(vs) => setAndRun({ columns: vs.map((v) => v.value!).filter(Boolean) })}
               />
             </InlineField>
           </InlineFieldRow>
 
           <InlineFieldRow>
-            <InlineField label="Group by" labelWidth={LABEL_WIDTH} tooltip="Comma-separated group keys.">
-              <Input
+            <InlineField label="Group by" labelWidth={LABEL_WIDTH}>
+              <MultiSelect
                 width={48}
-                value={(q.groupBy ?? []).join(', ')}
+                options={attrOptions}
+                value={(q.groupBy ?? []).map(opt)}
+                allowCustomValue
                 placeholder="Owner"
-                onChange={(e: ChangeEvent<HTMLInputElement>) => set({ groupBy: toList(e.currentTarget.value) })}
-                onBlur={() => onRunQuery()}
+                onChange={(vs) => setAndRun({ groupBy: vs.map((v) => v.value!).filter(Boolean) })}
               />
             </InlineField>
           </InlineFieldRow>
 
-          {/* Metrics (aggregates) */}
           {metrics.map((m, i) => (
             <InlineFieldRow key={`m-${i}`}>
               <InlineField label={i === 0 ? 'Metric' : ' '} labelWidth={LABEL_WIDTH}>
                 <Select
                   width={16}
                   options={AGG_FUNCS.map((f) => ({ label: f || '(plain)', value: f }))}
-                  value={m.func}
+                  value={opt(m.func)}
                   onChange={(v) => updateMetric(i, { func: v.value ?? '' })}
                 />
               </InlineField>
               <InlineField label="of" labelWidth={4}>
-                <Input
-                  width={20}
-                  value={m.attr}
-                  placeholder="* / Cpus"
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => updateMetric(i, { attr: e.currentTarget.value })}
-                  onBlur={() => onRunQuery()}
+                <Select
+                  width={22}
+                  options={[opt('*'), ...attrOptions]}
+                  value={m.attr ? opt(m.attr) : null}
+                  allowCustomValue
+                  placeholder="*"
+                  onChange={(v) => setAndRun({ metrics: metrics.map((mm, j) => (j === i ? { ...mm, attr: v?.value ?? '' } : mm)) })}
                 />
               </InlineField>
-              <IconButton
-                name="trash-alt"
-                aria-label="remove metric"
-                onClick={() => setAndRun({ metrics: metrics.filter((_, j) => j !== i) })}
-              />
+              <IconButton name="trash-alt" aria-label="remove metric" onClick={() => setAndRun({ metrics: metrics.filter((_, j) => j !== i) })} />
             </InlineFieldRow>
           ))}
-          <Button
-            variant="secondary"
-            size="sm"
-            icon="plus"
-            onClick={() => set({ metrics: [...metrics, { func: 'COUNT', attr: '*' }] })}
-          >
+          <Button variant="secondary" size="sm" icon="plus" onClick={() => set({ metrics: [...metrics, { func: 'COUNT', attr: '*' }] })}>
             Add metric
           </Button>
 
-          {/* Filters (WHERE terms) */}
           {filters.map((f, i) => (
             <InlineFieldRow key={`f-${i}`}>
               <InlineField label={i === 0 ? 'Where' : ' '} labelWidth={LABEL_WIDTH}>
-                <Input
+                <Select
                   width={20}
-                  value={f.attr}
+                  options={attrOptions}
+                  value={f.attr ? opt(f.attr) : null}
+                  allowCustomValue
                   placeholder="State"
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => updateFilter(i, { attr: e.currentTarget.value })}
-                  onBlur={() => onRunQuery()}
+                  onChange={(v) => updateFilter(i, { attr: v?.value ?? '' })}
                 />
               </InlineField>
               <InlineField label=" " labelWidth={2}>
                 <Select
                   width={10}
-                  options={FILTER_OPS.map((op) => ({ label: op, value: op }))}
-                  value={f.op || '=='}
+                  options={FILTER_OPS.map(opt)}
+                  value={opt(f.op || '==')}
                   onChange={(v) => updateFilter(i, { op: v.value ?? '==' })}
                 />
               </InlineField>
@@ -208,19 +246,10 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
                   onBlur={() => onRunQuery()}
                 />
               </InlineField>
-              <IconButton
-                name="trash-alt"
-                aria-label="remove filter"
-                onClick={() => setAndRun({ filters: filters.filter((_, j) => j !== i) })}
-              />
+              <IconButton name="trash-alt" aria-label="remove filter" onClick={() => setAndRun({ filters: filters.filter((_, j) => j !== i) })} />
             </InlineFieldRow>
           ))}
-          <Button
-            variant="secondary"
-            size="sm"
-            icon="plus"
-            onClick={() => set({ filters: [...filters, { attr: '', op: '==', value: '' }] })}
-          >
+          <Button variant="secondary" size="sm" icon="plus" onClick={() => set({ filters: [...filters, { attr: '', op: '==', value: '' }] })}>
             Add filter
           </Button>
 
@@ -234,7 +263,7 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
                 onBlur={() => onRunQuery()}
               />
             </InlineField>
-            <InlineField label="Desc" labelWidth={8}>
+            <InlineField label="Dir" labelWidth={6}>
               <RadioButtonGroup
                 options={[
                   { label: 'Asc', value: false },
@@ -244,7 +273,7 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
                 onChange={(v) => setAndRun({ orderDesc: v })}
               />
             </InlineField>
-            <InlineField label="Limit" labelWidth={8}>
+            <InlineField label="Limit" labelWidth={7}>
               <Input
                 width={12}
                 type="number"

@@ -1,9 +1,17 @@
 {
-  "extends": "./.config/tsconfig.json",
-  "include": ["src", "types", "./.config/types"],
   "compilerOptions": {
-    "rootDirs": [".", "./.config"],
-    "baseUrl": "./src",
-    "typeRoots": ["./node_modules/@types"]
-  }
+    "target": "ES2020",
+    "module": "esnext",
+    "moduleResolution": "node",
+    "jsx": "react-jsx",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "types": ["node"]
+  },
+  "include": ["src"]
 }

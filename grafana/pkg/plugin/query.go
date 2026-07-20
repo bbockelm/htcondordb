@@ -29,6 +29,11 @@ type queryModel struct {
 
 	// Format hints frame shaping: "timeseries" or "table" (default).
 	Format string `json:"format"`
+
+	// Stream requests a live tail of the table's change stream (htcondordb WATCH)
+	// instead of a one-shot query. Builder-only: Table (and optional Columns) select
+	// what to watch. QueryData returns a live channel; the StreamHandler drives it.
+	Stream bool `json:"stream"`
 }
 
 // metricDef is one aggregate in the builder, e.g. {Func:"AVG", Attr:"Cpus"} or

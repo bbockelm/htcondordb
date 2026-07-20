@@ -34,6 +34,10 @@ export interface HtcondordbQuery extends DataQuery {
   limit?: number;
 
   format?: 'table' | 'timeseries';
+
+  // stream tails the table's change stream (htcondordb WATCH) live instead of
+  // running a one-shot query. Builder-only; uses table + columns.
+  stream?: boolean;
 }
 
 export const DEFAULT_QUERY: Partial<HtcondordbQuery> = {

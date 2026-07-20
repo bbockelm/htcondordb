@@ -21,6 +21,8 @@ import (
 var (
 	_ backend.QueryDataHandler      = (*Datasource)(nil)
 	_ backend.CheckHealthHandler    = (*Datasource)(nil)
+	_ backend.CallResourceHandler   = (*Datasource)(nil)
+	_ backend.StreamHandler         = (*Datasource)(nil)
 	_ instancemgmt.InstanceDisposer = (*Datasource)(nil)
 )
 
@@ -32,11 +34,13 @@ type datasourceSettings struct {
 	ConnectTimeoutSeconds int `json:"connectTimeoutSeconds"`
 }
 
-// Datasource is one configured htcondordb datasource instance. It holds no
-// long-lived connection: each QueryData/CheckHealth dials its own dbrpc session,
-// which keeps the plugin robust to server restarts and avoids stale sessions.
+// Datasource is one configured htcondordb datasource instance. Request/response
+// queries share a pooled dbrpc session (connManager); streaming queries open their
+// own watch connection.
 type Datasource struct {
-	cfg connConfig
+	cfg   connConfig
+	uid   string
+	conns *connManager
 }
 
 // NewDatasource is the instance factory registered with the SDK. Grafana calls it
@@ -62,44 +66,63 @@ func NewDatasource(_ context.Context, s backend.DataSourceInstanceSettings) (ins
 	if js.ConnectTimeoutSeconds > 0 {
 		cfg.ConnectTimeout = time.Duration(js.ConnectTimeoutSeconds) * time.Second
 	}
-	return &Datasource{cfg: cfg}, nil
+	return &Datasource{cfg: cfg, uid: s.UID, conns: newConnManager(cfg)}, nil
 }
 
-// Dispose is called when an instance is replaced or removed. Nothing to release --
-// the plugin holds no persistent connections.
-func (d *Datasource) Dispose() {}
+// Dispose is called when an instance is replaced or removed; close the pooled
+// session.
+func (d *Datasource) Dispose() { d.conns.close() }
 
-// QueryData opens one dbrpc session for the whole request and runs each query
-// through the repl SQL engine. A per-query error is attached to that query's
-// response so one bad query does not sink the panel's other queries; a connection
-// failure fails the whole batch (there is nothing to run against).
+// QueryData runs each query. Regular queries share one pooled dbrpc session and
+// execute through the repl SQL engine; streaming queries return a live channel
+// (the StreamHandler drives it). A per-query error is attached to that query's
+// response so one bad query does not sink the others.
 func (d *Datasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
 	resp := backend.NewQueryDataResponse()
 
-	sess, err := connect(ctx, d.cfg)
-	if err != nil {
-		for _, q := range req.Queries {
-			resp.Responses[q.RefID] = backend.ErrDataResponse(backend.StatusBadGateway, err.Error())
+	var exec *repl.Executor
+	var execErr error
+	getExec := func() (*repl.Executor, error) {
+		if exec == nil && execErr == nil {
+			exec, execErr = d.conns.executor(ctx)
 		}
-		return resp, nil
+		return exec, execErr
 	}
-	defer sess.cleanup()
 
-	exec := repl.NewExecutor(sess.client, repl.ExecConfig{})
+	connBroken := false
 	for _, q := range req.Queries {
-		resp.Responses[q.RefID] = d.runQuery(exec, q)
+		var qm queryModel
+		if err := json.Unmarshal(q.JSON, &qm); err != nil {
+			resp.Responses[q.RefID] = backend.ErrDataResponse(backend.StatusBadRequest, fmt.Sprintf("parsing query: %v", err))
+			continue
+		}
+		if qm.Stream {
+			resp.Responses[q.RefID] = d.streamQueryResponse(q.RefID, qm)
+			continue
+		}
+		e, err := getExec()
+		if err != nil {
+			resp.Responses[q.RefID] = backend.ErrDataResponse(backend.StatusBadGateway, err.Error())
+			continue
+		}
+		dr, broken := d.runSQL(e, q, qm)
+		connBroken = connBroken || broken
+		resp.Responses[q.RefID] = dr
+	}
+	// If the shared session died mid-batch, drop it so the next request redials.
+	if connBroken {
+		d.conns.reset()
 	}
 	return resp, nil
 }
 
-func (d *Datasource) runQuery(exec *repl.Executor, q backend.DataQuery) backend.DataResponse {
-	var qm queryModel
-	if err := json.Unmarshal(q.JSON, &qm); err != nil {
-		return backend.ErrDataResponse(backend.StatusBadRequest, fmt.Sprintf("parsing query: %v", err))
-	}
+// runSQL renders the query to SQL, executes it, and maps the result to a frame.
+// The bool reports whether the failure was connection-level (so the caller resets
+// the pooled session).
+func (d *Datasource) runSQL(exec *repl.Executor, q backend.DataQuery, qm queryModel) (backend.DataResponse, bool) {
 	sql, err := qm.toSQL(newTimeRange(q.TimeRange.From, q.TimeRange.To))
 	if err != nil {
-		return backend.ErrDataResponse(backend.StatusBadRequest, err.Error())
+		return backend.ErrDataResponse(backend.StatusBadRequest, err.Error()), false
 	}
 	res, err := exec.ExecString(sql)
 	if err != nil {
@@ -107,33 +130,37 @@ func (d *Datasource) runQuery(exec *repl.Executor, q backend.DataQuery) backend.
 		if h := repl.HintFor(err); h != "" {
 			msg += " (" + h + ")"
 		}
-		return backend.ErrDataResponse(backend.StatusInternal, msg)
+		status := backend.StatusInternal
+		if isConnError(err) {
+			status = backend.StatusBadGateway
+		}
+		return backend.ErrDataResponse(status, msg), isConnError(err)
 	}
 	frame := resultToFrame(q.RefID, res, qm.TimeField, qm.Format)
 	if frame.Meta == nil {
 		frame.Meta = &data.FrameMeta{}
 	}
 	frame.Meta.ExecutedQueryString = sql // shown in Grafana's "Query inspector"
-	return backend.DataResponse{Frames: data.Frames{frame}}
+	return backend.DataResponse{Frames: data.Frames{frame}}, false
 }
 
 // CheckHealth verifies the datasource can connect, authenticate, and run a query.
-// The "Save & test" button in the ConfigEditor calls this.
 func (d *Datasource) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
-	sess, err := connect(ctx, d.cfg)
+	exec, err := d.conns.executor(ctx)
 	if err != nil {
+		d.conns.reset()
 		return &backend.CheckHealthResult{
 			Status:  backend.HealthStatusError,
 			Message: "Connection failed: " + err.Error(),
 		}, nil
 	}
-	defer sess.cleanup()
-
-	// A cheap probe query proves the dbrpc session works end to end. If it fails we
-	// are still connected + authenticated (e.g. the default table may not exist),
-	// so report OK with the detail rather than a hard error.
-	exec := repl.NewExecutor(sess.client, repl.ExecConfig{})
 	if _, err := exec.ExecString("SELECT COUNT(*) FROM " + dbrpc.DefaultTable); err != nil {
+		if isConnError(err) {
+			d.conns.reset()
+			return &backend.CheckHealthResult{Status: backend.HealthStatusError, Message: "Connection failed: " + err.Error()}, nil
+		}
+		// Connected + authenticated, but the probe query failed (e.g. the default
+		// table does not exist) -- still healthy.
 		return &backend.CheckHealthResult{
 			Status:  backend.HealthStatusOk,
 			Message: "Connected to htcondordb (probe query failed: " + err.Error() + ")",

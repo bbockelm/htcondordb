@@ -25,6 +25,27 @@ export class DataSource extends DataSourceWithBackend<HtcondordbQuery, Htcondord
     };
   }
 
+  // Builder discovery: the QueryEditor calls these to populate dropdowns from the
+  // backend CallResource endpoints, so users don't memorize schema.
+  async getTables(): Promise<string[]> {
+    try {
+      return (await this.getResource('tables')) ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  async getAttributes(table: string): Promise<string[]> {
+    if (!table) {
+      return [];
+    }
+    try {
+      return (await this.getResource('attributes', { table })) ?? [];
+    } catch {
+      return [];
+    }
+  }
+
   // Skip running queries that have nothing to execute (avoids spurious errors on
   // a freshly added, empty query row).
   filterQuery(query: HtcondordbQuery): boolean {

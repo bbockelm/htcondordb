@@ -1,0 +1,94 @@
+name: Grafana plugin
+
+# Builds the htcondordb Grafana datasource plugin (grafana/): the Go backend as a
+# standalone module (GOWORK=off, i.e. how a consumer builds it), the TypeScript
+# frontend, and a combined plugin bundle. Path-filtered so it only runs on plugin
+# changes.
+on:
+  push:
+    branches: [main]
+    paths: ['grafana/**', '.github/workflows/grafana-plugin.yml']
+  pull_request:
+    paths: ['grafana/**', '.github/workflows/grafana-plugin.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: grafana
+
+jobs:
+  backend:
+    name: Backend (Go)
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off" # build/test the plugin as a standalone module using tagged deps
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25'
+          cache-dependency-path: grafana/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -s -l .)" || { gofmt -s -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+
+  frontend:
+    name: Frontend (TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: grafana/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Verify frontend assets
+        run: test -f dist/module.js && test -f dist/plugin.json && test -f dist/img/logo.svg
+
+  package:
+    name: Full plugin bundle
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    env:
+      GOWORK: "off"
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25'
+          cache-dependency-path: grafana/go.sum
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: grafana/package-lock.json
+      - name: Build frontend
+        run: npm ci && npm run build
+      - name: Cross-compile backend binaries (pure Go, all supported platforms)
+        run: |
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os="${t%/*}"; arch="${t#*/}"; ext=""; [ "$os" = "windows" ] && ext=".exe"
+            echo "building gpx_htcondordb_${os}_${arch}${ext}"
+            GOOS="$os" GOARCH="$arch" go build -trimpath -o "dist/gpx_htcondordb_${os}_${arch}${ext}" ./pkg
+          done
+      - name: Verify full bundle (frontend + all backend binaries)
+        run: |
+          test -f dist/module.js
+          test -f dist/plugin.json
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            test -f "dist/gpx_htcondordb_${t%/*}_${t#*/}"
+          done
+          test -f dist/gpx_htcondordb_windows_amd64.exe
+          ls -l dist/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bbockelm-htcondordb-datasource
+          path: grafana/dist
+          if-no-files-found: error
