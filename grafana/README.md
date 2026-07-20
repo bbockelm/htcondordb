@@ -79,6 +79,23 @@ loadable plugin (point Grafana's `plugins` path at it, or zip it). Unsigned plug
 for local use. CI (`.github/workflows/grafana-plugin.yml`) runs exactly these
 steps for all platforms and uploads the combined bundle as an artifact.
 
+## End-to-end test
+
+`e2e/` contains a browser-level test (Playwright + `@grafana/plugin-e2e`) that runs
+the whole stack in docker-compose — a real htcondordb server preloaded with sample
+ads (`e2e/sample-data.sql`) plus Grafana with this plugin — and drives the UI to
+**configure the datasource** (and pass its health check) and **build a dashboard
+panel** that queries the data.
+
+```sh
+npm run e2e        # build dist -> compose up --wait -> playwright test
+npm run e2e:down   # stop + remove the stack
+```
+
+The htcondordb container runs with a throwaway anonymous-read/write config so the
+plugin connects without credentials; Grafana loads the unsigned plugin and a
+provisioned datasource. CI runs this as the `E2E (Playwright)` job.
+
 ## Limitations / follow-ups
 
 - **No `$__timeGroup` macro.** The htcondordb SQL engine's SELECT/GROUP BY accept

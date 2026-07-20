@@ -71,10 +71,12 @@ func connect(ctx context.Context, cc connConfig) (*dbSession, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connecting to htcondordb at %s: %w", cc.Address, err)
 	}
-	// dbrpc rides the still-authenticated stream; NewCedarConn takes the long-lived
-	// ctx (not the dial-timeout one) so the session is not torn down when connect
-	// returns.
-	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()))
+	// dbrpc rides the still-authenticated stream. Its context governs the session's
+	// LIFETIME, so it must NOT be the per-request ctx (which Grafana cancels when
+	// the handler returns -- that would kill a pooled session between requests).
+	// Use Background; the session ends only when cleanup() closes it (pool reset /
+	// Dispose, or the stream ending).
+	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(context.Background(), cl.GetStream()))
 	return &dbSession{
 		client:  dbc,
 		cleanup: func() { _ = dbc.Close(); _ = cl.Close() },

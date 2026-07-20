@@ -91,6 +91,7 @@ export function QueryEditor({ datasource, query, onChange, onRunQuery }: Props) 
     <InlineField label="Table" labelWidth={LABEL_WIDTH} tooltip="Discovered from the server; type to add a custom name.">
       <Select
         width={28}
+        data-testid="htcondordb-query-table"
         options={tableOptions}
         value={q.table ? opt(q.table) : null}
         allowCustomValue

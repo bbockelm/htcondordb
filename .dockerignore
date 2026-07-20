@@ -1,0 +1,5 @@
+.git
+grafana/node_modules
+grafana/dist
+grafana/.playwright
+**/*.log

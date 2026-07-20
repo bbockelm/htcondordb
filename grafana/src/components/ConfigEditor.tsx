@@ -46,6 +46,7 @@ export function ConfigEditor(props: Props) {
       >
         <Input
           width={40}
+          data-testid="htcondordb-config-address"
           value={jsonData.address ?? ''}
           placeholder="condordb.example.edu:9619"
           onChange={onAddressChange}

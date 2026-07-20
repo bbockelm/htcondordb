@@ -1,0 +1,44 @@
+# E2E stack for the htcondordb Grafana datasource plugin:
+#   - htcondordb: the DB server, preloaded with sample ads (Dockerfile.htcondordb)
+#   - grafana:    Grafana OSS with the built plugin mounted, unsigned + anon-admin
+#
+# Grafana reaches the DB by service name (htcondordb:9630) on the compose network;
+# the plugin backend (inside the Grafana container) dials it. Playwright drives
+# Grafana on the host at http://localhost:3000.
+services:
+  htcondordb:
+    build:
+      context: ../..
+      dockerfile: grafana/e2e/Dockerfile.htcondordb
+    ports:
+      - "9630:9630"
+    healthcheck:
+      test: ["CMD-SHELL", "htcondordb-cli -addr 127.0.0.1:9630 -e 'SELECT COUNT(*) FROM machines' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  grafana:
+    image: grafana/grafana-oss:11.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_DEFAULT_APP_MODE: development
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: bbockelm-htcondordb-datasource
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_BASIC_ENABLED: "true"
+      GF_LOG_LEVEL: warn
+    volumes:
+      - ../dist:/var/lib/grafana/plugins/bbockelm-htcondordb-datasource
+      - ./provisioning:/etc/grafana/provisioning
+    depends_on:
+      htcondordb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s

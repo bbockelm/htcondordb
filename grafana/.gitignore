@@ -5,3 +5,7 @@
 coverage
 # Go
 /pkg/**/*.test
+# Playwright / e2e
+/playwright
+/playwright-report
+/test-results
