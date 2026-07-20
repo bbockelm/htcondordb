@@ -9,3 +9,5 @@ coverage
 /playwright
 /playwright-report
 /test-results
+/e2e/demo-output
+/e2e/*.webm

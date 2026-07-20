@@ -23,6 +23,9 @@ export default defineConfig<PluginOptions>({
     { name: 'auth', testDir: pluginE2eAuth, testMatch: [/.*\.js/] },
     {
       name: 'e2e',
+      // The demo (video walkthrough) is run on demand via playwright.demo.config.ts,
+      // not as part of the normal/CI suite.
+      testIgnore: /demo\.spec\.ts/,
       use: { ...devices['Desktop Chrome'], storageState: 'playwright/.auth/admin.json' },
       dependencies: ['auth'],
     },

@@ -182,6 +182,7 @@ export function QueryEditor({ datasource, query, onChange, onRunQuery }: Props) 
             <InlineField label="Group by" labelWidth={LABEL_WIDTH}>
               <MultiSelect
                 width={48}
+                data-testid="htcondordb-query-groupby"
                 options={attrOptions}
                 value={(q.groupBy ?? []).map(opt)}
                 allowCustomValue
@@ -214,7 +215,7 @@ export function QueryEditor({ datasource, query, onChange, onRunQuery }: Props) 
               <IconButton name="trash-alt" aria-label="remove metric" onClick={() => setAndRun({ metrics: metrics.filter((_, j) => j !== i) })} />
             </InlineFieldRow>
           ))}
-          <Button variant="secondary" size="sm" icon="plus" onClick={() => set({ metrics: [...metrics, { func: 'COUNT', attr: '*' }] })}>
+          <Button variant="secondary" size="sm" icon="plus" data-testid="htcondordb-add-metric" onClick={() => set({ metrics: [...metrics, { func: 'COUNT', attr: '*' }] })}>
             Add metric
           </Button>
 
