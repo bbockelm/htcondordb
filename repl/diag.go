@@ -43,6 +43,8 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.maintenance(console, arg, "rewrite")
 	case ".retrain":
 		s.maintenance(console, arg, "codec.retrain")
+	case ".memory":
+		s.convertToMemory(console, arg)
 	default:
 		return false
 	}
@@ -430,6 +432,21 @@ func (s *session) refreshHot(console io.Writer, arg string) {
 // admin runs a management action on the current table and prints the result.
 func (s *session) admin(console io.Writer, action string, args ...string) {
 	s.adminTable(console, s.table, action, args...)
+}
+
+// convertToMemory drops a table's on-disk backing, keeping its data in RAM only. It targets
+// the argument table, or the current table if none is given. Requires DAEMON authorization
+// at the daemon; best run during low write activity (a racing write can be lost).
+func (s *session) convertToMemory(console io.Writer, arg string) {
+	table := s.tableArg(arg)
+	if err := s.exec.ConvertTableToMemory(table); err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		if h := HintFor(err); h != "" {
+			fmt.Fprintf(console, "  hint: %s\n", h)
+		}
+		return
+	}
+	fmt.Fprintf(console, "table %q is now memory-only (on-disk backing dropped; data gone after a daemon restart)\n", table)
 }
 
 // adminTable runs a management action on a named table and prints the result.

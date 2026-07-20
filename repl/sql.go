@@ -59,6 +59,10 @@ type Statement struct {
 	// IndexKind is "value" or "categorical" for CREATE INDEX.
 	IndexKind string
 
+	// InMemory is set by CREATE TABLE <name> MEMORY: create the table as RAM-only
+	// (data not persisted across a server restart).
+	InMemory bool
+
 	// MatchResource is the resource table for a MATCH statement (Table is the
 	// request table); TargetWhere is the pushed-down resource-side filter; Key,
 	// if set, matches only that single request key; MatchUsing lists the
@@ -437,7 +441,9 @@ func (p *parser) parseCreate() (*Statement, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Statement{Kind: StmtCreateTable, Table: name}, nil
+		// Optional MEMORY: create the table as RAM-only (non-persistent).
+		inMemory := p.takeKeyword("MEMORY")
+		return &Statement{Kind: StmtCreateTable, Table: name, InMemory: inMemory}, nil
 	}
 	// Optional index kind before INDEX; default value.
 	kind := "value"
