@@ -471,7 +471,24 @@ func constraint(where string) string {
 // queryAds runs the WHERE query against table and parses each returned ad.
 // limit > 0 pushes a row cap to the server so it stops the scan early (0 = all).
 func (e *Executor) queryAds(table, where string, limit int) ([]*classad.ClassAd, error) {
-	texts, err := e.c.QueryTable(context.Background(), table, constraint(where), limit)
+	return e.queryAdsAsOf(table, where, limit, "")
+}
+
+// queryAdsAsOf is queryAds with an optional point-in-time instant (asOf). When asOf is
+// empty it reads the current state; otherwise it parses asOf and issues a time-travel
+// query. asOf accepts RFC3339, "2006-01-02 15:04:05", or a relative look-back ("-1h").
+func (e *Executor) queryAdsAsOf(table, where string, limit int, asOf string) ([]*classad.ClassAd, error) {
+	var texts []string
+	var err error
+	if asOf == "" {
+		texts, err = e.c.QueryTable(context.Background(), table, constraint(where), limit)
+	} else {
+		var at time.Time
+		if at, err = parseAsOf(asOf); err != nil {
+			return nil, err
+		}
+		texts, err = e.c.QueryAsOfTable(context.Background(), table, constraint(where), limit, at)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -503,7 +520,7 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	if st.Limit > 0 && len(st.OrderBy) == 0 && !st.Distinct {
 		pushLimit = st.Limit
 	}
-	ads, err := e.queryAds(st.Table, st.Where, pushLimit)
+	ads, err := e.queryAdsAsOf(st.Table, st.Where, pushLimit, st.AsOf)
 	if err != nil {
 		return nil, err
 	}
@@ -567,6 +584,12 @@ func effectiveGroupBy(st *Statement) []string {
 // execAggregate runs a GROUP BY / aggregate query on the server and assembles the
 // tabular result in the SELECT's column order, then applies ORDER BY and LIMIT.
 func (e *Executor) execAggregate(st *Statement, groupBy []string) (*Result, error) {
+	// Point-in-time aggregates are computed client-side over the AS OF rows (the
+	// server aggregate pushdown is current-time only). Fetch the historical rows and
+	// group/reduce locally.
+	if st.AsOf != "" {
+		return e.execAggregateAsOf(st, groupBy)
+	}
 	// Build the aggregate specs (in item order) and the group-column index map.
 	var aggs []dbrpc.AggSpec
 	groupIdx := map[string]int{}
@@ -619,6 +642,159 @@ func (e *Executor) execAggregate(st *Statement, groupBy []string) (*Result, erro
 		res.Rows = res.Rows[:st.Limit]
 	}
 	return res, nil
+}
+
+// execAggregateAsOf computes a GROUP BY / aggregate SELECT over a point-in-time
+// snapshot by fetching the AS OF rows and grouping/reducing them client-side (the
+// server aggregate pushdown has no time-travel variant in v1).
+func (e *Executor) execAggregateAsOf(st *Statement, groupBy []string) (*Result, error) {
+	ads, err := e.queryAdsAsOf(st.Table, st.Where, 0, st.AsOf)
+	if err != nil {
+		return nil, err
+	}
+	groupIdx := map[string]int{}
+	for i, g := range groupBy {
+		groupIdx[strings.ToLower(g)] = i
+	}
+	// Bucket ads by their group-column tuple, preserving first-seen order.
+	type bucket struct {
+		group []string
+		ads   []*classad.ClassAd
+	}
+	var order []string
+	buckets := map[string]*bucket{}
+	for _, ad := range ads {
+		g := make([]string, len(groupBy))
+		for i, col := range groupBy {
+			g[i] = valueDisplay(ad.EvaluateAttr(col))
+		}
+		key := strings.Join(g, "\x00")
+		b := buckets[key]
+		if b == nil {
+			b = &bucket{group: g}
+			buckets[key] = b
+			order = append(order, key)
+		}
+		b.ads = append(b.ads, ad)
+	}
+	// With no GROUP BY and no rows, aggregates over the empty set still yield one row
+	// (e.g. COUNT(*) = 0).
+	if len(groupBy) == 0 && len(order) == 0 {
+		order = []string{""}
+		buckets[""] = &bucket{}
+	}
+
+	res := &Result{IsSelect: true}
+	for _, it := range st.Items {
+		res.Columns = append(res.Columns, it.header())
+	}
+	for _, key := range order {
+		b := buckets[key]
+		row := make([]string, 0, len(st.Items))
+		for _, it := range st.Items {
+			if it.IsAggregate() {
+				row = append(row, aggregateAds(it, b.ads))
+			} else if idx, ok := groupIdx[strings.ToLower(it.Col)]; ok && idx < len(b.group) {
+				row = append(row, b.group[idx])
+			} else {
+				row = append(row, "")
+			}
+		}
+		res.Rows = append(res.Rows, row)
+	}
+	if len(st.OrderBy) > 0 {
+		if err := sortRows(res, st.OrderBy); err != nil {
+			return nil, err
+		}
+	}
+	if st.Limit > 0 && len(res.Rows) > st.Limit {
+		res.Rows = res.Rows[:st.Limit]
+	}
+	return res, nil
+}
+
+// aggregateAds reduces one aggregate item over a group's ads (client-side, for AS OF).
+func aggregateAds(it SelectItem, ads []*classad.ClassAd) string {
+	switch strings.ToUpper(it.Agg) {
+	case "COUNT":
+		if it.Col == "*" || it.Col == "" {
+			return strconv.Itoa(len(ads))
+		}
+		n := 0
+		for _, ad := range ads {
+			if v := ad.EvaluateAttr(it.Col); !v.IsUndefined() && !v.IsError() {
+				n++
+			}
+		}
+		return strconv.Itoa(n)
+	case "SUM", "AVG", "MIN", "MAX":
+		var sum, min, max float64
+		n := 0
+		for _, ad := range ads {
+			f, ok := numValue(ad.EvaluateAttr(it.Col))
+			if !ok {
+				continue
+			}
+			if n == 0 || f < min {
+				min = f
+			}
+			if n == 0 || f > max {
+				max = f
+			}
+			sum += f
+			n++
+		}
+		if n == 0 {
+			return "" // no numeric values
+		}
+		switch strings.ToUpper(it.Agg) {
+		case "SUM":
+			return trimFloat(sum)
+		case "AVG":
+			return trimFloat(sum / float64(n))
+		case "MIN":
+			return trimFloat(min)
+		default:
+			return trimFloat(max)
+		}
+	}
+	return ""
+}
+
+// numValue extracts a float from an integer/real ClassAd value.
+func numValue(v classad.Value) (float64, bool) {
+	if v.IsInteger() {
+		i, _ := v.IntValue()
+		return float64(i), true
+	}
+	if v.IsReal() {
+		r, _ := v.RealValue()
+		return r, true
+	}
+	return 0, false
+}
+
+// parseAsOf parses a point-in-time instant for FOR SYSTEM_TIME AS OF: RFC3339, a
+// "2006-01-02 15:04:05" datetime (interpreted in local time), a bare "2006-01-02"
+// date, or a relative look-back like "-1h" / "-30m" (subtracted from now).
+func parseAsOf(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, fmt.Errorf("empty AS OF timestamp")
+	}
+	if s[0] == '-' || s[0] == '+' {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("AS OF %q: bad relative duration: %w", s, err)
+		}
+		return time.Now().Add(d), nil
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("AS OF %q: not a recognized timestamp (use RFC3339, \"2006-01-02 15:04:05\", or a relative \"-1h\")", s)
 }
 
 // aggFunc maps a SQL aggregate name to the dbrpc function code.

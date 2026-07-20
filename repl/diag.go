@@ -52,10 +52,50 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.showViews(console)
 	case ".export":
 		s.exportViews(console, arg)
+	case ".timetravel":
+		s.timeTravel(console, arg)
 	default:
 		return false
 	}
 	return true
+}
+
+// timeTravel handles ".timetravel on <window> [checkpoint] | off" for the current
+// table, dispatching to the DAEMON-gated timetravel.* admin actions. Durations are Go
+// duration strings (e.g. 168h, 1m); enabling is not retroactive.
+func (s *session) timeTravel(console io.Writer, arg string) {
+	fields := strings.Fields(arg)
+	if len(fields) == 0 {
+		fmt.Fprintln(console, "usage: .timetravel on <window> [checkpoint] | off   (e.g. .timetravel on 168h 1m)")
+		return
+	}
+	secs := func(d time.Duration) string { return fmt.Sprintf("%d", int(d/time.Second)) }
+	switch strings.ToLower(fields[0]) {
+	case "off", "disable":
+		s.admin(console, "timetravel.disable")
+	case "on", "enable":
+		if len(fields) < 2 {
+			fmt.Fprintln(console, "usage: .timetravel on <window> [checkpoint]  (e.g. .timetravel on 168h 1m)")
+			return
+		}
+		maxD, err := time.ParseDuration(fields[1])
+		if err != nil || maxD <= 0 {
+			fmt.Fprintf(console, "error: bad window %q (use a duration like 168h)\n", fields[1])
+			return
+		}
+		args := []string{secs(maxD)}
+		if len(fields) > 2 {
+			ckpt, err := time.ParseDuration(fields[2])
+			if err != nil || ckpt < 0 {
+				fmt.Fprintf(console, "error: bad checkpoint interval %q\n", fields[2])
+				return
+			}
+			args = append(args, secs(ckpt))
+		}
+		s.admin(console, "timetravel.enable", args...)
+	default:
+		fmt.Fprintf(console, "unknown .timetravel subcommand %q (use: on <window> [checkpoint] | off)\n", fields[0])
+	}
 }
 
 // tableArg returns arg as the target table if given, else the current table.

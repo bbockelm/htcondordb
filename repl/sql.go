@@ -104,6 +104,11 @@ type Statement struct {
 	// Since is the WATCH start point: "now" (default; live changes only) or
 	// "beginning" (replay the current contents, then live).
 	Since string
+
+	// AsOf, if set, is the point-in-time ("FOR SYSTEM_TIME AS OF '<ts>'") instant a
+	// SELECT reads at -- a timestamp (RFC3339 / "2006-01-02 15:04:05") or a relative
+	// look-back like "-1h". Empty means read the current state.
+	AsOf string
 }
 
 // SelectItem is one projected column or aggregate. For "*", Star is set. For a
@@ -679,6 +684,29 @@ func (p *parser) parseSelect() (*Statement, error) {
 		return nil, err
 	}
 	st.Table = table
+	// Optional temporal clause (SQL:2011 "FOR SYSTEM_TIME AS OF <ts>", or the shorter
+	// "AS OF <ts>"), right after the table name -- a point-in-time read.
+	if p.takeKeyword("FOR") {
+		if err := p.expectKeyword("SYSTEM_TIME"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("AS"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("OF"); err != nil {
+			return nil, err
+		}
+		if st.AsOf, err = p.parseStringLiteral(); err != nil {
+			return nil, err
+		}
+	} else if p.takeKeyword("AS") {
+		if err := p.expectKeyword("OF"); err != nil {
+			return nil, err
+		}
+		if st.AsOf, err = p.parseStringLiteral(); err != nil {
+			return nil, err
+		}
+	}
 	if err := p.rejectJoins(); err != nil {
 		return nil, err
 	}
