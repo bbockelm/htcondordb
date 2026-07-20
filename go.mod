@@ -4,8 +4,8 @@ go 1.25.7
 
 require (
 	github.com/PelicanPlatform/classad v0.9.1
-	github.com/PelicanPlatform/classad/db v0.10.1
-	github.com/PelicanPlatform/classad/dbrpc v0.10.0
+	github.com/PelicanPlatform/classad/db v0.10.2
+	github.com/PelicanPlatform/classad/dbrpc v0.10.2
 	github.com/bbockelm/cedar v0.6.1
 	github.com/bbockelm/golang-htcondor v0.8.1
 	github.com/chzyer/readline v1.5.1
