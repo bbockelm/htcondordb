@@ -3,7 +3,8 @@ module github.com/bbockelm/htcondordb/grafana
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad/dbrpc v0.11.0
+	github.com/PelicanPlatform/classad v0.11.0
+	github.com/PelicanPlatform/classad/dbrpc v0.11.1-0.20260720184351-c0ef33329ccc
 	github.com/bbockelm/cedar v0.6.1
 	github.com/bbockelm/golang-htcondor v0.8.1
 	github.com/bbockelm/htcondordb v0.0.0
@@ -11,9 +12,9 @@ require (
 )
 
 require (
-	github.com/PelicanPlatform/classad v0.11.0 // indirect
+	github.com/BurntSushi/toml v1.5.0 // indirect
 	github.com/PelicanPlatform/classad/collections v0.11.0 // indirect
-	github.com/PelicanPlatform/classad/db v0.11.0 // indirect
+	github.com/PelicanPlatform/classad/db v0.11.1-0.20260720184351-c0ef33329ccc // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/apache/arrow-go/v18 v18.5.2 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
@@ -24,6 +25,7 @@ require (
 	github.com/cheekybits/genny v1.0.0 // indirect
 	github.com/clipperhouse/displaywidth v0.10.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.6.0 // indirect
+	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -53,6 +55,7 @@ require (
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.19.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+	github.com/magefile/mage v1.16.1 // indirect
 	github.com/mattetti/filebuffer v1.0.1 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
@@ -73,7 +76,12 @@ require (
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.0 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
+	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
+	github.com/unknwon/bra v0.0.0-20200517080246-1e3013ecaff8 // indirect
+	github.com/unknwon/com v1.0.1 // indirect
+	github.com/unknwon/log v0.0.0-20150304194804-e617c87089d3 // indirect
+	github.com/urfave/cli v1.22.17 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.67.0 // indirect
@@ -102,6 +110,7 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
 	google.golang.org/grpc v1.79.3 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
+	gopkg.in/fsnotify/fsnotify.v1 v1.4.7 // indirect
 )
 
 // The plugin lives inside the htcondordb repo and reuses its repl SQL engine.
