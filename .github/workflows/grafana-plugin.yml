@@ -71,21 +71,23 @@ jobs:
           cache-dependency-path: grafana/package-lock.json
       - name: Build frontend
         run: npm ci && npm run build
-      - name: Cross-compile backend binaries (pure Go, all supported platforms)
+      - name: Cross-compile backend binaries (pure Go)
+        # Unix only: the htcondordb server stack (cedar shared-port, droppriv,
+        # logging) uses Unix-specific syscalls, so the backend does not build for
+        # Windows. Grafana deployments that use this datasource run on Linux/macOS.
         run: |
-          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
-            os="${t%/*}"; arch="${t#*/}"; ext=""; [ "$os" = "windows" ] && ext=".exe"
-            echo "building gpx_htcondordb_${os}_${arch}${ext}"
-            GOOS="$os" GOARCH="$arch" go build -trimpath -o "dist/gpx_htcondordb_${os}_${arch}${ext}" ./pkg
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${t%/*}"; arch="${t#*/}"
+            echo "building gpx_htcondordb_${os}_${arch}"
+            GOOS="$os" GOARCH="$arch" go build -trimpath -o "dist/gpx_htcondordb_${os}_${arch}" ./pkg
           done
-      - name: Verify full bundle (frontend + all backend binaries)
+      - name: Verify full bundle (frontend + backend binaries)
         run: |
           test -f dist/module.js
           test -f dist/plugin.json
           for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             test -f "dist/gpx_htcondordb_${t%/*}_${t#*/}"
           done
-          test -f dist/gpx_htcondordb_windows_amd64.exe
           ls -l dist/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

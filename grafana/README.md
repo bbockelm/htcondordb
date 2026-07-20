@@ -72,8 +72,9 @@ CGO_ENABLED=0 go build -o dist/gpx_htcondordb_linux_amd64 ./pkg
 # ...repeat per GOOS/GOARCH you need to serve.
 ```
 
-`dist/` is then the loadable plugin (point Grafana's `plugins` path at it, or zip
-it). Unsigned plugins require
+The backend is **Unix only** (Linux/macOS): htcondordb's server stack uses
+Unix-specific syscalls, so it does not build for Windows. `dist/` is then the
+loadable plugin (point Grafana's `plugins` path at it, or zip it). Unsigned plugins require
 `allow_loading_unsigned_plugins = bbockelm-htcondordb-datasource` in `grafana.ini`
 for local use. CI (`.github/workflows/grafana-plugin.yml`) runs exactly these
 steps for all platforms and uploads the combined bundle as an artifact.
