@@ -66,6 +66,8 @@ load subcommand:
   -auto               route each ad to a table named for its MyType
   -key <attr>         source attribute used as the primary key (default: Name)
 
+  -version            print version and exit
+
 Interactive meta-commands: .tables .use .help .format .output .quit
   (type .help in the shell)
 
@@ -74,6 +76,10 @@ DISTINCT, aggregates (COUNT/SUM/AVG/MIN/MAX), GROUP BY, ORDER BY, LIMIT;
 CREATE/DROP TABLE and CREATE/DROP INDEX. WHERE is a ClassAd expression
 (==, =?=, undefined, regexp(), ...). Writing requires WRITE at the daemon.
 `
+
+// version is stamped at build time via `-ldflags "-X main.version=..."` (see the
+// Makefile); it is "dev" for a plain `go build`.
+var version = "dev"
 
 func main() {
 	if err := run(); err != nil {
@@ -84,6 +90,10 @@ func main() {
 
 func run() error {
 	fs := parseFlags()
+	if fs.version {
+		fmt.Println("htcondordb-cli", version)
+		return nil
+	}
 	if fs.help {
 		fmt.Print(usageText)
 		return nil
@@ -214,6 +224,7 @@ type flags struct {
 	loadAuto   bool   // `load`: route each ad to a table named for its MyType
 	help       bool
 	debug      bool
+	version    bool
 	args       []string
 }
 
@@ -260,6 +271,8 @@ func parseFlags() *flags {
 			}
 		case "-auto", "--auto":
 			f.loadAuto = true
+		case "-version", "--version":
+			f.version = true
 		case "-h", "-help", "--help":
 			f.help = true
 		default:

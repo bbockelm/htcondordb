@@ -6,6 +6,11 @@
 
 BIN_DIR ?= bin
 
+# Version stamped into both binaries' -version flag (main.version); a plain
+# `go build` without this leaves it "dev".
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -X main.version=$(VERSION)
+
 # Sibling modules are private and resolved directly (replaces point at local
 # checkouts); GOWORK=off keeps a stray workspace file from overriding them.
 GOENV := GOWORK=off GOFLAGS=-mod=mod \
@@ -13,17 +18,20 @@ GOENV := GOWORK=off GOFLAGS=-mod=mod \
          GOPROXY=direct
 GO    ?= go
 
-.PHONY: all build daemon cli test vet tidy clean
+.PHONY: all build daemon cli test vet tidy clean version
 
 all: build
 
 build: daemon cli ## Build both binaries into $(BIN_DIR)
 
 daemon: ## Build the htcondordb daemon
-	$(GOENV) $(GO) build -o $(BIN_DIR)/htcondordb ./cmd/htcondordb
+	$(GOENV) $(GO) build -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/htcondordb ./cmd/htcondordb
 
 cli: ## Build the htcondordb-cli shell/loader
-	$(GOENV) $(GO) build -o $(BIN_DIR)/htcondordb-cli ./cmd/htcondordb-cli
+	$(GOENV) $(GO) build -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/htcondordb-cli ./cmd/htcondordb-cli
+
+version: ## Print the version that would be stamped
+	@echo $(VERSION)
 
 test: ## Run the test suite
 	$(GOENV) $(GO) test ./...
