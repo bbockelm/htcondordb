@@ -3,6 +3,8 @@ package repl
 import (
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +48,10 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.maintenance(console, arg, "codec.retrain")
 	case ".memory":
 		s.convertToMemory(console, arg)
+	case ".views":
+		s.showViews(console)
+	case ".export":
+		s.exportViews(console, arg)
 	default:
 		return false
 	}
@@ -549,4 +555,126 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// Prometheus column-alias prefixes: a projected column named label_<x> becomes a Prometheus
+// label <x>; metric_<y> becomes a sample of the metric <view>_<y>. Columns without either
+// prefix are ignored by the exporter.
+const (
+	viewLabelPrefix  = "label_"
+	viewMetricPrefix = "metric_"
+)
+
+// showViews lists the materialized view names.
+func (s *session) showViews(console io.Writer) {
+	names, err := s.exec.ListViews()
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	if len(names) == 0 {
+		fmt.Fprintln(console, "no materialized views")
+		return
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		fmt.Fprintf(console, "  %s\n", n)
+	}
+}
+
+// exportViews writes the Prometheus text exposition for one view (arg) or, if arg is empty,
+// every view. Each view's rows are rendered from its label_*/metric_* columns.
+func (s *session) exportViews(console io.Writer, arg string) {
+	var names []string
+	if arg = strings.TrimSpace(arg); arg != "" {
+		names = []string{arg}
+	} else {
+		var err error
+		names, err = s.exec.ListViews()
+		if err != nil {
+			fmt.Fprintf(console, "error: %v\n", err)
+			return
+		}
+		sort.Strings(names)
+	}
+	for _, name := range names {
+		if err := s.exportView(console, name); err != nil {
+			fmt.Fprintf(console, "# error exporting %s: %v\n", name, err)
+		}
+	}
+}
+
+func (s *session) exportView(console io.Writer, name string) error {
+	rows, err := s.exec.ViewRows(name)
+	if err != nil {
+		return err
+	}
+	type promSample struct {
+		labels string // pre-rendered `{k="v",...}` (or "" when the row has no labels)
+		value  float64
+	}
+	samples := map[string][]promSample{}
+	var metricOrder []string
+	for _, ad := range rows {
+		attrs := ad.GetAttributes()
+		sort.Strings(attrs)
+
+		// Build this row's label set from its label_* columns.
+		var lbl strings.Builder
+		nlabels := 0
+		for _, a := range attrs {
+			if !strings.HasPrefix(a, viewLabelPrefix) {
+				continue
+			}
+			key := strings.TrimPrefix(a, viewLabelPrefix)
+			val, ok := ad.EvaluateAttrString(a)
+			if !ok {
+				val = ad.EvaluateAttr(a).String()
+			}
+			if nlabels == 0 {
+				lbl.WriteByte('{')
+			} else {
+				lbl.WriteByte(',')
+			}
+			fmt.Fprintf(&lbl, "%s=%q", key, promEscape(val))
+			nlabels++
+		}
+		if nlabels > 0 {
+			lbl.WriteByte('}')
+		}
+		labels := lbl.String()
+
+		// Emit one sample per metric_* column.
+		for _, a := range attrs {
+			if !strings.HasPrefix(a, viewMetricPrefix) {
+				continue
+			}
+			metric := name + "_" + strings.TrimPrefix(a, viewMetricPrefix)
+			v, ok := ad.EvaluateAttrNumber(a)
+			if !ok {
+				continue
+			}
+			if _, seen := samples[metric]; !seen {
+				metricOrder = append(metricOrder, metric)
+			}
+			samples[metric] = append(samples[metric], promSample{labels: labels, value: v})
+		}
+	}
+	sort.Strings(metricOrder)
+	for _, metric := range metricOrder {
+		fmt.Fprintf(console, "# HELP %s Materialized view %q metric.\n", metric, name)
+		fmt.Fprintf(console, "# TYPE %s gauge\n", metric)
+		for _, smp := range samples[metric] {
+			fmt.Fprintf(console, "%s%s %s\n", metric, smp.labels, strconv.FormatFloat(smp.value, 'g', -1, 64))
+		}
+	}
+	return nil
+}
+
+// promEscape escapes a Prometheus label value (backslash, double-quote, newline).
+func promEscape(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	return s
 }
