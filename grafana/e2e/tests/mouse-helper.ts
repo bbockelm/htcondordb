@@ -24,7 +24,10 @@ export async function installMouseHelper(page: Page): Promise<void> {
           border: 2px solid rgba(20,20,20,.85); border-radius: 50%;
           background: rgba(255,255,255,.35);
           box-shadow: 0 0 0 2px rgba(255,255,255,.7), 0 1px 4px rgba(0,0,0,.4);
-          transition: transform .12s ease, background .12s ease;
+          /* Ease left/top so the cursor GLIDES between targets instead of
+             teleporting (Playwright moves the mouse in one hop). slowMo (400ms)
+             > this duration, so it arrives before the click fires. */
+          transition: left .32s ease-out, top .32s ease-out, transform .12s ease, background .12s ease;
         }
         [data-mouse-helper].down {
           transform: scale(.55); background: rgba(56,128,255,.75);
