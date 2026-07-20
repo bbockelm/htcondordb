@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/metrics"
 	"github.com/bbockelm/htcondordb/scheddsync"
 	"github.com/bbockelm/htcondordb/server"
 )
@@ -247,6 +249,27 @@ func run() error {
 	defer ha.close()
 	if err := ha.start(ctx, d, cfg, svc, srv, advertisedAddr(d, ln)); err != nil {
 		return err
+	}
+
+	// Prometheus /metrics endpoint (opt-in via HTCONDORDB_METRICS_ADDRESS, e.g.
+	// ":9095"): a plain HTTP listener exposing per-table storage and operational
+	// timing counters, so the database's health is scrapable directly (not only via a
+	// collector in front of it). It carries no secrets -- storage sizes and timings --
+	// but bind it to a trusted interface.
+	if addr := getStr(cfg, "HTCONDORDB_METRICS_ADDRESS"); addr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metrics.Handler(svc.Catalog()))
+		metricsSrv := &http.Server{Addr: addr, Handler: mux}
+		go func() {
+			<-ctx.Done()
+			_ = metricsSrv.Close()
+		}()
+		go func() {
+			log.Info(logging.DestinationGeneral, "serving Prometheus metrics", "address", addr)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error(logging.DestinationGeneral, "metrics endpoint failed", "err", err.Error())
+			}
+		}()
 	}
 
 	log.Info(logging.DestinationGeneral, "htcondordb starting",

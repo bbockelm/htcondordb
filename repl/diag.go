@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
@@ -117,6 +118,35 @@ func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 	fmt.Fprintf(w, "\nretrained:  %s\n", retrain)
 	if cs.Codec == "identity" {
 		fmt.Fprintln(w, "  (no compression configured; enable ZSTD or run .retrain to train a dictionary)")
+	}
+	showOpStats(w, d.OpStats)
+}
+
+// showOpStats prints the cumulative operational timing counters -- where the store
+// spent time blocked in, or holding, each stall point -- so an operator can see what
+// is "blocking the world" (long shard-write holds, slow syncs, expensive maintenance).
+func showOpStats(w io.Writer, o db.OpStats) {
+	rows := []struct {
+		label string
+		s     db.OpStat
+	}{
+		{"shard write wait", o.ShardWriteWait},
+		{"shard write hold", o.ShardWriteHold},
+		{"segment alloc", o.SegmentAlloc},
+		{"sync (msync)", o.Sync},
+		{"compact", o.Compact},
+		{"retrain", o.Retrain},
+		{"reindex", o.Reindex},
+		{"snapshot lock", o.SnapshotLock},
+	}
+	fmt.Fprintln(w, "operational timings (cumulative):")
+	for _, r := range rows {
+		mean := time.Duration(0)
+		if r.s.Count > 0 {
+			mean = time.Duration(r.s.Nanos / r.s.Count)
+		}
+		fmt.Fprintf(w, "  %-17s n=%-8d total=%-11s mean=%s\n",
+			r.label, r.s.Count, time.Duration(r.s.Nanos), mean)
 	}
 }
 

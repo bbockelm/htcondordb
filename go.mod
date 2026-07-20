@@ -3,24 +3,27 @@ module github.com/bbockelm/htcondordb
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.9.1
-	github.com/PelicanPlatform/classad/db v0.10.2
-	github.com/PelicanPlatform/classad/dbrpc v0.10.2
+	github.com/PelicanPlatform/classad v0.11.0
+	github.com/PelicanPlatform/classad/db v0.11.0
+	github.com/PelicanPlatform/classad/dbrpc v0.11.0
 	github.com/bbockelm/cedar v0.6.1
 	github.com/bbockelm/golang-htcondor v0.8.1
 	github.com/chzyer/readline v1.5.1
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
+	github.com/prometheus/client_golang v1.24.0
 )
 
 require (
-	github.com/PelicanPlatform/classad/collections v0.9.0 // indirect
+	github.com/PelicanPlatform/classad/collections v0.11.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
+	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/hashicorp/go-immutable-radix v1.0.0 // indirect
@@ -37,11 +40,16 @@ require (
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
+	github.com/prometheus/client_model v0.6.2 // indirect
+	github.com/prometheus/common v0.70.0 // indirect
+	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 )
