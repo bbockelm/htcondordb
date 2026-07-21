@@ -6,7 +6,9 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,15 +24,16 @@ const redpandaImage = "redpandadata/redpanda:v24.2.7"
 // the topic back, asserting the exported upserts and a tombstone arrive with the right
 // keys, values, and version headers.
 //
-// It obtains a broker via resolveBroker: an already-running broker named by
-// KAFKASYNC_BROKER (e.g. a CI service or a broker in the same container), else a probe of
-// the default localhost:9092, else a Redpanda container started through the docker CLI.
-// Skipped under -short or when none of those are available.
+// The test launches and manages its own broker (see startBroker): a native redpanda via
+// rpk if present, otherwise a Redpanda container via the docker CLI. Each instance gets its
+// own ephemeral ports and data dir, so tests may run in parallel. Skipped under -short or
+// when neither rpk nor docker is available.
 func TestIntegrationKafkaRoundTrip(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in -short mode")
 	}
-	broker := resolveBroker(t)
+	t.Parallel()
+	broker := startBroker(t)
 
 	// In-process DB + privileged dbrpc server (same harness as the unit tests).
 	dir := t.TempDir()
@@ -105,41 +108,101 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// resolveBroker returns a ready Kafka broker for the integration test, in priority order:
-//
-//  1. KAFKASYNC_BROKER -- an already-running broker (a CI service container, or a broker in
-//     the same container as the test). Fatal if it is set but never becomes ready, so a
-//     misconfigured CI fails loudly instead of silently skipping.
-//  2. a broker already answering at the conventional localhost:9092 (e.g. a Redpanda started
-//     alongside the tests) -- used if it responds within a short probe.
-//  3. a Redpanda dev-container started via the docker CLI (skips if docker is unavailable).
-//
-// If none apply, the test is skipped.
-func resolveBroker(t *testing.T) string {
+// startBroker launches and manages a Redpanda broker for this test and returns its
+// host:port. It prefers a native redpanda (via rpk) and falls back to a Redpanda container
+// via the docker CLI. Every instance binds its own ephemeral ports and data dir, so tests
+// can run in parallel; cleanup is registered on t. Skips when neither rpk nor docker exists.
+func startBroker(t *testing.T) string {
 	t.Helper()
-	if b := strings.TrimSpace(os.Getenv("KAFKASYNC_BROKER")); b != "" {
-		if !brokerReady(b, 60*time.Second) {
-			t.Fatalf("KAFKASYNC_BROKER=%s never became ready", b)
+	// rpk is redpanda's CLI (installed alongside the broker); it is the version-stable way
+	// to launch a dev broker. Prefer it, then fall back to a container via docker.
+	if _, err := exec.LookPath("rpk"); err == nil {
+		return startRedpandaNative(t)
+	}
+	if _, err := exec.LookPath("docker"); err == nil {
+		if out, err := exec.Command("docker", "info").CombinedOutput(); err != nil {
+			t.Skipf("docker present but not usable: %v\n%s", err, out)
 		}
-		return b
+		return startRedpandaDocker(t)
 	}
-	// A broker already listening where we conventionally run one (dev container / sidecar).
-	if brokerReady("localhost:9092", 2*time.Second) {
-		return "localhost:9092"
+	t.Skip("neither rpk (native redpanda) nor docker is available")
+	return ""
+}
+
+// startRedpandaNative launches a native broker via `rpk redpanda start --mode dev-container`
+// on its own ephemeral kafka/rpc/admin ports, with a per-instance data dir and config file
+// so parallel runs never collide. (Redpanda cannot bind :0 and report the chosen port back,
+// so we pre-allocate free ports and pin them.) The process is killed on test cleanup.
+func startRedpandaNative(t *testing.T) string {
+	t.Helper()
+	kport, rport, aport := freePort(t), freePort(t), freePort(t)
+	dir := t.TempDir()
+	broker := fmt.Sprintf("127.0.0.1:%d", kport)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "rpk", append([]string{"redpanda"},
+		redpandaStartArgs("PLAINTEXT://"+broker, "PLAINTEXT://"+broker, rport, aport,
+			"--set", "redpanda.data_directory="+filepath.Join(dir, "data"),
+			"--config", filepath.Join(dir, "redpanda.yaml"))...)...)
+	logBuf := &syncBuffer{}
+	cmd.Stdout, cmd.Stderr = logBuf, logBuf
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Skipf("could not start the redpanda binary: %v", err)
 	}
-	// Fall back to starting our own via docker.
-	if os.Getenv("KAFKASYNC_SKIP_DOCKER") != "" {
-		t.Skip("KAFKASYNC_SKIP_DOCKER set and no reachable broker")
+	t.Cleanup(func() {
+		cancel()
+		_ = cmd.Wait()
+	})
+	if !brokerReady(broker, 60*time.Second) {
+		t.Fatalf("native redpanda did not become ready at %s\n%s", broker, logBuf.String())
 	}
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("no KAFKASYNC_BROKER, no broker at localhost:9092, and docker not in PATH")
+	return broker
+}
+
+// startRedpandaDocker runs a dev-container Redpanda in a container on an ephemeral host port.
+// (The advertised address must be known before start, so we pre-allocate the host port and
+// map it rather than letting docker assign one.) The container is removed on cleanup.
+func startRedpandaDocker(t *testing.T) string {
+	t.Helper()
+	hostPort := freePort(t)
+	broker := fmt.Sprintf("localhost:%d", hostPort)
+	name := fmt.Sprintf("kafkasync-it-%d", hostPort)
+	_ = exec.Command("docker", "rm", "-f", name).Run() // clear any stale container
+	// Same --mode dev-container start args as the native path, inside the container: bind on
+	// 9092 and advertise the mapped host port.
+	args := append([]string{
+		"run", "-d", "--rm", "--name", name,
+		"-p", fmt.Sprintf("127.0.0.1:%d:9092", hostPort),
+		redpandaImage, "redpanda",
+	}, redpandaStartArgs("PLAINTEXT://0.0.0.0:9092", "PLAINTEXT://"+broker, 33145, 9644)...)
+	if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
+		t.Skipf("could not start redpanda container (pull/start failed): %v\n%s", err, out)
 	}
-	if out, err := exec.Command("docker", "info").CombinedOutput(); err != nil {
-		t.Skipf("docker not usable: %v\n%s", err, out)
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", name).Run() })
+	if !brokerReady(broker, 60*time.Second) {
+		t.Fatalf("redpanda container did not become ready at %s", broker)
 	}
-	port := freePort(t)
-	startRedpanda(t, port)
-	return fmt.Sprintf("localhost:%d", port)
+	return broker
+}
+
+// redpandaStartArgs builds the `... start ...` argument list shared by the native and docker
+// launchers. It uses `--mode dev-container`, which both the container's redpanda entrypoint
+// and the native `rpk redpanda start` accept and which is stable across redpanda versions
+// (unlike the raw seastar flags, which drift). extra carries per-launcher options (a native
+// instance adds an isolated data_directory + config path so parallel runs never collide).
+func redpandaStartArgs(kafkaAddr, advertiseAddr string, rpcPort, adminPort int, extra ...string) []string {
+	args := []string{
+		"start", "--mode", "dev-container",
+		"--kafka-addr", kafkaAddr,
+		"--advertise-kafka-addr", advertiseAddr,
+		"--rpc-addr", fmt.Sprintf("127.0.0.1:%d", rpcPort),
+		"--set", fmt.Sprintf(`redpanda.admin=[{"address":"127.0.0.1","port":%d}]`, adminPort),
+		// Keep the optional HTTP listeners off so their default ports never collide.
+		"--set", "pandaproxy.pandaproxy_api=[]",
+		"--set", "schema_registry.schema_registry_api=[]",
+	}
+	return append(args, extra...)
 }
 
 // brokerReady reports whether a Kafka broker at addr answers a metadata ping within timeout.
@@ -161,29 +224,24 @@ func brokerReady(addr string, timeout time.Duration) bool {
 	return false
 }
 
-// startRedpanda launches a dev-container Redpanda mapped to hostPort and registers cleanup.
-func startRedpanda(t *testing.T, hostPort int) {
-	t.Helper()
-	name := fmt.Sprintf("kafkasync-it-%d", hostPort)
-	_ = exec.Command("docker", "rm", "-f", name).Run() // clear any stale container
-	args := []string{
-		"run", "-d", "--rm", "--name", name,
-		"-p", fmt.Sprintf("%d:9092", hostPort),
-		redpandaImage,
-		"redpanda", "start",
-		"--mode", "dev-container", "--smp", "1", "--overprovisioned", "--node-id", "0",
-		"--kafka-addr", "PLAINTEXT://0.0.0.0:9092",
-		"--advertise-kafka-addr", fmt.Sprintf("PLAINTEXT://localhost:%d", hostPort),
-	}
-	if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
-		t.Skipf("could not start redpanda (pull/start failed): %v\n%s", err, out)
-	}
-	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", name).Run() })
+// syncBuffer is a tiny concurrency-safe buffer for capturing a subprocess's output while it
+// runs in the background.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
 
-	broker := fmt.Sprintf("localhost:%d", hostPort)
-	if !brokerReady(broker, 60*time.Second) {
-		t.Fatalf("redpanda did not become ready at %s", broker)
-	}
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
 }
 
 // consumeLatest reads the topic from the start until want() is satisfied (or timeout),

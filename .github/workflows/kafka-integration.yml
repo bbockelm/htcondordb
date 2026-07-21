@@ -1,10 +1,10 @@
 name: kafka-integration
 
-# Runs the kafkasync exporter integration test against a real Kafka broker (Redpanda),
-# started as a container in the runner. The test connects the exporter's dbrpc watch to an
-# in-process htcondordb catalog and asserts the changes land on the topic (upserts + a
-# tombstone, with version headers). KAFKASYNC_BROKER points the test at the broker below;
-# the test also has a docker-CLI fallback for local runs.
+# Runs the kafkasync exporter integration test against a real Kafka broker (Redpanda). The
+# test launches and manages the broker itself: it prefers a native `redpanda` binary (which
+# we install below) and falls back to a Redpanda container via the docker CLI (also present
+# on the runner). No externally-provided broker; each test instance uses its own ephemeral
+# ports so the suite can run in parallel.
 
 on:
   push:
@@ -23,25 +23,15 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: { go-version: '1.25' }
 
-      - name: Start Redpanda
-        # dev-container mode is a single fast-starting binary that speaks the Kafka protocol.
-        # Advertise localhost:9092 so the test (on the host network) reconnects correctly.
+      - name: Install Redpanda (native; test prefers it over docker)
         run: |
-          docker run -d --name redpanda -p 9092:9092 \
-            redpandadata/redpanda:v24.2.7 \
-            redpanda start --mode dev-container --smp 1 --overprovisioned --node-id 0 \
-            --kafka-addr PLAINTEXT://0.0.0.0:9092 \
-            --advertise-kafka-addr PLAINTEXT://localhost:9092
+          curl -1sLf 'https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.deb.sh' | sudo -E bash
+          sudo apt-get install -y redpanda
+          redpanda --version
 
       - name: Run kafkasync integration tests
         working-directory: htcondordb/kafkasync
         env:
           GOFLAGS: -mod=mod
           GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
-          # Point the test at the Redpanda started above; it waits for readiness itself.
-          KAFKASYNC_BROKER: localhost:9092
         run: go test -v -count=1 -timeout 10m ./...
-
-      - name: Redpanda logs on failure
-        if: failure()
-        run: docker logs redpanda || true
