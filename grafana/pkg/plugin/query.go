@@ -109,7 +109,9 @@ func newTimeRange(from, to time.Time) timeRange {
 }
 
 // toSQL renders the query to an htcondordb SQL statement for the given time range.
-func (q *queryModel) toSQL(tr timeRange) (string, error) {
+// interval is Grafana's suggested step (from the panel width / time range); it sets
+// the bucket width for a time-series builder query.
+func (q *queryModel) toSQL(tr timeRange, interval time.Duration) (string, error) {
 	if strings.EqualFold(q.EditorMode, "code") {
 		sql := strings.TrimSpace(applyMacros(q.RawSQL, tr))
 		if sql == "" {
@@ -123,8 +125,23 @@ func (q *queryModel) toSQL(tr timeRange) (string, error) {
 		return "", fmt.Errorf("no table selected")
 	}
 
-	sel := make([]string, 0, len(q.GroupBy)+len(q.Metrics)+len(q.Columns))
-	sel = append(sel, q.GroupBy...) // group keys lead the projection
+	// Time-series builder: when the format is Time series and a time field is set,
+	// floor it into interval-wide buckets so the result is a series (one row per
+	// bucket). The bucket is the leading projected + grouped column, aliased `time`.
+	tsField := ""
+	if strings.EqualFold(q.Format, "timeseries") {
+		tsField = strings.TrimSpace(q.TimeField)
+	}
+	bucketExpr := ""
+	if tsField != "" {
+		bucketExpr = fmt.Sprintf("time_bucket(%s, '%ds')", tsField, bucketWidthSeconds(interval))
+	}
+
+	sel := make([]string, 0, len(q.GroupBy)+len(q.Metrics)+len(q.Columns)+1)
+	if bucketExpr != "" {
+		sel = append(sel, bucketExpr+" AS time") // time axis leads the projection
+	}
+	sel = append(sel, q.GroupBy...) // then group keys
 	for _, m := range q.Metrics {
 		if e := m.expr(); e != "" {
 			sel = append(sel, e)
@@ -150,19 +167,41 @@ func (q *queryModel) toSQL(tr timeRange) (string, error) {
 	if len(conds) > 0 {
 		fmt.Fprintf(&b, " WHERE %s", strings.Join(conds, " && "))
 	}
-	if len(q.GroupBy) > 0 {
-		fmt.Fprintf(&b, " GROUP BY %s", strings.Join(q.GroupBy, ", "))
+
+	groupCols := q.GroupBy
+	if bucketExpr != "" {
+		groupCols = append([]string{bucketExpr}, q.GroupBy...) // group by the bucket too
 	}
+	if len(groupCols) > 0 {
+		fmt.Fprintf(&b, " GROUP BY %s", strings.Join(groupCols, ", "))
+	}
+
 	if ob := strings.TrimSpace(q.OrderBy); ob != "" {
 		b.WriteString(" ORDER BY " + ob)
 		if q.OrderDesc {
 			b.WriteString(" DESC")
 		}
+	} else if bucketExpr != "" {
+		b.WriteString(" ORDER BY time") // chronological series by default
 	}
 	if q.Limit > 0 {
 		fmt.Fprintf(&b, " LIMIT %d", q.Limit)
 	}
 	return b.String(), nil
+}
+
+// bucketWidthSeconds converts Grafana's suggested interval into a whole-second
+// time_bucket width, rounding to the nearest second (minimum 1s) and defaulting to
+// 60s when no interval was supplied.
+func bucketWidthSeconds(interval time.Duration) int64 {
+	if interval <= 0 {
+		return 60
+	}
+	s := int64((interval + time.Second/2) / time.Second)
+	if s < 1 {
+		s = 1
+	}
+	return s
 }
 
 // timeFilterExpr constrains a unix-epoch attribute to [from, to] as a ClassAd

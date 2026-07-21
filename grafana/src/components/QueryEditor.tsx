@@ -152,9 +152,18 @@ export function QueryEditor({ datasource, query, onChange, onRunQuery }: Props) 
         <>
           <InlineFieldRow>
             {tableSelect}
-            <InlineField label="Time field" labelWidth={LABEL_WIDTH} tooltip="Attribute constrained to the dashboard time range (unix epoch), e.g. QDate.">
+            <InlineField
+              label="Time field"
+              labelWidth={LABEL_WIDTH}
+              tooltip={
+                q.format === 'timeseries'
+                  ? "Unix-epoch attribute bucketed by the panel interval to form the time-series axis, e.g. QDate."
+                  : "Attribute constrained to the dashboard time range (unix epoch), e.g. QDate."
+              }
+            >
               <Select
                 width={24}
+                data-testid="htcondordb-query-timefield"
                 options={attrOptions}
                 value={q.timeField ? opt(q.timeField) : null}
                 allowCustomValue

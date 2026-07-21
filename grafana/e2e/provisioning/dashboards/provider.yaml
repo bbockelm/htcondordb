@@ -7,3 +7,9 @@ providers:
     allowUiUpdates: false
     options:
       path: /var/lib/grafana/dashboards
+  # E2E-only dashboards (not shipped with the plugin), e.g. the time_bucket time series.
+  - name: htcondordb-e2e
+    type: file
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards-e2e

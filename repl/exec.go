@@ -3,6 +3,7 @@ package repl
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -510,6 +511,11 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	// only the grouped result crosses the wire, not every matched ad.
 	groupBy := effectiveGroupBy(st)
 	if len(groupBy) > 0 || hasAggregate(st) {
+		// time_bucket grouping is computed client-side (the server aggregate groups
+		// by raw attribute value only, so a floored bucket key can't be pushed down).
+		if hasBucket(st) || groupByHasBucket(st) {
+			return e.execAggregateBucket(st)
+		}
 		return e.execAggregate(st, groupBy)
 	}
 
@@ -711,6 +717,105 @@ func (e *Executor) execAggregateAsOf(st *Statement, groupBy []string) (*Result, 
 		res.Rows = res.Rows[:st.Limit]
 	}
 	return res, nil
+}
+
+// hasBucket reports whether any selected item is a time_bucket grouping expression.
+func hasBucket(st *Statement) bool {
+	for _, it := range st.Items {
+		if it.Bucket {
+			return true
+		}
+	}
+	return false
+}
+
+// execAggregateBucket computes a GROUP BY that includes a time_bucket(...) column.
+// It fetches the matching rows (honoring an AS OF instant) and groups/reduces them
+// client-side, flooring the bucket attribute -- the server aggregate can only group
+// by raw attribute values, so a computed bucket key can't be pushed down (Phase 0).
+// Grouping is driven by the projected non-aggregate items (validateSelect ensures
+// those are exactly the GROUP BY terms when bucketing), so the group tuple lines up
+// with the output columns positionally.
+func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
+	ads, err := e.queryAdsAsOf(st.Table, st.Where, 0, st.AsOf)
+	if err != nil {
+		return nil, err
+	}
+	type group struct {
+		vals []string
+		ads  []*classad.ClassAd
+	}
+	var order []string
+	groups := map[string]*group{}
+	for _, ad := range ads {
+		vals := make([]string, 0, len(st.Items))
+		drop := false
+		for _, it := range st.Items {
+			if it.IsAggregate() {
+				continue
+			}
+			if it.Bucket {
+				sec, ok := ad.EvaluateAttrNumber(it.Col)
+				if !ok {
+					drop = true // undefined bucket timestamp: row falls out of the series
+					break
+				}
+				vals = append(vals, bucketFloor(sec, it.BucketWidth))
+				continue
+			}
+			vals = append(vals, valueDisplay(ad.EvaluateAttr(it.Col)))
+		}
+		if drop {
+			continue
+		}
+		key := strings.Join(vals, "\x00")
+		g := groups[key]
+		if g == nil {
+			g = &group{vals: vals}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.ads = append(g.ads, ad)
+	}
+
+	res := &Result{IsSelect: true}
+	for _, it := range st.Items {
+		res.Columns = append(res.Columns, it.header())
+	}
+	for _, key := range order {
+		g := groups[key]
+		row := make([]string, 0, len(st.Items))
+		gi := 0
+		for _, it := range st.Items {
+			if it.IsAggregate() {
+				row = append(row, aggregateAds(it, g.ads))
+				continue
+			}
+			row = append(row, g.vals[gi])
+			gi++
+		}
+		res.Rows = append(res.Rows, row)
+	}
+	if len(st.OrderBy) > 0 {
+		if err := sortRows(res, st.OrderBy); err != nil {
+			return nil, err
+		}
+	}
+	if st.Limit > 0 && len(res.Rows) > st.Limit {
+		res.Rows = res.Rows[:st.Limit]
+	}
+	return res, nil
+}
+
+// bucketFloor floors unix-epoch seconds to a width-aligned bucket (aligned to the
+// epoch, so bucket boundaries are stable across queries) and returns it as a decimal
+// seconds string -- the same shape the frame layer reads as a time field.
+func bucketFloor(sec float64, width int64) string {
+	if width <= 0 {
+		return ""
+	}
+	b := int64(math.Floor(sec/float64(width))) * width
+	return strconv.FormatInt(b, 10)
 }
 
 // aggregateAds reduces one aggregate item over a group's ads (client-side, for AS OF).

@@ -10,6 +10,14 @@
 // (hash-map GROUP BY). JOIN and subqueries are intentionally unsupported and
 // rejected with a clear error; cross-table work is matchmaking, not a join.
 //
+// A GROUP BY term may be time_bucket(<attr>, '<width>'): it floors a unix-epoch
+// attribute (e.g. QDate) to a fixed width -- '30s', '5m', '1h', '1d', '1w', or a
+// bare integer number of seconds -- aligning buckets to the epoch. Selecting it
+// (typically aliased AS time) turns point-in-time rows into a time series, e.g.
+// SELECT time_bucket(QDate, '1h') AS time, COUNT(*) AS n FROM jobs
+// GROUP BY time_bucket(QDate, '1h'). This grouping is computed client-side (the
+// server aggregate groups by raw attribute value only).
+//
 // A WHERE clause (and an UPDATE assignment's right-hand side) is a *ClassAd*
 // expression, captured verbatim and evaluated by the store's expression engine
 // -- the full ClassAd language is available (==, =?=, =!=, undefined, member(),
@@ -29,6 +37,7 @@ package repl
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -113,12 +122,20 @@ type Statement struct {
 
 // SelectItem is one projected column or aggregate. For "*", Star is set. For a
 // plain column, Agg is "" and Col is the attribute name. For an aggregate,
-// Agg is COUNT/SUM/AVG/MIN/MAX and Col is its argument ("*" for COUNT(*)).
+// Agg is COUNT/SUM/AVG/MIN/MAX and Col is its argument ("*" for COUNT(*)). For a
+// time_bucket(col, 'width') grouping expression, Bucket is set: Col is the
+// unix-epoch timestamp attribute and BucketWidth is the bucket width in seconds.
 type SelectItem struct {
 	Star  bool
 	Agg   string // "", "COUNT", "SUM", "AVG", "MIN", "MAX"
 	Col   string
 	Alias string // display header; defaults to the source text
+
+	// Bucket marks a time_bucket(Col, 'width') expression -- a non-aggregate
+	// grouping column that floors the epoch-seconds attribute Col to BucketWidth
+	// (see parseBucketWidth). It groups a time axis into fixed-width buckets.
+	Bucket      bool
+	BucketWidth int64 // seconds; >0 when Bucket
 }
 
 // IsAggregate reports whether this item is an aggregate function.
@@ -146,6 +163,9 @@ func (it SelectItem) header() string {
 	}
 	if it.Agg != "" {
 		return it.Agg + "(" + it.Col + ")"
+	}
+	if it.Bucket {
+		return "time_bucket(" + it.Col + ", " + strconv.FormatInt(it.BucketWidth, 10) + ")"
 	}
 	return it.Col
 }
@@ -790,11 +810,45 @@ func (p *parser) parseSelectItem() (SelectItem, error) {
 		it.Alias = p.parseOptionalAlias()
 		return it, nil
 	}
+	// time_bucket(attr, 'width') grouping expression.
+	if strings.EqualFold(t.text, "time_bucket") && p.peekAheadPunct(1, "(") {
+		attr, secs, err := p.parseBucketCall()
+		if err != nil {
+			return SelectItem{}, err
+		}
+		it := SelectItem{Bucket: true, Col: attr, BucketWidth: secs}
+		it.Alias = p.parseOptionalAlias()
+		return it, nil
+	}
 	// Plain column.
 	p.pos++
 	it := SelectItem{Col: t.text}
 	it.Alias = p.parseOptionalAlias()
 	return it, nil
+}
+
+// parseBucketCall parses "time_bucket ( <attr> , '<width>' )" starting at the
+// time_bucket identifier, returning the attribute name and the width in seconds.
+func (p *parser) parseBucketCall() (attr string, secs int64, err error) {
+	p.pos += 2 // time_bucket + '('
+	attr, err = p.parseIdent()
+	if err != nil {
+		return "", 0, err
+	}
+	if err = p.expectPunct(","); err != nil {
+		return "", 0, fmt.Errorf("time_bucket(attr, 'width') requires a width argument: %w", err)
+	}
+	width, err := p.parseStringLiteral()
+	if err != nil {
+		return "", 0, err
+	}
+	if secs, err = parseBucketWidth(width); err != nil {
+		return "", 0, err
+	}
+	if err = p.expectPunct(")"); err != nil {
+		return "", 0, err
+	}
+	return attr, secs, nil
 }
 
 // parseOptionalAlias consumes an optional `AS name` (or bare `name`) alias.
@@ -1111,15 +1165,25 @@ func isAggName(up string) bool {
 	return false
 }
 
-// parseGroupCols parses the comma-separated GROUP BY column list.
+// parseGroupCols parses the comma-separated GROUP BY term list. Each term is a
+// plain column name or a time_bucket(attr, 'width') expression, which is stored
+// as its canonical key so validateSelect can match it against a projected item.
 func (p *parser) parseGroupCols() ([]string, error) {
 	var cols []string
 	for {
-		id, err := p.parseIdent()
-		if err != nil {
-			return nil, err
+		if t := p.peek(); strings.EqualFold(t.text, "time_bucket") && p.peekAheadPunct(1, "(") {
+			attr, secs, err := p.parseBucketCall()
+			if err != nil {
+				return nil, err
+			}
+			cols = append(cols, canonicalBucketKey(attr, secs))
+		} else {
+			id, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			cols = append(cols, id)
 		}
-		cols = append(cols, id)
 		if p.atPunct(",") {
 			p.pos++
 			continue
@@ -1129,18 +1193,70 @@ func (p *parser) parseGroupCols() ([]string, error) {
 	return cols, nil
 }
 
+// canonicalBucketKey is the case-insensitive identity of a time_bucket grouping
+// term -- "time_bucket(<attr>,<seconds>)" -- so a SELECT item and a GROUP BY term
+// over the same attribute and width compare equal.
+func canonicalBucketKey(attr string, secs int64) string {
+	return "time_bucket(" + strings.ToLower(attr) + "," + strconv.FormatInt(secs, 10) + ")"
+}
+
+// groupItemKey is a select item's identity for GROUP BY matching: the canonical
+// bucket key for a time_bucket item, else the lower-cased column name.
+func groupItemKey(it SelectItem) string {
+	if it.Bucket {
+		return canonicalBucketKey(it.Col, it.BucketWidth)
+	}
+	return strings.ToLower(it.Col)
+}
+
+// parseBucketWidth parses a time_bucket width literal into whole seconds. It
+// accepts a bare integer (seconds) or an integer with a unit suffix: s (second),
+// m (minute), h (hour), d (day), w (week) -- e.g. "30s", "5m", "1h", "1d". This
+// matches Grafana's interval syntax (its $__interval expands to values like these).
+func parseBucketWidth(s string) (int64, error) {
+	orig := s
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty time_bucket width")
+	}
+	mult := int64(1)
+	switch s[len(s)-1] {
+	case 's', 'S':
+		s = s[:len(s)-1]
+	case 'm', 'M':
+		mult, s = 60, s[:len(s)-1]
+	case 'h', 'H':
+		mult, s = 3600, s[:len(s)-1]
+	case 'd', 'D':
+		mult, s = 86400, s[:len(s)-1]
+	case 'w', 'W':
+		mult, s = 604800, s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid time_bucket width %q", orig)
+	}
+	return n * mult, nil
+}
+
 // validateSelect enforces the SELECT/GROUP BY rules: `*` stands alone; without
 // GROUP BY, aggregates cannot mix with plain columns; with GROUP BY, every plain
 // column must appear in the GROUP BY list and `*` is not allowed.
 func validateSelect(st *Statement) error {
-	var aggs, plains int
+	var aggs, plains, buckets int
 	for _, it := range st.Items {
 		switch {
 		case it.IsAggregate():
 			aggs++
+		case it.Bucket:
+			buckets++
 		case !it.Star:
 			plains++
 		}
+	}
+	bucketing := buckets > 0 || groupByHasBucket(st)
+	if bucketing && len(st.GroupBy) == 0 {
+		return fmt.Errorf("time_bucket(...) requires a matching GROUP BY")
 	}
 	if len(st.GroupBy) == 0 {
 		if aggs > 0 && plains > 0 {
@@ -1153,15 +1269,45 @@ func validateSelect(st *Statement) error {
 	for _, g := range st.GroupBy {
 		inGroup[strings.ToLower(g)] = true
 	}
+	itemKeys := map[string]bool{}
 	for _, it := range st.Items {
 		if it.Star {
 			return fmt.Errorf("`*` cannot be used with GROUP BY")
 		}
-		if !it.IsAggregate() && !inGroup[strings.ToLower(it.Col)] {
+		if it.IsAggregate() {
+			continue
+		}
+		key := groupItemKey(it)
+		itemKeys[key] = true
+		if !inGroup[key] {
+			if it.Bucket {
+				return fmt.Errorf("time_bucket(%s, ...) must appear in GROUP BY", it.Col)
+			}
 			return fmt.Errorf("column %q must appear in GROUP BY or be used in an aggregate", it.Col)
 		}
 	}
+	// A time_bucket query aggregates client-side over the projected group columns
+	// (§ Phase 0), so every GROUP BY term must be one of them -- no grouping by a
+	// column that isn't selected.
+	if bucketing {
+		for g := range inGroup {
+			if !itemKeys[g] {
+				return fmt.Errorf("GROUP BY term %q must also be selected when using time_bucket", g)
+			}
+		}
+	}
 	return nil
+}
+
+// groupByHasBucket reports whether any GROUP BY term is a time_bucket expression
+// (stored as its canonical "time_bucket(...)" key).
+func groupByHasBucket(st *Statement) bool {
+	for _, g := range st.GroupBy {
+		if strings.HasPrefix(strings.ToLower(g), "time_bucket(") {
+			return true
+		}
+	}
+	return false
 }
 
 // quoteClassAd renders s as a ClassAd double-quoted string literal.

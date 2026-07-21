@@ -18,6 +18,9 @@ var knownTimeAttrs = map[string]bool{
 	"daemonstarttime": true, "lastmatchtime": true, "joblaststartdate": true,
 	"shadowbday": true, "enteredcurrentactivity": true, "mycurrenttime": true,
 	"lastbenchmark": true,
+	// A column literally named "time" holds unix-epoch seconds -- the conventional
+	// alias for a time_bucket(...) series, so it graphs as the time axis.
+	"time": true,
 }
 
 // resultToFrame converts a repl SELECT result into a Grafana data frame, inferring

@@ -14,10 +14,23 @@ func testRange() timeRange {
 func TestToSQL_Builder(t *testing.T) {
 	tr := testRange() // from=1609459200 to=1609462800
 	cases := []struct {
-		name string
-		q    queryModel
-		want string
+		name     string
+		q        queryModel
+		interval time.Duration
+		want     string
 	}{
+		{
+			name: "time series buckets the time field by the interval",
+			q: queryModel{
+				Table:     "jobs",
+				Format:    "timeseries",
+				TimeField: "QDate",
+				Metrics:   []metricDef{{Func: "COUNT", Attr: "*"}},
+				GroupBy:   []string{"Owner"},
+			},
+			interval: 5 * time.Minute,
+			want:     `SELECT time_bucket(QDate, '300s') AS time, Owner, COUNT(*) FROM jobs WHERE (QDate >= 1609459200 && QDate <= 1609462800) GROUP BY time_bucket(QDate, '300s'), Owner ORDER BY time`,
+		},
 		{
 			name: "count group by with filter",
 			q: queryModel{
@@ -55,7 +68,7 @@ func TestToSQL_Builder(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := tc.q.toSQL(tr)
+			got, err := tc.q.toSQL(tr, tc.interval)
 			if err != nil {
 				t.Fatalf("toSQL: %v", err)
 			}
@@ -67,7 +80,7 @@ func TestToSQL_Builder(t *testing.T) {
 }
 
 func TestToSQL_NoTableError(t *testing.T) {
-	if _, err := (&queryModel{}).toSQL(testRange()); err == nil {
+	if _, err := (&queryModel{}).toSQL(testRange(), 0); err == nil {
 		t.Error("expected an error when no table is selected")
 	}
 }
@@ -78,7 +91,7 @@ func TestToSQL_CodeModeMacros(t *testing.T) {
 		EditorMode: "code",
 		RawSQL:     "SELECT Owner FROM jobs WHERE $__timeFilter(QDate) && QDate > $__unixEpochFrom() LIMIT $__timeTo()",
 	}
-	got, err := q.toSQL(tr)
+	got, err := q.toSQL(tr, 0)
 	if err != nil {
 		t.Fatalf("toSQL: %v", err)
 	}
@@ -89,7 +102,7 @@ func TestToSQL_CodeModeMacros(t *testing.T) {
 }
 
 func TestToSQL_CodeModeEmpty(t *testing.T) {
-	if _, err := (&queryModel{EditorMode: "code", RawSQL: "   "}).toSQL(testRange()); err == nil {
+	if _, err := (&queryModel{EditorMode: "code", RawSQL: "   "}).toSQL(testRange(), 0); err == nil {
 		t.Error("expected an error for empty SQL in code mode")
 	}
 }

@@ -1,0 +1,31 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "schemaVersion": 39,
+  "tags": ["htcondor", "e2e"],
+  "title": "HTCondorDB Time Series E2E",
+  "uid": "htcondordb-timeseries-e2e",
+  "time": { "from": "2025-07-08T18:00:00.000Z", "to": "2025-07-08T20:00:00.000Z" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Jobs per 15m (time_bucket)",
+      "type": "timeseries",
+      "datasource": { "type": "bbockelm-htcondordb-datasource", "uid": "htcondordb-e2e" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "bbockelm-htcondordb-datasource", "uid": "htcondordb-e2e" },
+          "editorMode": "code",
+          "format": "timeseries",
+          "rawSql": "SELECT time_bucket(QDate, '15m') AS time, COUNT(*) AS metric_jobs FROM jobs GROUP BY time_bucket(QDate, '15m') ORDER BY time"
+        }
+      ]
+    }
+  ]
+}
