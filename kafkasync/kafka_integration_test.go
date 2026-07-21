@@ -18,29 +18,19 @@ import (
 // fast-starting binary that speaks the Kafka protocol.
 const redpandaImage = "redpandadata/redpanda:v24.2.7"
 
-// TestIntegrationKafkaRoundTrip exports a table to a real broker (Redpanda in Docker) and
-// consumes the topic back, asserting the exported upserts and a tombstone arrive with the
-// right keys, values, and version headers. It shells out to `docker` (matching the GitHub
-// Actions environment) rather than depending on a container library.
+// TestIntegrationKafkaRoundTrip exports a table to a real broker (Redpanda) and consumes
+// the topic back, asserting the exported upserts and a tombstone arrive with the right
+// keys, values, and version headers.
 //
-// Skipped when docker is unavailable or `go test -short` is used.
+// It obtains a broker via resolveBroker: an already-running broker named by
+// KAFKASYNC_BROKER (e.g. a CI service or a broker in the same container), else a probe of
+// the default localhost:9092, else a Redpanda container started through the docker CLI.
+// Skipped under -short or when none of those are available.
 func TestIntegrationKafkaRoundTrip(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping docker integration test in -short mode")
+		t.Skip("skipping integration test in -short mode")
 	}
-	if os.Getenv("KAFKASYNC_SKIP_DOCKER") != "" {
-		t.Skip("KAFKASYNC_SKIP_DOCKER set")
-	}
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not found in PATH")
-	}
-	if out, err := exec.Command("docker", "info").CombinedOutput(); err != nil {
-		t.Skipf("docker not usable: %v\n%s", err, out)
-	}
-
-	port := freePort(t)
-	broker := fmt.Sprintf("localhost:%d", port)
-	startRedpanda(t, port)
+	broker := resolveBroker(t)
 
 	// In-process DB + privileged dbrpc server (same harness as the unit tests).
 	dir := t.TempDir()
@@ -57,7 +47,8 @@ func TestIntegrationKafkaRoundTrip(t *testing.T) {
 	putAd(t, jobs, "2.0", "bob", 200)
 
 	c := clientFor(t, cat)
-	topic := "htc.jobs.test"
+	// Unique per run so a reused (KAFKASYNC_BROKER) broker never mixes state across runs.
+	topic := fmt.Sprintf("htc.jobs.test.%d", os.Getpid())
 	cfg, err := Config{Table: "jobs", Brokers: []string{broker}, Topic: topic, BatchSize: 2, FlushInterval: Duration(50 * time.Millisecond)}.Validate()
 	if err != nil {
 		t.Fatal(err)
@@ -114,6 +105,62 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// resolveBroker returns a ready Kafka broker for the integration test, in priority order:
+//
+//  1. KAFKASYNC_BROKER -- an already-running broker (a CI service container, or a broker in
+//     the same container as the test). Fatal if it is set but never becomes ready, so a
+//     misconfigured CI fails loudly instead of silently skipping.
+//  2. a broker already answering at the conventional localhost:9092 (e.g. a Redpanda started
+//     alongside the tests) -- used if it responds within a short probe.
+//  3. a Redpanda dev-container started via the docker CLI (skips if docker is unavailable).
+//
+// If none apply, the test is skipped.
+func resolveBroker(t *testing.T) string {
+	t.Helper()
+	if b := strings.TrimSpace(os.Getenv("KAFKASYNC_BROKER")); b != "" {
+		if !brokerReady(b, 60*time.Second) {
+			t.Fatalf("KAFKASYNC_BROKER=%s never became ready", b)
+		}
+		return b
+	}
+	// A broker already listening where we conventionally run one (dev container / sidecar).
+	if brokerReady("localhost:9092", 2*time.Second) {
+		return "localhost:9092"
+	}
+	// Fall back to starting our own via docker.
+	if os.Getenv("KAFKASYNC_SKIP_DOCKER") != "" {
+		t.Skip("KAFKASYNC_SKIP_DOCKER set and no reachable broker")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("no KAFKASYNC_BROKER, no broker at localhost:9092, and docker not in PATH")
+	}
+	if out, err := exec.Command("docker", "info").CombinedOutput(); err != nil {
+		t.Skipf("docker not usable: %v\n%s", err, out)
+	}
+	port := freePort(t)
+	startRedpanda(t, port)
+	return fmt.Sprintf("localhost:%d", port)
+}
+
+// brokerReady reports whether a Kafka broker at addr answers a metadata ping within timeout.
+func brokerReady(addr string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		cl, err := kgo.NewClient(kgo.SeedBrokers(addr))
+		if err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			perr := cl.Ping(ctx)
+			cancel()
+			cl.Close()
+			if perr == nil {
+				return true
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
+}
+
 // startRedpanda launches a dev-container Redpanda mapped to hostPort and registers cleanup.
 func startRedpanda(t *testing.T, hostPort int) {
 	t.Helper()
@@ -133,23 +180,10 @@ func startRedpanda(t *testing.T, hostPort int) {
 	}
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", name).Run() })
 
-	// Wait for the broker to accept connections and answer metadata.
 	broker := fmt.Sprintf("localhost:%d", hostPort)
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		cl, err := kgo.NewClient(kgo.SeedBrokers(broker))
-		if err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			perr := cl.Ping(ctx)
-			cancel()
-			cl.Close()
-			if perr == nil {
-				return
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
+	if !brokerReady(broker, 60*time.Second) {
+		t.Fatalf("redpanda did not become ready at %s", broker)
 	}
-	t.Fatalf("redpanda did not become ready at %s", broker)
 }
 
 // consumeLatest reads the topic from the start until want() is satisfied (or timeout),

@@ -1,0 +1,47 @@
+name: kafka-integration
+
+# Runs the kafkasync exporter integration test against a real Kafka broker (Redpanda),
+# started as a container in the runner. The test connects the exporter's dbrpc watch to an
+# in-process htcondordb catalog and asserts the changes land on the topic (upserts + a
+# tombstone, with version headers). KAFKASYNC_BROKER points the test at the broker below;
+# the test also has a docker-CLI fallback for local runs.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  integration:
+    name: Kafka exporter integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout htcondordb
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with: { path: htcondordb }
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version: '1.25' }
+
+      - name: Start Redpanda
+        # dev-container mode is a single fast-starting binary that speaks the Kafka protocol.
+        # Advertise localhost:9092 so the test (on the host network) reconnects correctly.
+        run: |
+          docker run -d --name redpanda -p 9092:9092 \
+            redpandadata/redpanda:v24.2.7 \
+            redpanda start --mode dev-container --smp 1 --overprovisioned --node-id 0 \
+            --kafka-addr PLAINTEXT://0.0.0.0:9092 \
+            --advertise-kafka-addr PLAINTEXT://localhost:9092
+
+      - name: Run kafkasync integration tests
+        working-directory: htcondordb/kafkasync
+        env:
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+          # Point the test at the Redpanda started above; it waits for readiness itself.
+          KAFKASYNC_BROKER: localhost:9092
+        run: go test -v -count=1 -timeout 10m ./...
+
+      - name: Redpanda logs on failure
+        if: failure()
+        run: docker logs redpanda || true
