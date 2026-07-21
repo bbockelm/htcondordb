@@ -18,8 +18,11 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"time"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -230,7 +233,16 @@ func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error 
 
 	conn := dbrpc.NewCedarConn(ctx, c.Stream)
 	err := s.rpc.ServeConnOpts(conn, opts)
-	s.log.Debug("htcondordb session closed", "remote", c.RemoteAddr, "err", errString(err))
+	// A clean close (client hung up, daemon shutting down) is Debug-only noise. An
+	// unexpected error -- notably an AES-GCM authentication failure, which means the
+	// encrypted stream was corrupted (e.g. a client that writes concurrently on one
+	// connection without serializing) -- is a real operational signal, so surface it at
+	// Warn even at the default log level.
+	if isCleanClose(err) {
+		s.log.Debug("htcondordb session closed", "remote", c.RemoteAddr, "err", errString(err))
+	} else {
+		s.log.Warn("htcondordb session closed with error", "remote", c.RemoteAddr, "err", errString(err))
+	}
 	return err
 }
 
@@ -306,4 +318,16 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// isCleanClose reports whether a connection ended the ordinary way -- no error, the
+// peer hung up (EOF), or the daemon is shutting down (context cancelled) / the listener
+// was closed. Anything else (a decode/authentication failure, an unexpected transport
+// error) is an anomaly worth logging at Warn rather than burying at Debug.
+func isCleanClose(err error) bool {
+	return err == nil ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, net.ErrClosed)
 }
