@@ -2,6 +2,7 @@ package repl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -511,9 +512,20 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	// only the grouped result crosses the wire, not every matched ad.
 	groupBy := effectiveGroupBy(st)
 	if len(groupBy) > 0 || hasAggregate(st) {
-		// time_bucket grouping is computed client-side (the server aggregate groups
-		// by raw attribute value only, so a floored bucket key can't be pushed down).
+		// time_bucket grouping: push the bucketing to the server for a current-time
+		// read (only the grouped rows cross the wire). Fall back to client-side
+		// bucketing for an AS OF read (the server aggregate has no time-travel
+		// variant) or against a server too old to implement the bucketed opcode.
 		if hasBucket(st) || groupByHasBucket(st) {
+			if st.AsOf == "" {
+				res, err := e.execAggregateBucketServer(st)
+				if err == nil {
+					return res, nil
+				}
+				if !errors.Is(err, dbrpc.ErrBucketedUnsupported) {
+					return nil, err
+				}
+			}
 			return e.execAggregateBucket(st)
 		}
 		return e.execAggregate(st, groupBy)
@@ -727,6 +739,64 @@ func hasBucket(st *Statement) bool {
 		}
 	}
 	return false
+}
+
+// execAggregateBucketServer runs a time_bucket GROUP BY on the server, pushing the
+// bucketing down (only the grouped rows cross the wire) via the dbrpc bucketed
+// aggregate. It returns an error wrapping dbrpc.ErrBucketedUnsupported when the
+// server is too old, so the caller falls back to client-side bucketing. Grouping is
+// driven by the projected non-aggregate items (as in execAggregateBucket), so the
+// returned group tuple lines up positionally with the output columns.
+func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
+	var groups []dbrpc.GroupCol
+	var aggs []dbrpc.AggSpec
+	for _, it := range st.Items {
+		if it.IsAggregate() {
+			aggs = append(aggs, dbrpc.AggSpec{Func: aggFunc(it.Agg), Arg: it.Col})
+			continue
+		}
+		// A plain group column has BucketWidth 0; a time_bucket item carries its width.
+		groups = append(groups, dbrpc.GroupCol{Attr: it.Col, BucketWidth: it.BucketWidth})
+	}
+	rows, err := e.c.AggregateBucketedTable(context.Background(), st.Table, constraint(st.Where), groups, aggs)
+	if err != nil {
+		return nil, err
+	}
+	res := &Result{IsSelect: true}
+	for _, it := range st.Items {
+		res.Columns = append(res.Columns, it.header())
+	}
+	for _, gr := range rows {
+		row := make([]string, 0, len(st.Items))
+		gi, ai := 0, 0
+		for _, it := range st.Items {
+			if it.IsAggregate() {
+				if ai < len(gr.Values) {
+					row = append(row, gr.Values[ai])
+				} else {
+					row = append(row, "")
+				}
+				ai++
+				continue
+			}
+			if gi < len(gr.Group) {
+				row = append(row, gr.Group[gi])
+			} else {
+				row = append(row, "")
+			}
+			gi++
+		}
+		res.Rows = append(res.Rows, row)
+	}
+	if len(st.OrderBy) > 0 {
+		if err := sortRows(res, st.OrderBy); err != nil {
+			return nil, err
+		}
+	}
+	if st.Limit > 0 && len(res.Rows) > st.Limit {
+		res.Rows = res.Rows[:st.Limit]
+	}
+	return res, nil
 }
 
 // execAggregateBucket computes a GROUP BY that includes a time_bucket(...) column.
