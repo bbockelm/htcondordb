@@ -21,3 +21,7 @@ INSERT INTO jobs (Key,ClusterId,ProcId,Owner,JobStatus,RequestCpus,RequestMemory
 INSERT INTO jobs (Key,ClusterId,ProcId,Owner,JobStatus,RequestCpus,RequestMemory,QDate) VALUES ('303.0',303,0,'carol',4,2,2048,1752002000)
 INSERT INTO jobs (Key,ClusterId,ProcId,Owner,JobStatus,RequestCpus,RequestMemory,QDate) VALUES ('303.1',303,1,'carol',1,2,2048,1752002400)
 INSERT INTO jobs (Key,ClusterId,ProcId,Owner,JobStatus,RequestCpus,RequestMemory,QDate) VALUES ('303.2',303,2,'carol',2,2,2048,1752002700)
+
+# --- Materialized view: jobs per Owner (label) with COUNT + total RequestCpus.
+# Exposed on /metrics as jobs_by_owner_jobs{owner=...} and jobs_by_owner_cpus{owner=...}.
+CREATE MATERIALIZED VIEW jobs_by_owner AS SELECT Owner AS label_owner, COUNT(*) AS metric_jobs, SUM(RequestCpus) AS metric_cpus FROM jobs GROUP BY Owner

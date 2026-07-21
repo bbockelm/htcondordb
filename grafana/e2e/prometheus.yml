@@ -1,0 +1,8 @@
+# Scrape htcondordb's /metrics (materialized-view gauges + storage stats) so the
+# view metrics become Prometheus time series Grafana can graph.
+global:
+  scrape_interval: 2s
+scrape_configs:
+  - job_name: htcondordb
+    static_configs:
+      - targets: ['htcondordb:9631']

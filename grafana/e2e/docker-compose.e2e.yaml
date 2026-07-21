@@ -12,12 +12,30 @@ services:
       dockerfile: grafana/e2e/Dockerfile.htcondordb
     ports:
       - "9630:9630"
+      - "9631:9631"
     healthcheck:
       test: ["CMD-SHELL", "htcondordb-cli -addr 127.0.0.1:9630 -e 'SELECT COUNT(*) FROM machines' >/dev/null 2>&1"]
       interval: 3s
       timeout: 5s
       retries: 20
       start_period: 5s
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      htcondordb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9090/-/healthy || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
 
   grafana:
     image: grafana/grafana-oss:11.3.0
@@ -35,6 +53,8 @@ services:
       - ./provisioning:/etc/grafana/provisioning
     depends_on:
       htcondordb:
+        condition: service_healthy
+      prometheus:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
