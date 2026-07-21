@@ -120,7 +120,7 @@ func (d *Datasource) QueryData(ctx context.Context, req *backend.QueryDataReques
 // The bool reports whether the failure was connection-level (so the caller resets
 // the pooled session).
 func (d *Datasource) runSQL(exec *repl.Executor, q backend.DataQuery, qm queryModel) (backend.DataResponse, bool) {
-	sql, err := qm.toSQL(newTimeRange(q.TimeRange.From, q.TimeRange.To))
+	sql, err := qm.toSQL(newTimeRange(q.TimeRange.From, q.TimeRange.To), q.Interval)
 	if err != nil {
 		return backend.ErrDataResponse(backend.StatusBadRequest, err.Error()), false
 	}
