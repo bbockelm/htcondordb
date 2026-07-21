@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 )
@@ -191,9 +192,41 @@ func showOpStats(w io.Writer, o db.OpStats) {
 		if r.s.Count > 0 {
 			mean = time.Duration(r.s.Nanos / r.s.Count)
 		}
-		fmt.Fprintf(w, "  %-17s n=%-8d total=%-11s mean=%s\n",
-			r.label, r.s.Count, time.Duration(r.s.Nanos), mean)
+		fmt.Fprintf(w, "  %-17s n=%-8d total=%-11s mean=%-10s max=%s\n",
+			r.label, r.s.Count, time.Duration(r.s.Nanos), mean, time.Duration(r.s.MaxNanos))
+		// The mean hides tail stalls (a slow msync or a long retrain averages out to
+		// milliseconds while its worst case is seconds). Show the latency histogram when
+		// the tail is non-trivial, so the distribution -- not just the average -- is visible.
+		if r.s.MaxNanos > int64(100*time.Millisecond) {
+			if line := histLine(r.s.Buckets); line != "" {
+				fmt.Fprintf(w, "  %17s %s\n", "", line)
+			}
+		}
 	}
+}
+
+// histLine renders a latency histogram as "<=1ms:60000 <=1s:80 >30s:8", showing only
+// non-empty buckets. buckets[i] counts occurrences <= bound[i]; the final entry counts
+// occurrences above the last bound.
+func histLine(buckets []int64) string {
+	if len(buckets) == 0 {
+		return ""
+	}
+	bounds := collections.LatencyBucketBoundsNanos()
+	var parts []string
+	for i, c := range buckets {
+		if c == 0 {
+			continue
+		}
+		var label string
+		if i < len(bounds) {
+			label = "<=" + time.Duration(bounds[i]).String()
+		} else if len(bounds) > 0 {
+			label = ">" + time.Duration(bounds[len(bounds)-1]).String()
+		}
+		parts = append(parts, fmt.Sprintf("%s:%d", label, c))
+	}
+	return strings.Join(parts, " ")
 }
 
 func (s *session) showIndexes(w io.Writer, d *dbrpc.Diagnostics) {
