@@ -50,6 +50,25 @@ HTCondor stores timestamps (`QDate`, `EnteredCurrentStatus`, …) as unix-epoch
 integers, so those columns render as Grafana time fields automatically; the
 builder's **Time field** forces any column to a time field.
 
+### Time series (`time_bucket`)
+
+To graph a metric over time, group by `time_bucket(<attr>, '<width>')` — it floors a
+unix-epoch attribute into fixed-width, epoch-aligned buckets (`'30s'`, `'5m'`, `'1h'`,
+`'1d'`, `'1w'`, or a bare integer of seconds). Alias it `AS time` and set the panel's
+format to **Time series**:
+
+```sql
+SELECT time_bucket(QDate, '1h') AS time, COUNT(*) AS metric_jobs
+FROM jobs
+GROUP BY time_bucket(QDate, '1h')
+ORDER BY time
+```
+
+A column named `time` renders as the graph's time axis. Add a plain column (e.g.
+`Owner AS label_owner`) to the SELECT and GROUP BY for one series per group. Bucketing
+is evaluated by htcondordb's SQL engine (`repl`); see the repo's `TIME_SERIES_DESIGN.md`
+for the roadmap (server-side pushdown and continuous aggregates).
+
 ### Template variables
 
 A dashboard **Query** variable runs its SQL against the datasource and takes the
