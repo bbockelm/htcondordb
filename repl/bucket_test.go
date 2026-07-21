@@ -161,3 +161,51 @@ func TestExecTimeBucketWithLabel(t *testing.T) {
 		}
 	}
 }
+
+// TestExecTimeBucketClientSide exercises the client-side bucketing path directly
+// (the fallback used for AS OF reads or against a server too old for the bucketed
+// opcode), asserting it produces the same series as the server pushdown.
+func TestExecTimeBucketClientSide(t *testing.T) {
+	e, _, cleanup := newPrivCatalogExec(t)
+	defer cleanup()
+
+	rows := []struct {
+		key  string
+		when int64
+		cpus int
+	}{
+		{"1.0", 3600, 1}, {"1.1", 3700, 2}, // bucket 3600
+		{"2.0", 7200, 4}, {"2.1", 7300, 8}, // bucket 7200
+		{"3.0", 10800, 3}, // bucket 10800
+	}
+	for _, r := range rows {
+		q := fmt.Sprintf(`INSERT INTO %s (Key, CompletionDate, RequestCpus) VALUES ('%s', %d, %d)`,
+			DefaultTable, r.key, r.when, r.cpus)
+		if _, err := e.ExecString(q); err != nil {
+			t.Fatalf("insert %s: %v", r.key, err)
+		}
+	}
+	if _, err := e.ExecString(fmt.Sprintf(`INSERT INTO %s (Key, RequestCpus) VALUES ('9.9', 5)`, DefaultTable)); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Parse(fmt.Sprintf(
+		`SELECT time_bucket(CompletionDate, '1h') AS time, COUNT(*) AS metric_jobs, SUM(RequestCpus) AS metric_cpus `+
+			`FROM %s GROUP BY time_bucket(CompletionDate, '1h') ORDER BY time`, DefaultTable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := e.execAggregateBucket(st) // force the client-side path
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"3600", "2", "3"}, {"7200", "2", "12"}, {"10800", "1", "3"}}
+	if len(res.Rows) != len(want) {
+		t.Fatalf("rows = %v, want %v", res.Rows, want)
+	}
+	for i, w := range want {
+		if res.Rows[i][0] != w[0] || res.Rows[i][1] != w[1] || res.Rows[i][2] != w[2] {
+			t.Errorf("row %d = %v, want %v", i, res.Rows[i], w)
+		}
+	}
+}
