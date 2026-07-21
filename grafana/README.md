@@ -95,9 +95,24 @@ npm run e2e        # build dist -> compose up --wait -> playwright test
 npm run e2e:down   # stop + remove the stack
 ```
 
+The suite also covers **materialized views** (htcondordb's Prometheus-oriented
+aggregate views), which live-update as their base tables change:
+
+- `viewStreaming` streams a materialized view through this plugin. A view is
+  queried like a table and is WATCH-able, so a Live panel on `jobs_by_owner`
+  tails it; adding a job for a new owner streams the view's new group into the
+  panel. (Views have no head cursor, so streaming a view replays its groups —
+  one row each, cheap — and then tails live; base tables tail from now.)
+- `viewMetrics` graphs a view exported to Prometheus. htcondordb's `/metrics`
+  endpoint exposes each view's aggregates (`jobs_by_owner_jobs{owner=…}`); the
+  compose stack adds a **Prometheus** service scraping it and a provisioned
+  Prometheus datasource, and the test builds a **time-series** panel on that
+  metric and asserts the per-owner series render.
+
 The htcondordb container runs with a throwaway anonymous-read/write config so the
-plugin connects without credentials; Grafana loads the unsigned plugin and a
-provisioned datasource. CI runs this as the `E2E (Playwright)` job.
+plugin connects without credentials; Grafana loads the unsigned plugin and
+provisioned datasources (htcondordb + Prometheus). CI runs this as the
+`E2E (Playwright)` job.
 
 ## Limitations / follow-ups
 

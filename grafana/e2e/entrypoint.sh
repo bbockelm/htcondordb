@@ -15,6 +15,9 @@ ALLOW_DAEMON = *
 # still writes here because ALLOW_WRITE = * grants it -- fine for a throwaway E2E DB.
 SEC_DEFAULT_AUTHENTICATION = NEVER
 HTCONDORDB_DIR = /var/lib/htcondordb
+# Expose the Prometheus /metrics endpoint (materialized-view gauges + storage
+# stats) so a Prometheus server can scrape it.
+HTCONDORDB_METRICS_ADDRESS = :9631
 CFG
 
 htcondordb -listen 0.0.0.0:9630 &

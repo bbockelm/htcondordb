@@ -26,7 +26,7 @@ func TestDecodeStreamPathErrors(t *testing.T) {
 }
 
 func TestWatchKindString(t *testing.T) {
-	cases := map[uint8]string{0: "upsert", 1: "delete", 2: "reset", 9: "unknown"}
+	cases := map[uint8]string{0: "upsert", 1: "delete", 2: "reset", 3: "synced", 4: "resync", 9: "unknown"}
 	for k, want := range cases {
 		if got := watchKindString(k); got != want {
 			t.Errorf("watchKindString(%d) = %q, want %q", k, got, want)

@@ -1,0 +1,9 @@
+# Prometheus datasource for the materialized-view timeseries E2E: it scrapes
+# htcondordb's /metrics, so a view's gauge (e.g. jobs_by_owner_jobs) graphs over time.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus-e2e
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090

@@ -17,15 +17,26 @@ import (
 	"github.com/bbockelm/htcondordb/repl"
 )
 
-// watchKindString names a dbrpc.WatchEvent.Kind (0 upsert, 1 delete, 2 reset).
+// dbrpc.WatchEvent.Kind values (classad/db WatchKind): upsert and delete carry a
+// row; reset/synced/resync are control markers.
+const (
+	watchKindUpsert uint8 = 0
+	watchKindDelete uint8 = 1
+)
+
+// watchKindString names a dbrpc.WatchEvent.Kind.
 func watchKindString(k uint8) string {
 	switch k {
-	case 0:
+	case watchKindUpsert:
 		return "upsert"
-	case 1:
+	case watchKindDelete:
 		return "delete"
 	case 2:
 		return "reset"
+	case 3:
+		return "synced"
+	case 4:
+		return "resync"
 	default:
 		return "unknown"
 	}
@@ -151,6 +162,11 @@ func (d *Datasource) RunStream(ctx context.Context, req *backend.RunStreamReques
 	// existing ad), which floods a live panel with current state; a live tail should
 	// show changes as they happen. Fall back to nil (replay) only if the head is
 	// unavailable.
+	// WatchHead gives the "from now" cursor for a base table so a live tail shows
+	// only new changes, not the whole current table. It is not defined for a
+	// materialized view (WatchHead reports "no such table"); there we fall back to a
+	// nil cursor, which replays the view's rows (one per group -- cheap) and then
+	// streams live updates.
 	cursor, herr := exec.WatchHead(spec.Table)
 	if herr != nil {
 		cursor = nil
@@ -168,6 +184,11 @@ func (d *Datasource) RunStream(ctx context.Context, req *backend.RunStreamReques
 		case ev, ok := <-events:
 			if !ok {
 				return nil // server ended the stream / connection closed
+			}
+			// Skip control markers (reset / synced / resync) -- they carry no row,
+			// only upserts and deletes are real changes to show.
+			if ev.Kind > watchKindDelete {
+				continue
 			}
 			frame := streamFrame("", spec, eventRow(spec, ev))
 			if err := sender.SendFrame(frame, data.IncludeDataOnly); err != nil {
