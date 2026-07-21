@@ -163,9 +163,15 @@ func cmdCreate(args []string) error {
 	noManageTopic := fs.Bool("no-manage-topic", false, "do not create/configure the topic (assume it exists)")
 	noCompact := fs.Bool("no-compact", false, "do not set cleanup.policy=compact on a managed topic")
 	batch := fs.Int("batch", 0, "records per flush/checkpoint during live tailing (0=default)")
-	saslUser := fs.String("sasl-user", "", "SASL/PLAIN username")
-	saslPass := fs.String("sasl-pass", "", "SASL/PLAIN password")
+	saslUser := fs.String("sasl-user", "", "SASL/PLAIN username (enables SASL)")
+	// Passwords are referenced, never stored: the exporter reads them at runtime.
+	saslPassFile := fs.String("sasl-password-file", "", "path the exporter reads the SASL password from")
+	saslPassEnv := fs.String("sasl-password-env", "", "env var the exporter reads the SASL password from")
 	tls := fs.Bool("tls", false, "dial the broker with TLS")
+	tlsCA := fs.String("tls-ca", "", "CA bundle to verify the broker (empty = system roots); implies -tls")
+	tlsCert := fs.String("tls-cert", "", "client certificate for mutual TLS; implies -tls")
+	tlsKey := fs.String("tls-key", "", "client private key for mutual TLS; implies -tls")
+	tlsServerName := fs.String("tls-server-name", "", "override the name verified against the broker cert")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -181,10 +187,12 @@ func cmdCreate(args []string) error {
 		ReplicationFactor: *replication,
 		ManageTopic:       boolPtr(!*noManageTopic),
 		Compact:           boolPtr(!*noCompact),
-		TLS:               *tls,
+	}
+	if *tls || *tlsCA != "" || *tlsCert != "" || *tlsKey != "" || *tlsServerName != "" {
+		cfgK.TLS = &kafkasync.TLSConfig{CAFile: *tlsCA, CertFile: *tlsCert, KeyFile: *tlsKey, ServerName: *tlsServerName}
 	}
 	if *saslUser != "" {
-		cfgK.SASL = &kafkasync.SASLConfig{Username: *saslUser, Password: *saslPass}
+		cfgK.SASL = &kafkasync.SASLConfig{Username: *saslUser, PasswordFile: *saslPassFile, PasswordEnv: *saslPassEnv}
 	}
 	if _, err := cfgK.Validate(); err != nil {
 		return err

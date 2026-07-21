@@ -15,6 +15,8 @@ package kafkasync
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -50,10 +52,16 @@ type Config struct {
 	Partitions        int   `json:"partitions,omitempty"`        // default 1
 	ReplicationFactor int   `json:"replicationFactor,omitempty"` // default 1
 
-	// SASL/TLS are intentionally minimal for now; extend as deployments require. Empty
-	// means a plaintext connection (suitable for a trusted network or a local broker).
+	// TLS, when non-nil, dials the broker with TLS. Its fields are all filesystem paths
+	// (never secret material), so the stored config holds no credentials. A zero-value
+	// &TLSConfig{} verifies the broker against the system roots with no client cert;
+	// setting CertFile+KeyFile enables mutual TLS.
+	TLS *TLSConfig `json:"tls,omitempty"`
+
+	// SASL, when non-nil, authenticates to the broker. The password is NEVER stored here;
+	// it is referenced (PasswordFile / PasswordEnv) and read by the exporter process at
+	// runtime, so the catalog never holds -- and no query can display -- the secret.
 	SASL *SASLConfig `json:"sasl,omitempty"`
-	TLS  bool        `json:"tls,omitempty"`
 }
 
 func boolOr(p *bool, def bool) bool {
@@ -69,11 +77,49 @@ func (c Config) ManagesTopic() bool { return boolOr(c.ManageTopic, true) }
 // Compacts reports whether a managed topic is created with cleanup.policy=compact.
 func (c Config) Compacts() bool { return boolOr(c.Compact, true) }
 
-// SASLConfig configures SASL/PLAIN authentication to the broker. Its presence in the stored
-// config is why GetExporter is DAEMON-gated on the server.
+// SASLConfig configures SASL/PLAIN authentication to the broker. The password is never
+// stored in the config; exactly one of PasswordFile or PasswordEnv references where the
+// exporter process reads it at runtime. This keeps the secret out of the catalog and out of
+// anything that displays a config.
 type SASLConfig struct {
 	Username string `json:"username"`
-	Password string `json:"password"`
+	// PasswordFile is a path (readable only by the exporter's account) holding the
+	// password; leading/trailing whitespace is trimmed.
+	PasswordFile string `json:"passwordFile,omitempty"`
+	// PasswordEnv names an environment variable the exporter reads the password from.
+	PasswordEnv string `json:"passwordEnv,omitempty"`
+}
+
+// ResolvePassword reads the SASL password from its referenced source at runtime. Called by
+// the exporter process (which holds the file/env), never by the catalog.
+func (s *SASLConfig) ResolvePassword() (string, error) {
+	switch {
+	case s.PasswordFile != "":
+		b, err := os.ReadFile(s.PasswordFile) //nolint:gosec // operator-provided path, read in the exporter process
+		if err != nil {
+			return "", fmt.Errorf("reading SASL passwordFile: %w", err)
+		}
+		return strings.TrimSpace(string(b)), nil
+	case s.PasswordEnv != "":
+		v, ok := os.LookupEnv(s.PasswordEnv)
+		if !ok {
+			return "", fmt.Errorf("SASL passwordEnv %q is not set in the exporter's environment", s.PasswordEnv)
+		}
+		return v, nil
+	default:
+		return "", fmt.Errorf("SASL configured without a password source (set passwordFile or passwordEnv)")
+	}
+}
+
+// TLSConfig configures a TLS (optionally mutual-TLS) connection to the broker. Every field
+// is a filesystem path or hostname -- no secret material -- so the stored config is safe to
+// persist and display. An empty CAFile verifies against the system roots; CertFile+KeyFile
+// (both required together) enable mutual TLS.
+type TLSConfig struct {
+	CAFile     string `json:"caFile,omitempty"`     // CA bundle to verify the broker (empty = system roots)
+	CertFile   string `json:"certFile,omitempty"`   // client certificate for mutual TLS
+	KeyFile    string `json:"keyFile,omitempty"`    // client private key for mutual TLS
+	ServerName string `json:"serverName,omitempty"` // override the name verified against the broker cert
 }
 
 const (
@@ -103,6 +149,22 @@ func (c Config) Validate() (Config, error) {
 	}
 	if c.ReplicationFactor <= 0 {
 		c.ReplicationFactor = 1
+	}
+	if c.SASL != nil {
+		if c.SASL.Username == "" {
+			return c, fmt.Errorf("kafka exporter: SASL username must be set")
+		}
+		if c.SASL.PasswordFile == "" && c.SASL.PasswordEnv == "" {
+			return c, fmt.Errorf("kafka exporter: SASL needs a password source (passwordFile or passwordEnv); passwords are never stored in the config")
+		}
+		if c.SASL.PasswordFile != "" && c.SASL.PasswordEnv != "" {
+			return c, fmt.Errorf("kafka exporter: set only one of SASL passwordFile or passwordEnv")
+		}
+	}
+	if c.TLS != nil {
+		if (c.TLS.CertFile == "") != (c.TLS.KeyFile == "") {
+			return c, fmt.Errorf("kafka exporter: mutual TLS needs both certFile and keyFile")
+		}
 	}
 	return c, nil
 }

@@ -3,8 +3,10 @@ package kafkasync
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -55,11 +57,21 @@ func NewProducer(ctx context.Context, cfg Config) (Producer, error) {
 		kgo.RequiredAcks(kgo.AllISRAcks()), // required by the idempotent producer
 		kgo.ProducerBatchCompression(kgo.SnappyCompression()),
 	}
-	if cfg.TLS {
-		opts = append(opts, kgo.DialTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12}))
+	if cfg.TLS != nil {
+		tlsCfg, err := buildTLSConfig(cfg.TLS)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, kgo.DialTLSConfig(tlsCfg))
 	}
 	if cfg.SASL != nil {
-		opts = append(opts, kgo.SASL(plain.Auth{User: cfg.SASL.Username, Pass: cfg.SASL.Password}.AsMechanism()))
+		// Resolve the password from its referenced source (file/env) here, in the exporter
+		// process -- it is never read from, or stored in, the catalog config.
+		pass, err := cfg.SASL.ResolvePassword()
+		if err != nil {
+			return nil, fmt.Errorf("kafka: %w", err)
+		}
+		opts = append(opts, kgo.SASL(plain.Auth{User: cfg.SASL.Username, Pass: pass}.AsMechanism()))
 	}
 	cl, err := kgo.NewClient(opts...)
 	if err != nil {
@@ -72,6 +84,34 @@ func NewProducer(ctx context.Context, cfg Config) (Producer, error) {
 		}
 	}
 	return &kgoProducer{cl: cl, topic: cfg.Topic}, nil
+}
+
+// buildTLSConfig turns a TLSConfig (all filesystem paths) into a *tls.Config, loading a
+// custom CA and/or a client certificate for mutual TLS from disk in the exporter process.
+func buildTLSConfig(t *TLSConfig) (*tls.Config, error) {
+	c := &tls.Config{MinVersion: tls.VersionTLS12}
+	if t.ServerName != "" {
+		c.ServerName = t.ServerName
+	}
+	if t.CAFile != "" {
+		pem, err := os.ReadFile(t.CAFile) //nolint:gosec // operator-provided CA path
+		if err != nil {
+			return nil, fmt.Errorf("kafka TLS: reading caFile: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("kafka TLS: caFile %q contained no valid certificates", t.CAFile)
+		}
+		c.RootCAs = pool
+	}
+	if t.CertFile != "" { // KeyFile presence is validated alongside in Config.Validate
+		cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("kafka TLS: loading client cert/key for mutual TLS: %w", err)
+		}
+		c.Certificates = []tls.Certificate{cert}
+	}
+	return c, nil
 }
 
 // ensureTopic creates the destination topic if it does not already exist, configuring
