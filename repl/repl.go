@@ -275,5 +275,14 @@ Management (needs WRITE):
   .retrain [-all] [<sampleMax>]                train/refresh ZSTD compression
   .memory [table]                              drop a table's on-disk backing, keeping
                                                its data in RAM only (needs DAEMON)
+  .timetravel on <window> [checkpoint] | off   enable/disable point-in-time queries on
+                                               the current table (needs DAEMON), e.g.
+                                               .timetravel on 168h 1m
   (-all runs the command on every table)
+
+Point-in-time query (when time travel is enabled):
+  SELECT ... FROM <table> FOR SYSTEM_TIME AS OF '<ts>' WHERE ...
+  (or the shorter "AS OF '<ts>'"); <ts> is RFC3339, "2006-01-02 15:04:05", or a
+  relative look-back like '-1h'. Example:
+  SELECT count(*) FROM jobs AS OF '-1h' WHERE JobStatus == 2
 `
