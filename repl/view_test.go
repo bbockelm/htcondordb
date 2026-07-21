@@ -231,3 +231,40 @@ func TestExecContinuousAggregate(t *testing.T) {
 		}
 	}
 }
+
+// TestViewWithOptions: WITH (grace, retention) parses to seconds and flows to the spec.
+func TestViewWithOptions(t *testing.T) {
+	st, err := Parse(`CREATE MATERIALIZED VIEW jobs_ts AS
+		SELECT time_bucket(QDate,'5m') AS time, COUNT(*) AS metric_jobs
+		FROM jobs GROUP BY time_bucket(QDate,'5m') WITH (grace = '10m', retention = '30d')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ViewGrace != 600 || st.ViewRetention != 2592000 {
+		t.Fatalf("grace=%d retention=%d, want 600, 2592000", st.ViewGrace, st.ViewRetention)
+	}
+	spec, err := viewSpecFromSelect(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Grace != 600 || spec.Retention != 2592000 {
+		t.Fatalf("spec grace=%d retention=%d, want 600, 2592000", spec.Grace, spec.Retention)
+	}
+}
+
+func TestViewWithOptionsErrors(t *testing.T) {
+	// WITH on a non-continuous (gauge) view is rejected at spec build.
+	st, err := Parse(`CREATE MATERIALIZED VIEW g AS SELECT Owner AS label_owner, COUNT(*) AS metric_n ` +
+		`FROM jobs GROUP BY Owner WITH (grace = '10m')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := viewSpecFromSelect(st); err == nil {
+		t.Fatal("expected error: WITH on a gauge view")
+	}
+	// An unknown option is rejected at parse.
+	if _, err := Parse(`CREATE MATERIALIZED VIEW v AS SELECT time_bucket(QDate,'5m') AS time, COUNT(*) AS metric_n ` +
+		`FROM jobs GROUP BY time_bucket(QDate,'5m') WITH (bogus = '1h')`); err == nil {
+		t.Fatal("expected parse error for unknown option")
+	}
+}
