@@ -1,4 +1,4 @@
-import { CoreApp, DataSourceInstanceSettings, ScopedVars } from '@grafana/data';
+import { CoreApp, DataSourceInstanceSettings, MetricFindValue, ScopedVars } from '@grafana/data';
 import { DataSourceWithBackend, getTemplateSrv } from '@grafana/runtime';
 
 import { DEFAULT_QUERY, HtcondordbDataSourceOptions, HtcondordbQuery } from './types';
@@ -44,6 +44,18 @@ export class DataSource extends DataSourceWithBackend<HtcondordbQuery, Htcondord
     } catch {
       return [];
     }
+  }
+
+  // Template variables: a dashboard "Query" variable runs its SQL here and takes
+  // the first column as the variable's values (e.g. SELECT DISTINCT Owner FROM jobs
+  // -> a $owner dropdown). Nested variables are interpolated first.
+  async metricFindQuery(query: string, options?: { scopedVars?: ScopedVars }): Promise<MetricFindValue[]> {
+    const sql = getTemplateSrv().replace((query ?? '').trim(), options?.scopedVars);
+    if (!sql) {
+      return [];
+    }
+    const values: string[] = (await this.postResource('values', { sql })) ?? [];
+    return values.map((v) => ({ text: v, value: v }));
   }
 
   // Skip running queries that have nothing to execute (avoids spurious errors on

@@ -20,21 +20,62 @@ const attrSampleLimit = 50
 // CallResource serves the builder-support endpoints the QueryEditor calls to
 // populate dropdowns without the user memorizing schema:
 //
-//	GET /tables                -> ["ads","history","jobs","machines", ...]
-//	GET /attributes?table=jobs -> ["ClusterId","JobStatus","Owner", ...]
+//	GET  /tables                -> ["ads","history","jobs","machines", ...]
+//	GET  /attributes?table=jobs -> ["ClusterId","JobStatus","Owner", ...]
+//	POST /values {sql}          -> distinct first-column values (template variables)
 func (d *Datasource) CallResource(ctx context.Context, req *backend.CallResourceRequest, sender backend.CallResourceResponseSender) error {
 	path := strings.Trim(pathOnly(req.Path), "/")
-	if req.Method != http.MethodGet {
-		return sendJSON(sender, http.StatusMethodNotAllowed, errBody(fmt.Errorf("method not allowed")))
-	}
-	switch path {
-	case "tables":
+	switch {
+	case req.Method == http.MethodGet && path == "tables":
 		return d.resTables(ctx, sender)
-	case "attributes":
+	case req.Method == http.MethodGet && path == "attributes":
 		return d.resAttributes(ctx, req, sender)
+	case req.Method == http.MethodPost && path == "values":
+		return d.resValues(ctx, req, sender)
 	default:
-		return sendJSON(sender, http.StatusNotFound, errBody(fmt.Errorf("unknown resource %q", path)))
+		return sendJSON(sender, http.StatusNotFound, errBody(fmt.Errorf("unknown resource %s %q", req.Method, path)))
 	}
+}
+
+// resValues runs a SELECT and returns the distinct values of its first column, in
+// first-seen order -- the backing for dashboard template variables (e.g.
+// `SELECT DISTINCT Owner FROM jobs` -> the list of owners for a $owner variable).
+func (d *Datasource) resValues(ctx context.Context, req *backend.CallResourceRequest, sender backend.CallResourceResponseSender) error {
+	var body struct {
+		SQL string `json:"sql"`
+	}
+	if err := json.Unmarshal(req.Body, &body); err != nil {
+		return sendJSON(sender, http.StatusBadRequest, errBody(fmt.Errorf("bad request body: %w", err)))
+	}
+	sql := strings.TrimSpace(body.SQL)
+	if sql == "" {
+		return sendJSON(sender, http.StatusBadRequest, errBody(fmt.Errorf("empty variable query")))
+	}
+	exec, err := d.conns.executor(ctx)
+	if err != nil {
+		d.conns.reset()
+		return sendJSON(sender, http.StatusBadGateway, errBody(err))
+	}
+	res, err := exec.ExecString(sql)
+	if err != nil {
+		if isConnError(err) {
+			d.conns.reset()
+		}
+		return sendJSON(sender, http.StatusBadGateway, errBody(err))
+	}
+	seen := make(map[string]struct{}, len(res.Rows))
+	values := make([]string, 0, len(res.Rows))
+	for _, row := range res.Rows {
+		if len(row) == 0 {
+			continue
+		}
+		if _, ok := seen[row[0]]; ok {
+			continue
+		}
+		seen[row[0]] = struct{}{}
+		values = append(values, row[0])
+	}
+	return sendJSON(sender, http.StatusOK, values)
 }
 
 func (d *Datasource) resTables(ctx context.Context, sender backend.CallResourceResponseSender) error {

@@ -51,6 +51,7 @@ services:
     volumes:
       - ../dist:/var/lib/grafana/plugins/bbockelm-htcondordb-datasource
       - ./provisioning:/etc/grafana/provisioning
+      - ../src/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       htcondordb:
         condition: service_healthy
