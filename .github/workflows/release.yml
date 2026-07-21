@@ -46,7 +46,7 @@ jobs:
             echo "==> building ${name}"
             stage="dist/${name}"
             mkdir -p "${stage}"
-            GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w" \
+            GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w -X main.version=${version}" \
               -o "${stage}/" ./cmd/htcondordb ./cmd/htcondordb-cli
             cp README.md "${stage}/" 2>/dev/null || true
             tar -czf "dist/${name}.tar.gz" -C dist "${name}"
