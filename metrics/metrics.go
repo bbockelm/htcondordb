@@ -46,6 +46,7 @@ type catalogCollector struct {
 	// pair per stall point, so a scraper derives rate() and mean latency (seconds/ops).
 	opSeconds *prometheus.Desc
 	opOps     *prometheus.Desc
+	opMax     *prometheus.Desc
 }
 
 func newCatalogCollector(cat *db.Catalog) *catalogCollector {
@@ -69,6 +70,8 @@ func newCatalogCollector(cat *db.Catalog) *catalogCollector {
 			"Cumulative wall time spent in each store stall point (shard write lock wait/hold, segment allocation, durability sync, compaction/retrain/reindex, snapshot lock), by table and op.", tblOp, nil),
 		opOps: prometheus.NewDesc(namespace+"_op_ops_total",
 			"Cumulative number of times each store stall point ran, by table and op. Divide op_seconds_total by this for mean latency.", tblOp, nil),
+		opMax: prometheus.NewDesc(namespace+"_op_max_seconds",
+			"Longest single occurrence of each store stall point (worst-case latency since start), by table and op. The mean (op_seconds_total/op_ops_total) hides tail stalls; this surfaces them.", tblOp, nil),
 	}
 }
 
@@ -81,6 +84,7 @@ func (c *catalogCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.segments
 	ch <- c.opSeconds
 	ch <- c.opOps
+	ch <- c.opMax
 }
 
 func (c *catalogCollector) Collect(ch chan<- prometheus.Metric) {
@@ -103,6 +107,7 @@ func (c *catalogCollector) Collect(ch chan<- prometheus.Metric) {
 		for _, e := range opStatList(t.OpStats()) {
 			ch <- prometheus.MustNewConstMetric(c.opOps, prometheus.CounterValue, float64(e.stat.Count), name, e.op)
 			ch <- prometheus.MustNewConstMetric(c.opSeconds, prometheus.CounterValue, float64(e.stat.Nanos)/1e9, name, e.op)
+			ch <- prometheus.MustNewConstMetric(c.opMax, prometheus.GaugeValue, float64(e.stat.MaxNanos)/1e9, name, e.op)
 		}
 	}
 }
