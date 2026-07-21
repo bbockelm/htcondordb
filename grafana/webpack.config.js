@@ -33,6 +33,7 @@ module.exports = (env, argv = {}) => ({
       patterns: [
         { from: 'plugin.json', to: '.' },
         { from: 'img', to: 'img', noErrorOnMissing: true },
+        { from: 'dashboards', to: 'dashboards', noErrorOnMissing: true },
         { from: '../README.md', to: '.', noErrorOnMissing: true },
       ],
     }),

@@ -50,6 +50,24 @@ HTCondor stores timestamps (`QDate`, `EnteredCurrentStatus`, …) as unix-epoch
 integers, so those columns render as Grafana time fields automatically; the
 builder's **Time field** forces any column to a time field.
 
+### Template variables
+
+A dashboard **Query** variable runs its SQL against the datasource and takes the
+first column of each row as the variable's values (distinct, order-preserving) —
+e.g. `SELECT DISTINCT Owner FROM jobs` populates a `$owner` dropdown. The SQL is
+executed by the backend `values` resource (`metricFindQuery` in
+`src/datasource.ts`), and nested variables are interpolated before it runs, so a
+variable query may reference another (`… WHERE Owner == "$owner"`). Selected
+values interpolate into panel SQL like any other Grafana variable.
+
+### Shipped dashboard
+
+The plugin bundles an **HTCondorDB Overview** dashboard (`src/dashboards/`,
+declared via `includes` in `plugin.json`) — jobs-by-owner and machines-by-state
+charts plus an `$owner`-filtered job table, with `Data source` and `Owner`
+template variables. Import it from the plugin's **Dashboards** tab after adding a
+datasource.
+
 ### Authentication
 
 The connection reuses htcondordb-cli's path: a CLIENT security config for the
