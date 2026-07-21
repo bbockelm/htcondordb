@@ -162,3 +162,72 @@ func TestExecMaterializedViewEndToEnd(t *testing.T) {
 		t.Fatalf("views after drop = %v, want none", views)
 	}
 }
+
+// TestViewSpecTimeBucket: a time_bucket in the view SELECT/GROUP BY produces a
+// bucketed ViewGroupCol (a continuous aggregate).
+func TestViewSpecTimeBucket(t *testing.T) {
+	st, err := Parse(`CREATE MATERIALIZED VIEW jobs_ts AS
+		SELECT time_bucket(QDate, '1h') AS time, Owner AS label_owner, COUNT(*) AS metric_jobs
+		FROM jobs GROUP BY time_bucket(QDate, '1h'), Owner`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := viewSpecFromSelect(st)
+	if err != nil {
+		t.Fatalf("viewSpecFromSelect: %v", err)
+	}
+	if len(spec.Groups) != 2 {
+		t.Fatalf("groups = %+v, want 2", spec.Groups)
+	}
+	if spec.Groups[0].Attr != "QDate" || spec.Groups[0].Alias != "time" || spec.Groups[0].BucketWidth != 3600 {
+		t.Fatalf("bucket group = %+v, want {QDate time 3600}", spec.Groups[0])
+	}
+	if spec.Groups[1].BucketWidth != 0 || spec.Groups[1].Attr != "Owner" {
+		t.Fatalf("label group = %+v, want plain Owner", spec.Groups[1])
+	}
+}
+
+// TestExecContinuousAggregate creates a time-bucketed view via SQL and reads the series.
+func TestExecContinuousAggregate(t *testing.T) {
+	e, _, cleanup := newPrivCatalogExec(t)
+	defer cleanup()
+	if _, err := e.ExecString("CREATE TABLE jobs"); err != nil {
+		t.Fatal(err)
+	}
+	// 1h buckets: (3600,alice)=2, (3600,bob)=1, (7200,alice)=1.
+	seed := []struct {
+		key, owner string
+		qdate      int
+	}{
+		{"1.0", "alice", 3600}, {"2.0", "alice", 3700},
+		{"3.0", "bob", 3800}, {"4.0", "alice", 7200},
+	}
+	for _, s := range seed {
+		q := "INSERT INTO jobs (Key, Owner, QDate) VALUES ('" + s.key + "', '" + s.owner + "', " + strconv.Itoa(s.qdate) + ")"
+		if _, err := e.ExecString(q); err != nil {
+			t.Fatalf("insert %s: %v", s.key, err)
+		}
+	}
+	if _, err := e.ExecString(`CREATE MATERIALIZED VIEW jobs_ts AS
+		SELECT time_bucket(QDate, '1h') AS time, Owner AS label_owner, COUNT(*) AS metric_jobs
+		FROM jobs GROUP BY time_bucket(QDate, '1h'), Owner`); err != nil {
+		t.Fatalf("CREATE continuous aggregate: %v", err)
+	}
+	r, err := e.ExecString("SELECT time, label_owner, metric_jobs FROM jobs_ts ORDER BY time, label_owner")
+	if err != nil {
+		t.Fatalf("read view: %v", err)
+	}
+	want := [][]string{
+		{"3600", "alice", "2"},
+		{"3600", "bob", "1"},
+		{"7200", "alice", "1"},
+	}
+	if len(r.Rows) != len(want) {
+		t.Fatalf("rows = %v, want %v", r.Rows, want)
+	}
+	for i, w := range want {
+		if r.Rows[i][0] != w[0] || r.Rows[i][1] != w[1] || r.Rows[i][2] != w[2] {
+			t.Errorf("row %d = %v, want %v", i, r.Rows[i], w)
+		}
+	}
+}

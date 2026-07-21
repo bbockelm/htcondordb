@@ -238,7 +238,10 @@ func viewSpecFromSelect(st *Statement) (db.ViewSpec, error) {
 			metrics = append(metrics, db.ViewMetric{Func: fn, Arg: it.Col, Alias: it.header()})
 			continue
 		}
-		groups = append(groups, db.ViewGroupCol{Attr: it.Col, Alias: it.header()})
+		// A time_bucket(attr, 'w') group column carries its width, so the view groups
+		// by the floored timestamp -- a continuous aggregate (time series) rather than a
+		// current-state gauge.
+		groups = append(groups, db.ViewGroupCol{Attr: it.Col, Alias: it.header(), BucketWidth: it.BucketWidth})
 	}
 	if len(metrics) == 0 {
 		return db.ViewSpec{}, fmt.Errorf("a materialized view requires at least one aggregate (COUNT, SUM, or AVG)")
@@ -273,7 +276,13 @@ func groupsMatchGroupBy(groups []db.ViewGroupCol, groupBy []string) error {
 		want[g] = true
 	}
 	for _, g := range groups {
-		if !want[g.Attr] {
+		// A time-bucketed column appears in GROUP BY as its canonical time_bucket key,
+		// not its raw attribute name.
+		key := g.Attr
+		if g.BucketWidth > 0 {
+			key = canonicalBucketKey(g.Attr, g.BucketWidth)
+		}
+		if !want[key] {
 			return fmt.Errorf("column %q is projected but not in GROUP BY", g.Attr)
 		}
 	}
