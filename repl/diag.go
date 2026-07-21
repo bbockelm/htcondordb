@@ -1,6 +1,8 @@
 package repl
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -55,6 +57,10 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.exportViews(console, arg)
 	case ".timetravel":
 		s.timeTravel(console, arg)
+	case ".exporters":
+		s.showExporters(console)
+	case ".exporter":
+		s.showExporter(console, arg)
 	default:
 		return false
 	}
@@ -639,6 +645,63 @@ const (
 )
 
 // showViews lists the materialized view names.
+// showExporters lists the registered external-sink exporters (name + kind). This works on
+// an unprivileged connection; the config is not fetched.
+func (s *session) showExporters(console io.Writer) {
+	infos, err := s.exec.ListExporters()
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	if len(infos) == 0 {
+		fmt.Fprintln(console, "no exporters")
+		return
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Name < infos[j].Name })
+	for _, in := range infos {
+		fmt.Fprintf(console, "  %-24s %s\n", in.Name, in.Kind)
+	}
+}
+
+// showExporter prints one exporter's definition and whether it has checkpointed resume
+// state. Fetching the full definition (including config, which may hold credentials) and the
+// state is DAEMON-gated by the server, so an unprivileged session gets an authorization
+// error here. The config is shown verbatim -- the CLI does not interpret exporter kinds.
+func (s *session) showExporter(console io.Writer, arg string) {
+	name := strings.TrimSpace(arg)
+	if name == "" {
+		fmt.Fprintln(console, "usage: .exporter <name>")
+		return
+	}
+	def, ok, err := s.exec.Exporter(name)
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	if !ok {
+		fmt.Fprintf(console, "no exporter named %q\n", name)
+		return
+	}
+	fmt.Fprintf(console, "name:   %s\n", def.Name)
+	fmt.Fprintf(console, "kind:   %s\n", def.Kind)
+	if len(def.Config) > 0 {
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, def.Config, "        ", "  "); err == nil {
+			fmt.Fprintf(console, "config: %s\n", buf.String())
+		} else {
+			fmt.Fprintf(console, "config: %s\n", string(def.Config))
+		}
+	}
+	switch n, ok, err := s.exec.ExporterStateSize(name); {
+	case err != nil:
+		fmt.Fprintf(console, "state:  (error: %v)\n", err)
+	case ok:
+		fmt.Fprintf(console, "state:  present (%d bytes)\n", n)
+	default:
+		fmt.Fprintln(console, "state:  none (not yet checkpointed)")
+	}
+}
+
 func (s *session) showViews(console io.Writer) {
 	names, err := s.exec.ListViews()
 	if err != nil {

@@ -435,6 +435,25 @@ func (e *Executor) ViewRows(name string) ([]*classad.ClassAd, error) {
 	return e.queryAds(name, "", 0)
 }
 
+// ListExporters returns the registered external-sink exporters (name + kind). This is safe
+// for an unprivileged connection; the config (which may hold credentials) is not returned.
+func (e *Executor) ListExporters() ([]dbrpc.ExporterInfo, error) {
+	return e.c.ListExporters(context.Background())
+}
+
+// Exporter returns a single exporter's full definition (including its opaque config). The
+// server gates this to DAEMON connections, so an unprivileged client gets an error.
+func (e *Executor) Exporter(name string) (db.ExporterDef, bool, error) {
+	return e.c.GetExporter(context.Background(), name)
+}
+
+// ExporterStateSize reports whether an exporter has checkpointed resume state and, if so,
+// its size in bytes. The blob itself is opaque to the CLI (owned by the exporter process).
+func (e *Executor) ExporterStateSize(name string) (int, bool, error) {
+	blob, ok, err := e.c.GetExporterState(context.Background(), name)
+	return len(blob), ok, err
+}
+
 // CreateTable creates a table (used by load auto-routing).
 func (e *Executor) CreateTable(name string) error { return e.c.CreateTable(context.Background(), name) }
 
