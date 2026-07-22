@@ -145,3 +145,92 @@ collect:
 		t.Errorf("1.0 was deleted during reconcile (blink-out); a surviving job must not be dropped; deletes=%v", deletes)
 	}
 }
+
+// TestJobSyncReconcileSkipsUnchanged: a reconciling reload must publish ONLY the real deltas --
+// no event at all for a job whose value is unchanged (the common case in a compaction), an
+// upsert for a changed job and a new job, and a delete for a removed job. This is the
+// watcher-quiet win over both Truncate+replay and a plain re-upsert-everything reload.
+func TestJobSyncReconcileSkipsUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	store := &FileStore{Path: filepath.Join(dir, "jobs.pos")}
+	writeFile(t, logPath, "105\n101 1.0 Job Machine\n103 1.0 Owner \"alice\"\n106\n"+
+		"105\n101 2.0 Job Machine\n103 2.0 Owner \"bob\"\n106\n")
+
+	target, err := db.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+
+	s := NewJobSync(target, JobSyncConfig{Filename: logPath, Store: store})
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor, err := target.WatchCursor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seq, err := target.Watch(ctx, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan db.WatchEvent, 64)
+	go func() {
+		for ev := range seq {
+			events <- ev
+		}
+	}()
+
+	// Compaction: 1.0 unchanged, 3.0 is new, 2.0 completed (removed). The rewrite carries the
+	// full current state (1.0 + 3.0) under a fresh inode.
+	renameOver(t, logPath, "105\n101 1.0 Job Machine\n103 1.0 Owner \"alice\"\n106\n"+
+		"105\n101 3.0 Job Machine\n103 3.0 Owner \"carol\"\n106\n")
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var deletes, upserts []string
+	deadline := time.After(3 * time.Second)
+collect:
+	for {
+		select {
+		case ev := <-events:
+			switch ev.Kind {
+			case db.WatchDelete:
+				deletes = append(deletes, ev.Key)
+			case db.WatchUpsert:
+				upserts = append(upserts, ev.Key)
+			}
+			for _, k := range deletes {
+				if k == "2.0" { // the sweep's delete is the final commit of the reload
+					break collect
+				}
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+	cancel()
+
+	has := func(s []string, key string) bool {
+		for _, k := range s {
+			if k == key {
+				return true
+			}
+		}
+		return false
+	}
+	if has(upserts, "1.0") {
+		t.Errorf("1.0 was re-published though unchanged; reconcile must skip it. upserts=%v", upserts)
+	}
+	if !has(upserts, "3.0") {
+		t.Errorf("3.0 (new) should have been upserted; upserts=%v", upserts)
+	}
+	if !has(deletes, "2.0") {
+		t.Errorf("2.0 (removed) should have been deleted; deletes=%v", deletes)
+	}
+}
