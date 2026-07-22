@@ -58,8 +58,9 @@ type JobSync struct {
 }
 
 // reconcileBatch bounds how many buffered writes a reconciling reload commits at once, so a
-// large compaction never holds the whole delta in one transaction.
-const reconcileBatch = 4096
+// large compaction never holds the whole delta in one transaction. A var (not a const) so a
+// test can lower it to exercise the batch boundary.
+var reconcileBatch = 4096
 
 // JobSyncConfig configures a JobSync.
 type JobSyncConfig struct {
