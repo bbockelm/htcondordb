@@ -147,8 +147,12 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 	// root's); the job's working dir must then be condor-writable.
 	jobDir := t.TempDir()
 	if asRoot {
+		// The job's sandbox: world-writable so it can write its output regardless of which
+		// user the startd maps the job to (the owner if UID_DOMAIN is trusted, else nobody).
 		jobDir = shallowTempDirE2E(t, "cap-job")
-		chownUserE2E(t, jobDir, submitterE2E(t)) // the job runs as the submitting user
+		if err := os.Chmod(jobDir, 0o777); err != nil {
+			t.Fatal(err)
+		}
 	}
 	submit := fmt.Sprintf("universe = vanilla\nexecutable = /bin/sleep\narguments = 3\n"+
 		"output = j.out\nerror = j.err\nlog = j.log\ntransfer_executable = false\ninitialdir = %s\nqueue\n", jobDir)
