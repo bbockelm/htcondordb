@@ -18,26 +18,31 @@ import (
 )
 
 // TestCapstoneE2E is the end-to-end capstone: a real personal HTCondor pool (condor_master
-// and friends, via the golang-htcondor harness -- local binaries, no Docker), a real Kafka
-// broker (Redpanda), the real htcondordb daemon running its schedd-sync job-queue watcher,
-// and the real kafkasync exporter. A job is submitted and run to completion; the test then
-// asserts Kafka saw the job's lifecycle: it appears (upsert, carrying its ClusterId) while
-// live in the queue, and becomes a tombstone once it completes and leaves job_queue.log.
+// and friends, via the golang-htcondor harness -- local binaries, no Docker), a real
+// SASL-authenticated Kafka broker (Redpanda), the real htcondordb daemon running its
+// schedd-sync job-queue watcher, and the real kafkasync exporter. A job is submitted and run
+// to completion; the test asserts Kafka saw the lifecycle -- the job appears (upsert,
+// carrying its ClusterId) while live, then becomes a tombstone once it completes and leaves
+// job_queue.log.
 //
 //	condor_submit -> schedd job_queue.log -> htcondordb (schedd-sync) "jobs" table
-//	             -> kafkasync exporter -> Kafka topic -> this test's consumer
+//	             -> kafkasync exporter --SASL/SCRAM--> Kafka topic -> this test's consumer
 //
-// Everything runs as real processes wired together. Skipped under -short, as root
-// (schedd-sync must not read schedd files privileged), when HTCondor is not installed (the
-// harness skips), when neither rpk nor docker can provide a broker, or when the htcondordb /
-// kafkasync binaries cannot be built.
+// It runs in BOTH deployment modes:
+//   - Unprivileged: the daemons run as the invoking user; the SASL password file is owned by
+//     that user. (Validated locally.)
+//   - As root (the production model under condor_master): htcondordb and kafkasync start as
+//     root and DROP PRIVILEGE to the condor service user. schedd files are then read as that
+//     dropped user, while the root-owned 0600 SASL password is read back AS ROOT via
+//     droppriv -- exercising the privilege model end to end. (Validated in CI.)
+//
+// Skipped under -short, when HTCondor is not installed (the harness skips), when neither rpk
+// nor docker can provide a broker, or when the binaries cannot be built.
 func TestCapstoneE2E(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping capstone E2E in -short mode")
 	}
-	if os.Geteuid() == 0 {
-		t.Skip("capstone E2E must run unprivileged (schedd files must not be read as root)")
-	}
+	asRoot := os.Geteuid() == 0
 
 	// 1. Real personal HTCondor pool from local binaries (skips if condor is not installed).
 	h := htcondor.SetupCondorHarness(t)
@@ -64,17 +69,36 @@ func TestCapstoneE2E(t *testing.T) {
 	htcondordbBin := buildBinaryE2E(t, htcondordbModDir, "./cmd/htcondordb", filepath.Join(binDir, "htcondordb"))
 	kafkasyncBin := buildBinaryE2E(t, kafkasyncModDir, "./cmd/kafkasync", filepath.Join(binDir, "kafkasync"))
 
-	// 3. Real Kafka broker (native rpk, else docker; skips if neither).
-	broker := startBroker(t)
+	// 3. Real SASL-authenticated Kafka broker (native rpk, else docker; skips if neither).
+	broker, saslUser, saslPass := startSASLBrokerE2E(t)
 
-	// 4. htcondordb config: FS auth mapping this user to DAEMON, and schedd-sync mirroring
-	// the harness's job_queue.log into the "jobs" table. Encryption REQUIRED (the released
-	// cedar rejects OPTIONAL request/response ops; a separate fix is in flight).
+	// 4. The SASL password on disk, 0600. When the test runs as root this is root-owned, so
+	// only root can read it -- the exporter must read it via droppriv-as-root after dropping
+	// privilege. (Unprivileged, it is owned by the invoking user.)
+	credDir := t.TempDir()
+	passFile := filepath.Join(credDir, "kafka.pass")
+	writeFileE2E(t, passFile, saslPass+"\n")
+	if err := os.Chmod(passFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. htcondordb config: FS auth mapping this identity to DAEMON, schedd-sync mirroring the
+	// harness's job_queue.log. When root, drop privilege to the condor service user (default),
+	// so schedd files are read unprivileged; credentials are still read as root via droppriv.
 	me, err := user.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
+	principal := me.Username
+	dropCfg := ""
+	if asRoot {
+		principal = "condor" // FS auth maps the dropped-to service user
+		dropCfg = "DROP_PRIVILEGES = True\nCONDOR_USER = condor\n"
+	}
 	dbDir := t.TempDir()
+	if asRoot { // the dropped-to service user must own its state/log dirs
+		chownToCondorE2E(t, dbDir)
+	}
 	addrFile := filepath.Join(dbDir, "addr")
 	hcdbCfg := filepath.Join(dbDir, "htcondordb.config")
 	listen := fmt.Sprintf("127.0.0.1:%d", freePort(t))
@@ -92,37 +116,39 @@ HTCONDORDB_DIR = %[2]s
 HTCONDORDB_ADDRESS_FILE = %[3]s
 HTCONDORDB_SYNC_SCHEDD = True
 HTCONDORDB_JOB_QUEUE_LOG = %[4]s
-`, me.Username, dbDir, addrFile, jobLog))
+%[5]s`, principal, dbDir, addrFile, jobLog, dropCfg))
 	dbEnv := append(os.Environ(), "CONDOR_CONFIG="+hcdbCfg)
 
-	// 5. Start the htcondordb daemon (real process) and wait for its address file.
+	// 6. Start the htcondordb daemon (real process; drops privilege itself when root) and wait
+	// for its address file.
 	dbLog := runProcessE2E(t, dbEnv, htcondordbBin, "-listen", listen)
 	waitForFileE2E(t, addrFile, 30*time.Second, func() string { return dbLog.String() })
 
-	// 6. Register + run the kafkasync exporter on the "jobs" table (real processes). Unique
-	// topic per run so a reused broker never mixes state.
+	// 7. Register + run the kafkasync exporter over SASL/SCRAM. Unique topic per run.
 	topic := fmt.Sprintf("htc.jobs.capstone.%d", os.Getpid())
-	if out, err := runToCompletionE2E(t, dbEnv, kafkasyncBin,
-		"create", "-name", "jobs", "-table", "jobs", "-brokers", broker, "-topic", topic); err != nil {
+	createArgs := []string{"create", "-name", "jobs", "-table", "jobs", "-brokers", broker, "-topic", topic,
+		"-sasl-user", saslUser, "-sasl-mechanism", SASLScramSHA256, "-sasl-password-file", passFile}
+	if out, err := runToCompletionE2E(t, dbEnv, kafkasyncBin, createArgs...); err != nil {
 		t.Fatalf("kafkasync create: %v\n%s", err, out)
 	}
-	exLog := runProcessE2E(t, dbEnv, kafkasyncBin, "run", "-name", "jobs")
-	_ = exLog
+	runProcessE2E(t, dbEnv, kafkasyncBin, "run", "-name", "jobs")
 
-	// 7. Submit a short job and let the pool run it to completion.
+	// 8. Submit a short job and run it to completion.
 	jobDir := t.TempDir()
+	if asRoot {
+		chownToCondorE2E(t, jobDir)
+	}
 	submit := fmt.Sprintf("universe = vanilla\nexecutable = /bin/sleep\narguments = 3\n"+
 		"output = j.out\nerror = j.err\nlog = j.log\ntransfer_executable = false\ninitialdir = %s\nqueue\n", jobDir)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 	clusterID, err := schedd.Submit(ctx, submit)
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	t.Logf("submitted cluster %s; job_queue.log -> htcondordb -> kafka topic %s", clusterID, topic)
+	t.Logf("submitted cluster %s (root=%v); job_queue.log -> htcondordb -> kafka topic %s", clusterID, asRoot, topic)
 	jobKey := clusterID + ".0"
 
-	// Drive the job to a terminal state / out of the queue (personal pool needs a nudge).
 	terminal := false
 	for deadline := time.Now().Add(2 * time.Minute); time.Now().Before(deadline); {
 		ads, qerr := schedd.Query(ctx, "ClusterId == "+clusterID, []string{"JobStatus"})
@@ -138,9 +164,8 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 	}
 	t.Logf("job %s completed and left the queue", clusterID)
 
-	// 8. Verify Kafka saw the lifecycle: the job appeared live (an upsert carrying its
-	// ClusterId), and finally became a tombstone when it left job_queue.log on completion.
-	sawUpsert, sawTombstone := consumeJobLifecycle(t, broker, topic, jobKey, clusterID, 60*time.Second)
+	// 9. Verify Kafka saw the lifecycle over the SASL-authenticated connection.
+	sawUpsert, sawTombstone := consumeJobLifecycle(t, broker, saslUser, saslPass, topic, jobKey, clusterID, 60*time.Second)
 	if !sawUpsert {
 		t.Errorf("kafka never saw job %s as a live upsert (submit->schedd-sync->kafka broke)", jobKey)
 	}
@@ -156,7 +181,6 @@ func configOrE2E(cfg *config.Config, key, fallback string) string {
 	return fallback
 }
 
-// buildBinaryE2E builds pkg in moduleDir to out, skipping the test if the build fails.
 func buildBinaryE2E(t *testing.T, moduleDir, pkg, out string) string {
 	t.Helper()
 	cmd := exec.Command("go", "build", "-o", out, pkg)
@@ -175,7 +199,15 @@ func writeFileE2E(t *testing.T, path, content string) {
 	}
 }
 
-// runProcessE2E starts a long-lived process, capturing its output, and kills it on cleanup.
+// chownToCondorE2E makes path (and its contents) owned by the condor service user, used in
+// root mode so the dropped-to daemon can read/write its own dirs. Best-effort via chown(1).
+func chownToCondorE2E(t *testing.T, path string) {
+	t.Helper()
+	if out, err := exec.Command("chown", "-R", "condor:condor", path).CombinedOutput(); err != nil {
+		t.Logf("chown %s to condor failed (continuing): %v\n%s", path, err, out)
+	}
+}
+
 func runProcessE2E(t *testing.T, env []string, name string, args ...string) *syncBuffer {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -191,7 +223,6 @@ func runProcessE2E(t *testing.T, env []string, name string, args ...string) *syn
 	return buf
 }
 
-// runToCompletionE2E runs a short-lived command and returns its combined output.
 func runToCompletionE2E(t *testing.T, env []string, name string, args ...string) (string, error) {
 	t.Helper()
 	cmd := exec.Command(name, args...)
@@ -212,12 +243,12 @@ func waitForFileE2E(t *testing.T, path string, timeout time.Duration, diag func(
 	t.Fatalf("timed out waiting for %s\n%s", path, diag())
 }
 
-// consumeJobLifecycle reads the topic from the start until it has seen both a live upsert for
-// jobKey (value present, carrying the expected ClusterId) and a later tombstone, or times out.
-func consumeJobLifecycle(t *testing.T, broker, topic, jobKey, clusterID string, timeout time.Duration) (upsert, tombstone bool) {
+// consumeJobLifecycle reads the topic (over SASL) from the start until it has seen both a
+// live upsert for jobKey (carrying the expected ClusterId) and a later tombstone, or times out.
+func consumeJobLifecycle(t *testing.T, broker, saslUser, saslPass, topic, jobKey, clusterID string, timeout time.Duration) (upsert, tombstone bool) {
 	t.Helper()
-	cl, err := kgo.NewClient(kgo.SeedBrokers(broker), kgo.ConsumeTopics(topic),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
+	cl, err := kgo.NewClient(kgo.SeedBrokers(broker), saslConsumerOpt(saslUser, saslPass),
+		kgo.ConsumeTopics(topic), kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +265,7 @@ func consumeJobLifecycle(t *testing.T, broker, topic, jobKey, clusterID string, 
 				return
 			}
 			if r.Value == nil {
-				tombstone = true // ordering: a tombstone only follows the live upserts
+				tombstone = true
 			} else if strings.Contains(string(r.Value), "ClusterId = "+clusterID) {
 				upsert = true
 			}
