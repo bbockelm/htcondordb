@@ -159,17 +159,26 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 	jobKey := clusterID + ".0"
 
 	terminal := false
+	lastStatus := "(never queried)"
 	for deadline := time.Now().Add(2 * time.Minute); time.Now().Before(deadline); {
-		ads, qerr := schedd.Query(ctx, "ClusterId == "+clusterID, []string{"JobStatus"})
-		if qerr == nil && len(ads) == 0 {
-			terminal = true
-			break
+		ads, qerr := schedd.Query(ctx, "ClusterId == "+clusterID,
+			[]string{"JobStatus", "HoldReason", "HoldReasonCode", "LastRejMatchReason", "NumJobStarts"})
+		if qerr == nil {
+			if len(ads) == 0 {
+				terminal = true
+				break
+			}
+			js, _ := ads[0].EvaluateAttrInt("JobStatus")
+			hr, _ := ads[0].EvaluateAttrString("HoldReason")
+			rej, _ := ads[0].EvaluateAttrString("LastRejMatchReason")
+			starts, _ := ads[0].EvaluateAttrInt("NumJobStarts")
+			lastStatus = fmt.Sprintf("JobStatus=%d(1=idle,2=run,5=held) NumJobStarts=%d HoldReason=%q LastRejMatchReason=%q", js, starts, hr, rej)
 		}
 		_ = schedd.Reschedule(ctx)
 		time.Sleep(1 * time.Second)
 	}
 	if !terminal {
-		t.Fatalf("job %s did not leave the queue in time", clusterID)
+		t.Fatalf("job %s did not leave the queue in time: %s", clusterID, lastStatus)
 	}
 	t.Logf("job %s completed and left the queue", clusterID)
 
