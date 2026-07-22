@@ -355,12 +355,23 @@ func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Confi
 	if jobLog == "" && histFile == "" {
 		return fmt.Errorf("HTCONDORDB_SYNC_SCHEDD is set but neither JOB_QUEUE_LOG nor HISTORY is configured")
 	}
+	// Persist each syncer's resume position durably under the database dir, so a restart
+	// resumes instead of re-reading the whole log -- and recovers correctly if the log was
+	// compacted/rotated while down. With an in-memory database (no dir) there is nowhere
+	// durable to keep it, so persistence is off (each start re-syncs from scratch).
+	posDir := getStr(cfg, "HTCONDORDB_DIR")
+	syncStore := func(name string) scheddsync.PositionStore {
+		if posDir == "" {
+			return nil
+		}
+		return &scheddsync.FileStore{Path: filepath.Join(posDir, "scheddsync", name)}
+	}
 	if jobLog != "" {
 		jobs, err := svc.Catalog().CreateTable("jobs")
 		if err != nil {
 			return fmt.Errorf("schedd-sync: creating jobs table: %w", err)
 		}
-		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{Filename: jobLog, Logger: logger})
+		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{Filename: jobLog, Logger: logger, Store: syncStore("jobs.pos")})
 		go func() { _ = js.Run(ctx) }()
 		logger.Info("schedd-sync: mirroring job_queue.log", "file", jobLog, "table", "jobs")
 	}
@@ -372,7 +383,7 @@ func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Confi
 		if err != nil {
 			return fmt.Errorf("schedd-sync: creating history archive: %w", err)
 		}
-		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{Filename: histFile, Logger: logger})
+		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{Filename: histFile, Logger: logger, Store: syncStore("history.pos")})
 		go func() { _ = hs.Run(ctx) }()
 		logger.Info("schedd-sync: tailing history file", "file", histFile, "archive", "history")
 	}
