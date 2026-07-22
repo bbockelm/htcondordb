@@ -18,6 +18,8 @@ github.com/bbockelm/golang-htcondor v0.8.2-0.20260722020852-eee98c30bcef h1:uj/T
 github.com/bbockelm/golang-htcondor v0.8.2-0.20260722020852-eee98c30bcef/go.mod h1:lWcfrrN/DGhZW6fAh9+8ncPlHasHF8oAc4nWG0ysvZw=
 github.com/bbockelm/golang-htcondor v0.8.2-0.20260722021402-5ee2325688d7 h1:hNmgiskXHVtcUgnZJ58bCUFJZClarJR+qaknVSuFvU8=
 github.com/bbockelm/golang-htcondor v0.8.2-0.20260722021402-5ee2325688d7/go.mod h1:lWcfrrN/DGhZW6fAh9+8ncPlHasHF8oAc4nWG0ysvZw=
+github.com/bbockelm/golang-htcondor v0.8.2-0.20260722022230-742a1cd3a1e0 h1:Y9i0OL1mjKib2yeIk7kyssI9lbUC5/2jWqhwPFUby9o=
+github.com/bbockelm/golang-htcondor v0.8.2-0.20260722022230-742a1cd3a1e0/go.mod h1:lWcfrrN/DGhZW6fAh9+8ncPlHasHF8oAc4nWG0ysvZw=
 github.com/bbockelm/gosssd v0.0.1 h1:p9wJYl+GDn29W1it2ZE2RekriwUNs/1U16aUNNro5SM=
 github.com/bbockelm/gosssd v0.0.1/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/bits-and-blooms/bitset v1.24.4 h1:95H15Og1clikBrKr/DuzMXkQzECs1M6hhoGXLwLQOZE=

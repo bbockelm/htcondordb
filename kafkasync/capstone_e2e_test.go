@@ -314,10 +314,11 @@ func submitJobE2E(t *testing.T, ctx context.Context, asRoot bool, condorConfig, 
 		t.Fatal(err)
 	}
 	// Fork condor_submit as the submitting user via a uid/gid credential -- the test is
-	// already root (never shell out to sudo). -name locates the schedd through the collector
-	// (the local schedd address file lives in the condor-only spool, unreadable by the
-	// submitter).
-	cmd := exec.Command("condor_submit", "-name", scheddName, sf)
+	// already root (never shell out to sudo). It finds the local schedd via its address file
+	// (the harness makes its dirs traversable in root mode). scheddName is retained for a
+	// collector-based fallback if ever needed.
+	_ = scheddName
+	cmd := exec.Command("condor_submit", sf)
 	cmd.Env = append(os.Environ(), "CONDOR_CONFIG="+condorConfig)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
 	out, err := cmd.CombinedOutput()
