@@ -191,8 +191,21 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 	if !sawUpsert || !sawTombstone {
 		// Dump the daemon logs so a broken link in condor->htcondordb(schedd-sync)->kafka
 		// is diagnosable (which side stalled, whether the exporter connected/produced).
-		t.Logf("=== htcondordb log ===\n%s", dbLog.String())
-		t.Logf("=== kafkasync log ===\n%s", exLog.String())
+		t.Logf("=== htcondordb stdout ===\n%s", dbLog.String())
+		t.Logf("=== kafkasync stdout ===\n%s", exLog.String())
+		// htcondordb logs to a file under LOG (=dbDir), not stdout; dump the tree.
+		_ = filepath.WalkDir(dbDir, func(p string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if b, rerr := os.ReadFile(p); rerr == nil {
+				if len(b) > 8000 {
+					b = b[len(b)-8000:]
+				}
+				t.Logf("=== dbDir file %s (%d bytes shown) ===\n%s", p, len(b), b)
+			}
+			return nil
+		})
 	}
 	if !sawUpsert {
 		t.Errorf("kafka never saw job %s as a live upsert (submit->schedd-sync->kafka broke)", jobKey)
