@@ -1,0 +1,44 @@
+name: capstone-e2e
+
+# End-to-end capstone: a real personal HTCondor pool (condor_master + schedd + startd +
+# collector + negotiator, from the installed binaries via the golang-htcondor harness), a
+# real Redpanda broker, the htcondordb daemon running its schedd-sync job-queue watcher, and
+# the kafkasync exporter. Submits a job, runs it to completion, and asserts Kafka saw the
+# job's lifecycle (live upsert -> tombstone on completion). No Docker for HTCondor.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  capstone:
+    name: Capstone E2E (condor -> htcondordb -> kafka)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout htcondordb
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with: { path: htcondordb }
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version: '1.25' }
+
+      - name: Install HTCondor
+        run: |
+          wget -qO - https://research.cs.wisc.edu/htcondor/repo/keys/HTCondor-25.x-Key | sudo gpg --dearmor -o /usr/share/keyrings/htcondor-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/htcondor-archive-keyring.gpg] http://research.cs.wisc.edu/htcondor/repo/ubuntu/25.x $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/htcondor.list
+          sudo apt-get update
+          sudo apt-get install -y condor
+
+      - name: Install Redpanda (native; test prefers it over docker)
+        run: |
+          curl -1sLf 'https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.deb.sh' | sudo -E bash
+          sudo apt-get install -y redpanda
+          redpanda --version
+
+      - name: Run capstone E2E
+        working-directory: htcondordb/kafkasync
+        env:
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+        run: go test -run TestCapstoneE2E -v -count=1 -timeout 15m ./...
