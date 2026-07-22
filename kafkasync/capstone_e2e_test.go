@@ -402,12 +402,17 @@ func consumeJobLifecycle(t *testing.T, broker, saslUser, saslPass, topic, jobKey
 	defer cl.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	seen := map[string]int{}
 	for {
 		fs := cl.PollFetches(ctx)
 		if ctx.Err() != nil {
+			// Surface every key observed so "produced nothing" vs "produced under a
+			// different key" is distinguishable when the expected job is missing.
+			t.Logf("consumeJobLifecycle: topic %s records by key: %v (wanted key %q)", topic, seen, jobKey)
 			return upsert, tombstone
 		}
 		fs.EachRecord(func(r *kgo.Record) {
+			seen[string(r.Key)]++
 			if string(r.Key) != jobKey {
 				return
 			}
