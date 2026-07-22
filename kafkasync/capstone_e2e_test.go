@@ -103,7 +103,7 @@ func TestCapstoneE2E(t *testing.T) {
 	if asRoot {
 		principal = "root"
 		dbDir = shallowTempDirE2E(t, "cap-hcdb")
-		chownCondorE2E(t, dbDir) // htcondordb drops to condor and must write LOG/HTCONDORDB_DIR
+		chownUserE2E(t, dbDir, "condor") // htcondordb drops to condor and writes LOG/HTCONDORDB_DIR
 	} else {
 		dbDir = t.TempDir()
 	}
@@ -147,7 +147,7 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 	jobDir := t.TempDir()
 	if asRoot {
 		jobDir = shallowTempDirE2E(t, "cap-job")
-		chownCondorE2E(t, jobDir)
+		chownUserE2E(t, jobDir, submitterE2E(t)) // the job runs as the submitting user
 	}
 	submit := fmt.Sprintf("universe = vanilla\nexecutable = /bin/sleep\narguments = 3\n"+
 		"output = j.out\nerror = j.err\nlog = j.log\ntransfer_executable = false\ninitialdir = %s\nqueue\n", jobDir)
@@ -225,20 +225,31 @@ func shallowTempDirE2E(t *testing.T, prefix string) string {
 	return dir
 }
 
-// chownCondorE2E hands an (empty, freshly created) directory to the condor service user, so
-// a daemon that drops to condor can create its files there. Called before anything is
-// written into path, so a single os.Chown suffices -- no shelling out, no tree walk.
-func chownCondorE2E(t *testing.T, path string) {
+// chownUserE2E hands an (empty, freshly created) directory to username, so a process running
+// as that user can create files there. Called before anything is written into path, so a
+// single os.Chown suffices -- no shelling out, no tree walk.
+func chownUserE2E(t *testing.T, path, username string) {
 	t.Helper()
-	u, err := user.Lookup("condor")
+	u, err := user.Lookup(username)
 	if err != nil {
-		t.Fatalf("root run needs a condor user to drop to: %v", err)
+		t.Fatalf("root run needs the %q user: %v", username, err)
 	}
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(u.Gid)
 	if err := os.Chown(path, uid, gid); err != nil {
-		t.Fatalf("chown %s to condor: %v", path, err)
+		t.Fatalf("chown %s to %s: %v", path, username, err)
 	}
+}
+
+// submitterE2E is the normal (non-root, non-condor) user a root run submits jobs as -- the
+// user who invoked sudo. HTCondor refuses to own a job by root or the condor daemon account.
+func submitterE2E(t *testing.T) string {
+	t.Helper()
+	u := os.Getenv("SUDO_USER")
+	if u == "" || u == "root" {
+		t.Fatal("root run needs SUDO_USER set to a normal user to submit jobs as (run via sudo)")
+	}
+	return u
 }
 
 func writeFileE2E(t *testing.T, path, content string) {
@@ -285,16 +296,17 @@ func submitJobE2E(t *testing.T, ctx context.Context, asRoot bool, condorConfig s
 		}
 		return id
 	}
+	submitter := submitterE2E(t)
 	dir := shallowTempDirE2E(t, "cap-sub")
-	chownCondorE2E(t, dir)
+	chownUserE2E(t, dir, submitter)
 	sf := filepath.Join(dir, "job.sub")
 	writeFileE2E(t, sf, submit)
-	if err := os.Chmod(sf, 0o644); err != nil { // readable by the condor user
+	if err := os.Chmod(sf, 0o644); err != nil { // readable by the submitting user
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sudo", "-u", "condor", "-E", "env", "CONDOR_CONFIG="+condorConfig, "condor_submit", sf).CombinedOutput()
+	out, err := exec.Command("sudo", "-u", submitter, "-E", "env", "CONDOR_CONFIG="+condorConfig, "condor_submit", sf).CombinedOutput()
 	if err != nil {
-		t.Fatalf("condor_submit as condor: %v\n%s", err, out)
+		t.Fatalf("condor_submit as %s: %v\n%s", submitter, err, out)
 	}
 	id := parseClusterE2E(string(out))
 	if id == "" {
