@@ -11,6 +11,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
+	"github.com/twmb/franz-go/pkg/sasl/scram"
 )
 
 // Header is a Kafka record header (metadata alongside key/value).
@@ -70,7 +71,14 @@ func NewProducer(ctx context.Context, cfg Config) (Producer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("kafka: %w", err)
 		}
-		opts = append(opts, kgo.SASL(plain.Auth{User: cfg.SASL.Username, Pass: pass}.AsMechanism()))
+		switch cfg.SASL.mechanism() {
+		case SASLPlain:
+			opts = append(opts, kgo.SASL(plain.Auth{User: cfg.SASL.Username, Pass: pass}.AsMechanism()))
+		case SASLScramSHA256:
+			opts = append(opts, kgo.SASL(scram.Auth{User: cfg.SASL.Username, Pass: pass}.AsSha256Mechanism()))
+		case SASLScramSHA512:
+			opts = append(opts, kgo.SASL(scram.Auth{User: cfg.SASL.Username, Pass: pass}.AsSha512Mechanism()))
+		}
 	}
 	cl, err := kgo.NewClient(opts...)
 	if err != nil {

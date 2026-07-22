@@ -94,17 +94,35 @@ func (c Config) ManagesTopic() bool { return boolOr(c.ManageTopic, true) }
 // Compacts reports whether a managed topic is created with cleanup.policy=compact.
 func (c Config) Compacts() bool { return boolOr(c.Compact, true) }
 
-// SASLConfig configures SASL/PLAIN authentication to the broker. The password is never
-// stored in the config; exactly one of PasswordFile or PasswordEnv references where the
-// exporter process reads it at runtime. This keeps the secret out of the catalog and out of
-// anything that displays a config.
+// SASL mechanisms supported by the exporter.
+const (
+	SASLPlain        = "PLAIN"
+	SASLScramSHA256  = "SCRAM-SHA-256"
+	SASLScramSHA512  = "SCRAM-SHA-512"
+	defaultMechanism = SASLScramSHA256 // the common default (e.g. Redpanda, most Kafka setups)
+)
+
+// SASLConfig configures SASL authentication to the broker. The password is never stored in
+// the config; exactly one of PasswordFile or PasswordEnv references where the exporter reads
+// it at runtime, keeping the secret out of the catalog and out of anything that displays a
+// config.
 type SASLConfig struct {
-	Username string `json:"username"`
+	// Mechanism is PLAIN, SCRAM-SHA-256 (default), or SCRAM-SHA-512.
+	Mechanism string `json:"mechanism,omitempty"`
+	Username  string `json:"username"`
 	// PasswordFile is a path (readable only by the exporter's account) holding the
 	// password; leading/trailing whitespace is trimmed.
 	PasswordFile string `json:"passwordFile,omitempty"`
 	// PasswordEnv names an environment variable the exporter reads the password from.
 	PasswordEnv string `json:"passwordEnv,omitempty"`
+}
+
+// mechanism returns the configured SASL mechanism, defaulting when unset.
+func (s *SASLConfig) mechanism() string {
+	if s.Mechanism == "" {
+		return defaultMechanism
+	}
+	return s.Mechanism
 }
 
 // ResolvePassword reads the SASL password from its referenced source at runtime. Called by
@@ -176,6 +194,11 @@ func (c Config) Validate() (Config, error) {
 		}
 		if c.SASL.PasswordFile != "" && c.SASL.PasswordEnv != "" {
 			return c, fmt.Errorf("kafka exporter: set only one of SASL passwordFile or passwordEnv")
+		}
+		switch c.SASL.mechanism() {
+		case SASLPlain, SASLScramSHA256, SASLScramSHA512:
+		default:
+			return c, fmt.Errorf("kafka exporter: unsupported SASL mechanism %q (want PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)", c.SASL.Mechanism)
 		}
 	}
 	if c.TLS != nil {

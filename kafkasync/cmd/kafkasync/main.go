@@ -163,7 +163,8 @@ func cmdCreate(args []string) error {
 	noManageTopic := fs.Bool("no-manage-topic", false, "do not create/configure the topic (assume it exists)")
 	noCompact := fs.Bool("no-compact", false, "do not set cleanup.policy=compact on a managed topic")
 	batch := fs.Int("batch", 0, "records per flush/checkpoint during live tailing (0=default)")
-	saslUser := fs.String("sasl-user", "", "SASL/PLAIN username (enables SASL)")
+	saslUser := fs.String("sasl-user", "", "SASL username (enables SASL)")
+	saslMech := fs.String("sasl-mechanism", "", "SASL mechanism: PLAIN, SCRAM-SHA-256 (default), or SCRAM-SHA-512")
 	// Passwords are referenced, never stored: the exporter reads them at runtime.
 	saslPassFile := fs.String("sasl-password-file", "", "path the exporter reads the SASL password from")
 	saslPassEnv := fs.String("sasl-password-env", "", "env var the exporter reads the SASL password from")
@@ -192,7 +193,7 @@ func cmdCreate(args []string) error {
 		cfgK.TLS = &kafkasync.TLSConfig{CAFile: *tlsCA, CertFile: *tlsCert, KeyFile: *tlsKey, ServerName: *tlsServerName}
 	}
 	if *saslUser != "" {
-		cfgK.SASL = &kafkasync.SASLConfig{Username: *saslUser, PasswordFile: *saslPassFile, PasswordEnv: *saslPassEnv}
+		cfgK.SASL = &kafkasync.SASLConfig{Mechanism: *saslMech, Username: *saslUser, PasswordFile: *saslPassFile, PasswordEnv: *saslPassEnv}
 	}
 	if _, err := cfgK.Validate(); err != nil {
 		return err

@@ -180,3 +180,22 @@ func genCertKey(t *testing.T) ([]byte, []byte, []byte) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	return certPEM, certPEM, keyPEM
 }
+
+func TestConfigValidateSASLMechanism(t *testing.T) {
+	for _, tc := range []struct {
+		mech string
+		ok   bool
+	}{
+		{"", true}, // default SCRAM-SHA-256
+		{SASLPlain, true},
+		{SASLScramSHA256, true},
+		{SASLScramSHA512, true},
+		{"KERBEROS", false},
+	} {
+		c := baseCfg()
+		c.SASL = &SASLConfig{Mechanism: tc.mech, Username: "u", PasswordFile: "/p"}
+		if _, err := c.Validate(); (err == nil) != tc.ok {
+			t.Errorf("mechanism %q: ok=%v, err=%v", tc.mech, tc.ok, err)
+		}
+	}
+}
