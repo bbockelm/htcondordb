@@ -140,7 +140,7 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 	if out, err := runToCompletionE2E(t, dbEnv, kafkasyncBin, createArgs...); err != nil {
 		t.Fatalf("kafkasync create: %v\n%s", err, out)
 	}
-	runProcessE2E(t, dbEnv, kafkasyncBin, "run", "-name", "jobs")
+	exLog := runProcessE2E(t, dbEnv, kafkasyncBin, "run", "-name", "jobs")
 
 	// 8. Submit a short job and run it to completion. HTCondor refuses to create/run a
 	// root-owned job, so as root we submit as the condor user (jobs are a user action, not
@@ -188,6 +188,12 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 
 	// 9. Verify Kafka saw the lifecycle over the SASL-authenticated connection.
 	sawUpsert, sawTombstone := consumeJobLifecycle(t, broker, saslUser, saslPass, topic, jobKey, clusterID, 60*time.Second)
+	if !sawUpsert || !sawTombstone {
+		// Dump the daemon logs so a broken link in condor->htcondordb(schedd-sync)->kafka
+		// is diagnosable (which side stalled, whether the exporter connected/produced).
+		t.Logf("=== htcondordb log ===\n%s", dbLog.String())
+		t.Logf("=== kafkasync log ===\n%s", exLog.String())
+	}
 	if !sawUpsert {
 		t.Errorf("kafka never saw job %s as a live upsert (submit->schedd-sync->kafka broke)", jobKey)
 	}
