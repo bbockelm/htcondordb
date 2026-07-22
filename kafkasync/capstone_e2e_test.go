@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -225,10 +226,8 @@ func shallowTempDirE2E(t *testing.T, prefix string) string {
 	return dir
 }
 
-// chownUserE2E hands an (empty, freshly created) directory to username, so a process running
-// as that user can create files there. Called before anything is written into path, so a
-// single os.Chown suffices -- no shelling out, no tree walk.
-func chownUserE2E(t *testing.T, path, username string) {
+// lookupUserIDsE2E resolves a username to its numeric uid/gid.
+func lookupUserIDsE2E(t *testing.T, username string) (int, int) {
 	t.Helper()
 	u, err := user.Lookup(username)
 	if err != nil {
@@ -236,6 +235,15 @@ func chownUserE2E(t *testing.T, path, username string) {
 	}
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(u.Gid)
+	return uid, gid
+}
+
+// chownUserE2E hands an (empty, freshly created) directory to username, so a process running
+// as that user can create files there. Called before anything is written into path, so a
+// single os.Chown suffices -- no shelling out, no tree walk.
+func chownUserE2E(t *testing.T, path, username string) {
+	t.Helper()
+	uid, gid := lookupUserIDsE2E(t, username)
 	if err := os.Chown(path, uid, gid); err != nil {
 		t.Fatalf("chown %s to %s: %v", path, username, err)
 	}
@@ -297,6 +305,7 @@ func submitJobE2E(t *testing.T, ctx context.Context, asRoot bool, condorConfig s
 		return id
 	}
 	submitter := submitterE2E(t)
+	uid, gid := lookupUserIDsE2E(t, submitter)
 	dir := shallowTempDirE2E(t, "cap-sub")
 	chownUserE2E(t, dir, submitter)
 	sf := filepath.Join(dir, "job.sub")
@@ -304,7 +313,12 @@ func submitJobE2E(t *testing.T, ctx context.Context, asRoot bool, condorConfig s
 	if err := os.Chmod(sf, 0o644); err != nil { // readable by the submitting user
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sudo", "-u", submitter, "-E", "env", "CONDOR_CONFIG="+condorConfig, "condor_submit", sf).CombinedOutput()
+	// Fork condor_submit as the submitting user via a uid/gid credential -- the test is
+	// already root (never shell out to sudo).
+	cmd := exec.Command("condor_submit", sf)
+	cmd.Env = append(os.Environ(), "CONDOR_CONFIG="+condorConfig)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("condor_submit as %s: %v\n%s", submitter, err, out)
 	}
