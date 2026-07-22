@@ -1,0 +1,37 @@
+name: kafka-integration
+
+# Runs the kafkasync exporter integration test against a real Kafka broker (Redpanda). The
+# test launches and manages the broker itself: it prefers a native `redpanda` binary (which
+# we install below) and falls back to a Redpanda container via the docker CLI (also present
+# on the runner). No externally-provided broker; each test instance uses its own ephemeral
+# ports so the suite can run in parallel.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  integration:
+    name: Kafka exporter integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout htcondordb
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with: { path: htcondordb }
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version: '1.25' }
+
+      - name: Install Redpanda (native; test prefers it over docker)
+        run: |
+          curl -1sLf 'https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.deb.sh' | sudo -E bash
+          sudo apt-get install -y redpanda
+          redpanda --version
+
+      - name: Run kafkasync integration tests
+        working-directory: htcondordb/kafkasync
+        env:
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+        run: go test -v -count=1 -timeout 10m ./...
