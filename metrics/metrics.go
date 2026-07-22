@@ -125,6 +125,7 @@ func opStatList(o db.OpStats) []struct {
 		{"shard_write_hold", o.ShardWriteHold},
 		{"segment_alloc", o.SegmentAlloc},
 		{"sync", o.Sync},
+		{"commit_sync", o.CommitSync},
 		{"compact", o.Compact},
 		{"retrain", o.Retrain},
 		{"reindex", o.Reindex},
