@@ -36,9 +36,31 @@ jobs:
           sudo apt-get install -y redpanda
           redpanda --version
 
-      - name: Run capstone E2E
-        working-directory: htcondordb/kafkasync
+      # Build the daemon binaries and the test binary ONCE, as the normal user (so `go` and
+      # its caches never run privileged), and reuse them for both runs below.
+      # -buildvcs=false: the CI checkout layout (repo in a subdirectory) can make the VCS
+      # stamp fail the build.
+      - name: Build binaries + test binary (once)
+        working-directory: htcondordb
         env:
           GOFLAGS: -mod=mod
           GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
-        run: go test -run TestCapstoneE2E -v -count=1 -timeout 15m ./...
+        run: |
+          go build -buildvcs=false -o /tmp/htcondordb ./cmd/htcondordb
+          ( cd kafkasync && go build -buildvcs=false -o /tmp/kafkasync ./cmd/kafkasync )
+          ( cd kafkasync && go test -buildvcs=false -c -o /tmp/capstone.test -run TestCapstoneE2E . )
+
+      - name: Run capstone E2E (unprivileged)
+        env:
+          HTCONDORDB_BIN: /tmp/htcondordb
+          KAFKASYNC_BIN: /tmp/kafkasync
+        run: /tmp/capstone.test -test.run '^TestCapstoneE2E$' -test.v -test.timeout 15m
+
+      # Run the same pre-built test binary as root: the harness runs the pool root->condor,
+      # htcondordb drops privilege to condor, kafkasync runs as root -- the production
+      # privilege model. apt's condor package created the condor user the drops need.
+      - name: Run capstone E2E (as root, privilege-drop path)
+        run: |
+          sudo -E env "PATH=$PATH" \
+            HTCONDORDB_BIN=/tmp/htcondordb KAFKASYNC_BIN=/tmp/kafkasync \
+            /tmp/capstone.test -test.run '^TestCapstoneE2E$' -test.v -test.timeout 15m
