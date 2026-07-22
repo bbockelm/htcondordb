@@ -8,6 +8,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,27 +29,25 @@ import (
 //	condor_submit -> schedd job_queue.log -> htcondordb (schedd-sync) "jobs" table
 //	             -> kafkasync exporter --SASL/SCRAM--> Kafka topic -> this test's consumer
 //
-// The daemons run as the invoking user and authenticate to Kafka over SASL/SCRAM with a
-// password read from a file (referenced, never stored in the exporter's catalog config).
+// It authenticates to Kafka over SASL/SCRAM with a password read from a file (referenced,
+// never stored in the exporter's catalog config), and runs in BOTH deployment modes:
+//   - Unprivileged: everything runs as the invoking user. (Validated locally.)
+//   - As root (the model under condor_master): the harness runs the pool root->condor,
+//     htcondordb's daemon.New drops privilege to condor and reads the condor-owned
+//     job_queue.log as condor, and kafkasync runs as root. (Validated in CI, which runs the
+//     pre-built test/daemon binaries under sudo.)
 //
-// The production privilege model -- daemons started as root under condor_master, dropping to
-// the condor user and reading root-owned credentials back as root via droppriv -- is a
-// follow-up (see the euid==0 skip below).
-//
-// Skipped under -short, as root, when HTCondor is not installed (the harness skips), when
-// neither rpk nor docker can provide a broker, or when the binaries cannot be built.
+// Skipped under -short, when HTCondor is not installed (the harness skips), when neither rpk
+// nor docker can provide a broker, or when the binaries cannot be built.
 func TestCapstoneE2E(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping capstone E2E in -short mode")
 	}
-	if os.Geteuid() == 0 {
-		// The production privilege model -- daemons start as root under condor_master and
-		// drop privilege to the condor user -- is not yet exercised here. It needs the
-		// harness's personal pool to run root->condor (requires a condor user + the right
-		// CONDOR_IDS config) and kafkasync to drop privilege on startup so its read-as-root
-		// credential path is meaningful. Tracked as a follow-up; run unprivileged for now.
-		t.Skip("capstone E2E runs unprivileged; root/privilege-drop mode is a follow-up")
-	}
+	// When run as root (the production model under condor_master), the harness runs the pool
+	// root->condor, htcondordb's daemon.New drops privilege to condor and reads the
+	// condor-owned job_queue.log, and kafkasync runs as root. Otherwise everything runs as
+	// the invoking user.
+	asRoot := os.Geteuid() == 0
 
 	// 1. Real personal HTCondor pool from local binaries (skips if condor is not installed).
 	h := htcondor.SetupCondorHarness(t)
@@ -67,16 +66,19 @@ func TestCapstoneE2E(t *testing.T) {
 	}
 	schedd := htcondor.NewSchedd(loc.Name, loc.Address)
 
-	// 2. Build the real binaries (skips if they cannot be built).
+	// 2. Real SASL-authenticated Kafka broker (native rpk, else docker; skips if neither).
+	broker, saslUser, saslPass := startSASLBrokerE2E(t)
+
+	// 3. The real binaries -- resolved AFTER the harness/broker skip checks so a skipped run
+	// never builds. Use pre-built paths from HTCONDORDB_BIN / KAFKASYNC_BIN when set (CI
+	// builds them once as the normal user and reuses them for both the unprivileged and root
+	// runs, so `go` never runs privileged), else build them here.
 	_, thisFile, _, _ := runtime.Caller(0)
 	kafkasyncModDir := filepath.Dir(thisFile) // .../htcondordb/kafkasync
 	htcondordbModDir := filepath.Dir(kafkasyncModDir)
 	binDir := t.TempDir()
-	htcondordbBin := buildBinaryE2E(t, htcondordbModDir, "./cmd/htcondordb", filepath.Join(binDir, "htcondordb"))
-	kafkasyncBin := buildBinaryE2E(t, kafkasyncModDir, "./cmd/kafkasync", filepath.Join(binDir, "kafkasync"))
-
-	// 3. Real SASL-authenticated Kafka broker (native rpk, else docker; skips if neither).
-	broker, saslUser, saslPass := startSASLBrokerE2E(t)
+	htcondordbBin := binaryE2E(t, "HTCONDORDB_BIN", htcondordbModDir, "./cmd/htcondordb", filepath.Join(binDir, "htcondordb"))
+	kafkasyncBin := binaryE2E(t, "KAFKASYNC_BIN", kafkasyncModDir, "./cmd/kafkasync", filepath.Join(binDir, "kafkasync"))
 
 	// 4. The SASL password on disk, 0600, owned by the invoking user (the exporter runs as
 	// that user here). The credential is referenced by path, never stored in the exporter's
@@ -88,14 +90,23 @@ func TestCapstoneE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 5. htcondordb config: FS auth mapping this identity to DAEMON, schedd-sync mirroring the
-	// harness's job_queue.log into the "jobs" table.
+	// 5. htcondordb config: FS auth mapping the exporter's identity to DAEMON, schedd-sync
+	// mirroring the harness's job_queue.log into the "jobs" table. As root, kafkasync (the
+	// dbrpc client) runs as root, so DAEMON is granted to root; htcondordb itself drops to
+	// condor, so its state/log dirs must be condor-writable.
 	me, err := user.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
 	principal := me.Username
-	dbDir := t.TempDir()
+	var dbDir string
+	if asRoot {
+		principal = "root"
+		dbDir = shallowTempDirE2E(t, "cap-hcdb")
+		chownCondorE2E(t, dbDir) // htcondordb drops to condor and must write LOG/HTCONDORDB_DIR
+	} else {
+		dbDir = t.TempDir()
+	}
 	addrFile := filepath.Join(dbDir, "addr")
 	hcdbCfg := filepath.Join(dbDir, "htcondordb.config")
 	listen := fmt.Sprintf("127.0.0.1:%d", freePort(t))
@@ -175,15 +186,56 @@ func configOrE2E(cfg *config.Config, key, fallback string) string {
 	return fallback
 }
 
+// binaryE2E returns the binary named by envVar if set (pre-built by the caller), else builds
+// pkg. The env path lets a root CI run avoid invoking `go` as root.
+func binaryE2E(t *testing.T, envVar, moduleDir, pkg, out string) string {
+	t.Helper()
+	if p := os.Getenv(envVar); p != "" {
+		return p
+	}
+	return buildBinaryE2E(t, moduleDir, pkg, out)
+}
+
 func buildBinaryE2E(t *testing.T, moduleDir, pkg, out string) string {
 	t.Helper()
-	cmd := exec.Command("go", "build", "-o", out, pkg)
+	// -buildvcs=false: the CI checkout layout (repo in a subdirectory) can make the VCS
+	// stamp fail the build; the binary needs no version stamp here.
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, pkg)
 	cmd.Dir = moduleDir
 	cmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod")
 	if b, err := cmd.CombinedOutput(); err != nil {
 		t.Skipf("cannot build %s in %s: %v\n%s", pkg, moduleDir, err, b)
 	}
 	return out
+}
+
+// shallowTempDirE2E makes a shallow /tmp directory (not the deeply-nested go test temp) and
+// removes it on cleanup -- short paths keep well under the Unix-socket path limit and are
+// simpler to chown to a service account.
+func shallowTempDirE2E(t *testing.T, prefix string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// chownCondorE2E hands an (empty, freshly created) directory to the condor service user, so
+// a daemon that drops to condor can create its files there. Called before anything is
+// written into path, so a single os.Chown suffices -- no shelling out, no tree walk.
+func chownCondorE2E(t *testing.T, path string) {
+	t.Helper()
+	u, err := user.Lookup("condor")
+	if err != nil {
+		t.Fatalf("root run needs a condor user to drop to: %v", err)
+	}
+	uid, _ := strconv.Atoi(u.Uid)
+	gid, _ := strconv.Atoi(u.Gid)
+	if err := os.Chown(path, uid, gid); err != nil {
+		t.Fatalf("chown %s to condor: %v", path, err)
+	}
 }
 
 func writeFileE2E(t *testing.T, path, content string) {
