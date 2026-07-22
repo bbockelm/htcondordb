@@ -145,11 +145,21 @@ func (s *HistorySync) Poll(ctx context.Context) error {
 	return s.drainToEOF()
 }
 
-// restore loads the persisted position and, if a rotation happened while we were down,
-// re-walks the rotation chain (rotated files + the current one) deduping against the archive
-// so nothing is missed or duplicated. It leaves the current file open at its end for live
-// tailing. With no saved position (first run) it starts at the head of the current file; the
-// archive is empty, so the dedup check trips off on the first record.
+// restore positions the syncer on startup, deduping against the archive so nothing is missed
+// or duplicated, and leaves the current file open at the right offset for live tailing. It has
+// four cases:
+//
+//   - Trusted position (the saved file is still in the chain): drain from it forward -- the
+//     fast, common path.
+//   - Saved file rotated out of retention: a data-loss gap. Fire a resync event and recover
+//     whatever remains on disk.
+//   - No usable position but the archive holds prior history (the position store was lost --
+//     state dir cleared, format change, ...): re-derive the frontier from the ARCHIVE by
+//     walking the chain, skipping files the archive already holds in full. This makes the
+//     position store a fast-path hint rather than a hard dependency.
+//   - No position and an empty archive: a genuine first run -- tail the current file from its
+//     head (the archive is empty, so dedup trips off on the first record); rotated history is
+//     not back-filled.
 func (s *HistorySync) restore() error {
 	s.dedup = true // recovery runs with dedup on until the first record the archive lacks
 	if s.store == nil {
@@ -160,63 +170,44 @@ func (s *HistorySync) restore() error {
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return nil // first run: Poll opens the current file at 0; dedup trips off immediately
-	}
 	var pos historyPos
-	if jerr := json.Unmarshal(blob, &pos); jerr != nil {
-		s.log.Warn("scheddsync: unreadable saved history position; recovering via dedup", "err", jerr.Error())
-		return nil
+	havePos := false
+	if ok {
+		if jerr := json.Unmarshal(blob, &pos); jerr == nil {
+			havePos = true
+		} else {
+			s.log.Warn("scheddsync: unreadable saved history position; recovering from the archive", "err", jerr.Error())
+		}
 	}
 
 	files, ferr := s.historyChain()
 	if ferr != nil {
 		return ferr
 	}
-	// Find where we left off. If the saved file is still in the chain, replay from it (at the
-	// saved offset) forward; otherwise it rotated out of retention -- read what remains and
-	// let dedup place us, warning that older completed jobs may have been lost while down.
+	// Locate our resume file when we have a usable saved position.
 	start, found := 0, false
-	for i, f := range files {
-		if sameFileIdentity(f.id, pos.File) {
-			start, found = i, true
-			break
-		}
-	}
-	if !found && len(files) > 0 {
-		// Data-loss gap: the file we were reading is gone. We recover everything still on disk
-		// below, but jobs that completed after our last sync yet before the oldest surviving
-		// record are lost -- surface that as a structured resync event, quantified by the
-		// oldest CompletionDate that remains.
-		ev := ResyncEvent{Reason: "history-file-rotated-out-of-retention"}
-		// Oldest-first, use the first file with a readable record -- skipping any sibling that
-		// matched the history.* glob but is not a history file (e.g. a co-located position file).
-		for _, f := range files {
-			if cd, cok := firstCompletionDate(f.path); cok {
-				ev.OldestAvailableCompletion = cd
+	if havePos {
+		for i, f := range files {
+			if sameFileIdentity(f.id, pos.File) {
+				start, found = i, true
 				break
 			}
 		}
-		s.log.Warn("scheddsync: saved history file rotated out of retention while down; some completed jobs may be missing",
-			"oldest_available_completion", ev.OldestAvailableCompletion)
-		if s.onResync != nil {
-			s.onResync(ev)
-		}
 	}
-	// Drain every rotated file from the start point up to (but not including) the current one;
-	// the current file is opened for live tailing afterward.
-	for i := start; i < len(files); i++ {
-		if files[i].path == s.filename {
-			continue // the current file is tailed live below
-		}
-		off := int64(0)
-		if i == start && found {
-			off = pos.Offset
-		}
-		if derr := s.drainRotatedFile(files[i].path, off); derr != nil {
-			s.log.Warn("scheddsync: reading rotated history file failed", "file", files[i].path, "err", derr.Error())
-		}
+
+	switch {
+	case found:
+		s.drainChain(files, start, pos.Offset)
+	case havePos && len(files) > 0:
+		s.reportRetentionGap(files)
+		s.drainChain(files, 0, 0)
+	case !havePos && s.archiveNonEmpty():
+		// Lost position, non-empty archive: re-derive the frontier from the archive.
+		s.drainChain(files, 0, 0)
+	default:
+		return nil // genuine first run (or nothing on disk): Poll opens the current file at 0
 	}
+
 	// Open the current file for tailing. If the saved position IS the current file, resume at
 	// its offset; else start at its head (dedup skips anything already archived).
 	startOff := int64(0)
@@ -227,6 +218,65 @@ func (s *HistorySync) restore() error {
 		return oerr
 	}
 	return nil
+}
+
+// drainChain replays rotated files [start, len) (the current file is tailed live by the
+// caller). firstOffset is the byte offset for the file at index start (a resumed saved file);
+// later files start at 0. While deduping, a rotated file whose LAST record the archive already
+// holds is skipped WITHOUT scanning it: history is appended chronologically and synced in
+// order, so if the last record is present every earlier one is too. This turns re-locating the
+// frontier across a deep rotation chain from O(all records) into O(files) for the already-
+// synced prefix -- the CompletionDate/last-record fast-skip.
+func (s *HistorySync) drainChain(files []historyEntry, start int, firstOffset int64) {
+	for i := start; i < len(files); i++ {
+		if files[i].path == s.filename {
+			continue // the current file is tailed live by the caller
+		}
+		off := int64(0)
+		if i == start {
+			off = firstOffset
+		}
+		if s.dedup && off == 0 && s.fileFullyArchived(files[i].path) {
+			continue // entire file already in the archive; skip without scanning
+		}
+		if derr := s.drainRotatedFile(files[i].path, off); derr != nil {
+			s.log.Warn("scheddsync: reading rotated history file failed", "file", files[i].path, "err", derr.Error())
+		}
+	}
+}
+
+// reportRetentionGap emits the resync event for a saved file that rotated out of retention:
+// completed jobs after our last sync but before the oldest surviving record are lost.
+func (s *HistorySync) reportRetentionGap(files []historyEntry) {
+	ev := ResyncEvent{Reason: "history-file-rotated-out-of-retention"}
+	// Oldest-first, use the first file with a readable record -- skipping any sibling that
+	// matched the history.* glob but is not a history file (e.g. a co-located position file).
+	for _, f := range files {
+		if cd, cok := firstCompletionDate(f.path); cok {
+			ev.OldestAvailableCompletion = cd
+			break
+		}
+	}
+	s.log.Warn("scheddsync: saved history file rotated out of retention while down; some completed jobs may be missing",
+		"oldest_available_completion", ev.OldestAvailableCompletion)
+	if s.onResync != nil {
+		s.onResync(ev)
+	}
+}
+
+// archiveNonEmpty reports whether the archive already holds any records (prior history).
+func (s *HistorySync) archiveNonEmpty() bool { return s.archive.Count() > 0 }
+
+// fileFullyArchived reports whether a rotated file's LAST record is already in the archive --
+// which, because history is appended chronologically and synced in order, means the whole file
+// is. A file whose last record cannot be read (unparseable, or beyond the tail window) is
+// treated as NOT fully archived, so it is scanned rather than wrongly skipped.
+func (s *HistorySync) fileFullyArchived(path string) bool {
+	ad, ok := lastRecordAd(path)
+	if !ok {
+		return false
+	}
+	return s.alreadyArchived(ad)
 }
 
 // historyEntry is one file in the rotation chain.
@@ -278,6 +328,56 @@ func firstCompletionDate(path string) (int64, bool) {
 		return 0, false
 	}
 	return cd, true
+}
+
+// lastRecordAd parses the last complete record of a history file (reading only a tail window,
+// so it is cheap on a large file). ok is false if the file is empty, the last record is
+// unparseable, or a single record does not fit the window. Used to test whether a whole file
+// is already archived via its final record.
+func lastRecordAd(path string) (*classad.ClassAd, bool) {
+	f, err := os.Open(path) //nolint:gosec // operator-controlled history path
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close() //nolint:errcheck
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, false
+	}
+	const window = 256 << 10
+	var start int64
+	if fi.Size() > window {
+		start = fi.Size() - window
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil, false
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, false
+	}
+	needle := append([]byte("\n"), bannerPrefix...) // "\n*** " -- newline before a banner line
+	lastNL := bytes.LastIndex(data, needle)         // newline before the final banner
+	if lastNL < 0 {
+		return nil, false
+	}
+	// The final record's attributes are the lines between the penultimate banner and the last.
+	recStart := 0
+	if prevNL := bytes.LastIndex(data[:lastNL], needle); prevNL >= 0 {
+		bannerLine := prevNL + 1
+		nl := bytes.IndexByte(data[bannerLine:], '\n')
+		if nl < 0 {
+			return nil, false
+		}
+		recStart = bannerLine + nl + 1
+	} else if start > 0 {
+		return nil, false // windowed and only one banner seen: cannot trust the record start
+	}
+	ad, perr := classad.ParseOld(string(data[recStart : lastNL+1]))
+	if perr != nil {
+		return nil, false
+	}
+	return ad, true
 }
 
 // drainRotatedFile reads a rotated (no-longer-current) file from off to EOF, appending its
