@@ -40,12 +40,29 @@ type HistorySync struct {
 	log      *slog.Logger
 	store    PositionStore
 
-	file    *os.File    // current open handle (survives a rename of filename)
-	fi      os.FileInfo // its FileInfo, for SameFile rotation detection
-	offset  int64       // bytes consumed from file
-	partial []byte      // buffered bytes of an incomplete trailing record
-	dedup   bool        // while true, skip records the archive already holds (recovery)
-	started bool        // whether restore() has run this process
+	file     *os.File    // current open handle (survives a rename of filename)
+	fi       os.FileInfo // its FileInfo, for SameFile rotation detection
+	offset   int64       // bytes consumed from file
+	partial  []byte      // buffered bytes of an incomplete trailing record
+	dedup    bool        // while true, skip records the archive already holds (recovery)
+	started  bool        // whether restore() has run this process
+	onResync func(ResyncEvent)
+}
+
+// ResyncEvent reports that a durability gap was detected on restart: the history file the
+// syncer was last reading has rotated out of retention entirely, so any completed jobs that
+// finished after the last sync but before the oldest record still on disk are permanently
+// lost from the source. It fires once, during recovery, so an operator can alert or trigger a
+// fuller reconciliation from another source. The syncer still recovers everything that
+// remains on disk (deduping against the archive) -- the event flags only the unrecoverable
+// hole.
+type ResyncEvent struct {
+	// Reason is a short, machine-stable code for the gap.
+	Reason string
+	// OldestAvailableCompletion is the CompletionDate (Unix seconds) of the oldest record
+	// still present on disk after the rotation, or 0 if it could not be read. Completed jobs
+	// with a CompletionDate before this that were not yet synced are lost.
+	OldestAvailableCompletion int64
 }
 
 // HistorySyncConfig configures a HistorySync.
@@ -56,6 +73,10 @@ type HistorySyncConfig struct {
 	// Store, if set, durably records the resume position so a restart resumes instead of
 	// re-appending the whole file, recovering across rotation via archive dedup.
 	Store PositionStore
+	// OnResync, if set, is called once during recovery when the history file the syncer was
+	// last reading has rotated out of retention entirely (a durability gap -- completed jobs
+	// were lost from the source). Recovery still proceeds against whatever remains on disk.
+	OnResync func(ResyncEvent)
 }
 
 // historyPos is HistorySync's persisted resume point.
@@ -75,7 +96,7 @@ func NewHistorySync(archive *db.ArchiveTable, cfg HistorySyncConfig) *HistorySyn
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &HistorySync{filename: cfg.Filename, archive: archive, interval: interval, log: logger, store: cfg.Store}
+	return &HistorySync{filename: cfg.Filename, archive: archive, interval: interval, log: logger, store: cfg.Store, onResync: cfg.OnResync}
 }
 
 // Run polls until ctx is cancelled, starting immediately.
@@ -163,7 +184,24 @@ func (s *HistorySync) restore() error {
 		}
 	}
 	if !found && len(files) > 0 {
-		s.log.Warn("scheddsync: saved history file rotated out of retention while down; some completed jobs may be missing")
+		// Data-loss gap: the file we were reading is gone. We recover everything still on disk
+		// below, but jobs that completed after our last sync yet before the oldest surviving
+		// record are lost -- surface that as a structured resync event, quantified by the
+		// oldest CompletionDate that remains.
+		ev := ResyncEvent{Reason: "history-file-rotated-out-of-retention"}
+		// Oldest-first, use the first file with a readable record -- skipping any sibling that
+		// matched the history.* glob but is not a history file (e.g. a co-located position file).
+		for _, f := range files {
+			if cd, cok := firstCompletionDate(f.path); cok {
+				ev.OldestAvailableCompletion = cd
+				break
+			}
+		}
+		s.log.Warn("scheddsync: saved history file rotated out of retention while down; some completed jobs may be missing",
+			"oldest_available_completion", ev.OldestAvailableCompletion)
+		if s.onResync != nil {
+			s.onResync(ev)
+		}
 	}
 	// Drain every rotated file from the start point up to (but not including) the current one;
 	// the current file is opened for live tailing afterward.
@@ -213,6 +251,33 @@ func (s *HistorySync) historyChain() ([]historyEntry, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].mod.Before(out[j].mod) })
 	return out, nil
+}
+
+// firstCompletionDate reads the first complete record of a history file and returns its
+// CompletionDate (Unix seconds). Used to quantify a retention gap; ok is false if the file is
+// empty, unreadable, or the record lacks the attribute.
+func firstCompletionDate(path string) (int64, bool) {
+	f, err := os.Open(path) //nolint:gosec // operator-controlled history path
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close() //nolint:errcheck
+	buf := make([]byte, 64*1024)
+	n, _ := io.ReadFull(f, buf)
+	data := buf[:n]
+	end := bytes.Index(data, append([]byte("\n"), bannerPrefix...))
+	if end < 0 {
+		return 0, false // no complete record within the first read
+	}
+	ad, perr := classad.ParseOld(string(data[:end+1]))
+	if perr != nil {
+		return 0, false
+	}
+	cd, ok := ad.EvaluateAttrInt("CompletionDate")
+	if !ok {
+		return 0, false
+	}
+	return cd, true
 }
 
 // drainRotatedFile reads a rotated (no-longer-current) file from off to EOF, appending its

@@ -48,6 +48,23 @@ type JobSync struct {
 	// detects a compaction/rotation that happened while we were down. nil disables it.
 	store    PositionStore
 	restored bool // whether restore() has run this process
+
+	// curID identifies the file we last read from; a differing inode on the next poll means
+	// the schedd rotated/compacted the log (it writes job_queue.log.tmp then renames over it,
+	// so the new file's size may equal or exceed our offset -- which the size-based prober
+	// misses). haveID gates the check until the first successful read.
+	curID  fileIdentity
+	haveID bool
+
+	// reconcile is set during a reconciling reload (after a rotation/compaction). While set,
+	// applyEntry records every key the current log contains in seen; the reload then deletes
+	// only the pre-reload keys the new log no longer mentions -- the jobs that completed while
+	// the log was rotated away -- instead of truncating. Unlike Truncate+replay this emits a
+	// real delete for each such job (Truncate drops them silently, leaving phantom copies in
+	// downstream watchers) and never makes a surviving job blink out. The resume position is
+	// checkpointed only after the post-reload sweep commits.
+	reconcile bool
+	seen      map[string]struct{}
 }
 
 // JobSyncConfig configures a JobSync.
@@ -111,6 +128,15 @@ func (s *JobSync) Poll(ctx context.Context) error {
 		}
 		s.restored = true
 	}
+	// Detect rotation/compaction independently of the size-based prober: if the path now
+	// names a different inode than the file we last read, the schedd replaced the log (a
+	// new inode whose size may equal or exceed our offset, which the prober's size heuristic
+	// would misread as a plain append and read our stale offset into the new file).
+	if s.haveID {
+		if cur, serr := statIdentity(s.parser.GetFilename()); serr == nil && !sameFileIdentity(cur, s.curID) {
+			return s.reconcileReload(ctx)
+		}
+	}
 	result, err := s.prober.Probe(s.parser.GetFilename(), s.parser.GetNextOffset())
 	if err != nil {
 		return err
@@ -119,7 +145,7 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	case classadlog.ProbeNoChange:
 		return nil
 	case classadlog.ProbeCompressed:
-		return s.fullReload(ctx)
+		return s.reconcileReload(ctx)
 	case classadlog.ProbeAddition:
 		return s.readAndApply(ctx, false)
 	default:
@@ -128,21 +154,50 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	}
 }
 
-// fullReload handles a rotated/rewritten log: reset to a clean table at offset 0 and replay
-// the whole current log.
-func (s *JobSync) fullReload(ctx context.Context) error {
-	s.prepareRebuild()
-	return s.readAndApply(ctx, true)
-}
-
-// prepareRebuild resets to a clean slate -- abort any open transaction, empty the table,
-// rewind to the start of the log, and clear the prober baseline -- so the next read pass
-// replays the whole current log from scratch.
-func (s *JobSync) prepareRebuild() {
+// reconcileReload rebuilds the table from the current log after a rotation/compaction
+// WITHOUT truncating. It rewinds to the start of the current log, replays it (upserting every
+// job the log contains and recording each key in seen), then deletes only the pre-reload keys
+// the new log no longer mentions -- the jobs that completed and were compacted away while the
+// log was rotated. This emits a real delete for each such job (Truncate would drop them
+// silently, leaving phantom copies in downstream watchers) and never makes a surviving job
+// blink out. The resume position is checkpointed only after the sweep commits, so a crash
+// mid-reload re-runs the (idempotent) reconcile rather than resuming past an un-swept table.
+func (s *JobSync) reconcileReload(ctx context.Context) error {
 	s.abort()
-	s.target.Truncate()
 	s.parser.SetNextOffset(0)
 	s.prober.Reset()
+	before := s.target.Keys()
+	s.reconcile = true
+	s.seen = make(map[string]struct{}, len(before))
+	err := s.readAndApply(ctx, true)
+	if err == nil {
+		err = s.sweep(before)
+	}
+	s.reconcile = false
+	s.seen = nil
+	if err == nil {
+		s.checkpoint() // position recorded only after the swept table matches the log
+	}
+	return err
+}
+
+// sweep deletes every key present before a reconcile reload that the current log no longer
+// contains -- the jobs that completed (and were compacted away) while the log was rotated.
+func (s *JobSync) sweep(before []string) error {
+	var stale []string
+	for _, k := range before {
+		if _, ok := s.seen[k]; !ok {
+			stale = append(stale, k)
+		}
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+	tx := s.target.Begin()
+	for _, k := range stale {
+		tx.DestroyClassAd(k)
+	}
+	return tx.Commit()
 }
 
 // restore positions the syncer from the persisted resume point (once, before the first
@@ -152,7 +207,9 @@ func (s *JobSync) prepareRebuild() {
 // were down -- or we simply don't know how far we got -- so it rebuilds from a clean table.
 // Resuming replays the bytes from the saved offset to EOF, which include any DestroyClassAd
 // for jobs that ended while we were down, keeping the table correct without a full rebuild.
-func (s *JobSync) restore(_ context.Context) error {
+// The rebuild reconciles rather than truncates, so a persistent table keeps its unchanged
+// jobs (only the ones the current log dropped are deleted).
+func (s *JobSync) restore(ctx context.Context) error {
 	if s.store == nil {
 		return nil // persistence disabled: legacy behavior (replay from the start each run)
 	}
@@ -165,6 +222,7 @@ func (s *JobSync) restore(_ context.Context) error {
 			if cur, serr := statIdentity(s.parser.GetFilename()); serr == nil &&
 				sameFileIdentity(cur, pos.File) && cur.Size >= pos.Offset {
 				s.parser.SetNextOffset(pos.Offset)
+				s.curID, s.haveID = cur, true
 				return nil
 			}
 			s.log.Info("scheddsync: job_queue.log rotated/compacted while down; rebuilding")
@@ -172,15 +230,16 @@ func (s *JobSync) restore(_ context.Context) error {
 			s.log.Warn("scheddsync: unreadable saved position; rebuilding", "err", derr.Error())
 		}
 	}
-	s.prepareRebuild()
-	return nil
+	return s.reconcileReload(ctx)
 }
 
 // checkpoint durably records the resume position after a clean read pass. It saves only at a
 // batch boundary with no explicit transaction open (s.tx == nil) -- committing the offset in
-// the middle of an unfinished on-disk transaction would resume past its BeginTransaction.
+// the middle of an unfinished on-disk transaction would resume past its BeginTransaction --
+// and never mid-reconcile (s.reconcile), where the table is not yet swept; reconcileReload
+// checkpoints explicitly once the sweep commits.
 func (s *JobSync) checkpoint() {
-	if s.store == nil || s.tx != nil {
+	if s.store == nil || s.tx != nil || s.reconcile {
 		return
 	}
 	id, err := statIdentity(s.parser.GetFilename())
@@ -209,6 +268,10 @@ func (s *JobSync) readAndApply(ctx context.Context, reload bool) (err error) {
 		_ = s.parser.Close()
 		if uerr := s.prober.Update(s.parser.GetFilename()); uerr != nil && err == nil {
 			err = uerr
+		}
+		// Record the inode we just read so the next poll can detect a rotation to a new file.
+		if id, ierr := statIdentity(s.parser.GetFilename()); ierr == nil {
+			s.curID, s.haveID = id, true
 		}
 		if err == nil {
 			s.checkpoint()
@@ -270,6 +333,11 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 	}
 
 	tx := s.ensureTx()
+	if s.reconcile {
+		// Record every key the current log contains so the post-reload sweep can delete only
+		// the pre-reload keys it no longer mentions.
+		s.seen[e.Key] = struct{}{}
+	}
 	switch e.OpType {
 	case classadlog.OpNewClassAd:
 		ad := classad.New()

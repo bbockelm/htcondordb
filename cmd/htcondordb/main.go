@@ -383,7 +383,18 @@ func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Confi
 		if err != nil {
 			return fmt.Errorf("schedd-sync: creating history archive: %w", err)
 		}
-		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{Filename: histFile, Logger: logger, Store: syncStore("history.pos")})
+		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
+			Filename: histFile,
+			Logger:   logger,
+			Store:    syncStore("history.pos"),
+			// A resync event means the history file rotated out of retention while we were
+			// down, so some completed jobs were lost from the source -- surface it at error
+			// level so it stands out from the routine per-file warnings.
+			OnResync: func(ev scheddsync.ResyncEvent) {
+				logger.Error("schedd-sync: history durability gap; completed jobs lost to rotation",
+					"reason", ev.Reason, "oldest_available_completion", ev.OldestAvailableCompletion)
+			},
+		})
 		go func() { _ = hs.Run(ctx) }()
 		logger.Info("schedd-sync: tailing history file", "file", histFile, "archive", "history")
 	}
