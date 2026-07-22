@@ -141,16 +141,19 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 	}
 	runProcessE2E(t, dbEnv, kafkasyncBin, "run", "-name", "jobs")
 
-	// 8. Submit a short job and run it to completion.
+	// 8. Submit a short job and run it to completion. HTCondor refuses to create/run a
+	// root-owned job, so as root we submit as the condor user (jobs are a user action, not
+	// root's); the job's working dir must then be condor-writable.
 	jobDir := t.TempDir()
+	if asRoot {
+		jobDir = shallowTempDirE2E(t, "cap-job")
+		chownCondorE2E(t, jobDir)
+	}
 	submit := fmt.Sprintf("universe = vanilla\nexecutable = /bin/sleep\narguments = 3\n"+
 		"output = j.out\nerror = j.err\nlog = j.log\ntransfer_executable = false\ninitialdir = %s\nqueue\n", jobDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
-	clusterID, err := schedd.Submit(ctx, submit)
-	if err != nil {
-		t.Fatalf("submit: %v", err)
-	}
+	clusterID := submitJobE2E(t, ctx, asRoot, h.GetConfigFile(), schedd, submit)
 	t.Logf("submitted cluster %s; job_queue.log -> htcondordb -> kafka topic %s", clusterID, topic)
 	jobKey := clusterID + ".0"
 
@@ -268,6 +271,50 @@ func runToCompletionE2E(t *testing.T, env []string, name string, args ...string)
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// submitJobE2E submits a job and returns its cluster id. Unprivileged, it submits directly
+// via the schedd client. As root, HTCondor rejects a root-owned job, so it submits as the
+// condor user through condor_submit (the submit file lives in a condor-owned dir).
+func submitJobE2E(t *testing.T, ctx context.Context, asRoot bool, condorConfig string, schedd *htcondor.Schedd, submit string) string {
+	t.Helper()
+	if !asRoot {
+		id, err := schedd.Submit(ctx, submit)
+		if err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+		return id
+	}
+	dir := shallowTempDirE2E(t, "cap-sub")
+	chownCondorE2E(t, dir)
+	sf := filepath.Join(dir, "job.sub")
+	writeFileE2E(t, sf, submit)
+	if err := os.Chmod(sf, 0o644); err != nil { // readable by the condor user
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sudo", "-u", "condor", "-E", "env", "CONDOR_CONFIG="+condorConfig, "condor_submit", sf).CombinedOutput()
+	if err != nil {
+		t.Fatalf("condor_submit as condor: %v\n%s", err, out)
+	}
+	id := parseClusterE2E(string(out))
+	if id == "" {
+		t.Fatalf("could not parse cluster id from condor_submit output:\n%s", out)
+	}
+	return id
+}
+
+// parseClusterE2E extracts N from condor_submit's "... submitted to cluster N.".
+func parseClusterE2E(out string) string {
+	i := strings.LastIndex(out, "cluster ")
+	if i < 0 {
+		return ""
+	}
+	rest := out[i+len("cluster "):]
+	n := 0
+	for n < len(rest) && rest[n] >= '0' && rest[n] <= '9' {
+		n++
+	}
+	return rest[:n]
 }
 
 func waitForFileE2E(t *testing.T, path string, timeout time.Duration, diag func() string) {
