@@ -154,7 +154,7 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 		"output = j.out\nerror = j.err\nlog = j.log\ntransfer_executable = false\ninitialdir = %s\nqueue\n", jobDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
-	clusterID := submitJobE2E(t, ctx, asRoot, h.GetConfigFile(), schedd, submit)
+	clusterID := submitJobE2E(t, ctx, asRoot, h.GetConfigFile(), loc.Name, schedd, submit)
 	t.Logf("submitted cluster %s; job_queue.log -> htcondordb -> kafka topic %s", clusterID, topic)
 	jobKey := clusterID + ".0"
 
@@ -295,7 +295,7 @@ func runToCompletionE2E(t *testing.T, env []string, name string, args ...string)
 // submitJobE2E submits a job and returns its cluster id. Unprivileged, it submits directly
 // via the schedd client. As root, HTCondor rejects a root-owned job, so it submits as the
 // condor user through condor_submit (the submit file lives in a condor-owned dir).
-func submitJobE2E(t *testing.T, ctx context.Context, asRoot bool, condorConfig string, schedd *htcondor.Schedd, submit string) string {
+func submitJobE2E(t *testing.T, ctx context.Context, asRoot bool, condorConfig, scheddName string, schedd *htcondor.Schedd, submit string) string {
 	t.Helper()
 	if !asRoot {
 		id, err := schedd.Submit(ctx, submit)
@@ -314,8 +314,10 @@ func submitJobE2E(t *testing.T, ctx context.Context, asRoot bool, condorConfig s
 		t.Fatal(err)
 	}
 	// Fork condor_submit as the submitting user via a uid/gid credential -- the test is
-	// already root (never shell out to sudo).
-	cmd := exec.Command("condor_submit", sf)
+	// already root (never shell out to sudo). -name locates the schedd through the collector
+	// (the local schedd address file lives in the condor-only spool, unreadable by the
+	// submitter).
+	cmd := exec.Command("condor_submit", "-name", scheddName, sf)
 	cmd.Env = append(os.Environ(), "CONDOR_CONFIG="+condorConfig)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
 	out, err := cmd.CombinedOutput()
