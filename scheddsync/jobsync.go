@@ -14,6 +14,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -42,6 +44,14 @@ type JobSync struct {
 	// pass); an explicit transaction stays open until its EndTransaction.
 	tx       *db.Txn
 	implicit bool
+
+	// children maps a cluster ad key ("0C.-1") to the set of its proc ad keys ("C.P"). Some
+	// HTCondor versions keep cluster-wide attributes (ClusterId, Owner, ...) only on the
+	// cluster ad and chain the proc ads to it (condor_q's merged view); a flat mirror would
+	// drop them. This index lets a new proc inherit its cluster's current attributes and a
+	// cluster-ad edit fan out to the chained proc rows -- in either on-disk order. Reset on a
+	// reconcile reload (the reconciler re-chains via a separate pass).
+	children map[string]map[string]struct{}
 
 	// store durably records the resume position (offset + which file we were reading) after
 	// each committed batch, so a restart resumes instead of replaying the whole log -- and
@@ -88,6 +98,7 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 		prober:   classadlog.NewProber(),
 		interval: interval,
 		log:      logger,
+		children: map[string]map[string]struct{}{},
 		store:    cfg.Store,
 	}
 }
@@ -162,6 +173,7 @@ func (s *JobSync) Poll(ctx context.Context) error {
 // reconcile rather than resuming past an unfinished table.
 func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	s.abort()
+	s.children = map[string]map[string]struct{}{}
 	s.parser.SetNextOffset(0)
 	s.prober.Reset()
 	before := s.target.Keys()
@@ -214,11 +226,57 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	if err = rec.finish(); err != nil { // flush the last key and commit the final batch
 		return err
 	}
+	// Chain proc ads to their cluster ads in a second pass: the cluster ad may be written
+	// after its procs in the log, so it is only guaranteed complete once every key is flushed.
+	if err = s.chainReconciledProcs(seen); err != nil {
+		return err
+	}
 	if err = s.sweepKeys(before, seen); err != nil {
 		return err
 	}
 	s.checkpoint() // position recorded only after the reconciled table matches the log
 	return nil
+}
+
+// chainReconciledProcs, run after a reconcile has written every key, copies each proc ad's
+// parent cluster ad attributes onto the proc row -- for HTCondor versions that keep
+// cluster-wide attributes only on the cluster ad. It is a no-op for procs that already carry
+// their own attributes. Writes are committed in bounded batches.
+func (s *JobSync) chainReconciledProcs(seen map[string]struct{}) error {
+	var batch *db.Txn
+	n := 0
+	commit := func() error {
+		if batch == nil {
+			return nil
+		}
+		err := batch.Commit()
+		batch, n = nil, 0
+		return err
+	}
+	for key := range seen {
+		parentKey, ok := clusterKeyOf(key)
+		if !ok {
+			continue
+		}
+		parent, ok := s.target.LookupClassAd(parentKey)
+		if !ok {
+			continue
+		}
+		proc, ok := s.target.LookupClassAd(key)
+		if !ok || !chainAttrsInto(proc, parent) {
+			continue
+		}
+		if batch == nil {
+			batch = s.target.Begin()
+		}
+		batch.NewClassAd(key, proc)
+		if n++; n >= reconcileBatch {
+			if err := commit(); err != nil {
+				return err
+			}
+		}
+	}
+	return commit()
 }
 
 // sweepKeys deletes every key present before a reconcile reload that the current log no longer
@@ -499,18 +557,108 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 			ad.InsertAttrString("TargetType", e.TargetType)
 		}
 		tx.NewClassAd(e.Key, ad)
+		// Chain a proc ad to its parent cluster ad: inherit the cluster's attributes already
+		// set (the proc's own, applied by later entries, win) and register it so a subsequent
+		// cluster-ad edit fans out to it. Together these cover both on-disk orders -- cluster
+		// attributes set before or after the proc's NewClassAd.
+		if parent, ok := clusterKeyOf(e.Key); ok {
+			s.chainFromParent(tx, e.Key, parent)
+			s.addChild(parent, e.Key)
+		}
 	case classadlog.OpDestroyClassAd:
 		tx.DestroyClassAd(e.Key)
+		if parent, ok := clusterKeyOf(e.Key); ok {
+			if kids := s.children[parent]; kids != nil {
+				delete(kids, e.Key)
+			}
+		} else {
+			delete(s.children, e.Key) // a destroyed cluster ad drops its child set
+		}
 	case classadlog.OpSetAttribute:
 		if err := tx.SetAttribute(e.Key, e.Name, e.Value); err != nil {
 			// A single malformed value must not abort the whole sync; skip it.
 			s.log.Warn("job_queue.log: skipping unparseable attribute",
 				"key", e.Key, "attr", e.Name, "err", err.Error())
+		} else {
+			// Propagate a cluster-ad attribute to its chained proc rows (a no-op for keys that
+			// are not cluster ads with children).
+			for child := range s.children[e.Key] {
+				if perr := tx.SetAttribute(child, e.Name, e.Value); perr != nil {
+					s.log.Warn("job_queue.log: skipping unparseable cluster attribute",
+						"key", child, "attr", e.Name, "err", perr.Error())
+				}
+			}
 		}
 	case classadlog.OpDeleteAttribute:
 		tx.DeleteAttribute(e.Key, e.Name)
+		for child := range s.children[e.Key] {
+			tx.DeleteAttribute(child, e.Name)
+		}
 	}
 	return nil
+}
+
+// addChild registers proc key child under its parent cluster ad key.
+func (s *JobSync) addChild(parent, child string) {
+	kids := s.children[parent]
+	if kids == nil {
+		kids = map[string]struct{}{}
+		s.children[parent] = kids
+	}
+	kids[child] = struct{}{}
+}
+
+// clusterKeyOf returns the parent cluster ad key for a proc ad key of the form "C.P"
+// (ProcId >= 0), following HTCondor's job_queue.log convention where cluster C's ad is
+// keyed "0C.-1". It returns ("", false) for anything that is not a real proc ad: cluster
+// ads ("0C.-1"), jobset ads ("C.-2"), and the schedd header namespace (cluster 0).
+func clusterKeyOf(key string) (string, bool) {
+	dot := strings.IndexByte(key, '.')
+	if dot <= 0 {
+		return "", false
+	}
+	clusterStr, procStr := key[:dot], key[dot+1:]
+	if proc, err := strconv.Atoi(procStr); err != nil || proc < 0 {
+		return "", false
+	}
+	if cluster, err := strconv.Atoi(clusterStr); err != nil || cluster <= 0 {
+		return "", false
+	}
+	return "0" + clusterStr + ".-1", true
+}
+
+// chainFromParent copies the parent cluster ad's attributes (as the transaction currently
+// sees them) onto the proc ad, so the materialized proc row carries its cluster's attributes.
+// A no-op when the parent has nothing the proc lacks.
+func (s *JobSync) chainFromParent(tx *db.Txn, procKey, parentKey string) {
+	parent, ok := tx.LookupClassAd(parentKey)
+	if !ok {
+		return
+	}
+	proc, ok := tx.LookupClassAd(procKey)
+	if !ok {
+		return
+	}
+	if chainAttrsInto(proc, parent) {
+		tx.NewClassAd(procKey, proc)
+	}
+}
+
+// chainAttrsInto copies every attribute of parent that dst does not already define into dst,
+// reporting whether anything was added. dst's own attributes win (HTCondor chaining, where a
+// proc ad overrides its cluster ad).
+func chainAttrsInto(dst, parent *classad.ClassAd) bool {
+	changed := false
+	for _, name := range parent.GetAttributes() {
+		if _, has := dst.Lookup(name); has {
+			continue
+		}
+		if e, ok := parent.Lookup(name); ok {
+			dst.InsertExpr(name, e)
+			changed = true
+		}
+	}
+	return changed
 }
 
 // ensureTx returns the open transaction, starting an implicit one if none is open (for a
