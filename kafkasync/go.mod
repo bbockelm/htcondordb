@@ -1,13 +1,13 @@
 module github.com/bbockelm/htcondordb/kafkasync
 
-go 1.25.0
+go 1.25.7
 
 require (
 	github.com/PelicanPlatform/classad v0.14.0
 	github.com/PelicanPlatform/classad/db v0.14.0
 	github.com/PelicanPlatform/classad/dbrpc v0.14.0
 	github.com/bbockelm/cedar v0.6.3
-	github.com/bbockelm/golang-htcondor v0.0.10
+	github.com/bbockelm/golang-htcondor v0.8.1
 	github.com/twmb/franz-go v1.21.5
 	github.com/twmb/franz-go/pkg/kadm v1.18.0
 )
@@ -15,8 +15,9 @@ require (
 require (
 	github.com/PelicanPlatform/classad/collections v0.14.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
+	github.com/bbockelm/gosssd v0.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
-	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
@@ -29,8 +30,8 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	github.com/twmb/franz-go/pkg/kmsg v1.13.1 // indirect
-	golang.org/x/crypto v0.53.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/time v0.14.0 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 )
