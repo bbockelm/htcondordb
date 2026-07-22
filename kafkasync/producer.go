@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -94,7 +93,7 @@ func buildTLSConfig(t *TLSConfig) (*tls.Config, error) {
 		c.ServerName = t.ServerName
 	}
 	if t.CAFile != "" {
-		pem, err := os.ReadFile(t.CAFile) //nolint:gosec // operator-provided CA path
+		pem, err := readCredentialFile(t.CAFile)
 		if err != nil {
 			return nil, fmt.Errorf("kafka TLS: reading caFile: %w", err)
 		}
@@ -105,7 +104,17 @@ func buildTLSConfig(t *TLSConfig) (*tls.Config, error) {
 		c.RootCAs = pool
 	}
 	if t.CertFile != "" { // KeyFile presence is validated alongside in Config.Validate
-		cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+		// Read both as root (the key is typically root-owned 0600), then pair in memory --
+		// tls.LoadX509KeyPair would read them under the current identity.
+		certPEM, err := readCredentialFile(t.CertFile)
+		if err != nil {
+			return nil, fmt.Errorf("kafka TLS: reading certFile: %w", err)
+		}
+		keyPEM, err := readCredentialFile(t.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("kafka TLS: reading keyFile: %w", err)
+		}
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
 		if err != nil {
 			return nil, fmt.Errorf("kafka TLS: loading client cert/key for mutual TLS: %w", err)
 		}

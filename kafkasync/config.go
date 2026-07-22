@@ -15,10 +15,27 @@ package kafkasync
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/bbockelm/golang-htcondor/droppriv"
 )
+
+// readCredentialFile reads a credential file, elevating to root via droppriv when the
+// process is privileged -- matching HTCondor's set_priv(PRIV_ROOT) -- so a root-owned 0600
+// credential (Kafka SASL password, TLS key/cert, CA) stays readable after the exporter has
+// dropped to a service account. When not privileged (or on an unsupported platform) it reads
+// under the current identity. Used for every on-disk Kafka credential the exporter loads.
+func readCredentialFile(path string) ([]byte, error) {
+	f, err := droppriv.OpenAsRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close() //nolint:errcheck
+	return io.ReadAll(f)
+}
 
 // Kind is the exporter kind this package implements; it is stored in db.ExporterDef.Kind.
 const Kind = "kafka"
@@ -95,7 +112,7 @@ type SASLConfig struct {
 func (s *SASLConfig) ResolvePassword() (string, error) {
 	switch {
 	case s.PasswordFile != "":
-		b, err := os.ReadFile(s.PasswordFile) //nolint:gosec // operator-provided path, read in the exporter process
+		b, err := readCredentialFile(s.PasswordFile)
 		if err != nil {
 			return "", fmt.Errorf("reading SASL passwordFile: %w", err)
 		}
