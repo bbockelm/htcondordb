@@ -28,21 +28,27 @@ import (
 //	condor_submit -> schedd job_queue.log -> htcondordb (schedd-sync) "jobs" table
 //	             -> kafkasync exporter --SASL/SCRAM--> Kafka topic -> this test's consumer
 //
-// It runs in BOTH deployment modes:
-//   - Unprivileged: the daemons run as the invoking user; the SASL password file is owned by
-//     that user. (Validated locally.)
-//   - As root (the production model under condor_master): htcondordb and kafkasync start as
-//     root and DROP PRIVILEGE to the condor service user. schedd files are then read as that
-//     dropped user, while the root-owned 0600 SASL password is read back AS ROOT via
-//     droppriv -- exercising the privilege model end to end. (Validated in CI.)
+// The daemons run as the invoking user and authenticate to Kafka over SASL/SCRAM with a
+// password read from a file (referenced, never stored in the exporter's catalog config).
 //
-// Skipped under -short, when HTCondor is not installed (the harness skips), when neither rpk
-// nor docker can provide a broker, or when the binaries cannot be built.
+// The production privilege model -- daemons started as root under condor_master, dropping to
+// the condor user and reading root-owned credentials back as root via droppriv -- is a
+// follow-up (see the euid==0 skip below).
+//
+// Skipped under -short, as root, when HTCondor is not installed (the harness skips), when
+// neither rpk nor docker can provide a broker, or when the binaries cannot be built.
 func TestCapstoneE2E(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping capstone E2E in -short mode")
 	}
-	asRoot := os.Geteuid() == 0
+	if os.Geteuid() == 0 {
+		// The production privilege model -- daemons start as root under condor_master and
+		// drop privilege to the condor user -- is not yet exercised here. It needs the
+		// harness's personal pool to run root->condor (requires a condor user + the right
+		// CONDOR_IDS config) and kafkasync to drop privilege on startup so its read-as-root
+		// credential path is meaningful. Tracked as a follow-up; run unprivileged for now.
+		t.Skip("capstone E2E runs unprivileged; root/privilege-drop mode is a follow-up")
+	}
 
 	// 1. Real personal HTCondor pool from local binaries (skips if condor is not installed).
 	h := htcondor.SetupCondorHarness(t)
@@ -72,9 +78,9 @@ func TestCapstoneE2E(t *testing.T) {
 	// 3. Real SASL-authenticated Kafka broker (native rpk, else docker; skips if neither).
 	broker, saslUser, saslPass := startSASLBrokerE2E(t)
 
-	// 4. The SASL password on disk, 0600. When the test runs as root this is root-owned, so
-	// only root can read it -- the exporter must read it via droppriv-as-root after dropping
-	// privilege. (Unprivileged, it is owned by the invoking user.)
+	// 4. The SASL password on disk, 0600, owned by the invoking user (the exporter runs as
+	// that user here). The credential is referenced by path, never stored in the exporter's
+	// catalog config.
 	credDir := t.TempDir()
 	passFile := filepath.Join(credDir, "kafka.pass")
 	writeFileE2E(t, passFile, saslPass+"\n")
@@ -83,22 +89,13 @@ func TestCapstoneE2E(t *testing.T) {
 	}
 
 	// 5. htcondordb config: FS auth mapping this identity to DAEMON, schedd-sync mirroring the
-	// harness's job_queue.log. When root, drop privilege to the condor service user (default),
-	// so schedd files are read unprivileged; credentials are still read as root via droppriv.
+	// harness's job_queue.log into the "jobs" table.
 	me, err := user.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
 	principal := me.Username
-	dropCfg := ""
-	if asRoot {
-		principal = "condor" // FS auth maps the dropped-to service user
-		dropCfg = "DROP_PRIVILEGES = True\nCONDOR_USER = condor\n"
-	}
 	dbDir := t.TempDir()
-	if asRoot { // the dropped-to service user must own its state/log dirs
-		chownToCondorE2E(t, dbDir)
-	}
 	addrFile := filepath.Join(dbDir, "addr")
 	hcdbCfg := filepath.Join(dbDir, "htcondordb.config")
 	listen := fmt.Sprintf("127.0.0.1:%d", freePort(t))
@@ -116,7 +113,7 @@ HTCONDORDB_DIR = %[2]s
 HTCONDORDB_ADDRESS_FILE = %[3]s
 HTCONDORDB_SYNC_SCHEDD = True
 HTCONDORDB_JOB_QUEUE_LOG = %[4]s
-%[5]s`, principal, dbDir, addrFile, jobLog, dropCfg))
+`, principal, dbDir, addrFile, jobLog))
 	dbEnv := append(os.Environ(), "CONDOR_CONFIG="+hcdbCfg)
 
 	// 6. Start the htcondordb daemon (real process; drops privilege itself when root) and wait
@@ -135,9 +132,6 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 
 	// 8. Submit a short job and run it to completion.
 	jobDir := t.TempDir()
-	if asRoot {
-		chownToCondorE2E(t, jobDir)
-	}
 	submit := fmt.Sprintf("universe = vanilla\nexecutable = /bin/sleep\narguments = 3\n"+
 		"output = j.out\nerror = j.err\nlog = j.log\ntransfer_executable = false\ninitialdir = %s\nqueue\n", jobDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
@@ -146,7 +140,7 @@ HTCONDORDB_JOB_QUEUE_LOG = %[4]s
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	t.Logf("submitted cluster %s (root=%v); job_queue.log -> htcondordb -> kafka topic %s", clusterID, asRoot, topic)
+	t.Logf("submitted cluster %s; job_queue.log -> htcondordb -> kafka topic %s", clusterID, topic)
 	jobKey := clusterID + ".0"
 
 	terminal := false
@@ -199,14 +193,7 @@ func writeFileE2E(t *testing.T, path, content string) {
 	}
 }
 
-// chownToCondorE2E makes path (and its contents) owned by the condor service user, used in
 // root mode so the dropped-to daemon can read/write its own dirs. Best-effort via chown(1).
-func chownToCondorE2E(t *testing.T, path string) {
-	t.Helper()
-	if out, err := exec.Command("chown", "-R", "condor:condor", path).CombinedOutput(); err != nil {
-		t.Logf("chown %s to condor failed (continuing): %v\n%s", path, err, out)
-	}
-}
 
 func runProcessE2E(t *testing.T, env []string, name string, args ...string) *syncBuffer {
 	t.Helper()

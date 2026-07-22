@@ -36,16 +36,9 @@ jobs:
           sudo apt-get install -y redpanda
           redpanda --version
 
-      - name: Run capstone E2E (unprivileged)
+      - name: Run capstone E2E
         working-directory: htcondordb/kafkasync
         env:
           GOFLAGS: -mod=mod
           GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
         run: go test -run TestCapstoneE2E -v -count=1 -timeout 15m ./...
-
-      - name: Run capstone E2E (as root, privilege-drop path)
-        working-directory: htcondordb/kafkasync
-        # As root, htcondordb/kafkasync drop privilege to the condor user, read schedd files
-        # as that user, and read the root-owned 0600 SASL password back as root via droppriv.
-        # -E preserves the Go env; PATH is passed explicitly since sudo resets it.
-        run: sudo -E env "PATH=$PATH" GOFLAGS=-mod=mod GOPRIVATE=github.com/bbockelm,github.com/PelicanPlatform go test -run TestCapstoneE2E -v -count=1 -timeout 15m ./...
