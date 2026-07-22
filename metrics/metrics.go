@@ -125,6 +125,7 @@ func opStatList(o db.OpStats) []struct {
 		{"shard_write_hold", o.ShardWriteHold},
 		{"segment_alloc", o.SegmentAlloc},
 		{"sync", o.Sync},
+		{"commit_sync", o.CommitSync},
 		{"compact", o.Compact},
 		{"retrain", o.Retrain},
 		{"reindex", o.Reindex},
@@ -154,6 +155,14 @@ func (c *viewCollector) Collect(ch chan<- prometheus.Metric) {
 			continue
 		}
 		spec := v.Spec()
+		// A continuous aggregate is a time series recorded to an archive, not a
+		// current-state gauge. Scraping its per-bucket rows would emit many samples of the
+		// same metric with no distinguishing label (the time bucket is not a label_ column),
+		// which the Prometheus registry rejects as duplicate series -- failing the whole
+		// scrape. Skip it; it is read as a time series via SQL instead.
+		if spec.IsContinuous() {
+			continue
+		}
 
 		// Label columns: group columns whose alias carries the label_ prefix.
 		type labelCol struct{ attr, key string }

@@ -256,13 +256,20 @@ func viewSpecFromSelect(st *Statement) (db.ViewSpec, error) {
 	if card <= 0 {
 		card = defaultViewCardinality
 	}
-	return db.ViewSpec{
+	spec := db.ViewSpec{
 		BaseTable:   sel.Table,
 		Groups:      groups,
 		Metrics:     metrics,
 		Cardinality: card,
 		SelectText:  renderViewSelect(sel),
-	}, nil
+		Grace:       st.ViewGrace,
+		Retention:   st.ViewRetention,
+	}
+	// grace/retention only apply to a continuous aggregate (a view with a time_bucket).
+	if (spec.Grace > 0 || spec.Retention > 0) && !spec.IsContinuous() {
+		return db.ViewSpec{}, fmt.Errorf("WITH (grace/retention) applies only to a continuous aggregate (a view with a time_bucket GROUP BY)")
+	}
+	return spec, nil
 }
 
 // groupsMatchGroupBy verifies the projected non-aggregate columns are exactly the GROUP BY

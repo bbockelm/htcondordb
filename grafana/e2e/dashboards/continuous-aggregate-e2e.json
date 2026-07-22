@@ -1,0 +1,58 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "schemaVersion": 39,
+  "tags": [
+    "htcondor",
+    "e2e",
+    "continuous-aggregate"
+  ],
+  "title": "HTCondorDB Continuous Aggregate E2E",
+  "uid": "htcondordb-ca-e2e",
+  "time": {
+    "from": "2025-07-08T18:00:00.000Z",
+    "to": "2025-07-08T23:00:00.000Z"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Events per 5m (continuous aggregate)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "bbockelm-htcondordb-datasource",
+        "uid": "htcondordb-e2e"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "bbockelm-htcondordb-datasource",
+            "uid": "htcondordb-e2e"
+          },
+          "editorMode": "code",
+          "format": "timeseries",
+          "rawSql": "SELECT time, metric_events FROM demo_ca ORDER BY time"
+        }
+      ]
+    }
+  ]
+}

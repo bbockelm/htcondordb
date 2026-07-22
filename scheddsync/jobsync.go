@@ -52,6 +52,12 @@ type JobSync struct {
 	// proc carries its cluster's attributes -- condor_q's chained view. Rebuilt from
 	// scratch on every full replay.
 	children map[string]map[string]struct{}
+
+	// store durably records the resume position (offset + which file we were reading) after
+	// each committed batch, so a restart resumes instead of replaying the whole log -- and
+	// detects a compaction/rotation that happened while we were down. nil disables it.
+	store    PositionStore
+	restored bool // whether restore() has run this process
 }
 
 // JobSyncConfig configures a JobSync.
@@ -59,6 +65,9 @@ type JobSyncConfig struct {
 	Filename     string        // path to job_queue.log (required)
 	PollInterval time.Duration // default 200ms
 	Logger       *slog.Logger  // default slog.Default()
+	// Store, if set, durably records the resume position so a restart resumes instead of
+	// replaying the whole log, and recovers correctly if the log was compacted while down.
+	Store PositionStore
 }
 
 // NewJobSync creates a syncer that mirrors cfg.Filename into target. The log need not
@@ -79,6 +88,7 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 		interval: interval,
 		log:      logger,
 		children: map[string]map[string]struct{}{},
+		store:    cfg.Store,
 	}
 }
 
@@ -106,6 +116,12 @@ func (s *JobSync) Run(ctx context.Context) error {
 // Poll probes the log and applies any new committed changes. Exported for synchronous
 // control in tests.
 func (s *JobSync) Poll(ctx context.Context) error {
+	if !s.restored {
+		if err := s.restore(ctx); err != nil {
+			return err
+		}
+		s.restored = true
+	}
 	result, err := s.prober.Probe(s.parser.GetFilename(), s.parser.GetNextOffset())
 	if err != nil {
 		return err
@@ -123,15 +139,73 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	}
 }
 
-// fullReload handles a rotated/rewritten log: abort any open transaction, truncate the
-// table, rewind to the start, and replay the whole current log.
+// fullReload handles a rotated/rewritten log: reset to a clean table at offset 0 and replay
+// the whole current log.
 func (s *JobSync) fullReload(ctx context.Context) error {
+	s.prepareRebuild()
+	return s.readAndApply(ctx, true)
+}
+
+// prepareRebuild resets to a clean slate -- abort any open transaction, empty the table,
+// rewind to the start of the log, and clear the prober baseline -- so the next read pass
+// replays the whole current log from scratch.
+func (s *JobSync) prepareRebuild() {
 	s.abort()
 	s.target.Truncate()
 	s.children = map[string]map[string]struct{}{}
 	s.parser.SetNextOffset(0)
 	s.prober.Reset()
-	return s.readAndApply(ctx, true)
+}
+
+// restore positions the syncer from the persisted resume point (once, before the first
+// read). It resumes in place only when the saved position still refers to the SAME file and
+// that file has not shrunk below the saved offset; otherwise (no saved position, a different
+// inode, a shorter file, an unreadable/absent log) the log was compacted or rotated while we
+// were down -- or we simply don't know how far we got -- so it rebuilds from a clean table.
+// Resuming replays the bytes from the saved offset to EOF, which include any DestroyClassAd
+// for jobs that ended while we were down, keeping the table correct without a full rebuild.
+func (s *JobSync) restore(_ context.Context) error {
+	if s.store == nil {
+		return nil // persistence disabled: legacy behavior (replay from the start each run)
+	}
+	blob, ok, err := s.store.Load()
+	if err != nil {
+		return err
+	}
+	if ok {
+		if pos, derr := decodeJobPosition(blob); derr == nil {
+			if cur, serr := statIdentity(s.parser.GetFilename()); serr == nil &&
+				sameFileIdentity(cur, pos.File) && cur.Size >= pos.Offset {
+				s.parser.SetNextOffset(pos.Offset)
+				return nil
+			}
+			s.log.Info("scheddsync: job_queue.log rotated/compacted while down; rebuilding")
+		} else {
+			s.log.Warn("scheddsync: unreadable saved position; rebuilding", "err", derr.Error())
+		}
+	}
+	s.prepareRebuild()
+	return nil
+}
+
+// checkpoint durably records the resume position after a clean read pass. It saves only at a
+// batch boundary with no explicit transaction open (s.tx == nil) -- committing the offset in
+// the middle of an unfinished on-disk transaction would resume past its BeginTransaction.
+func (s *JobSync) checkpoint() {
+	if s.store == nil || s.tx != nil {
+		return
+	}
+	id, err := statIdentity(s.parser.GetFilename())
+	if err != nil {
+		return
+	}
+	blob, err := jobPosition{File: id, Offset: s.parser.GetNextOffset()}.encode()
+	if err != nil {
+		return
+	}
+	if serr := s.store.Save(blob); serr != nil {
+		s.log.Warn("scheddsync: saving job position failed", "err", serr.Error())
+	}
 }
 
 // readAndApply reads entries from the current offset to EOF, applying them. reload marks a
@@ -142,9 +216,14 @@ func (s *JobSync) readAndApply(ctx context.Context, reload bool) (err error) {
 		return oerr
 	}
 	defer func() {
+		// Close finalizes the parser's next offset to the current file position; only after
+		// it is the offset accurate to checkpoint.
 		_ = s.parser.Close()
 		if uerr := s.prober.Update(s.parser.GetFilename()); uerr != nil && err == nil {
 			err = uerr
+		}
+		if err == nil {
+			s.checkpoint()
 		}
 	}()
 	for {
@@ -168,6 +247,12 @@ func (s *JobSync) readAndApply(ctx context.Context, reload bool) (err error) {
 	// explicit transaction with no EndTransaction yet stays open across polls.
 	if s.tx != nil && s.implicit {
 		err = s.commit()
+	}
+	// Durably record how far we got, but only at a clean boundary (no open explicit
+	// transaction) so a resume never lands mid-transaction. Saved after the commit above, so
+	// the position never runs ahead of applied data.
+	if err == nil {
+		s.checkpoint()
 	}
 	return err
 }

@@ -80,6 +80,11 @@ type Statement struct {
 	ViewName      string
 	ViewSelect    *Statement
 	ViewMaxSeries int
+	// Continuous-aggregate options from an optional WITH (...) clause, in seconds (0 =
+	// default). ViewGrace delays sealing a time bucket after its window closes;
+	// ViewRetention bounds how much sealed history the archive keeps.
+	ViewGrace     int64
+	ViewRetention int64
 
 	// MatchResource is the resource table for a MATCH statement (Table is the
 	// request table); TargetWhere is the pushed-down resource-side filter; Key,
@@ -498,7 +503,12 @@ func (p *parser) parseCreate() (*Statement, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Statement{Kind: StmtCreateView, ViewName: name, ViewSelect: sel, ViewMaxSeries: maxSeries}, nil
+		grace, retention, err := p.parseViewOptions()
+		if err != nil {
+			return nil, err
+		}
+		return &Statement{Kind: StmtCreateView, ViewName: name, ViewSelect: sel, ViewMaxSeries: maxSeries,
+			ViewGrace: grace, ViewRetention: retention}, nil
 	}
 	if p.takeKeyword("TABLE") {
 		name, err := p.parseIdent()
@@ -524,6 +534,54 @@ func (p *parser) parseCreate() (*Statement, error) {
 		return nil, err
 	}
 	return &Statement{Kind: StmtCreateIndex, Table: table, IndexKind: kind, Columns: cols}, nil
+}
+
+// parseViewOptions parses an optional continuous-aggregate options clause after a
+// materialized view's SELECT: WITH (grace = '<dur>', retention = '<dur>'). Durations use the
+// time_bucket width syntax ('30s', '5m', '1h', '1d', ...). Both keys are optional and each
+// defaults to 0 (grace 0 = seal at the window's close; retention 0 = keep all history).
+func (p *parser) parseViewOptions() (grace, retention int64, err error) {
+	if !p.takeKeyword("WITH") {
+		return 0, 0, nil
+	}
+	if err = p.expectPunct("("); err != nil {
+		return 0, 0, err
+	}
+	for {
+		key, kerr := p.parseIdent()
+		if kerr != nil {
+			return 0, 0, kerr
+		}
+		if t := p.peek(); !(t.kind == tOp && t.text == "=") {
+			return 0, 0, fmt.Errorf("expected `=` after %q in WITH (...)", key)
+		}
+		p.pos++ // consume '='
+		val, verr := p.parseStringLiteral()
+		if verr != nil {
+			return 0, 0, verr
+		}
+		secs, derr := parseBucketWidth(val)
+		if derr != nil {
+			return 0, 0, fmt.Errorf("invalid %s duration %q: %w", key, val, derr)
+		}
+		switch strings.ToLower(key) {
+		case "grace":
+			grace = secs
+		case "retention":
+			retention = secs
+		default:
+			return 0, 0, fmt.Errorf("unknown view option %q (expected grace or retention)", key)
+		}
+		if p.atPunct(",") {
+			p.pos++
+			continue
+		}
+		break
+	}
+	if err = p.expectPunct(")"); err != nil {
+		return 0, 0, err
+	}
+	return grace, retention, nil
 }
 
 // parseDrop parses DROP TABLE <name> or DROP INDEX ON <table> (<attr>, ...).
