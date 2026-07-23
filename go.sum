@@ -19,8 +19,8 @@ github.com/armon/go-metrics v0.4.1 h1:hR91U9KYmb6bLBYLQjyM+3j+rcd/UhE+G78SFnF8gJ
 github.com/armon/go-metrics v0.4.1/go.mod h1:E6amYzXo6aW1tqzoZGT755KkbgrJsSdpwZ+3JqfkOG4=
 github.com/bbockelm/cedar v0.6.5 h1:KMimWd7g2ofPzFaI1oICf26EfFVam2/uC1qvLXyYYyE=
 github.com/bbockelm/cedar v0.6.5/go.mod h1:C4u6CKJoweg3LZniOi7Yh8avQv1KZjHs9k1vTGa1+2w=
-github.com/bbockelm/golang-htcondor v0.9.0 h1:GYenlLuTn0ZXx3E8pNvJjmqi7c6UvCsWLkyVMHak3Bc=
-github.com/bbockelm/golang-htcondor v0.9.0/go.mod h1:+8pze9DpJ/IUK7UqLXapD6dE6Lazlacq7Rx/UM2mCoQ=
+github.com/bbockelm/golang-htcondor v0.9.1 h1:IBfAKza/H3+f5Xko36JIxghSlSIBwjCqDqb9I3BZIMo=
+github.com/bbockelm/golang-htcondor v0.9.1/go.mod h1:+8pze9DpJ/IUK7UqLXapD6dE6Lazlacq7Rx/UM2mCoQ=
 github.com/bbockelm/gosssd v0.0.1 h1:p9wJYl+GDn29W1it2ZE2RekriwUNs/1U16aUNNro5SM=
 github.com/bbockelm/gosssd v0.0.1/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24TaqPxmxbtue+5NUziq4I4S80YR8gNf3Q=
