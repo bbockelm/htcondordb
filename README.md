@@ -123,6 +123,56 @@ with `HTCONDORDB_JOB_QUEUE_LOG` / `HTCONDORDB_HISTORY`.
 > must have dropped to the condor user first (do not combine `HTCONDORDB_SYNC_SCHEDD`
 > with `DROP_PRIVILEGES=false`).
 
+### Quickstart
+
+Mirror a local schedd's queue and history into a queryable database. Run
+htcondordb on the **same host as the schedd**, under `condor_master`, so it
+inherits the condor config and drops to the condor user.
+
+1. **Build** the daemon and shell (see [Building](#building)):
+
+   ```sh
+   make build      # -> bin/htcondordb and bin/htcondordb-cli
+   ```
+
+2. **Configure.** Add to the HTCondor config the master reads (e.g. a file in
+   `/etc/condor/config.d/`). The `HTCONDORDB_*` file paths default to the
+   schedd's own `$(JOB_QUEUE_LOG)` / `$(HISTORY)`, so on the schedd host this is
+   the whole minimum:
+
+   ```conf
+   DAEMON_LIST = $(DAEMON_LIST), HTCONDORDB
+   HTCONDORDB  = /path/to/bin/htcondordb   # absolute path to the built binary
+
+   HTCONDORDB_SYNC_SCHEDD = true           # tail job_queue.log -> jobs, history -> history
+   ```
+
+   Off the schedd host, or with non-standard paths, point the tailers explicitly:
+
+   ```conf
+   HTCONDORDB_JOB_QUEUE_LOG = /var/lib/condor/spool/job_queue.log
+   HTCONDORDB_HISTORY       = /var/lib/condor/spool/history
+   ```
+
+3. **Start it.** `condor_reconfig` (the master starts newly-listed
+   `DAEMON_LIST` daemons), or restart the master. The daemon publishes its
+   command address to `$(LOG)/.htcondordb_address`.
+
+4. **Query.** The two tables fill as the tailers catch up — the live queue in
+   `jobs`, completed jobs in `history`:
+
+   ```sh
+   bin/htcondordb-cli -e "SELECT COUNT(*) FROM jobs"
+   bin/htcondordb-cli -e "SELECT Owner, COUNT(*) FROM jobs GROUP BY Owner ORDER BY COUNT(*) DESC"
+   bin/htcondordb-cli -e "SELECT ClusterId, ProcId, JobStatus FROM jobs WHERE Owner == \"alice\""
+   bin/htcondordb-cli -e "SELECT COUNT(*) FROM history WHERE CompletionDate > 1700000000"
+   ```
+
+   `htcondordb-cli` with no arguments opens the interactive shell and auto-locates
+   the daemon via the address file (see [REPL](#repl)). Reading requires READ
+   authorization; the sync itself writes in-process and needs no client
+   credentials.
+
 ## Configuration knobs
 
 | Knob | Default | Meaning |
