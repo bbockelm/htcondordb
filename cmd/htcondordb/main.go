@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"strings"
@@ -269,6 +270,19 @@ func run() error {
 	if addr := getStr(cfg, "HTCONDORDB_METRICS_ADDRESS"); addr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", metrics.Handler(svc.Catalog()))
+		// pprof (opt-in via HTCONDORDB_ENABLE_PPROF): profiling endpoints on the same
+		// trusted listener, so a memory/CPU anomaly in a live daemon is one
+		// `go tool pprof http://.../debug/pprof/heap` away instead of a blind restart.
+		// Off by default: profiles expose internals (symbol names, allocation sites)
+		// beyond the storage-size counters /metrics carries.
+		if configBool(cfg, "HTCONDORDB_ENABLE_PPROF") {
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			log.Info(logging.DestinationGeneral, "pprof profiling endpoints enabled (HTCONDORDB_ENABLE_PPROF)")
+		}
 		metricsSrv := &http.Server{Addr: addr, Handler: mux}
 		go func() {
 			<-ctx.Done()
