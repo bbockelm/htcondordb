@@ -141,22 +141,35 @@ inherits the condor config and drops to the condor user.
    the whole minimum:
 
    ```conf
-   DAEMON_LIST = $(DAEMON_LIST), HTCONDORDB
-   HTCONDORDB  = /path/to/bin/htcondordb   # absolute path to the built binary
+   HTCONDORDB     = /path/to/bin/htcondordb   # absolute path to the built binary
+   DAEMON_LIST    = $(DAEMON_LIST), HTCONDORDB
+   DC_DAEMON_LIST = +HTCONDORDB               # register it as a DaemonCore daemon
 
-   HTCONDORDB_SYNC_SCHEDD = true           # tail job_queue.log -> jobs, history -> history
+   HTCONDORDB_SYNC_SCHEDD = true              # tail job_queue.log -> jobs, history -> history
    ```
 
-   Off the schedd host, or with non-standard paths, point the tailers explicitly:
+   `DC_DAEMON_LIST` is required for any non-stock daemon: without it the master
+   won't treat htcondordb as a DaemonCore daemon (no address file, no
+   ready/keepalive), even though `DAEMON_LIST` starts it. The leading `+`
+   appends to the built-in list.
+
+   If the schedd's files aren't at the standard `$(JOB_QUEUE_LOG)` /
+   `$(HISTORY)` locations, point the tailers explicitly (they read local files,
+   so htcondordb still runs beside the schedd):
 
    ```conf
    HTCONDORDB_JOB_QUEUE_LOG = /var/lib/condor/spool/job_queue.log
    HTCONDORDB_HISTORY       = /var/lib/condor/spool/history
    ```
 
-3. **Start it.** `condor_reconfig` (the master starts newly-listed
-   `DAEMON_LIST` daemons), or restart the master. The daemon publishes its
-   command address to `$(LOG)/.htcondordb_address`.
+3. **Start it.** Restart the master — a `condor_reconfig` is **not** enough,
+   because `DC_DAEMON_LIST` is only consulted when daemons start:
+
+   ```sh
+   condor_restart -master
+   ```
+
+   The daemon publishes its command address to `$(LOG)/.htcondordb_address`.
 
 4. **Query.** The two tables fill as the tailers catch up — the live queue in
    `jobs`, completed jobs in `history`:
