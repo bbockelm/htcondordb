@@ -75,7 +75,7 @@ func run() error {
 
 	// Bootstrap logging and condor_master integration (drops privileges to the
 	// condor user when started as root).
-	d, err := daemon.New(daemon.Options{Subsys: "HTCONDORDB", Config: cfg})
+	d, err := daemon.New(daemon.Options{Subsys: "HTCONDORDB", LocalName: *localName, Config: cfg})
 	if err != nil {
 		return err
 	}
