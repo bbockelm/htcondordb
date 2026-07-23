@@ -132,6 +132,7 @@ type Service struct {
 	forceReadOn  bool
 	logQueries   bool
 	log          *slog.Logger
+	stopReaper   func() // stops the idle-transaction reaper; set in New
 }
 
 // New opens the table catalog and builds the service. The caller owns the
@@ -186,6 +187,11 @@ func New(cfg Config) (*Service, error) {
 		}
 		svc.rpc.StartMaintenance(cfg.MaintenanceInterval, opts)
 	}
+	// Reap transactions abandoned on still-open connections (a client whose context was
+	// cancelled mid-transaction never sends the abort; disconnect cleanup only covers
+	// closed connections). Each orphan holds its buffered ad writes on the heap, so an
+	// unreaped server leaks live heap for the life of the connection. Always on.
+	svc.stopReaper = svc.rpc.StartTxnReaper(time.Minute, 5*time.Minute)
 	return svc, nil
 }
 
@@ -300,6 +306,9 @@ func (s *Service) effectiveLevel(c *cedarserver.Conn) Level {
 
 // Close stops background work and closes the database.
 func (s *Service) Close() error {
+	if s.stopReaper != nil {
+		s.stopReaper()
+	}
 	s.rpc.Close()
 	return s.cat.Close()
 }
