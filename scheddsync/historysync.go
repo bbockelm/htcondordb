@@ -41,13 +41,14 @@ type HistorySync struct {
 	log      *slog.Logger
 	store    PositionStore
 
-	file     *os.File    // current open handle (survives a rename of filename)
-	fi       os.FileInfo // its FileInfo, for SameFile rotation detection
-	offset   int64       // bytes consumed from file
-	partial  []byte      // buffered bytes of an incomplete trailing record
-	dedup    bool        // while true, skip records the archive already holds (recovery)
-	started  bool        // whether restore() has run this process
-	onResync func(ResyncEvent)
+	file         *os.File    // current open handle (survives a rename of filename)
+	fi           os.FileInfo // its FileInfo, for SameFile rotation detection
+	offset       int64       // bytes consumed from file
+	partial      []byte      // buffered bytes of an incomplete trailing record
+	dedup        bool        // while true, skip records the archive already holds (recovery)
+	started      bool        // whether restore() has run this process
+	warnedNoFile bool        // whether we have logged that the history file is absent (log once)
+	onResync     func(ResyncEvent)
 
 	// resyncs / lastResync accumulate durability-gap events for the status snapshot; status
 	// holds the latest published snapshot read lock-free by Status(). All written only from the
@@ -145,10 +146,18 @@ func (s *HistorySync) Poll(ctx context.Context) error {
 	if s.file == nil {
 		if err := s.openCurrent(0); err != nil {
 			if os.IsNotExist(err) {
+				// Absent history file is common (no jobs have completed yet, or HISTORY points
+				// at the wrong path). Say so once, at info, so a misconfiguration is diagnosable
+				// rather than a silent no-op -- the primary cause of "history isn't syncing".
+				if !s.warnedNoFile {
+					s.warnedNoFile = true
+					s.log.Info("scheddsync: history file not present yet; waiting", "file", s.filename)
+				}
 				return nil // not created yet
 			}
 			return err
 		}
+		s.warnedNoFile = false // re-arm so a later disappearance is reported again
 	}
 	return s.drainToEOF()
 }
