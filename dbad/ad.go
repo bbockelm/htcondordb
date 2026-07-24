@@ -22,15 +22,6 @@ import (
 // it via UPDATE_AD_GENERIC.
 const AdType = "HTCondorDB"
 
-// Identity describes the advertising daemon.
-type Identity struct {
-	Name      string
-	Machine   string
-	MyAddress string    // dbrpc command address (sinful string)
-	Version   string    // CondorVersion string, optional
-	StartTime time.Time // daemon start, for DaemonStartTime
-}
-
 // TableStat is one table's storage footprint.
 type TableStat struct {
 	Name      string
@@ -51,7 +42,15 @@ type Capabilities struct {
 
 // Input is everything BuildAd needs; it holds no live handles, so BuildAd is pure and testable.
 type Input struct {
-	Identity     Identity
+	// PublishBase, if set, seeds the ad with the daemon's common attributes -- identity, address,
+	// version, timing, self-monitoring, and config_fill_ad's <SUBSYS>_ATTRS -- before
+	// augmentation. It is normally (*daemon.Daemon).PublishAd; dbad adds only the
+	// HTCondorDB-specific attributes on top, rather than re-deriving identity itself.
+	PublishBase func(*classad.ClassAd)
+	// MyAddress is the daemon's authoritative reachable command address. PublishBase can only
+	// know the shared-port sinful; the caller (which has the listener) supplies the address that
+	// also covers the non-shared-port fallback, so dbad sets it after PublishBase.
+	MyAddress    string
 	Tables       []TableStat
 	Capabilities Capabilities
 	Sources      []scheddsync.SyncStatus
@@ -59,23 +58,18 @@ type Input struct {
 	UpdateSeq    int64
 }
 
-// BuildAd assembles the HTCondorDB ClassAd. All numeric attributes are chosen so a
-// ClassAd->Prometheus exporter reads them as gauges/counters directly.
+// BuildAd assembles the HTCondorDB ClassAd by augmenting the daemon-produced base ad. All
+// numeric attributes are chosen so a ClassAd->Prometheus exporter reads them as gauges/counters
+// directly.
 func BuildAd(in Input) *classad.ClassAd {
 	ad := classad.New()
-	ad.InsertAttrString("MyType", AdType)
-	ad.InsertAttrString("Name", in.Identity.Name)
-	ad.InsertAttrString("Machine", in.Identity.Machine)
-	if in.Identity.MyAddress != "" {
-		ad.InsertAttrString("MyAddress", in.Identity.MyAddress)
+	if in.PublishBase != nil {
+		in.PublishBase(ad) // daemon common attrs: Name, Machine, MyAddress, version, MonitorSelf*, <SUBSYS>_ATTRS, ...
 	}
-	if in.Identity.Version != "" {
-		ad.InsertAttrString("CondorVersion", in.Identity.Version)
+	ad.InsertAttrString("MyType", AdType) // subsystem-specific; the daemon base ad does not set MyType
+	if in.MyAddress != "" {
+		ad.InsertAttrString("MyAddress", ensureAngle(in.MyAddress))
 	}
-	if !in.Identity.StartTime.IsZero() {
-		ad.InsertAttr("DaemonStartTime", in.Identity.StartTime.Unix())
-	}
-	ad.InsertAttr("MyCurrentTime", in.Now.Unix())
 	ad.InsertAttr("UpdateSequenceNumber", in.UpdateSeq)
 
 	// Capabilities.
@@ -147,6 +141,14 @@ func syncPrefix(kind string) string {
 	default:
 		return ""
 	}
+}
+
+// ensureAngle wraps a bare command address in <> if it is not already a sinful string.
+func ensureAngle(addr string) string {
+	if strings.HasPrefix(addr, "<") {
+		return addr
+	}
+	return "<" + addr + ">"
 }
 
 // sanitize turns a table name into a valid ClassAd attribute-name fragment (identifier chars

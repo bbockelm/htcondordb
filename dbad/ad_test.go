@@ -4,19 +4,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PelicanPlatform/classad/classad"
+
 	"github.com/bbockelm/htcondordb/scheddsync"
 )
 
 func TestBuildAd(t *testing.T) {
 	now := time.Unix(1_700_000_500, 0)
 	in := Input{
-		Identity: Identity{
-			Name:      "htcondordb@ap40",
-			Machine:   "ap40.chtc.wisc.edu",
-			MyAddress: "<10.0.0.1:9619>",
-			Version:   "$CondorVersion: 25.4.0 $",
-			StartTime: time.Unix(1_700_000_000, 0),
+		// The daemon base ad (identity/version/timing) is simulated here; dbad augments it.
+		PublishBase: func(ad *classad.ClassAd) {
+			ad.InsertAttrString("Name", "htcondordb@ap40")
+			ad.InsertAttrString("Machine", "ap40.chtc.wisc.edu")
+			ad.InsertAttrString("CondorVersion", "$CondorVersion: 25.4.0 $")
+			ad.InsertAttr("DaemonStartTime", int64(1_700_000_000))
 		},
+		MyAddress: "10.0.0.1:9619",
 		Tables: []TableStat{
 			{Name: "jobs", Ads: 1200, LiveBytes: 4096, DeadBytes: 512, Segments: 3},
 			{Name: "history", Archive: true, Ads: 98000},
@@ -46,7 +49,7 @@ func TestBuildAd(t *testing.T) {
 	if str("Name") != "htcondordb@ap40" || str("MyAddress") != "<10.0.0.1:9619>" {
 		t.Errorf("identity wrong: Name=%q Addr=%q", str("Name"), str("MyAddress"))
 	}
-	if i("UpdateSequenceNumber") != 7 || i("DaemonStartTime") != 1_700_000_000 || i("MyCurrentTime") != 1_700_000_500 {
+	if i("UpdateSequenceNumber") != 7 || i("DaemonStartTime") != 1_700_000_000 {
 		t.Errorf("timing/seq wrong")
 	}
 
@@ -86,7 +89,7 @@ func TestBuildAd(t *testing.T) {
 }
 
 func TestBuildAdNoSources(t *testing.T) {
-	ad := BuildAd(Input{Identity: Identity{Name: "db"}, Now: time.Unix(1, 0)})
+	ad := BuildAd(Input{Now: time.Unix(1, 0)})
 	if v, _ := ad.EvaluateAttrBool("Syncing"); v {
 		t.Error("Syncing should be false with no sources")
 	}

@@ -441,19 +441,28 @@ func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.
 	if v := getStr(cfg, "HTCONDORDB_ADVERTISE"); strings.TrimSpace(v) != "" && !configBool(cfg, "HTCONDORDB_ADVERTISE") {
 		return // explicitly disabled
 	}
-	machine, _ := os.Hostname()
+	// The daemon's Name (for the shutdown INVALIDATE) is derived the same way daemon.PublishAd
+	// derives it: HTCONDORDB_NAME, else <subsys>@<full-hostname>.
 	name := getStr(cfg, "HTCONDORDB_NAME")
 	if strings.TrimSpace(name) == "" {
-		name = "htcondordb@" + machine
+		fqdn := getStr(cfg, "FULL_HOSTNAME")
+		if fqdn == "" {
+			fqdn, _ = os.Hostname()
+		}
+		name = "htcondordb@" + fqdn
 	}
 	interval := DefaultAdvertiseInterval
 	if s := configInt(cfg, "HTCONDORDB_UPDATE_INTERVAL"); s > 0 {
 		interval = time.Duration(s) * time.Second
 	}
 	adv := &dbad.Advertiser{
-		Collector:    htcondor.NewCollector(host),
-		Catalog:      svc.Catalog(),
-		Identity:     dbad.Identity{Name: name, Machine: machine, MyAddress: "<" + addr + ">", StartTime: time.Now()},
+		Collector: htcondor.NewCollector(host),
+		Catalog:   svc.Catalog(),
+		// Seed each ad with the daemon's common attributes (identity, version, MonitorSelf*,
+		// <SUBSYS>_ATTRS, ...) via the generic capability, then dbad augments it.
+		PublishBase:  d.PublishAd,
+		MyAddress:    addr,
+		Name:         name,
 		Capabilities: dbad.CatalogCapabilities(svc.Catalog()),
 		Sources:      sources,
 		Interval:     interval,

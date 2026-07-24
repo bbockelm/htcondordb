@@ -85,8 +85,8 @@ func TestAdvertiserBuild(t *testing.T) {
 	}
 
 	adv := &Advertiser{
-		Catalog:  cat,
-		Identity: Identity{Name: "db@host", Machine: "host"},
+		Catalog:     cat,
+		PublishBase: func(ad *classad.ClassAd) { ad.InsertAttrString("Name", "db@host") },
 		Sources: []StatusSource{
 			fakeSource{st: scheddsync.SyncStatus{Kind: "job_queue.log", Offset: 10, FileSize: 10, CaughtUp: true, LastSync: time.Unix(1000, 0)}},
 			fakeSource{st: scheddsync.SyncStatus{Kind: "history", Offset: 5, FileSize: 20, LagBytes: 15, Resyncs: 1, LastResync: time.Unix(900, 0)}},

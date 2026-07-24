@@ -77,9 +77,13 @@ func CatalogCapabilities(cat *db.Catalog) Capabilities {
 
 // Advertiser periodically builds the HTCondorDB ad from live state and sends it to a collector.
 type Advertiser struct {
-	Collector    *htcondor.Collector
-	Catalog      *db.Catalog
-	Identity     Identity
+	Collector *htcondor.Collector
+	Catalog   *db.Catalog
+	// PublishBase seeds each ad with the daemon's common attributes (normally
+	// (*daemon.Daemon).PublishAd) before dbad augments it. Its Name is used for INVALIDATE.
+	PublishBase  func(*classad.ClassAd)
+	MyAddress    string // authoritative reachable command address (covers the non-shared-port fallback)
+	Name         string // daemon Name, for the INVALIDATE query on shutdown
 	Capabilities Capabilities
 	Sources      []StatusSource
 	Interval     time.Duration
@@ -142,7 +146,8 @@ func (a *Advertiser) build(now time.Time) *classad.ClassAd {
 		srcs = append(srcs, st)
 	}
 	return BuildAd(Input{
-		Identity:     a.Identity,
+		PublishBase:  a.PublishBase,
+		MyAddress:    a.MyAddress,
 		Tables:       CatalogTables(a.Catalog),
 		Capabilities: a.Capabilities,
 		Sources:      srcs,
@@ -159,7 +164,7 @@ func (a *Advertiser) invalidate() {
 	ad := classad.New()
 	ad.InsertAttrString("MyType", "Query")
 	ad.InsertAttrString("TargetType", AdType)
-	ad.InsertAttrString("Name", a.Identity.Name)
+	ad.InsertAttrString("Name", a.Name)
 	if err := a.Collector.Advertise(ctx, ad, &htcondor.AdvertiseOptions{Command: commands.INVALIDATE_ADS_GENERIC}); err != nil {
 		a.Logger.Warn("htcondordb: collector invalidate failed", "err", err.Error())
 	}
