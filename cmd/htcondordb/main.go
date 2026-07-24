@@ -37,6 +37,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/logging"
 
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/dbad"
 	"github.com/bbockelm/htcondordb/metrics"
 	"github.com/bbockelm/htcondordb/scheddsync"
 	"github.com/bbockelm/htcondordb/server"
@@ -249,11 +250,20 @@ func run() error {
 
 	// Schedd-sync mode: mirror a schedd's job_queue.log into a "jobs" table and its
 	// history file into a "history" archive table (a read model of the schedd's state).
+	var syncSources []dbad.StatusSource
 	if configBool(cfg, "HTCONDORDB_SYNC_SCHEDD") {
-		if err := startScheddSync(ctx, svc, cfg, d.Slog()); err != nil {
-			return err
+		ss, serr := startScheddSync(ctx, svc, cfg, d.Slog())
+		if serr != nil {
+			return serr
 		}
+		syncSources = ss
 	}
+
+	// Advertise a discovery/monitoring ClassAd to the collector: agents (and the htcondor-api
+	// MCP) discover this database and its command address here, and the ad doubles as a metrics
+	// sink carrying per-table storage gauges and per-source sync health -- scrapable via the
+	// collector even when the daemon's own /metrics endpoint is off.
+	startCollectorAdvertise(ctx, d, cfg, svc, advertisedAddr(d, ln), syncSources)
 
 	// Start any background HA machinery (a follower's replicator, or the raft
 	// coordinator and its command handlers in consistent mode).
@@ -355,20 +365,21 @@ func encryptionConfig(cfg *config.Config) (poolKeys []db.KEK, attrs []string, er
 // come from HTCONDORDB_JOB_QUEUE_LOG / HTCONDORDB_HISTORY, falling back to HTCondor's
 // standard JOB_QUEUE_LOG / HISTORY params. At least one source must be configured. The
 // goroutines stop when ctx is cancelled (daemon shutdown).
-func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Config, logger *slog.Logger) error {
+func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Config, logger *slog.Logger) ([]dbad.StatusSource, error) {
 	// Never read a schedd's job_queue.log / history as root: those files are owned by the
 	// condor user, and following them as root risks reading through an attacker-planted
 	// symlink to a privileged file. The daemon drops privilege in daemon.New before this
 	// runs; if it is still root here (e.g. DROP_PRIVILEGES=false), refuse rather than read
 	// schedd files privileged.
 	if err := scheddSyncGuardEUID(os.Geteuid()); err != nil {
-		return err
+		return nil, err
 	}
 	jobLog := firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG"))
 	histFile := firstNonEmpty(getStr(cfg, "HTCONDORDB_HISTORY"), getStr(cfg, "HISTORY"))
 	if jobLog == "" && histFile == "" {
-		return fmt.Errorf("HTCONDORDB_SYNC_SCHEDD is set but neither JOB_QUEUE_LOG nor HISTORY is configured")
+		return nil, fmt.Errorf("HTCONDORDB_SYNC_SCHEDD is set but neither JOB_QUEUE_LOG nor HISTORY is configured")
 	}
+	var sources []dbad.StatusSource
 	// Persist each syncer's resume position durably under the database dir, so a restart
 	// resumes instead of re-reading the whole log -- and recovers correctly if the log was
 	// compacted/rotated while down. With an in-memory database (no dir) there is nowhere
@@ -383,10 +394,11 @@ func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Confi
 	if jobLog != "" {
 		jobs, err := svc.Catalog().CreateTable("jobs")
 		if err != nil {
-			return fmt.Errorf("schedd-sync: creating jobs table: %w", err)
+			return nil, fmt.Errorf("schedd-sync: creating jobs table: %w", err)
 		}
 		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{Filename: jobLog, Logger: logger, Store: syncStore("jobs.pos")})
 		go func() { _ = js.Run(ctx) }()
+		sources = append(sources, js)
 		logger.Info("schedd-sync: mirroring job_queue.log", "file", jobLog, "table", "jobs")
 	}
 	if histFile != "" {
@@ -395,7 +407,7 @@ func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Confi
 			ZoneAttrs:  []string{"CompletionDate"},
 		})
 		if err != nil {
-			return fmt.Errorf("schedd-sync: creating history archive: %w", err)
+			return nil, fmt.Errorf("schedd-sync: creating history archive: %w", err)
 		}
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
 			Filename: histFile,
@@ -410,10 +422,59 @@ func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Confi
 			},
 		})
 		go func() { _ = hs.Run(ctx) }()
+		sources = append(sources, hs)
 		logger.Info("schedd-sync: tailing history file", "file", histFile, "archive", "history")
 	}
-	return nil
+	return sources, nil
 }
+
+// startCollectorAdvertise launches the periodic HTCondorDB ad advertisement to the collector
+// (COLLECTOR_HOST). It is a no-op when no collector is configured or when advertisement is
+// explicitly disabled (HTCONDORDB_ADVERTISE=false). The ad carries the daemon's command
+// address for discovery plus per-table storage gauges and per-source sync health for
+// monitoring.
+func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, addr string, sources []dbad.StatusSource) {
+	host := getStr(cfg, "COLLECTOR_HOST")
+	if strings.TrimSpace(host) == "" {
+		return // no collector to advertise to
+	}
+	if v := getStr(cfg, "HTCONDORDB_ADVERTISE"); strings.TrimSpace(v) != "" && !configBool(cfg, "HTCONDORDB_ADVERTISE") {
+		return // explicitly disabled
+	}
+	// The daemon's Name (for the shutdown INVALIDATE) is derived the same way daemon.PublishAd
+	// derives it: HTCONDORDB_NAME, else <subsys>@<full-hostname>.
+	name := getStr(cfg, "HTCONDORDB_NAME")
+	if strings.TrimSpace(name) == "" {
+		fqdn := getStr(cfg, "FULL_HOSTNAME")
+		if fqdn == "" {
+			fqdn, _ = os.Hostname()
+		}
+		name = "htcondordb@" + fqdn
+	}
+	interval := DefaultAdvertiseInterval
+	if s := configInt(cfg, "HTCONDORDB_UPDATE_INTERVAL"); s > 0 {
+		interval = time.Duration(s) * time.Second
+	}
+	adv := &dbad.Advertiser{
+		Collector: htcondor.NewCollector(host),
+		Catalog:   svc.Catalog(),
+		// Seed each ad with the daemon's common attributes (identity, version, MonitorSelf*,
+		// <SUBSYS>_ATTRS, ...) via the generic capability, then dbad augments it.
+		PublishBase:  d.PublishAd,
+		MyAddress:    addr,
+		Name:         name,
+		Capabilities: dbad.CatalogCapabilities(svc.Catalog()),
+		Sources:      sources,
+		Interval:     interval,
+		Logger:       d.Slog(),
+	}
+	go adv.Run(ctx)
+	d.Slog().Info("advertising HTCondorDB ad to collector", "collector", host, "name", name, "interval", interval.String())
+}
+
+// DefaultAdvertiseInterval is the collector update cadence when HTCONDORDB_UPDATE_INTERVAL is
+// unset.
+const DefaultAdvertiseInterval = 5 * time.Minute
 
 // scheddSyncGuardEUID enforces that schedd-sync never runs as root: reading the schedd's
 // job_queue.log/history privileged is a symlink-following risk. Separated from os.Geteuid

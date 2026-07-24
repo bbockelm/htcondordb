@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -65,6 +66,9 @@ type JobSync struct {
 	// misses). haveID gates the check until the first successful read.
 	curID  fileIdentity
 	haveID bool
+
+	// status holds the latest published SyncStatus snapshot, read lock-free by Status().
+	status atomic.Pointer[SyncStatus]
 }
 
 // reconcileBatch bounds how many buffered writes a reconciling reload commits at once, so a
@@ -235,6 +239,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 		return err
 	}
 	s.checkpoint() // position recorded only after the reconciled table matches the log
+	s.publishStatus(true)
 	return nil
 }
 
@@ -490,6 +495,7 @@ func (s *JobSync) readAndApply(ctx context.Context, reload bool) (err error) {
 		if err == nil {
 			s.checkpoint()
 		}
+		s.publishStatus(err == nil)
 	}()
 	for {
 		select {
