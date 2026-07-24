@@ -69,6 +69,30 @@ type Executor struct {
 	keyAttr    string
 	genKey     func() string
 	applyBatch func([]WriteOp) error
+
+	// archives caches the set of append-only (history) table names, so a SELECT can be routed
+	// to the archive query path -- archives are not mutable tables and the regular query op
+	// does not resolve them. Loaded lazily; archivesOK gates a successful load so a transient
+	// list error just retries next time.
+	archives   map[string]bool
+	archivesOK bool
+}
+
+// isArchive reports whether table is an append-only history table, loading (and caching) the
+// archive-table set from the server on first use.
+func (e *Executor) isArchive(table string) bool {
+	if !e.archivesOK {
+		names, err := e.c.ArchiveTables(context.Background())
+		if err != nil {
+			return false // couldn't list; treat as a normal table (retry next call)
+		}
+		e.archives = make(map[string]bool, len(names))
+		for _, n := range names {
+			e.archives[n] = true
+		}
+		e.archivesOK = true
+	}
+	return e.archives[table]
 }
 
 // NewExecutor builds an Executor over an established dbrpc client.
@@ -440,7 +464,19 @@ func (e *Executor) Admin(table, action string, args ...string) (string, error) {
 }
 
 // Tables lists the catalog's table names.
-func (e *Executor) Tables() ([]string, error) { return e.c.Tables(context.Background()) }
+func (e *Executor) Tables() ([]string, error) {
+	tables, err := e.c.Tables(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	// Include append-only history tables so `.tables` and completion surface them -- they are a
+	// distinct namespace the regular table list omits, and are otherwise invisible.
+	archives, aerr := e.c.ArchiveTables(context.Background())
+	if aerr == nil {
+		tables = append(tables, archives...)
+	}
+	return tables, nil
+}
 
 // ListViews returns the materialized view names.
 func (e *Executor) ListViews() ([]string, error) { return e.c.ListViews(context.Background()) }
@@ -517,9 +553,18 @@ func (e *Executor) queryAds(table, where string, limit int) ([]*classad.ClassAd,
 func (e *Executor) queryAdsAsOf(table, where string, limit int, asOf string) ([]*classad.ClassAd, error) {
 	var texts []string
 	var err error
-	if asOf == "" {
+	switch {
+	case e.isArchive(table):
+		// History (append-only) tables are not mutable tables; the regular query op cannot
+		// resolve them. Route to the archive query path (newest-first, limit-capped), which is
+		// how the archived job history becomes visible to SELECT at all.
+		if asOf != "" {
+			return nil, fmt.Errorf("AS OF is not supported on the append-only %q table", table)
+		}
+		texts, err = e.c.ArchiveQuery(context.Background(), table, constraint(where), limit)
+	case asOf == "":
 		texts, err = e.c.QueryTable(context.Background(), table, constraint(where), limit)
-	} else {
+	default:
 		var at time.Time
 		if at, err = parseAsOf(asOf); err != nil {
 			return nil, err
@@ -552,7 +597,9 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 		// bucketing for an AS OF read (the server aggregate has no time-travel
 		// variant) or against a server too old to implement the bucketed opcode.
 		if hasBucket(st) || groupByHasBucket(st) {
-			if st.AsOf == "" {
+			// The server aggregate pushdown is current-time, mutable-table only. Archives (and
+			// AS OF) bucket client-side.
+			if st.AsOf == "" && !e.isArchive(st.Table) {
 				res, err := e.execAggregateBucketServer(st)
 				if err == nil {
 					return res, nil
@@ -562,6 +609,11 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 				}
 			}
 			return e.execAggregateBucket(st)
+		}
+		// Archives have no server-side aggregate op; compute the aggregate client-side over the
+		// fetched rows (the same path AS OF uses -- queryAdsAsOf already routes archives).
+		if e.isArchive(st.Table) {
+			return e.execAggregateAsOf(st, groupBy)
 		}
 		return e.execAggregate(st, groupBy)
 	}
