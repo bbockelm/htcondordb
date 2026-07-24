@@ -25,6 +25,10 @@ import (
 	"github.com/bbockelm/golang-htcondor/classadlog"
 )
 
+// KeyAttr is the ad attribute the schedd-sync stamps with each row's storage key, so the
+// REPL can address the row for UPDATE/DELETE (its default key attribute is "Key").
+const KeyAttr = "Key"
+
 // DefaultPollInterval is how often job_queue.log is polled when unset.
 const DefaultPollInterval = 200 * time.Millisecond
 
@@ -446,6 +450,12 @@ func (r *reconciler) flush() error {
 		return nil
 	}
 	r.seen[r.curKey] = struct{}{}
+	// Stamp the storage key (as applyEntry does) so the reconciled row is addressable by the
+	// REPL's key attribute. Stamped before the Equal check below, so an already-stamped stored
+	// ad reconciles as unchanged.
+	if !r.destroy {
+		r.curAd.InsertAttrString(KeyAttr, r.curKey)
+	}
 	cur, ok := r.curTable.LookupClassAd(r.curKey)
 	switch {
 	case r.destroy:
@@ -682,6 +692,10 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 	switch e.OpType {
 	case classadlog.OpNewClassAd:
 		ad := classad.New()
+		// Stamp the storage key so the row is addressable by the REPL's default key attribute
+		// (UPDATE/DELETE recover a row's key from this). Synced ads otherwise carry no "Key",
+		// so `DELETE FROM jobs WHERE ...` could not target them.
+		ad.InsertAttrString(KeyAttr, e.Key)
 		if e.MyType != "" && e.MyType != "(unknown)" {
 			ad.InsertAttrString("MyType", e.MyType)
 		}
