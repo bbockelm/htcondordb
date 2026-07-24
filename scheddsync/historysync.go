@@ -17,6 +17,13 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 )
 
+// EnteredHistoryAttr is stamped on every archived record with the Unix time (seconds) at
+// which htcondordb ingested it into the history table -- the "when did this enter history"
+// timestamp, distinct from the job's own CompletionDate. It is a zone-mapped index on the
+// archive (see the ArchiveConfig in cmd/htcondordb), so a time-range query such as
+// `WHERE EnteredHistoryTime > <now-86400>` prunes whole segments instead of scanning.
+const EnteredHistoryAttr = "EnteredHistoryTime"
+
 // bannerPrefix terminates each record in an HTCondor history file: a line like
 // "*** Offset = N ClusterId = C ProcId = P ...". The attributes of the completed job
 // precede it as old-ClassAd "Attr = Value" lines.
@@ -40,6 +47,7 @@ type HistorySync struct {
 	interval time.Duration
 	log      *slog.Logger
 	store    PositionStore
+	now      func() time.Time // ingest-time clock; overridable in tests
 
 	file         *os.File    // current open handle (survives a rename of filename)
 	fi           os.FileInfo // its FileInfo, for SameFile rotation detection
@@ -105,7 +113,7 @@ func NewHistorySync(archive *db.ArchiveTable, cfg HistorySyncConfig) *HistorySyn
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &HistorySync{filename: cfg.Filename, archive: archive, interval: interval, log: logger, store: cfg.Store, onResync: cfg.OnResync}
+	return &HistorySync{filename: cfg.Filename, archive: archive, interval: interval, log: logger, store: cfg.Store, onResync: cfg.OnResync, now: time.Now}
 }
 
 // Run polls until ctx is cancelled, starting immediately.
@@ -502,6 +510,13 @@ func (s *HistorySync) appendRecord(rec []byte) {
 			return // already synced before the crash; skip
 		}
 		s.dedup = false // first record the archive lacks: caught up, everything after is new
+	}
+	// Stamp the ingest time so "when did this enter history" is queryable and indexed. Only
+	// records not already archived reach here (dedup above), so each record is stamped once,
+	// at first archive -- a later re-scan finds it present and skips it, preserving the original
+	// time. Set only if absent, so we never clobber a value already on the record.
+	if _, ok := ad.Lookup(EnteredHistoryAttr); !ok {
+		_ = ad.Set(EnteredHistoryAttr, s.now().Unix())
 	}
 	if err := s.archive.Append(ad); err != nil {
 		s.log.Warn("history: append failed", "err", err.Error())

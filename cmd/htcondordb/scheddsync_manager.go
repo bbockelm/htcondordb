@@ -156,7 +156,10 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	if s.histFile != "" {
 		hist, err := m.svc.Catalog().CreateArchiveTable("history", db.ArchiveConfig{
 			ValueAttrs: []string{"ClusterId"},
-			ZoneAttrs:  []string{"CompletionDate"},
+			// Zone-map both the job's completion time and htcondordb's ingest time
+			// (EnteredHistoryTime, stamped per record), so range queries on either prune whole
+			// segments instead of scanning -- e.g. "jobs that entered history in the last 24h".
+			ZoneAttrs: []string{"CompletionDate", scheddsync.EnteredHistoryAttr},
 		})
 		if err != nil {
 			return nil, nil, fmt.Errorf("schedd-sync: creating history archive: %w", err)
