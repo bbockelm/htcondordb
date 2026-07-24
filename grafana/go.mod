@@ -5,7 +5,7 @@ go 1.25.7
 require (
 	github.com/PelicanPlatform/classad v0.16.7
 	github.com/PelicanPlatform/classad/dbrpc v0.16.7
-	github.com/bbockelm/cedar v0.6.5
+	github.com/bbockelm/cedar v0.6.6
 	github.com/bbockelm/golang-htcondor v0.9.4
 	github.com/bbockelm/htcondordb v0.0.0
 	github.com/grafana/grafana-plugin-sdk-go v0.291.0
