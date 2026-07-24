@@ -640,20 +640,42 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 
 	limited := applyLimit(ads, st.Limit)
 	res := &Result{IsSelect: true, Ads: limited}
-	// Determine columns.
+
+	// SELECT * : every attribute, each rendered by name.
 	if len(st.Items) == 1 && st.Items[0].Star {
 		res.Columns = e.starColumns(limited)
 		res.Star = true
-	} else {
-		for _, it := range st.Items {
-			res.Columns = append(res.Columns, it.header())
+		for _, ad := range limited {
+			row := make([]string, len(res.Columns))
+			for j, col := range res.Columns {
+				row[j] = valueDisplay(ad.EvaluateAttr(col))
+			}
+			res.Rows = append(res.Rows, row)
 		}
+		return res, nil
 	}
 
+	// Explicit items. Precompile any expression columns once (e.g.
+	// "CurrentTime - EnteredHistoryTime"); a plain column is rendered by attribute name.
+	compiled := make([]*classad.Expr, len(st.Items))
+	for j, it := range st.Items {
+		res.Columns = append(res.Columns, it.header())
+		if it.Expr != "" {
+			ex, perr := classad.ParseExpr(it.Expr)
+			if perr != nil {
+				return nil, fmt.Errorf("SELECT expression %q: %w", it.Expr, perr)
+			}
+			compiled[j] = ex
+		}
+	}
 	for _, ad := range limited {
-		row := make([]string, len(res.Columns))
-		for j, col := range res.Columns {
-			row[j] = valueDisplay(ad.EvaluateAttr(col))
+		row := make([]string, len(st.Items))
+		for j, it := range st.Items {
+			if compiled[j] != nil {
+				row[j] = valueDisplay(compiled[j].Eval(ad))
+			} else {
+				row[j] = valueDisplay(ad.EvaluateAttr(it.Col))
+			}
 		}
 		res.Rows = append(res.Rows, row)
 	}
