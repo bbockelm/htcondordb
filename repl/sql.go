@@ -136,6 +136,11 @@ type SelectItem struct {
 	Col   string
 	Alias string // display header; defaults to the source text
 
+	// Expr is a general ClassAd expression captured verbatim (e.g.
+	// "CurrentTime - EnteredHistoryTime"), evaluated per row against each ad. It is
+	// empty for a plain column (Col holds the attribute name) and for aggregates.
+	Expr string
+
 	// Bucket marks a time_bucket(Col, 'width') expression -- a non-aggregate
 	// grouping column that floors the epoch-seconds attribute Col to BucketWidth
 	// (see parseBucketWidth). It groups a time axis into fixed-width buckets.
@@ -841,7 +846,9 @@ func (p *parser) parseSelectItem() (SelectItem, error) {
 	}
 	t := p.peek()
 	if t.kind != tIdent {
-		return SelectItem{}, fmt.Errorf("expected a column name, got %q", t.text)
+		// A leading non-identifier (e.g. "(a - b)", "-x", a literal) begins a general
+		// expression rather than a column/aggregate; capture and evaluate it per row.
+		return p.parseSelectExpr()
 	}
 	// Aggregate?  IDENT '(' ... ')'
 	if agg := strings.ToUpper(t.text); isAggName(agg) && p.peekAheadPunct(1, "(") {
@@ -878,11 +885,43 @@ func (p *parser) parseSelectItem() (SelectItem, error) {
 		it.Alias = p.parseOptionalAlias()
 		return it, nil
 	}
-	// Plain column.
+	// A lone identifier NOT followed by an operator or '(' is a plain column; an identifier
+	// followed by an operator (a - b) or '(' (a function call that is not an aggregate/
+	// time_bucket, handled above) is a general expression.
+	if nt := p.peekAt(1); nt.kind == tOp || (nt.kind == tPunct && nt.text == "(") {
+		return p.parseSelectExpr()
+	}
 	p.pos++
 	it := SelectItem{Col: t.text}
 	it.Alias = p.parseOptionalAlias()
 	return it, nil
+}
+
+// parseSelectExpr captures a general ClassAd expression SELECT item verbatim (up to a
+// top-level comma, FROM, or AS) and evaluates it per row. An alias needs the explicit AS form,
+// since a trailing bare identifier would be ambiguous with the expression itself.
+func (p *parser) parseSelectExpr() (SelectItem, error) {
+	raw, err := p.captureRawExpr(func() bool {
+		if p.atEnd() {
+			return true
+		}
+		pk := p.peek()
+		return (pk.kind == tPunct && pk.text == ",") || p.isKeyword("FROM") || p.isKeyword("AS")
+	})
+	if err != nil {
+		return SelectItem{}, err
+	}
+	it := SelectItem{Expr: raw, Col: raw}
+	it.Alias = p.parseOptionalAlias()
+	return it, nil
+}
+
+// peekAt returns the token n positions ahead (or a zero token past the end).
+func (p *parser) peekAt(n int) token {
+	if p.pos+n >= len(p.toks) {
+		return token{}
+	}
+	return p.toks[p.pos+n]
 }
 
 // parseBucketCall parses "time_bucket ( <attr> , '<width>' )" starting at the
