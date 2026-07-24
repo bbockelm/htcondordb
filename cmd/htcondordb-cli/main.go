@@ -293,28 +293,17 @@ func oneShotStatements(f *flags) string {
 	return ""
 }
 
-// locateDaemon resolves the daemon's command address: HTCONDORDB_ADDRESS_FILE
-// (default $(LOG)/.htcondordb_address), else the HTCONDORDB_HOST knob.
+// locateDaemon resolves the daemon's command address using the standard convention --
+// HTCONDORDB_ADDRESS_FILE (default $(LOG)/.htcondordb_address) preferred, else the
+// HTCONDORDB_HOST knob. The mechanics live in golang-htcondor so the collector and this
+// CLI resolve htcondordb the same way; here we resolve once (the CLI is a short-lived
+// tool that does not reconnect).
 func locateDaemon(cfg *config.Config) (string, error) {
-	addrFile := strings.TrimSpace(getConfig(cfg, "HTCONDORDB_ADDRESS_FILE"))
-	if addrFile == "" {
-		if logDir := strings.TrimSpace(getConfig(cfg, "LOG")); logDir != "" {
-			addrFile = filepath.Join(logDir, ".htcondordb_address")
-		}
+	resolve, _, err := htcondor.LocalDaemonAddress(cfg, "HTCONDORDB")
+	if err != nil {
+		return "", fmt.Errorf("cannot locate the htcondordb daemon: pass -addr, or set HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST")
 	}
-	if addrFile != "" {
-		if data, err := os.ReadFile(addrFile); err == nil {
-			for _, line := range strings.Split(string(data), "\n") {
-				if line = strings.TrimSpace(line); line != "" {
-					return line, nil
-				}
-			}
-		}
-	}
-	if host := strings.TrimSpace(getConfig(cfg, "HTCONDORDB_HOST")); host != "" {
-		return host, nil
-	}
-	return "", fmt.Errorf("cannot locate the htcondordb daemon: pass -addr, or set HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST")
+	return resolve()
 }
 
 func getConfig(cfg *config.Config, key string) string {
