@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -47,6 +48,13 @@ type HistorySync struct {
 	dedup    bool        // while true, skip records the archive already holds (recovery)
 	started  bool        // whether restore() has run this process
 	onResync func(ResyncEvent)
+
+	// resyncs / lastResync accumulate durability-gap events for the status snapshot; status
+	// holds the latest published snapshot read lock-free by Status(). All written only from the
+	// sync goroutine.
+	resyncs    int64
+	lastResync time.Time
+	status     atomic.Pointer[SyncStatus]
 }
 
 // ResyncEvent reports that a durability gap was detected on restart: the history file the
@@ -248,6 +256,8 @@ func (s *HistorySync) drainChain(files []historyEntry, start int, firstOffset in
 // reportRetentionGap emits the resync event for a saved file that rotated out of retention:
 // completed jobs after our last sync but before the oldest surviving record are lost.
 func (s *HistorySync) reportRetentionGap(files []historyEntry) {
+	s.resyncs++
+	s.lastResync = nowFn()
 	ev := ResyncEvent{Reason: "history-file-rotated-out-of-retention"}
 	// Oldest-first, use the first file with a readable record -- skipping any sibling that
 	// matched the history.* glob but is not a history file (e.g. a co-located position file).
@@ -431,12 +441,12 @@ func (s *HistorySync) drainToEOF() error {
 	if err != nil {
 		return err
 	}
-	if len(data) == 0 {
-		return nil
+	if len(data) > 0 {
+		s.offset += int64(len(data))
+		s.processRecords(data)
+		s.checkpoint()
 	}
-	s.offset += int64(len(data))
-	s.processRecords(data)
-	s.checkpoint()
+	s.publishStatus(len(data) > 0)
 	return nil
 }
 
