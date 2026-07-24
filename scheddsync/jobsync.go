@@ -516,6 +516,13 @@ func (s *JobSync) restore(ctx context.Context) error {
 		if pos, derr := decodeJobPosition(blob); derr == nil {
 			if cur, serr := statIdentity(s.parser.GetFilename()); serr == nil &&
 				sameFileIdentity(cur, pos.File) && cur.Size >= pos.Offset {
+				// One-time migration: a jobs table written before record-type routing holds
+				// cluster/jobset/user/header ads too. Resuming does not rewrite them (they are
+				// not in the tail we replay), so sweep them now -- jobs holds only proc ads, and
+				// each proc already carries its cluster's chained attributes.
+				if err := s.migrateJobsTable(); err != nil {
+					return err
+				}
 				s.parser.SetNextOffset(pos.Offset)
 				s.curID, s.haveID = cur, true
 				return nil
@@ -526,6 +533,46 @@ func (s *JobSync) restore(ctx context.Context) error {
 		}
 	}
 	return s.reconcileReload(ctx)
+}
+
+// migrateJobsTable removes any key in the jobs table that does not belong there under the
+// current namespace routing -- cluster ads ("0C.-1"), jobset ads, user/owner records, and the
+// schedd header ad, all left over from a build that mirrored every job_queue.log record into
+// one table. It is a no-op once the table is clean (the common case), so it costs one key scan
+// on the resume path. Deletions are committed in bounded batches.
+func (s *JobSync) migrateJobsTable() error {
+	var stale []string
+	for _, k := range s.target.Keys() {
+		if !isJobKey(k) {
+			stale = append(stale, k)
+		}
+	}
+	if len(stale) == 0 {
+		return nil
+	}
+	s.log.Info("scheddsync: sweeping non-job rows from the jobs table (record-type routing migration)",
+		"count", len(stale))
+	var batch *db.Txn
+	commit := func() error {
+		if batch == nil {
+			return nil
+		}
+		err := batch.Commit()
+		batch = nil
+		return err
+	}
+	for i, k := range stale {
+		if batch == nil {
+			batch = s.target.Begin()
+		}
+		batch.DestroyClassAd(k)
+		if (i+1)%reconcileBatch == 0 {
+			if err := commit(); err != nil {
+				return err
+			}
+		}
+	}
+	return commit()
 }
 
 // checkpoint durably records the resume position after a clean read pass. It saves only at a
