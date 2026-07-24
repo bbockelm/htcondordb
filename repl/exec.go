@@ -610,10 +610,11 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 			}
 			return e.execAggregateBucket(st)
 		}
-		// Archives have no server-side aggregate op; compute the aggregate client-side over the
-		// fetched rows (the same path AS OF uses -- queryAdsAsOf already routes archives).
+		// Archives use their own server-side aggregate op (with a client-side fallback for an
+		// older server), so COUNT/GROUP BY over history streams only the grouped result instead
+		// of every matching row to the client.
 		if e.isArchive(st.Table) {
-			return e.execAggregateAsOf(st, groupBy)
+			return e.execArchiveAggregate(st, groupBy)
 		}
 		return e.execAggregate(st, groupBy)
 	}
@@ -717,23 +718,49 @@ func (e *Executor) execAggregate(st *Statement, groupBy []string) (*Result, erro
 	if st.AsOf != "" {
 		return e.execAggregateAsOf(st, groupBy)
 	}
-	// Build the aggregate specs (in item order) and the group-column index map.
-	var aggs []dbrpc.AggSpec
+	aggs, groupIdx := aggSpecs(st, groupBy)
+	rows, err := e.c.AggregateTable(context.Background(), st.Table, constraint(st.Where), groupBy, aggs)
+	if err != nil {
+		return nil, err
+	}
+	return formatAggResult(st, groupIdx, rows)
+}
+
+// execArchiveAggregate computes a GROUP BY / aggregate SELECT over an append-only history
+// table using the server-side archive aggregate (only the grouped result crosses the wire,
+// instead of every matched row). A server too old to know the op reports
+// ErrArchiveAggregateUnsupported, so we fall back to client-side aggregation over the rows.
+func (e *Executor) execArchiveAggregate(st *Statement, groupBy []string) (*Result, error) {
+	aggs, groupIdx := aggSpecs(st, groupBy)
+	rows, err := e.c.ArchiveAggregate(context.Background(), st.Table, constraint(st.Where), groupBy, aggs)
+	if errors.Is(err, dbrpc.ErrArchiveAggregateUnsupported) {
+		return e.execAggregateAsOf(st, groupBy) // client-side fetch-and-reduce fallback
+	}
+	if err != nil {
+		return nil, err
+	}
+	return formatAggResult(st, groupIdx, rows)
+}
+
+// aggSpecs builds the aggregate specs (in item order) and the group-column index map for a
+// GROUP BY / aggregate SELECT.
+func aggSpecs(st *Statement, groupBy []string) ([]dbrpc.AggSpec, map[string]int) {
 	groupIdx := map[string]int{}
 	for i, g := range groupBy {
 		groupIdx[strings.ToLower(g)] = i
 	}
+	var aggs []dbrpc.AggSpec
 	for _, it := range st.Items {
 		if it.IsAggregate() {
 			aggs = append(aggs, dbrpc.AggSpec{Func: aggFunc(it.Agg), Arg: it.Col})
 		}
 	}
+	return aggs, groupIdx
+}
 
-	rows, err := e.c.AggregateTable(context.Background(), st.Table, constraint(st.Where), groupBy, aggs)
-	if err != nil {
-		return nil, err
-	}
-
+// formatAggResult assembles server-side aggregate rows into the SELECT's column order, then
+// applies ORDER BY and LIMIT.
+func formatAggResult(st *Statement, groupIdx map[string]int, rows []dbrpc.AggRow) (*Result, error) {
 	res := &Result{IsSelect: true}
 	for _, it := range st.Items {
 		res.Columns = append(res.Columns, it.header())
