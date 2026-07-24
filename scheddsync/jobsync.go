@@ -32,19 +32,30 @@ const DefaultPollInterval = 200 * time.Millisecond
 // table. It reuses classadlog's parser/prober for parsing + rotation detection, but keeps
 // no in-memory copy of the queue -- the DB table is the materialized state.
 type JobSync struct {
+	// target is the jobs table (real proc ads). users, jobsets, and clusters are the sibling
+	// tables the other job_queue.log namespaces flatten into: user/owner records, jobset ads,
+	// and cluster ads. A key's "cluster.proc" namespace (see tableFor) routes it to exactly one
+	// of these -- or to none (the schedd header, cluster-private ads, OCU ads are dropped).
+	// Cluster ads get their own durable table so a proc materializing into a pre-existing
+	// cluster after a resume-from-offset restart can still chain its cluster's attributes.
 	target   *db.DB
+	users    *db.DB
+	jobsets  *db.DB
+	clusters *db.DB
 	parser   *classadlog.Parser
 	prober   *classadlog.Prober
 	interval time.Duration
 	log      *slog.Logger
 
-	// tx is the DB transaction currently accumulating the on-disk transaction being
-	// replayed. It persists ACROSS polls when a schedd transaction spans a poll boundary
-	// (BeginTransaction seen, EndTransaction not yet). implicit is set when tx batches
-	// ops that were written outside an explicit transaction (committed at end of a read
-	// pass); an explicit transaction stays open until its EndTransaction.
-	tx       *db.Txn
-	implicit bool
+	// txs holds one open DB transaction per target table for the on-disk transaction being
+	// replayed -- writes across the four tables are separate *db.Txn, opened lazily and committed
+	// together. It persists ACROSS polls when a schedd transaction spans a poll boundary
+	// (BeginTransaction seen, EndTransaction not yet). explicit marks that an explicit schedd
+	// transaction is open; when it is false the open txns batch ops written outside a transaction
+	// (committed at the end of a read pass), and an explicit transaction stays open until its
+	// EndTransaction.
+	txs      map[*db.DB]*db.Txn
+	explicit bool
 
 	// children maps a cluster ad key ("0C.-1") to the set of its proc ad keys ("C.P"). Some
 	// HTCondor versions keep cluster-wide attributes (ClusterId, Owner, ...) only on the
@@ -80,13 +91,21 @@ type JobSyncConfig struct {
 	Filename     string        // path to job_queue.log (required)
 	PollInterval time.Duration // default 200ms
 	Logger       *slog.Logger  // default slog.Default()
+	// Users, Jobsets, and Clusters are the sibling tables the non-proc job_queue.log namespaces
+	// flatten into (the jobs table is the NewJobSync target). When any is nil a private in-memory
+	// table stands in, so routing and cluster-ad chaining still work for callers that only inspect
+	// the jobs table (e.g. tests).
+	Users    *db.DB
+	Jobsets  *db.DB
+	Clusters *db.DB
 	// Store, if set, durably records the resume position so a restart resumes instead of
 	// replaying the whole log, and recovers correctly if the log was compacted while down.
 	Store PositionStore
 }
 
-// NewJobSync creates a syncer that mirrors cfg.Filename into target. The log need not
-// exist yet; it is picked up when it appears.
+// NewJobSync creates a syncer that mirrors cfg.Filename into target (the jobs table) and routes
+// the schedd's other namespaces into cfg.Users/Jobsets/Clusters. The log need not exist yet; it
+// is picked up when it appears.
 func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 	interval := cfg.PollInterval
 	if interval <= 0 {
@@ -96,15 +115,39 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	users, jobsets, clusters := cfg.Users, cfg.Jobsets, cfg.Clusters
+	if users == nil {
+		users = mustMemTable()
+	}
+	if jobsets == nil {
+		jobsets = mustMemTable()
+	}
+	if clusters == nil {
+		clusters = mustMemTable()
+	}
 	return &JobSync{
 		target:   target,
+		users:    users,
+		jobsets:  jobsets,
+		clusters: clusters,
 		parser:   classadlog.NewParser(cfg.Filename),
 		prober:   classadlog.NewProber(),
 		interval: interval,
 		log:      logger,
 		children: map[string]map[string]struct{}{},
+		txs:      map[*db.DB]*db.Txn{},
 		store:    cfg.Store,
 	}
+}
+
+// mustMemTable opens a private in-memory table for a sibling namespace a caller did not supply.
+// An in-memory Open does not fail in practice; a failure here means the process cannot function.
+func mustMemTable() *db.DB {
+	d, err := db.Open("")
+	if err != nil {
+		panic("scheddsync: opening in-memory table: " + err.Error())
+	}
+	return d
 }
 
 // Run polls and applies until ctx is cancelled, starting with an immediate poll. Transient
@@ -180,8 +223,13 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	s.children = map[string]map[string]struct{}{}
 	s.parser.SetNextOffset(0)
 	s.prober.Reset()
-	before := s.target.Keys()
-	seen := make(map[string]struct{}, len(before))
+	// Snapshot each table's keys before the reload so the post-reconcile sweep can delete the
+	// keys the current log no longer mentions (per namespace).
+	beforeJobs := s.target.Keys()
+	beforeUsers := s.users.Keys()
+	beforeJobsets := s.jobsets.Keys()
+	beforeClusters := s.clusters.Keys()
+	seen := make(map[string]struct{}, len(beforeJobs))
 
 	if oerr := s.parser.Open(); oerr != nil {
 		return oerr
@@ -205,7 +253,10 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	}
 	defer closeParser()
 
-	rec := &reconciler{target: s.target, seen: seen, log: s.log}
+	rec := &reconciler{
+		jobs: s.target, users: s.users, jobsets: s.jobsets, clusters: s.clusters,
+		seen: seen, log: s.log, batches: map[*db.DB]*db.Txn{},
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -235,8 +286,17 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	if err = s.chainReconciledProcs(seen); err != nil {
 		return err
 	}
-	if err = s.sweepKeys(before, seen); err != nil {
-		return err
+	// Sweep each namespace's table: delete the pre-reload keys the current log no longer contains.
+	for _, sw := range []struct {
+		table  *db.DB
+		before []string
+	}{
+		{s.target, beforeJobs}, {s.users, beforeUsers},
+		{s.jobsets, beforeJobsets}, {s.clusters, beforeClusters},
+	} {
+		if err = s.sweepKeys(sw.table, sw.before, seen); err != nil {
+			return err
+		}
 	}
 	s.checkpoint() // position recorded only after the reconciled table matches the log
 	s.publishStatus(true)
@@ -263,7 +323,7 @@ func (s *JobSync) chainReconciledProcs(seen map[string]struct{}) error {
 		if !ok {
 			continue
 		}
-		parent, ok := s.target.LookupClassAd(parentKey)
+		parent, ok := s.clusters.LookupClassAd(parentKey)
 		if !ok {
 			continue
 		}
@@ -284,10 +344,11 @@ func (s *JobSync) chainReconciledProcs(seen map[string]struct{}) error {
 	return commit()
 }
 
-// sweepKeys deletes every key present before a reconcile reload that the current log no longer
-// contains -- the jobs that completed (and were compacted away) while the log was rotated.
-// Deletions are committed in bounded batches so a large sweep never holds one giant transaction.
-func (s *JobSync) sweepKeys(before []string, seen map[string]struct{}) error {
+// sweepKeys deletes every key present in table before a reconcile reload that the current log no
+// longer contains -- e.g. the jobs that completed (and were compacted away) while the log was
+// rotated. Deletions are committed in bounded batches so a large sweep never holds one giant
+// transaction.
+func (s *JobSync) sweepKeys(table *db.DB, before []string, seen map[string]struct{}) error {
 	var batch *db.Txn
 	n := 0
 	commit := func() error {
@@ -303,7 +364,7 @@ func (s *JobSync) sweepKeys(before []string, seen map[string]struct{}) error {
 			continue
 		}
 		if batch == nil {
-			batch = s.target.Begin()
+			batch = table.Begin()
 		}
 		batch.DestroyClassAd(k)
 		if n++; n >= reconcileBatch {
@@ -321,16 +382,17 @@ func (s *JobSync) sweepKeys(before []string, seen map[string]struct{}) error {
 // holding just one ad at a time. Writes are buffered into a transaction committed in bounded
 // batches. The op handling mirrors JobSync.applyEntry; keep the two in sync.
 type reconciler struct {
-	target *db.DB
-	seen   map[string]struct{}
-	log    *slog.Logger
+	jobs, users, jobsets, clusters *db.DB
+	seen                           map[string]struct{}
+	log                            *slog.Logger
 
-	batch *db.Txn
-	n     int
+	batches map[*db.DB]*db.Txn // one buffered transaction per table touched this batch
+	n       int
 
-	curKey  string
-	curAd   *classad.ClassAd
-	destroy bool // the current key was destroyed within the log window
+	curKey   string
+	curAd    *classad.ClassAd
+	curTable *db.DB // the table curKey routes to; nil for a dropped namespace
+	destroy  bool   // the current key was destroyed within the log window
 }
 
 func (r *reconciler) apply(e *classadlog.LogEntry) error {
@@ -343,6 +405,7 @@ func (r *reconciler) apply(e *classadlog.LogEntry) error {
 			return err
 		}
 		r.curKey, r.curAd, r.destroy = e.Key, classad.New(), false
+		r.curTable = routeTable(e.Key, r.jobs, r.users, r.jobsets, r.clusters)
 	}
 	switch e.OpType {
 	case classadlog.OpNewClassAd:
@@ -370,46 +433,58 @@ func (r *reconciler) apply(e *classadlog.LogEntry) error {
 	return nil
 }
 
-// flush finalizes the current key: it records the key as seen (so the sweep keeps it) and
-// writes it only when the table lacks it or holds a different ad -- an unchanged job produces
-// no write and therefore no watch event.
+// flush finalizes the current key: it routes the key to its table, records it as seen (so that
+// table's sweep keeps it), and writes it only when the table lacks it or holds a different ad --
+// an unchanged job produces no write and therefore no watch event. A dropped namespace (the
+// schedd header, cluster-private ads, OCU ads) is discarded without touching any table.
 func (r *reconciler) flush() error {
 	if r.curKey == "" {
 		return nil
 	}
+	if r.curTable == nil {
+		r.curKey, r.curAd, r.destroy = "", nil, false
+		return nil
+	}
 	r.seen[r.curKey] = struct{}{}
-	cur, ok := r.target.LookupClassAd(r.curKey)
+	cur, ok := r.curTable.LookupClassAd(r.curKey)
 	switch {
 	case r.destroy:
 		if ok {
-			r.batchTx().DestroyClassAd(r.curKey)
+			r.batchTx(r.curTable).DestroyClassAd(r.curKey)
 			r.n++
 		}
 	case !ok || !cur.Equal(r.curAd):
-		r.batchTx().NewClassAd(r.curKey, r.curAd)
+		r.batchTx(r.curTable).NewClassAd(r.curKey, r.curAd)
 		r.n++
 	}
-	r.curKey, r.curAd, r.destroy = "", nil, false
+	r.curKey, r.curAd, r.curTable, r.destroy = "", nil, nil, false
 	if r.n >= reconcileBatch {
 		return r.commit()
 	}
 	return nil
 }
 
-func (r *reconciler) batchTx() *db.Txn {
-	if r.batch == nil {
-		r.batch = r.target.Begin()
+func (r *reconciler) batchTx(table *db.DB) *db.Txn {
+	tx := r.batches[table]
+	if tx == nil {
+		tx = table.Begin()
+		r.batches[table] = tx
 	}
-	return r.batch
+	return tx
 }
 
+// commit commits every buffered per-table transaction (the tables are independent) and resets the
+// batch. It returns the first commit error, if any.
 func (r *reconciler) commit() error {
-	if r.batch == nil {
-		return nil
+	var firstErr error
+	for _, tx := range r.batches {
+		if err := tx.Commit(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	err := r.batch.Commit()
-	r.batch, r.n = nil, 0
-	return err
+	r.batches = map[*db.DB]*db.Txn{}
+	r.n = 0
+	return firstErr
 }
 
 // finish flushes the last accumulated key and commits any remaining buffered writes.
@@ -454,11 +529,11 @@ func (s *JobSync) restore(ctx context.Context) error {
 }
 
 // checkpoint durably records the resume position after a clean read pass. It saves only at a
-// batch boundary with no explicit transaction open (s.tx == nil) -- committing the offset in
+// batch boundary with no explicit transaction open (!s.explicit) -- committing the offset in
 // the middle of an unfinished on-disk transaction would resume past its BeginTransaction --
-// reconcileReload does not use s.tx; it calls checkpoint itself once its sweep commits.
+// reconcileReload does not use s.txs; it calls checkpoint itself once its sweep commits.
 func (s *JobSync) checkpoint() {
-	if s.store == nil || s.tx != nil {
+	if s.store == nil || s.explicit {
 		return
 	}
 	id, err := statIdentity(s.parser.GetFilename())
@@ -514,10 +589,10 @@ func (s *JobSync) readAndApply(ctx context.Context, reload bool) (err error) {
 			return aerr
 		}
 	}
-	// End of this read pass: commit an implicit (non-explicit-transaction) batch. An
+	// End of this read pass: commit any implicit (non-explicit-transaction) batches. An
 	// explicit transaction with no EndTransaction yet stays open across polls.
-	if s.tx != nil && s.implicit {
-		err = s.commit()
+	if !s.explicit {
+		err = s.commitAll()
 	}
 	// Durably record how far we got, but only at a clean boundary (no open explicit
 	// transaction) so a resume never lands mid-transaction. Saved after the commit above, so
@@ -528,31 +603,35 @@ func (s *JobSync) readAndApply(ctx context.Context, reload bool) (err error) {
 	return err
 }
 
-// applyEntry applies one log entry to the target, managing the buffered DB transaction.
+// applyEntry applies one log entry to the table its key routes to, managing the buffered
+// per-table DB transactions.
 func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 	switch e.OpType {
 	case classadlog.OpBeginTransaction:
 		// A commit of any implicit batch precedes an explicit transaction.
-		if s.tx != nil && s.implicit {
-			if err := s.commit(); err != nil {
+		if !s.explicit {
+			if err := s.commitAll(); err != nil {
 				return err
 			}
 		}
-		if s.tx == nil {
-			s.tx = s.target.Begin()
-			s.implicit = false
-		}
+		s.explicit = true
 		return nil
 	case classadlog.OpEndTransaction:
-		if s.tx != nil && !s.implicit {
-			return s.commit()
+		if s.explicit {
+			return s.commitAll()
 		}
 		return nil
 	case classadlog.OpLogHistoricalSequenceNumber:
 		return nil
 	}
 
-	tx := s.ensureTx()
+	// Route the data op to the table its key namespace belongs to; drop keys we do not mirror
+	// (the schedd header, cluster-private ads, OCU ads).
+	table := s.tableFor(e.Key)
+	if table == nil {
+		return nil
+	}
+	tx := s.ensureTx(table)
 	switch e.OpType {
 	case classadlog.OpNewClassAd:
 		ad := classad.New()
@@ -566,7 +645,8 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 		// Chain a proc ad to its parent cluster ad: inherit the cluster's attributes already
 		// set (the proc's own, applied by later entries, win) and register it so a subsequent
 		// cluster-ad edit fans out to it. Together these cover both on-disk orders -- cluster
-		// attributes set before or after the proc's NewClassAd.
+		// attributes set before or after the proc's NewClassAd. The cluster ad lives in the
+		// clusters table, so chaining reads it from there (durable across a restart).
 		if parent, ok := clusterKeyOf(e.Key); ok {
 			s.chainFromParent(tx, e.Key, parent)
 			s.addChild(parent, e.Key)
@@ -585,11 +665,12 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 			// A single malformed value must not abort the whole sync; skip it.
 			s.log.Warn("job_queue.log: skipping unparseable attribute",
 				"key", e.Key, "attr", e.Name, "err", err.Error())
-		} else {
-			// Propagate a cluster-ad attribute to its chained proc rows (a no-op for keys that
-			// are not cluster ads with children).
-			for child := range s.children[e.Key] {
-				if perr := tx.SetAttribute(child, e.Name, e.Value); perr != nil {
+		} else if kids := s.children[e.Key]; len(kids) > 0 {
+			// Propagate a cluster-ad attribute to its chained proc rows in the jobs table (only
+			// cluster ads ever have children).
+			jtx := s.ensureTx(s.target)
+			for child := range kids {
+				if perr := jtx.SetAttribute(child, e.Name, e.Value); perr != nil {
 					s.log.Warn("job_queue.log: skipping unparseable cluster attribute",
 						"key", child, "attr", e.Name, "err", perr.Error())
 				}
@@ -597,11 +678,38 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 		}
 	case classadlog.OpDeleteAttribute:
 		tx.DeleteAttribute(e.Key, e.Name)
-		for child := range s.children[e.Key] {
-			tx.DeleteAttribute(child, e.Name)
+		if kids := s.children[e.Key]; len(kids) > 0 {
+			jtx := s.ensureTx(s.target)
+			for child := range kids {
+				jtx.DeleteAttribute(child, e.Name)
+			}
 		}
 	}
 	return nil
+}
+
+// tableFor returns the mirror table a job_queue.log key belongs to, or nil for keys we do not
+// mirror (the schedd header "0.0", cluster-private ads "C.-2", OCU ads "C.-99"). The namespace
+// is encoded in the "cluster.proc" key; see the is*Key classifiers.
+func (s *JobSync) tableFor(key string) *db.DB {
+	return routeTable(key, s.target, s.users, s.jobsets, s.clusters)
+}
+
+// routeTable classifies a job_queue.log key and returns the table it flattens into, or nil for a
+// dropped namespace. Shared by the incremental (applyEntry) and reconcile (reconciler) paths.
+func routeTable(key string, jobs, users, jobsets, clusters *db.DB) *db.DB {
+	switch {
+	case isJobKey(key):
+		return jobs
+	case isClusterKey(key):
+		return clusters
+	case isJobsetKey(key):
+		return jobsets
+	case isUserKey(key):
+		return users
+	default:
+		return nil
+	}
 }
 
 // addChild registers proc key child under its parent cluster ad key.
@@ -614,39 +722,82 @@ func (s *JobSync) addChild(parent, child string) {
 	kids[child] = struct{}{}
 }
 
+// parseJobKey splits a job_queue.log key "cluster.proc" into its two integer components. HTCondor
+// may pad the cluster with a leading zero for namespace sorting (e.g. "01.-1"), which Atoi
+// tolerates. ok is false for a key without a '.' or with a non-integer part.
+func parseJobKey(key string) (cluster, proc int, ok bool) {
+	dot := strings.IndexByte(key, '.')
+	if dot < 0 {
+		return 0, 0, false
+	}
+	c, err := strconv.Atoi(key[:dot])
+	if err != nil {
+		return 0, 0, false
+	}
+	p, err := strconv.Atoi(key[dot+1:])
+	if err != nil {
+		return 0, 0, false
+	}
+	return c, p, true
+}
+
+// isJobKey reports whether key names a real proc ad (cluster>0, proc>=0) -- the only keys that
+// become rows in the jobs table. It is exactly clusterKeyOf's success condition.
+func isJobKey(key string) bool {
+	_, ok := clusterKeyOf(key)
+	return ok
+}
+
+// isClusterKey reports whether key names a cluster ad (cluster>0, proc==-1): not a job row, but
+// the holder of attributes shared by (and chained into) the cluster's procs.
+func isClusterKey(key string) bool {
+	c, p, ok := parseJobKey(key)
+	return ok && c > 0 && p == -1
+}
+
+// isJobsetKey reports whether key names a jobset ad (cluster>0, proc==-100).
+func isJobsetKey(key string) bool {
+	c, p, ok := parseJobKey(key)
+	return ok && c > 0 && p == -100
+}
+
+// isUserKey reports whether key names a user/owner/project record (cluster==0, proc>0).
+func isUserKey(key string) bool {
+	c, p, ok := parseJobKey(key)
+	return ok && c == 0 && p > 0
+}
+
 // clusterKeyOf returns the parent cluster ad key for a proc ad key of the form "C.P"
 // (ProcId >= 0), following HTCondor's job_queue.log convention where cluster C's ad is
 // keyed "0C.-1". It returns ("", false) for anything that is not a real proc ad: cluster
-// ads ("0C.-1"), jobset ads ("C.-2"), and the schedd header namespace (cluster 0).
+// ads ("0C.-1"), jobset ads ("C.-100"), and the schedd header/user namespace (cluster 0).
 func clusterKeyOf(key string) (string, bool) {
+	cluster, proc, ok := parseJobKey(key)
+	if !ok || cluster <= 0 || proc < 0 {
+		return "", false
+	}
+	// The on-disk cluster ad key keeps the raw cluster substring prefixed with "0" (parsing the
+	// int would drop any leading zero), so build it from the substring, not the parsed int.
 	dot := strings.IndexByte(key, '.')
-	if dot <= 0 {
-		return "", false
-	}
-	clusterStr, procStr := key[:dot], key[dot+1:]
-	if proc, err := strconv.Atoi(procStr); err != nil || proc < 0 {
-		return "", false
-	}
-	if cluster, err := strconv.Atoi(clusterStr); err != nil || cluster <= 0 {
-		return "", false
-	}
-	return "0" + clusterStr + ".-1", true
+	return "0" + key[:dot] + ".-1", true
 }
 
-// chainFromParent copies the parent cluster ad's attributes (as the transaction currently
-// sees them) onto the proc ad, so the materialized proc row carries its cluster's attributes.
-// A no-op when the parent has nothing the proc lacks.
-func (s *JobSync) chainFromParent(tx *db.Txn, procKey, parentKey string) {
-	parent, ok := tx.LookupClassAd(parentKey)
+// chainFromParent copies the parent cluster ad's attributes onto the proc ad, so the materialized
+// proc row carries its cluster's attributes. The parent lives in the clusters table; reading it
+// through that table's open transaction sees both cluster ads written earlier in this pass and
+// ones committed by a prior pass (so a proc that materializes into a pre-existing cluster after a
+// resume still chains). A no-op when the parent has nothing the proc lacks.
+func (s *JobSync) chainFromParent(jobsTx *db.Txn, procKey, parentKey string) {
+	parent, ok := s.ensureTx(s.clusters).LookupClassAd(parentKey)
 	if !ok {
 		return
 	}
-	proc, ok := tx.LookupClassAd(procKey)
+	proc, ok := jobsTx.LookupClassAd(procKey)
 	if !ok {
 		return
 	}
 	if chainAttrsInto(proc, parent) {
-		tx.NewClassAd(procKey, proc)
+		jobsTx.NewClassAd(procKey, proc)
 	}
 }
 
@@ -667,30 +818,37 @@ func chainAttrsInto(dst, parent *classad.ClassAd) bool {
 	return changed
 }
 
-// ensureTx returns the open transaction, starting an implicit one if none is open (for a
-// data op written outside an explicit transaction).
-func (s *JobSync) ensureTx() *db.Txn {
-	if s.tx == nil {
-		s.tx = s.target.Begin()
-		s.implicit = true
+// ensureTx returns the open transaction for table, starting one if none is open for it. When no
+// explicit schedd transaction is in progress the txn batches ops written outside a transaction
+// (committed at the end of the read pass); inside an explicit transaction it commits at
+// EndTransaction.
+func (s *JobSync) ensureTx(table *db.DB) *db.Txn {
+	tx := s.txs[table]
+	if tx == nil {
+		tx = table.Begin()
+		s.txs[table] = tx
 	}
-	return s.tx
+	return tx
 }
 
-func (s *JobSync) commit() error {
-	if s.tx == nil {
-		return nil
+// commitAll commits every open per-table transaction (the tables are independent, so order does
+// not matter) and clears the set. It returns the first commit error, if any.
+func (s *JobSync) commitAll() error {
+	var firstErr error
+	for _, tx := range s.txs {
+		if err := tx.Commit(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	err := s.tx.Commit()
-	s.tx = nil
-	s.implicit = false
-	return err
+	s.txs = map[*db.DB]*db.Txn{}
+	s.explicit = false
+	return firstErr
 }
 
 func (s *JobSync) abort() {
-	if s.tx != nil {
-		s.tx.Abort()
-		s.tx = nil
-		s.implicit = false
+	for _, tx := range s.txs {
+		tx.Abort()
 	}
+	s.txs = map[*db.DB]*db.Txn{}
+	s.explicit = false
 }
