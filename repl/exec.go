@@ -742,6 +742,27 @@ func (e *Executor) execArchiveAggregate(st *Statement, groupBy []string) (*Resul
 	return formatAggResult(st, groupIdx, rows)
 }
 
+// archiveRowCount returns the number of rows in an append-only history table via the
+// server-side count aggregate (falling back to a client-side count against an older server).
+func (e *Executor) archiveRowCount(table string) (int, error) {
+	rows, err := e.c.ArchiveAggregate(context.Background(), table, "true", nil,
+		[]dbrpc.AggSpec{{Func: dbrpc.AggCount, Arg: "*"}})
+	if errors.Is(err, dbrpc.ErrArchiveAggregateUnsupported) {
+		ads, aerr := e.queryAds(table, "", 0) // client-side fallback (queryAds routes archives)
+		if aerr != nil {
+			return 0, aerr
+		}
+		return len(ads), nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 || len(rows[0].Values) == 0 {
+		return 0, nil
+	}
+	return strconv.Atoi(rows[0].Values[0])
+}
+
 // aggSpecs builds the aggregate specs (in item order) and the group-column index map for a
 // GROUP BY / aggregate SELECT.
 func aggSpecs(st *Statement, groupBy []string) ([]dbrpc.AggSpec, map[string]int) {
