@@ -68,7 +68,12 @@ func TestJobSyncIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer target.Close()
-	js := NewJobSync(target, JobSyncConfig{Filename: jobLog})
+	clusters, err := db.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clusters.Close()
+	js := NewJobSync(target, JobSyncConfig{Filename: jobLog, Clusters: clusters})
 
 	key := clusterID + ".0"
 	deadline := time.Now().Add(20 * time.Second)
@@ -92,18 +97,23 @@ func TestJobSyncIntegration(t *testing.T) {
 	if v, _ := ad.EvaluateAttrInt("ProcId"); v != 0 {
 		t.Errorf("mirrored ProcId = %d, want 0", v)
 	}
-	// The cluster ad is mirrored too. HTCondor writes its key with a namespace-sorting
-	// leading zero (e.g. "01.-1" for cluster 1), so match any cluster ad (key ".-1"),
-	// proving the syncer faithfully mirrors every key the schedd writes, not only procs.
-	hasCluster := false
+	// Cluster ads are NOT rows in the jobs table -- they flatten into their own clusters table
+	// (their attributes are chained into the proc rows instead). Assert the jobs table holds no
+	// cluster ad (key ending ".-1"), and that the cluster ad landed in the clusters table.
 	for _, k := range target.Keys() {
+		if strings.HasSuffix(k, ".-1") {
+			t.Errorf("cluster ad %q leaked into the jobs table; keys: %v", k, target.Keys())
+		}
+	}
+	hasCluster := false
+	for _, k := range clusters.Keys() {
 		if strings.HasSuffix(k, ".-1") {
 			hasCluster = true
 			break
 		}
 	}
 	if !hasCluster {
-		t.Errorf("no cluster ad (key ending .-1) mirrored; keys: %v", target.Keys())
+		t.Errorf("no cluster ad (key ending .-1) in the clusters table; keys: %v", clusters.Keys())
 	}
 }
 

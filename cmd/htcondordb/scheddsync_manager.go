@@ -124,15 +124,34 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	var wg sync.WaitGroup
 
 	if s.jobLog != "" {
+		// job_queue.log flattens into four tables by key namespace: proc ads -> jobs, cluster ads
+		// -> clusters (their own durable table so late procs still chain), jobset ads -> jobsets,
+		// user/owner records -> users. CreateTable is idempotent (returns the existing table).
 		jobs, err := m.svc.Catalog().CreateTable("jobs")
 		if err != nil {
 			return nil, nil, fmt.Errorf("schedd-sync: creating jobs table: %w", err)
 		}
-		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{Filename: s.jobLog, Logger: m.logger, Store: syncStore("jobs.pos")})
+		users, err := m.svc.Catalog().CreateTable("users")
+		if err != nil {
+			return nil, nil, fmt.Errorf("schedd-sync: creating users table: %w", err)
+		}
+		jobsets, err := m.svc.Catalog().CreateTable("jobsets")
+		if err != nil {
+			return nil, nil, fmt.Errorf("schedd-sync: creating jobsets table: %w", err)
+		}
+		clusters, err := m.svc.Catalog().CreateTable("clusters")
+		if err != nil {
+			return nil, nil, fmt.Errorf("schedd-sync: creating clusters table: %w", err)
+		}
+		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{
+			Filename: s.jobLog, Logger: m.logger, Store: syncStore("jobs.pos"),
+			Users: users, Jobsets: jobsets, Clusters: clusters,
+		})
 		wg.Add(1)
 		go func() { defer wg.Done(); _ = js.Run(ctx) }()
 		sources = append(sources, js)
-		m.logger.Info("schedd-sync: mirroring job_queue.log", "file", s.jobLog, "table", "jobs")
+		m.logger.Info("schedd-sync: mirroring job_queue.log", "file", s.jobLog,
+			"tables", "jobs,users,jobsets,clusters")
 	}
 	if s.histFile != "" {
 		hist, err := m.svc.Catalog().CreateArchiveTable("history", db.ArchiveConfig{
