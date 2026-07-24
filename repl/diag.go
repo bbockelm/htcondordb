@@ -24,11 +24,23 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 	case ".use":
 		s.useTable(console, arg)
 	case ".stats":
-		s.withDiag(console, s.tableArg(arg), s.showStats)
+		if t := s.tableArg(arg); s.exec.isArchive(t) {
+			s.showArchiveStats(console, t)
+		} else {
+			s.withDiag(console, t, s.showStats)
+		}
 	case ".indexes", ".index":
-		s.withDiag(console, s.tableArg(arg), s.showIndexes)
+		if t := s.tableArg(arg); s.exec.isArchive(t) {
+			s.showArchiveIndexes(console, t)
+		} else {
+			s.withDiag(console, t, s.showIndexes)
+		}
 	case ".hot":
-		s.withDiag(console, s.tableArg(arg), s.showHot)
+		if t := s.tableArg(arg); s.exec.isArchive(t) {
+			s.showArchiveIndexes(console, t) // archives have no hot set; explain like .indexes
+		} else {
+			s.withDiag(console, t, s.showHot)
+		}
 	case ".suggest":
 		s.suggest(console, arg)
 	case ".explain":
@@ -146,6 +158,30 @@ func (s *session) withDiag(console io.Writer, table string, fn func(io.Writer, *
 		return
 	}
 	fn(console, d)
+}
+
+// showArchiveStats prints the diagnostics available for an append-only history table.
+// Archives do not expose the per-segment/op statistics that .stats shows for mutable tables,
+// but the row count is available cheaply via the server-side count aggregate.
+func (s *session) showArchiveStats(w io.Writer, table string) {
+	n, err := s.exec.archiveRowCount(table)
+	if err != nil {
+		fmt.Fprintf(w, "error: %v\n", err)
+		return
+	}
+	fmt.Fprintf(w, "table:  %s (append-only history archive)\n", table)
+	fmt.Fprintf(w, "rows:   %d\n", n)
+	fmt.Fprintln(w, "  (archives keep zone maps for range pruning; per-segment storage/op stats are not exposed for archives)")
+}
+
+// showArchiveIndexes explains the fixed index layout of a history archive -- its value indexes
+// and zone maps are set when the archive is created and are not queryable over the wire, unlike
+// a mutable table's runtime-managed indexes.
+func (s *session) showArchiveIndexes(w io.Writer, table string) {
+	fmt.Fprintf(w, "%s is an append-only history archive.\n", table)
+	fmt.Fprintln(w, "Its indexes and zone maps are fixed at creation and not enumerable over the wire.")
+	fmt.Fprintln(w, "For schedd-synced history, CompletionDate and EnteredHistoryTime are zone-mapped, so range")
+	fmt.Fprintln(w, "queries on them (e.g. WHERE EnteredHistoryTime > <t>) prune whole segments.")
 }
 
 func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
