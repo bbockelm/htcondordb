@@ -39,7 +39,6 @@ import (
 	"github.com/bbockelm/htcondordb/command"
 	"github.com/bbockelm/htcondordb/dbad"
 	"github.com/bbockelm/htcondordb/metrics"
-	"github.com/bbockelm/htcondordb/scheddsync"
 	"github.com/bbockelm/htcondordb/server"
 )
 
@@ -250,20 +249,24 @@ func run() error {
 
 	// Schedd-sync mode: mirror a schedd's job_queue.log into a "jobs" table and its
 	// history file into a "history" archive table (a read model of the schedd's state).
-	var syncSources []dbad.StatusSource
-	if configBool(cfg, "HTCONDORDB_SYNC_SCHEDD") {
-		ss, serr := startScheddSync(ctx, svc, cfg, d.Slog())
-		if serr != nil {
-			return serr
-		}
-		syncSources = ss
+	// The manager (re)starts the tailers so a JOB_QUEUE_LOG / HISTORY /
+	// HTCONDORDB_SYNC_SCHEDD change takes effect on condor_reconfig without a restart.
+	syncMgr := &scheddSyncManager{parent: ctx, svc: svc, logger: d.Slog()}
+	if serr := syncMgr.apply(cfg); serr != nil {
+		return serr
 	}
+	d.OnReconfig(func(newCfg *config.Config) {
+		if serr := syncMgr.apply(newCfg); serr != nil {
+			log.Error(logging.DestinationGeneral, "reconfigure: schedd-sync not reapplied", "err", serr.Error())
+			return
+		}
+	})
 
 	// Advertise a discovery/monitoring ClassAd to the collector: agents (and the htcondor-api
 	// MCP) discover this database and its command address here, and the ad doubles as a metrics
 	// sink carrying per-table storage gauges and per-source sync health -- scrapable via the
 	// collector even when the daemon's own /metrics endpoint is off.
-	startCollectorAdvertise(ctx, d, cfg, svc, advertisedAddr(d, ln), syncSources)
+	startCollectorAdvertise(ctx, d, cfg, svc, advertisedAddr(d, ln), syncMgr.Sources)
 
 	// Start any background HA machinery (a follower's replicator, or the raft
 	// coordinator and its command handlers in consistent mode).
@@ -360,80 +363,12 @@ func encryptionConfig(cfg *config.Config) (poolKeys []db.KEK, attrs []string, er
 	return poolKeys, splitAttrs(getStr(cfg, "HTCONDORDB_ENCRYPT_ATTRS")), nil
 }
 
-// startScheddSync launches the schedd-sync goroutines: a job_queue.log mirror into the
-// "jobs" mutable table and a history-file tail into the "history" archive table. Paths
-// come from HTCONDORDB_JOB_QUEUE_LOG / HTCONDORDB_HISTORY, falling back to HTCondor's
-// standard JOB_QUEUE_LOG / HISTORY params. At least one source must be configured. The
-// goroutines stop when ctx is cancelled (daemon shutdown).
-func startScheddSync(ctx context.Context, svc *server.Service, cfg *config.Config, logger *slog.Logger) ([]dbad.StatusSource, error) {
-	// Never read a schedd's job_queue.log / history as root: those files are owned by the
-	// condor user, and following them as root risks reading through an attacker-planted
-	// symlink to a privileged file. The daemon drops privilege in daemon.New before this
-	// runs; if it is still root here (e.g. DROP_PRIVILEGES=false), refuse rather than read
-	// schedd files privileged.
-	if err := scheddSyncGuardEUID(os.Geteuid()); err != nil {
-		return nil, err
-	}
-	jobLog := firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG"))
-	histFile := firstNonEmpty(getStr(cfg, "HTCONDORDB_HISTORY"), getStr(cfg, "HISTORY"))
-	if jobLog == "" && histFile == "" {
-		return nil, fmt.Errorf("HTCONDORDB_SYNC_SCHEDD is set but neither JOB_QUEUE_LOG nor HISTORY is configured")
-	}
-	var sources []dbad.StatusSource
-	// Persist each syncer's resume position durably under the database dir, so a restart
-	// resumes instead of re-reading the whole log -- and recovers correctly if the log was
-	// compacted/rotated while down. With an in-memory database (no dir) there is nowhere
-	// durable to keep it, so persistence is off (each start re-syncs from scratch).
-	posDir := getStr(cfg, "HTCONDORDB_DIR")
-	syncStore := func(name string) scheddsync.PositionStore {
-		if posDir == "" {
-			return nil
-		}
-		return &scheddsync.FileStore{Path: filepath.Join(posDir, "scheddsync", name)}
-	}
-	if jobLog != "" {
-		jobs, err := svc.Catalog().CreateTable("jobs")
-		if err != nil {
-			return nil, fmt.Errorf("schedd-sync: creating jobs table: %w", err)
-		}
-		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{Filename: jobLog, Logger: logger, Store: syncStore("jobs.pos")})
-		go func() { _ = js.Run(ctx) }()
-		sources = append(sources, js)
-		logger.Info("schedd-sync: mirroring job_queue.log", "file", jobLog, "table", "jobs")
-	}
-	if histFile != "" {
-		hist, err := svc.Catalog().CreateArchiveTable("history", db.ArchiveConfig{
-			ValueAttrs: []string{"ClusterId"},
-			ZoneAttrs:  []string{"CompletionDate"},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("schedd-sync: creating history archive: %w", err)
-		}
-		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
-			Filename: histFile,
-			Logger:   logger,
-			Store:    syncStore("history.pos"),
-			// A resync event means the history file rotated out of retention while we were
-			// down, so some completed jobs were lost from the source -- surface it at error
-			// level so it stands out from the routine per-file warnings.
-			OnResync: func(ev scheddsync.ResyncEvent) {
-				logger.Error("schedd-sync: history durability gap; completed jobs lost to rotation",
-					"reason", ev.Reason, "oldest_available_completion", ev.OldestAvailableCompletion)
-			},
-		})
-		go func() { _ = hs.Run(ctx) }()
-		sources = append(sources, hs)
-		logger.Info("schedd-sync: tailing history file", "file", histFile, "archive", "history")
-	}
-	return sources, nil
-}
-
 // startCollectorAdvertise launches the periodic HTCondorDB ad advertisement to the collector
 // (COLLECTOR_HOST). It is a no-op when no collector is configured or when advertisement is
 // explicitly disabled (HTCONDORDB_ADVERTISE=false). The ad carries the daemon's command
 // address for discovery plus per-table storage gauges and per-source sync health for
 // monitoring.
-func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, addr string, sources []dbad.StatusSource) {
+func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, addr string, sourcesFunc func() []dbad.StatusSource) {
 	host := getStr(cfg, "COLLECTOR_HOST")
 	if strings.TrimSpace(host) == "" {
 		return // no collector to advertise to
@@ -464,7 +399,7 @@ func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.
 		MyAddress:    addr,
 		Name:         name,
 		Capabilities: dbad.CatalogCapabilities(svc.Catalog()),
-		Sources:      sources,
+		SourcesFunc:  sourcesFunc,
 		Interval:     interval,
 		Logger:       d.Slog(),
 	}

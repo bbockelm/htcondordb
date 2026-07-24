@@ -85,9 +85,13 @@ type Advertiser struct {
 	MyAddress    string // authoritative reachable command address (covers the non-shared-port fallback)
 	Name         string // daemon Name, for the INVALIDATE query on shutdown
 	Capabilities Capabilities
-	Sources      []StatusSource
-	Interval     time.Duration
-	Logger       *slog.Logger
+	// Sources is the static set of sync-status sources. SourcesFunc, when set,
+	// takes precedence and is queried each advertise cycle -- for a source set
+	// that changes at runtime (e.g. schedd-sync tailers restarted on reconfigure).
+	Sources     []StatusSource
+	SourcesFunc func() []StatusSource
+	Interval    time.Duration
+	Logger      *slog.Logger
 
 	seq int64
 }
@@ -127,8 +131,12 @@ func (a *Advertiser) advertiseOnce(ctx context.Context) {
 
 // build assembles the current ad; separated from advertiseOnce so a test can inspect it.
 func (a *Advertiser) build(now time.Time) *classad.ClassAd {
-	srcs := make([]scheddsync.SyncStatus, 0, len(a.Sources))
-	for _, s := range a.Sources {
+	sources := a.Sources
+	if a.SourcesFunc != nil {
+		sources = a.SourcesFunc()
+	}
+	srcs := make([]scheddsync.SyncStatus, 0, len(sources))
+	for _, s := range sources {
 		st := s.Status()
 		// Recompute the lag against the LIVE file size (the snapshot's is measured right after a
 		// poll drains to EOF, so it is ~0): a stalled syncer whose offset is frozen while the
