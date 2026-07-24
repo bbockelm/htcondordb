@@ -7,7 +7,7 @@ require (
 	github.com/PelicanPlatform/classad/db v0.16.7
 	github.com/PelicanPlatform/classad/dbrpc v0.16.7
 	github.com/bbockelm/cedar v0.6.5
-	github.com/bbockelm/golang-htcondor v0.9.1
+	github.com/bbockelm/golang-htcondor v0.9.2
 	github.com/twmb/franz-go v1.21.5
 	github.com/twmb/franz-go/pkg/kadm v1.18.0
 )
