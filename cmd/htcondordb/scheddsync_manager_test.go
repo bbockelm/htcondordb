@@ -60,7 +60,10 @@ func TestScheddSyncManagerReconcile(t *testing.T) {
 	jobA := filepath.Join(logDir, "job_queue_a.log")
 	jobB := filepath.Join(logDir, "job_queue_b.log")
 	for _, f := range []string{jobA, jobB} {
-		if err := os.WriteFile(f, []byte("103\n"), 0o644); err != nil {
+		// A valid minimal job_queue.log record. (The syncer now persists its resume position
+		// under the DB dir even for SPOOL-only configs, so startup reconciles the log rather
+		// than replaying blindly -- the content must parse.)
+		if err := os.WriteFile(f, []byte("101 1.0 Job Machine\n103 1.0 ProcId 0\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -78,7 +81,7 @@ func TestScheddSyncManagerReconcile(t *testing.T) {
 	}
 
 	// Enable, tailing jobA.
-	if err := m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nHISTORY =\nHTCONDORDB_JOB_QUEUE_LOG = "+jobA+"\n")); err != nil {
+	if err := m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nHTCONDORDB_DIR = "+dir+"\nHISTORY =\nHTCONDORDB_JOB_QUEUE_LOG = "+jobA+"\n")); err != nil {
 		t.Fatal(err)
 	}
 	srcs := m.Sources()
@@ -91,7 +94,7 @@ func TestScheddSyncManagerReconcile(t *testing.T) {
 	first := srcs[0]
 
 	// Re-apply the same config: a no-op, the same tailer keeps running.
-	if err := m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nHISTORY =\nHTCONDORDB_JOB_QUEUE_LOG = "+jobA+"\n")); err != nil {
+	if err := m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nHTCONDORDB_DIR = "+dir+"\nHISTORY =\nHTCONDORDB_JOB_QUEUE_LOG = "+jobA+"\n")); err != nil {
 		t.Fatal(err)
 	}
 	if again := m.Sources(); len(again) != 1 || again[0] != first {
@@ -99,7 +102,7 @@ func TestScheddSyncManagerReconcile(t *testing.T) {
 	}
 
 	// Change the path: the old tailer stops and a new one starts on jobB.
-	if err := m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nHISTORY =\nHTCONDORDB_JOB_QUEUE_LOG = "+jobB+"\n")); err != nil {
+	if err := m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nHTCONDORDB_DIR = "+dir+"\nHISTORY =\nHTCONDORDB_JOB_QUEUE_LOG = "+jobB+"\n")); err != nil {
 		t.Fatal(err)
 	}
 	srcs = m.Sources()
@@ -136,7 +139,7 @@ func TestScheddSyncManagerEnabledNoPaths(t *testing.T) {
 
 	m := &scheddSyncManager{parent: context.Background(), svc: svc, logger: slog.Default()}
 	// Enabled but JOB_QUEUE_LOG/HISTORY forced empty (override the params to blank).
-	err = m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nJOB_QUEUE_LOG =\nHISTORY =\n"))
+	err = m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nHTCONDORDB_DIR = "+dir+"\nJOB_QUEUE_LOG =\nHISTORY =\n"))
 	if err == nil {
 		t.Fatal("enabled with no sources should error")
 	}

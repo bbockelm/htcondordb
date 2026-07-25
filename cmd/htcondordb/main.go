@@ -329,15 +329,26 @@ func localUIDDomain(cfg *config.Config) string {
 	return ""
 }
 
-func databaseDir(d *daemon.Daemon, cfg *config.Config) string {
+// resolveDBDir resolves the on-disk database directory from config alone: HTCONDORDB_DIR if
+// set, else $(SPOOL)/htcondordb, else "" (in-memory). It is the single source of truth for
+// the DB dir so everything under it -- the catalog, archives, and the schedd-sync position
+// store -- lands in the same place regardless of which knob is set.
+func resolveDBDir(cfg *config.Config) string {
 	if v, ok := cfg.Get("HTCONDORDB_DIR"); ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
 	}
 	if spool, ok := cfg.Get("SPOOL"); ok && strings.TrimSpace(spool) != "" {
 		return filepath.Join(strings.TrimSpace(spool), "htcondordb")
 	}
-	d.Logger().Warn(logging.DestinationGeneral, "no HTCONDORDB_DIR or SPOOL configured; database is in-memory only")
 	return ""
+}
+
+func databaseDir(d *daemon.Daemon, cfg *config.Config) string {
+	dir := resolveDBDir(cfg)
+	if dir == "" {
+		d.Logger().Warn(logging.DestinationGeneral, "no HTCONDORDB_DIR or SPOOL configured; database is in-memory only")
+	}
+	return dir
 }
 
 // encryptionConfig resolves encryption at rest from configuration. It is opt-in via
