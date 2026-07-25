@@ -5,8 +5,10 @@ package opensearchsync
 // category tables the transform uses, plus dynamic templates that type unknown-but-patterned
 // fields (matching the transform's auto-rules). date/numeric auto-detection is disabled.
 
-// buildMappings returns the OpenSearch index body {settings, mappings} for the adstash schema.
-func buildMappings() map[string]any {
+// indexProperties returns the explicit per-attribute field mappings (the "properties" block).
+// Split out from buildMappings so the additive mapping-patch (EnsureIndex) can diff the desired
+// fields against an existing index and PUT only the missing ones.
+func indexProperties() map[string]any {
 	properties := map[string]any{
 		// metadata is a nested object; its two runtime fields are typed as epoch-second dates.
 		"metadata": map[string]any{
@@ -40,7 +42,11 @@ func buildMappings() map[string]any {
 	for _, a := range nestedAttrs {
 		properties[a] = map[string]any{"type": "nested", "dynamic": true}
 	}
+	return properties
+}
 
+// buildMappings returns the OpenSearch index body {settings, mappings} for the adstash schema.
+func buildMappings() map[string]any {
 	// Dynamic templates (first match wins), mirroring the transform's auto-rules for fields
 	// that are not explicitly mapped above.
 	dynamicTemplates := []map[string]any{
@@ -61,7 +67,7 @@ func buildMappings() map[string]any {
 		},
 		"mappings": map[string]any{
 			"dynamic_templates": dynamicTemplates,
-			"properties":        properties,
+			"properties":        indexProperties(),
 			"date_detection":    false,
 			"numeric_detection": false,
 		},
