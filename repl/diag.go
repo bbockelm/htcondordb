@@ -211,6 +211,23 @@ func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 	showOpStats(w, d.OpStats)
 }
 
+// fmtDur formats a duration with at most two fractional digits of its natural unit, so
+// operator timings read "2.24ms" / "375.55ms" / "3h2m17.62s" instead of nanosecond noise
+// like "2.23993ms". It rounds to 1% of the unit time.Duration.String would choose (10ms
+// within seconds, 10µs within milliseconds, 10ns within microseconds).
+func fmtDur(d time.Duration) string {
+	switch {
+	case d >= time.Second:
+		return d.Round(10 * time.Millisecond).String()
+	case d >= time.Millisecond:
+		return d.Round(10 * time.Microsecond).String()
+	case d >= time.Microsecond:
+		return d.Round(10 * time.Nanosecond).String()
+	default:
+		return d.String() // sub-microsecond: whole nanoseconds, no fraction
+	}
+}
+
 // showOpStats prints the cumulative operational timing counters -- where the store
 // spent time blocked in, or holding, each stall point -- so an operator can see what
 // is "blocking the world" (long shard-write holds, slow syncs, expensive maintenance).
@@ -235,7 +252,7 @@ func showOpStats(w io.Writer, o db.OpStats) {
 			mean = time.Duration(r.s.Nanos / r.s.Count)
 		}
 		fmt.Fprintf(w, "  %-17s n=%-8d total=%-11s mean=%-10s max=%s\n",
-			r.label, r.s.Count, time.Duration(r.s.Nanos), mean, time.Duration(r.s.MaxNanos))
+			r.label, r.s.Count, fmtDur(time.Duration(r.s.Nanos)), fmtDur(mean), fmtDur(time.Duration(r.s.MaxNanos)))
 		// The mean hides tail stalls (a slow msync or a long retrain averages out to
 		// milliseconds while its worst case is seconds). Show the latency histogram when
 		// the tail is non-trivial, so the distribution -- not just the average -- is visible.
