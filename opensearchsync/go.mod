@@ -3,16 +3,16 @@ module github.com/bbockelm/htcondordb/opensearchsync
 go 1.25.9
 
 require (
-	github.com/PelicanPlatform/classad v0.20.1
-	github.com/PelicanPlatform/classad/db v0.20.1
-	github.com/PelicanPlatform/classad/dbrpc v0.20.1
+	github.com/PelicanPlatform/classad v0.20.2
+	github.com/PelicanPlatform/classad/db v0.20.2
+	github.com/PelicanPlatform/classad/dbrpc v0.20.2
 	github.com/bbockelm/cedar v0.6.8
 	github.com/bbockelm/golang-htcondor v0.12.0
 	github.com/opensearch-project/opensearch-go/v4 v4.7.2
 )
 
 require (
-	github.com/PelicanPlatform/classad/collections v0.20.1 // indirect
+	github.com/PelicanPlatform/classad/collections v0.20.2 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
