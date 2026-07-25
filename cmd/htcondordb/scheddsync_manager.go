@@ -50,7 +50,10 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		enabled:  true,
 		jobLog:   firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG")),
 		histFile: firstNonEmpty(getStr(cfg, "HTCONDORDB_HISTORY"), getStr(cfg, "HISTORY")),
-		posDir:   getStr(cfg, "HTCONDORDB_DIR"),
+		// The position store lives under the database dir, resolved the same way the DB is
+		// (HTCONDORDB_DIR or $(SPOOL)/htcondordb) -- not HTCONDORDB_DIR alone, which left
+		// SPOOL-configured deployments with no persisted resume position.
+		posDir: resolveDBDir(cfg),
 	}
 }
 
