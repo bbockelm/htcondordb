@@ -9,16 +9,9 @@ import (
 	"github.com/bbockelm/htcondordb/scheddsync"
 )
 
-func TestBuildAd(t *testing.T) {
+func TestAddAttrs(t *testing.T) {
 	now := time.Unix(1_700_000_500, 0)
 	in := Input{
-		// The daemon base ad (identity/version/timing) is simulated here; dbad augments it.
-		PublishBase: func(ad *classad.ClassAd) {
-			ad.InsertAttrString("Name", "htcondordb@ap40")
-			ad.InsertAttrString("Machine", "ap40.chtc.wisc.edu")
-			ad.InsertAttrString("CondorVersion", "$CondorVersion: 25.4.0 $")
-			ad.InsertAttr("DaemonStartTime", int64(1_700_000_000))
-		},
 		MyAddress: "10.0.0.1:9619",
 		Tables: []TableStat{
 			{Name: "jobs", Ads: 1200, LiveBytes: 4096, DeadBytes: 512, Segments: 3},
@@ -34,23 +27,19 @@ func TestBuildAd(t *testing.T) {
 			{Kind: "job_queue.log", Source: "/spool/job_queue.log", Offset: 900, FileSize: 900, LagBytes: 0, CaughtUp: true, LastSync: time.Unix(1_700_000_480, 0)},
 			{Kind: "history", Source: "/spool/history", Offset: 500, FileSize: 700, LagBytes: 200, CaughtUp: false, LastSync: time.Unix(1_700_000_400, 0), Resyncs: 2, LastResync: time.Unix(1_700_000_300, 0)},
 		},
-		Now:       now,
-		UpdateSeq: 7,
+		Now: now,
 	}
-	ad := BuildAd(in)
+	// AddAttrs augments a (here empty) base ad -- MyType/UpdateSequenceNumber/identity are the
+	// daemon's job (daemon.Advertise/PublishAd), tested in golang-htcondor.
+	ad := classad.New()
+	AddAttrs(ad, in)
 
 	str := func(k string) string { v, _ := ad.EvaluateAttrString(k); return v }
 	i := func(k string) int64 { v, _ := ad.EvaluateAttrInt(k); return v }
 	b := func(k string) bool { v, _ := ad.EvaluateAttrBool(k); return v }
 
-	if str("MyType") != AdType {
-		t.Errorf("MyType = %q, want %q", str("MyType"), AdType)
-	}
-	if str("Name") != "htcondordb@ap40" || str("MyAddress") != "<10.0.0.1:9619>" {
-		t.Errorf("identity wrong: Name=%q Addr=%q", str("Name"), str("MyAddress"))
-	}
-	if i("UpdateSequenceNumber") != 7 || i("DaemonStartTime") != 1_700_000_000 {
-		t.Errorf("timing/seq wrong")
+	if str("MyAddress") != "<10.0.0.1:9619>" {
+		t.Errorf("MyAddress = %q, want <10.0.0.1:9619>", str("MyAddress"))
 	}
 
 	// Capabilities.
@@ -88,8 +77,9 @@ func TestBuildAd(t *testing.T) {
 	}
 }
 
-func TestBuildAdNoSources(t *testing.T) {
-	ad := BuildAd(Input{Now: time.Unix(1, 0)})
+func TestAddAttrsNoSources(t *testing.T) {
+	ad := classad.New()
+	AddAttrs(ad, Input{Now: time.Unix(1, 0)})
 	if v, _ := ad.EvaluateAttrBool("Syncing"); v {
 		t.Error("Syncing should be false with no sources")
 	}

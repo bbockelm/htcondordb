@@ -1,27 +1,68 @@
 package dbad
 
 import (
-	"context"
-	"log/slog"
 	"os"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
-	"github.com/bbockelm/cedar/commands"
-	htcondor "github.com/bbockelm/golang-htcondor"
 
 	"github.com/bbockelm/htcondordb/scheddsync"
 )
-
-// DefaultInterval is the collector update cadence when unset (matches HTCondor's typical
-// UPDATE_INTERVAL feel; the collector's own timeout is much longer).
-const DefaultInterval = 5 * time.Minute
 
 // StatusSource is anything exposing a live SyncStatus -- a *scheddsync.JobSync or
 // *scheddsync.HistorySync.
 type StatusSource interface {
 	Status() scheddsync.SyncStatus
+}
+
+// Augment returns the daemon.AdvertiseConfig.Augment callback: on each advertisement it reads
+// the live catalog (per-table storage gauges, discoverable capabilities) and sync sources
+// (per-source health, with the lag recomputed against the current file size) and writes the
+// HTCondorDB-specific attributes onto the daemon-produced base ad. The generic daemon.Advertise
+// owns the loop, the base ad (PublishAd), MyType, the sequence number, DAEMON_SHUTDOWN, the
+// collector list, and INVALIDATE-on-shutdown -- dbad only supplies the subsystem attributes.
+//
+// myAddress is the daemon's authoritative reachable command address (covering the non-shared-port
+// fallback that PublishAd cannot know). sources is queried each cycle so a set that changes at
+// runtime (schedd-sync tailers restarted on reconfigure) is always current.
+func Augment(cat *db.Catalog, sources func() []StatusSource, myAddress string) func(*classad.ClassAd) {
+	return func(ad *classad.ClassAd) {
+		AddAttrs(ad, Input{
+			MyAddress:    myAddress,
+			Tables:       CatalogTables(cat),
+			Capabilities: CatalogCapabilities(cat),
+			Sources:      liveStatuses(sources),
+			Now:          time.Now(),
+		})
+	}
+}
+
+// liveStatuses snapshots each source's status, recomputing the lag against the LIVE file size:
+// a syncer's own snapshot measures lag right after a poll drains to EOF, so it reads ~0; a
+// stalled syncer whose offset is frozen while the schedd keeps appending must instead show a
+// growing LagBytes, not a misleading zero.
+func liveStatuses(sources func() []StatusSource) []scheddsync.SyncStatus {
+	if sources == nil {
+		return nil
+	}
+	srcs := sources()
+	out := make([]scheddsync.SyncStatus, 0, len(srcs))
+	for _, s := range srcs {
+		st := s.Status()
+		if st.Source != "" {
+			if fi, err := os.Stat(st.Source); err == nil {
+				st.FileSize = fi.Size()
+				st.LagBytes = 0
+				if st.FileSize > st.Offset {
+					st.LagBytes = st.FileSize - st.Offset
+				}
+				st.CaughtUp = st.LagBytes == 0
+			}
+		}
+		out = append(out, st)
+	}
+	return out
 }
 
 // CatalogTables extracts per-table storage stats (mutable tables + archive tables) from a live
@@ -73,107 +114,4 @@ func CatalogCapabilities(cat *db.Catalog) Capabilities {
 		}
 	}
 	return caps
-}
-
-// Advertiser periodically builds the HTCondorDB ad from live state and sends it to a collector.
-type Advertiser struct {
-	Collector *htcondor.Collector
-	Catalog   *db.Catalog
-	// PublishBase seeds each ad with the daemon's common attributes (normally
-	// (*daemon.Daemon).PublishAd) before dbad augments it. Its Name is used for INVALIDATE.
-	PublishBase  func(*classad.ClassAd)
-	MyAddress    string // authoritative reachable command address (covers the non-shared-port fallback)
-	Name         string // daemon Name, for the INVALIDATE query on shutdown
-	Capabilities Capabilities
-	// Sources is the static set of sync-status sources. SourcesFunc, when set,
-	// takes precedence and is queried each advertise cycle -- for a source set
-	// that changes at runtime (e.g. schedd-sync tailers restarted on reconfigure).
-	Sources     []StatusSource
-	SourcesFunc func() []StatusSource
-	Interval    time.Duration
-	Logger      *slog.Logger
-
-	seq int64
-}
-
-// Run advertises immediately, then every Interval, until ctx is cancelled. On the way out it
-// sends a final INVALIDATE so the collector expires the ad promptly instead of waiting for its
-// classad timeout.
-func (a *Advertiser) Run(ctx context.Context) {
-	interval := a.Interval
-	if interval <= 0 {
-		interval = DefaultInterval
-	}
-	if a.Logger == nil {
-		a.Logger = slog.Default()
-	}
-	a.advertiseOnce(ctx)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			a.invalidate()
-			return
-		case <-ticker.C:
-			a.advertiseOnce(ctx)
-		}
-	}
-}
-
-func (a *Advertiser) advertiseOnce(ctx context.Context) {
-	a.seq++
-	ad := a.build(time.Now())
-	if err := a.Collector.Advertise(ctx, ad, nil); err != nil {
-		a.Logger.Warn("htcondordb: collector advertise failed", "err", err.Error())
-	}
-}
-
-// build assembles the current ad; separated from advertiseOnce so a test can inspect it.
-func (a *Advertiser) build(now time.Time) *classad.ClassAd {
-	sources := a.Sources
-	if a.SourcesFunc != nil {
-		sources = a.SourcesFunc()
-	}
-	srcs := make([]scheddsync.SyncStatus, 0, len(sources))
-	for _, s := range sources {
-		st := s.Status()
-		// Recompute the lag against the LIVE file size (the snapshot's is measured right after a
-		// poll drains to EOF, so it is ~0): a stalled syncer whose offset is frozen while the
-		// schedd keeps appending then shows a growing LagBytes, not a misleading zero.
-		if st.Source != "" {
-			if fi, err := os.Stat(st.Source); err == nil {
-				st.FileSize = fi.Size()
-				st.LagBytes = 0
-				if st.FileSize > st.Offset {
-					st.LagBytes = st.FileSize - st.Offset
-				}
-				st.CaughtUp = st.LagBytes == 0
-			}
-		}
-		srcs = append(srcs, st)
-	}
-	return BuildAd(Input{
-		PublishBase:  a.PublishBase,
-		MyAddress:    a.MyAddress,
-		Tables:       CatalogTables(a.Catalog),
-		Capabilities: a.Capabilities,
-		Sources:      srcs,
-		Now:          now,
-		UpdateSeq:    a.seq,
-	})
-}
-
-// invalidate asks the collector to expire our ad (best effort, on a fresh short context since
-// ctx is already cancelled at shutdown).
-func (a *Advertiser) invalidate() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	ad := classad.New()
-	ad.InsertAttrString("MyType", "Query")
-	ad.InsertAttrString("TargetType", AdType)
-	ad.InsertAttrString("Name", a.Name)
-	if err := a.Collector.Advertise(ctx, ad, &htcondor.AdvertiseOptions{Command: commands.INVALIDATE_ADS_GENERIC}); err != nil {
-		a.Logger.Warn("htcondordb: collector invalidate failed", "err", err.Error())
-	}
 }

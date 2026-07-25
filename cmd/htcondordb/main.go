@@ -369,47 +369,20 @@ func encryptionConfig(cfg *config.Config) (poolKeys []db.KEK, attrs []string, er
 // address for discovery plus per-table storage gauges and per-source sync health for
 // monitoring.
 func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, addr string, sourcesFunc func() []dbad.StatusSource) {
-	host := getStr(cfg, "COLLECTOR_HOST")
-	if strings.TrimSpace(host) == "" {
-		return // no collector to advertise to
-	}
 	if v := getStr(cfg, "HTCONDORDB_ADVERTISE"); strings.TrimSpace(v) != "" && !configBool(cfg, "HTCONDORDB_ADVERTISE") {
 		return // explicitly disabled
 	}
-	// The daemon's Name (for the shutdown INVALIDATE) is derived the same way daemon.PublishAd
-	// derives it: HTCONDORDB_NAME, else <subsys>@<full-hostname>.
-	name := getStr(cfg, "HTCONDORDB_NAME")
-	if strings.TrimSpace(name) == "" {
-		fqdn := getStr(cfg, "FULL_HOSTNAME")
-		if fqdn == "" {
-			fqdn, _ = os.Hostname()
-		}
-		name = "htcondordb@" + fqdn
-	}
-	interval := DefaultAdvertiseInterval
-	if s := configInt(cfg, "HTCONDORDB_UPDATE_INTERVAL"); s > 0 {
-		interval = time.Duration(s) * time.Second
-	}
-	adv := &dbad.Advertiser{
-		Collector: htcondor.NewCollector(host),
-		Catalog:   svc.Catalog(),
-		// Seed each ad with the daemon's common attributes (identity, version, MonitorSelf*,
-		// <SUBSYS>_ATTRS, ...) via the generic capability, then dbad augments it.
-		PublishBase:  d.PublishAd,
-		MyAddress:    addr,
-		Name:         name,
-		Capabilities: dbad.CatalogCapabilities(svc.Catalog()),
-		SourcesFunc:  sourcesFunc,
-		Interval:     interval,
-		Logger:       d.Slog(),
-	}
-	go adv.Run(ctx)
-	d.Slog().Info("advertising HTCondorDB ad to collector", "collector", host, "name", name, "interval", interval.String())
+	// The generic daemon.Advertise owns the whole cycle -- the base ad (PublishAd: identity,
+	// version, MonitorSelf*, <SUBSYS>_ATTRS), MyType, the sequence number, DAEMON_SHUTDOWN, the
+	// COLLECTOR_HOST list, the HTCONDORDB_UPDATE_INTERVAL cadence, and INVALIDATE-on-shutdown.
+	// dbad supplies only the HTCondorDB-specific attributes (table gauges, sync health,
+	// capabilities, reachable address). It is a no-op when COLLECTOR_HOST is empty.
+	go d.Advertise(ctx, daemon.AdvertiseConfig{
+		MyType:  dbad.AdType,
+		Augment: dbad.Augment(svc.Catalog(), sourcesFunc, addr),
+		Logger:  d.Slog(),
+	})
 }
-
-// DefaultAdvertiseInterval is the collector update cadence when HTCONDORDB_UPDATE_INTERVAL is
-// unset.
-const DefaultAdvertiseInterval = 5 * time.Minute
 
 // scheddSyncGuardEUID enforces that schedd-sync never runs as root: reading the schedd's
 // job_queue.log/history privileged is a symlink-following risk. Separated from os.Geteuid
