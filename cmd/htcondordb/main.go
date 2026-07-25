@@ -244,7 +244,7 @@ func run() error {
 		rotSecs = 3600
 	}
 	if rotSecs > 0 {
-		go svc.RunPeriodicArchiveRotation(ctx, time.Duration(rotSecs)*time.Second)
+		go svc.RunPeriodicArchiveMaintenance(ctx, time.Duration(rotSecs)*time.Second)
 	}
 
 	// Schedd-sync mode: mirror a schedd's job_queue.log into a "jobs" table and its
