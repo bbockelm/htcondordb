@@ -478,6 +478,25 @@ func (e *Executor) Tables() ([]string, error) {
 	return tables, nil
 }
 
+// tableExists reports whether name is a known table -- a mutable table or an append-only
+// archive (history) table. Used to peel an optional leading table name off a maintenance
+// meta-command (e.g. `.retrain history`).
+func (e *Executor) tableExists(name string) bool {
+	if e.isArchive(name) { // cached
+		return true
+	}
+	names, err := e.c.Tables(context.Background())
+	if err != nil {
+		return false
+	}
+	for _, n := range names {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
 // ListViews returns the materialized view names.
 func (e *Executor) ListViews() ([]string, error) { return e.c.ListViews(context.Background()) }
 
