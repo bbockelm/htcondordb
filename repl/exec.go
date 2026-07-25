@@ -605,6 +605,75 @@ func (e *Executor) queryAdsAsOf(table, where string, limit int, asOf string) ([]
 	return ads, nil
 }
 
+// projectionAttrs returns the attribute set to push to the server for a plain-column SELECT,
+// or nil to fetch whole ads. Projecting sends (and decodes) only the needed attributes rather
+// than every attribute of a wide job ad -- a large wire + CPU saving for narrow SELECTs.
+//
+// It applies only to the safe, common case: a current-time (non AS OF), non-DISTINCT,
+// non-star SELECT of plain columns over a mutable table or a history archive (the server
+// projection op serves both, an archive newest-first). The WHERE is evaluated server-side,
+// so only the SELECT and ORDER BY columns are read client-side and need to cross the wire.
+// SELECT *, expression columns, and time_bucket columns may reference arbitrary attributes
+// (fetch the whole ad); AS OF has no projected query variant.
+//
+// Projected columns are evaluated against the projected attributes (HTCondor's projection
+// semantics): an attribute whose stored value references a sibling that was not projected
+// evaluates to undefined. In practice job/history display columns are literal-valued, so the
+// result is identical to a whole-ad fetch.
+func (e *Executor) projectionAttrs(st *Statement) []string {
+	if st.AsOf != "" || st.Distinct {
+		return nil
+	}
+	if len(st.Items) == 0 || (len(st.Items) == 1 && st.Items[0].Star) {
+		return nil
+	}
+	seen := map[string]bool{}
+	var attrs []string
+	add := func(name string) {
+		if k := strings.ToLower(name); name != "" && !seen[k] {
+			seen[k] = true
+			attrs = append(attrs, name)
+		}
+	}
+	plainCol := func(it SelectItem) bool {
+		return !it.Star && !it.IsAggregate() && !it.Bucket && it.Expr == "" && it.Col != ""
+	}
+	for _, it := range st.Items {
+		if !plainCol(it) {
+			return nil // may reference arbitrary attributes: fetch the whole ad
+		}
+		add(it.Col)
+	}
+	for _, t := range st.OrderBy {
+		if !plainCol(t.Item) {
+			return nil // ordering by an expression/aggregate needs the whole ad
+		}
+		add(t.Item.Col)
+	}
+	return attrs
+}
+
+// queryAdsProjected fetches only the projection attributes of each matching row via the
+// server-side projection op (QueryRawProject), which streams the old-ClassAd render of the
+// projected subset. limit > 0 caps the scan server-side.
+func (e *Executor) queryAdsProjected(table, where string, attrs []string, limit int) ([]*classad.ClassAd, error) {
+	texts, err := e.c.QueryRawProject(context.Background(), table, constraint(where), attrs, limit)
+	if err != nil {
+		return nil, err
+	}
+	ads := make([]*classad.ClassAd, 0, len(texts))
+	for _, t := range texts {
+		// The projection op streams the old-ClassAd text form (unlike QueryTable's bracketed
+		// new-ClassAd form), so parse with ParseOld.
+		ad, perr := classad.ParseOld(t)
+		if perr != nil {
+			return nil, fmt.Errorf("parsing a projected ad: %w", perr)
+		}
+		ads = append(ads, ad)
+	}
+	return ads, nil
+}
+
 func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	// GROUP BY / aggregates -- and DISTINCT over explicit columns, which is just
 	// GROUP BY those columns -- are computed server-side (hash-map aggregation):
@@ -645,7 +714,17 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	if st.Limit > 0 && len(st.OrderBy) == 0 && !st.Distinct {
 		pushLimit = st.Limit
 	}
-	ads, err := e.queryAdsAsOf(st.Table, st.Where, pushLimit, st.AsOf)
+	// Push the column projection to the server for a plain-column SELECT so only the needed
+	// attributes cross the wire (and are decoded), instead of every attribute of a wide job
+	// ad. nil ⇒ fetch whole ads (SELECT *, expression columns, archives, AS OF -- see
+	// projectionAttrs).
+	var ads []*classad.ClassAd
+	var err error
+	if proj := e.projectionAttrs(st); proj != nil {
+		ads, err = e.queryAdsProjected(st.Table, st.Where, proj, pushLimit)
+	} else {
+		ads, err = e.queryAdsAsOf(st.Table, st.Where, pushLimit, st.AsOf)
+	}
 	if err != nil {
 		return nil, err
 	}
