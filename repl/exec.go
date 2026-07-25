@@ -1404,6 +1404,20 @@ func (e *Executor) execUpdate(st *Statement) (*Result, error) {
 }
 
 func (e *Executor) execDelete(st *Statement) (*Result, error) {
+	// Prefer the server-side bulk delete: the store addresses each matching row by its real
+	// storage key, so DELETE works regardless of whether the row carries a "Key" attribute.
+	// The client-side path (matchedKeys) reads a "Key" attribute off each matched ad, which
+	// rows written before key-stamping -- and Owner/User records -- do not have, so
+	// `DELETE FROM jobs WHERE MyType =?= "Owner"` failed to address them. It also avoids
+	// round-tripping every matched ad just to delete it.
+	if e.applyBatch == nil {
+		n, err := e.c.DeleteWhereTable(context.Background(), st.Table, constraint(st.Where))
+		if err != nil {
+			return nil, fmt.Errorf("deleting: %w", err)
+		}
+		return &Result{Affected: n, Note: fmt.Sprintf("DELETE %d", n)}, nil
+	}
+	// Batch/embedded mode (writes captured client-side): fall back to match-keys + destroy.
 	keys, err := e.matchedKeys(st.Table, st.Where)
 	if err != nil {
 		return nil, err
