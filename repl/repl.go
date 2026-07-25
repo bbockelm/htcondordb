@@ -275,6 +275,10 @@ CompletionDate); with none, the current table:
   .rewrite [table|-all]                        re-encode all ads with the hot set
   .compact [table|-all]                        reclaim dead space
   .retrain [table|-all] [<sampleMax>]          train/refresh ZSTD compression
+  .rotate [table|-all]                         drop history segments outside retention now
+  .retention [table] [maxSegments maxBytes [attr ageSecs]]
+                                               show/set an archive's retention bounds
+                                               (maxBytes takes a KiB/MiB/GiB suffix; 0=none)
   .memory [table]                              drop a table's on-disk backing, keeping
                                                its data in RAM only (needs DAEMON)
   .timetravel on <window> [checkpoint] | off   enable/disable point-in-time queries on

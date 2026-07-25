@@ -24,11 +24,9 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 	case ".use":
 		s.useTable(console, arg)
 	case ".stats":
-		if t := s.tableArg(arg); s.exec.isArchive(t) {
-			s.showArchiveStats(console, t)
-		} else {
-			s.withDiag(console, t, s.showStats)
-		}
+		// Archives now report the same rich diagnostics as mutable tables (opDiag is
+		// archive-aware), so both render through showStats (which adapts for an archive).
+		s.withDiag(console, s.tableArg(arg), s.showStats)
 	case ".indexes", ".index":
 		if t := s.tableArg(arg); s.exec.isArchive(t) {
 			s.showArchiveIndexes(console, t)
@@ -61,6 +59,10 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.maintenance(console, arg, "rewrite")
 	case ".retrain":
 		s.maintenance(console, arg, "codec.retrain")
+	case ".rotate":
+		s.maintenance(console, arg, "rotate")
+	case ".retention":
+		s.retention(console, arg)
 	case ".memory":
 		s.convertToMemory(console, arg)
 	case ".views":
@@ -160,18 +162,34 @@ func (s *session) withDiag(console io.Writer, table string, fn func(io.Writer, *
 	fn(console, d)
 }
 
-// showArchiveStats prints the diagnostics available for an append-only history table.
-// Archives do not expose the per-segment/op statistics that .stats shows for mutable tables,
-// but the row count is available cheaply via the server-side count aggregate.
-func (s *session) showArchiveStats(w io.Writer, table string) {
-	n, err := s.exec.archiveRowCount(table)
-	if err != nil {
-		fmt.Fprintf(w, "error: %v\n", err)
+// retention shows or sets an archive's retention bounds:
+//
+//	.retention [table]                                            show current bounds
+//	.retention [table] <maxSegments> <maxBytes> [attr ageSeconds] set them (0 = no bound)
+//
+// maxBytes accepts a size suffix (KiB/MiB/GiB/TiB or KB/MB/GB/TB). The change is persisted
+// and takes effect on the next rotation (run .rotate to apply it now).
+func (s *session) retention(console io.Writer, arg string) {
+	table, rest := s.peelTable(strings.Fields(arg))
+	if len(rest) == 0 {
+		d, err := s.exec.Diagnostics(table)
+		if err != nil {
+			fmt.Fprintf(console, "error: %v\n", err)
+			return
+		}
+		if !d.Archive {
+			fmt.Fprintf(console, "%s is not an archive; retention applies to append-only history tables\n", table)
+			return
+		}
+		r := db.Retention{}
+		if d.Retention != nil {
+			r = *d.Retention
+		}
+		fmt.Fprintf(console, "retention (%s): %s\n", table, retentionSummary(r))
+		fmt.Fprintf(console, "  set: .retention %s <maxSegments> <maxBytes> [maxAgeAttr maxAgeSeconds]   (0 = no bound)\n", table)
 		return
 	}
-	fmt.Fprintf(w, "table:  %s (append-only history archive)\n", table)
-	fmt.Fprintf(w, "rows:   %d\n", n)
-	fmt.Fprintln(w, "  (archives keep zone maps for range pruning; per-segment storage/op stats are not exposed for archives)")
+	s.adminTable(console, table, "retention.set", rest...)
 }
 
 // showArchiveIndexes explains the fixed index layout of a history archive -- its value indexes
@@ -186,12 +204,28 @@ func (s *session) showArchiveIndexes(w io.Writer, table string) {
 
 func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 	st := d.Stats
-	fmt.Fprintf(w, "ads:        %d\n", st.Ads)
+	if d.Archive {
+		// An append log measures the same way a mutable table does; only the labels and the
+		// reclamation model differ (rotation drops whole segments; there is no compaction).
+		fmt.Fprintf(w, "records:    %d\n", st.Ads)
+	} else {
+		fmt.Fprintf(w, "ads:        %d\n", st.Ads)
+	}
 	fmt.Fprintf(w, "segments:   %d\n", st.Segments)
 	fmt.Fprintf(w, "arena:      %s (reserved)\n", humanBytes(st.ArenaBytes))
 	fmt.Fprintf(w, "used:       %s\n", humanBytes(st.UsedBytes))
 	fmt.Fprintf(w, "live:       %s\n", humanBytes(st.LiveBytes()))
-	fmt.Fprintf(w, "dead:       %s (reclaimable by compaction)\n", humanBytes(st.DeadBytes))
+	if d.Archive {
+		if st.DeadBytes > 0 {
+			fmt.Fprintf(w, "dead:       %s (reclaimed on next retrain/rewrite)\n", humanBytes(st.DeadBytes))
+		}
+		if d.SidecarSizes.MappedBytes > 0 {
+			fmt.Fprintf(w, "sidecar:    %s (index; mmap-backed, evictable)\n", humanBytes(d.SidecarSizes.MappedBytes))
+		}
+		fmt.Fprintf(w, "disk:       %s (segments + index sidecars)\n", humanBytes(st.ArenaBytes+d.SidecarSizes.MappedBytes))
+	} else {
+		fmt.Fprintf(w, "dead:       %s (reclaimable by compaction)\n", humanBytes(st.DeadBytes))
+	}
 	cs := d.Codec
 	retrain := "never (compression not retrained this run)"
 	if !cs.LastRetrain.IsZero() {
@@ -208,7 +242,28 @@ func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 	if cs.Codec == "identity" {
 		fmt.Fprintln(w, "  (no compression configured; enable ZSTD or run .retrain to train a dictionary)")
 	}
+	if d.Archive && d.Retention != nil {
+		fmt.Fprintf(w, "retention:  %s\n", retentionSummary(*d.Retention))
+	}
 	showOpStats(w, d.OpStats)
+}
+
+// retentionSummary renders an archive's retention bounds for display.
+func retentionSummary(r db.Retention) string {
+	if (r == db.Retention{}) {
+		return "unbounded (keep everything; set with .retention <table> ...)"
+	}
+	var parts []string
+	if r.MaxSegments > 0 {
+		parts = append(parts, fmt.Sprintf("max %d segments", r.MaxSegments))
+	}
+	if r.MaxBytes > 0 {
+		parts = append(parts, "max "+humanBytes(r.MaxBytes))
+	}
+	if r.MaxAgeAttr != "" && r.MaxAge > 0 {
+		parts = append(parts, fmt.Sprintf("age %s > %.0fs", r.MaxAgeAttr, r.MaxAge))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // fmtDur formats a duration with at most two fractional digits of its natural unit, so

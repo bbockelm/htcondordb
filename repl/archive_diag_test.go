@@ -7,7 +7,8 @@ import (
 )
 
 // TestArchiveDiagMeta verifies .stats / .indexes work on a history archive instead of erroring
-// ("no such table"): .stats reports the row count, .indexes explains the fixed archive layout.
+// ("no such table"): .stats reports the rich storage/op stats (record count included),
+// .indexes explains the archive layout.
 func TestArchiveDiagMeta(t *testing.T) {
 	e, cleanup := newArchiveExec(t) // seeds a "history" archive with 3 records
 	defer cleanup()
@@ -21,8 +22,12 @@ func TestArchiveDiagMeta(t *testing.T) {
 	if strings.Contains(out, "no such table") {
 		t.Fatalf(".stats history errored: %q", out)
 	}
-	if !strings.Contains(out, "rows:   3") {
-		t.Errorf(".stats history = %q, want a row count of 3", out)
+	// Rich stats now (not just a row count): record count + storage + op timings.
+	if !strings.Contains(out, "records:    3") {
+		t.Errorf(".stats history = %q, want a record count of 3", out)
+	}
+	if !strings.Contains(out, "operational timings") {
+		t.Errorf(".stats history missing op timings (impoverished output):\n%s", out)
 	}
 
 	buf.Reset()
