@@ -264,15 +264,17 @@ Diagnostics (current table, or an explicit one where noted):
   .explain <expr>       how the current table's planner would run a constraint
   .explain MATCH KEY '<k>' IN <req> TO <res>   how matchmaking one request would run
 
-Management (needs WRITE):
-  .addindex value|categorical <attr>[, ...]   create an index
-  .dropindex <attr>[, ...]                     drop an index
-  .reindex [-all]                              rebuild indexes
+Management (needs WRITE). A leading [table] targets that table -- a mutable table
+or an append-only history archive (e.g. .retrain history, .addindex history value
+CompletionDate); with none, the current table:
+  .addindex [table] value|categorical <attr>[, ...]   create an index
+  .dropindex [table] <attr>[, ...]                     drop an index
+  .reindex [table|-all]                                rebuild indexes
   .addhot <attr>[, ...]                        pin hot attributes
   .refreshhot [-all] [<sampleMax> <topN>]      recompute the hot set
-  .rewrite [-all]                              re-encode all ads with the hot set
-  .compact [-all]                              reclaim dead space
-  .retrain [-all] [<sampleMax>]                train/refresh ZSTD compression
+  .rewrite [table|-all]                        re-encode all ads with the hot set
+  .compact [table|-all]                        reclaim dead space
+  .retrain [table|-all] [<sampleMax>]          train/refresh ZSTD compression
   .memory [table]                              drop a table's on-disk backing, keeping
                                                its data in RAM only (needs DAEMON)
   .timetravel on <window> [checkpoint] | off   enable/disable point-in-time queries on

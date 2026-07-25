@@ -48,7 +48,7 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 	case ".addindex":
 		s.addIndex(console, arg)
 	case ".dropindex":
-		s.admin(console, "index.drop", splitAttrs(arg)...)
+		s.dropIndex(console, arg)
 	case ".reindex":
 		s.maintenance(console, arg, "index.reindex")
 	case ".addhot":
@@ -533,23 +533,36 @@ func (s *session) explainMatch(console io.Writer, arg string) {
 }
 
 func (s *session) addIndex(console io.Writer, arg string) {
-	fields := strings.Fields(arg)
-	if len(fields) < 2 {
-		fmt.Fprintln(console, "usage: .addindex value|categorical <attr>[, <attr>...]")
+	// Optional leading table name (`.addindex [table] value|categorical <attr>...`), so an
+	// archive such as `history` can be indexed directly; defaults to the current table.
+	table, toks := s.peelTable(strings.Fields(arg))
+	if len(toks) < 2 {
+		fmt.Fprintln(console, "usage: .addindex [table] value|categorical <attr>[, <attr>...]")
 		return
 	}
 	var action string
-	switch strings.ToLower(fields[0]) {
+	switch strings.ToLower(toks[0]) {
 	case "value", "val", "v":
 		action = "index.add.value"
 	case "categorical", "cat", "c":
 		action = "index.add.categorical"
 	default:
-		fmt.Fprintf(console, "unknown index kind %q (want value or categorical)\n", fields[0])
+		fmt.Fprintf(console, "unknown index kind %q (want value or categorical)\n", toks[0])
 		return
 	}
-	attrs := splitAttrs(strings.TrimSpace(strings.TrimPrefix(arg, fields[0])))
-	s.admin(console, action, attrs...)
+	attrs := splitAttrs(strings.Join(toks[1:], " "))
+	s.adminTable(console, table, action, attrs...)
+}
+
+// dropIndex removes indexes from a table: `.dropindex [table] <attr>[, <attr>...]`.
+func (s *session) dropIndex(console io.Writer, arg string) {
+	table, toks := s.peelTable(strings.Fields(arg))
+	attrs := splitAttrs(strings.Join(toks, " "))
+	if len(attrs) == 0 {
+		fmt.Fprintln(console, "usage: .dropindex [table] <attr>[, <attr>...]")
+		return
+	}
+	s.adminTable(console, table, "index.drop", attrs...)
 }
 
 func (s *session) refreshHot(console io.Writer, arg string) {
@@ -613,10 +626,11 @@ func (s *session) adminTable(console io.Writer, table, action string, args ...st
 	fmt.Fprintln(console, msg)
 }
 
-// maintenance runs a maintenance action on the current table, or on every table when the
-// argument leads with "-all" (or "all"); the remaining tokens are passed as action args.
-// It is used by .reindex/.retrain/.compact/.rewrite so a whole store can be maintained
-// without enumerating tables by hand.
+// maintenance runs a maintenance action on a table, or on every table when the argument
+// leads with "-all" (or "all"). An optional leading token that names a table (mutable or an
+// append-only archive such as `history`) targets that table; the remaining tokens are the
+// action args. So `.retrain`, `.retrain 500`, `.retrain history`, `.retrain history 500`,
+// and `.retrain -all` all work. Used by .reindex/.retrain/.compact/.rewrite.
 func (s *session) maintenance(console io.Writer, arg, action string) {
 	fields := strings.Fields(arg)
 	if len(fields) > 0 && (fields[0] == "-all" || strings.EqualFold(fields[0], "all")) {
@@ -635,7 +649,20 @@ func (s *session) maintenance(console io.Writer, arg, action string) {
 		}
 		return
 	}
-	s.admin(console, action, fields...)
+	table, rest := s.peelTable(fields)
+	s.adminTable(console, table, action, rest...)
+}
+
+// peelTable consumes a leading table name from toks when present: if toks[0] names an
+// existing table (mutable or archive), it returns that table and the remaining tokens;
+// otherwise it returns the current table and all tokens unchanged. This lets a maintenance
+// meta-command take an explicit `[table]` argument (e.g. `.retrain history`) while still
+// defaulting to the session's current table.
+func (s *session) peelTable(toks []string) (string, []string) {
+	if len(toks) > 0 && s.exec.tableExists(toks[0]) {
+		return toks[0], toks[1:]
+	}
+	return s.table, toks
 }
 
 // splitAttrs splits a comma/space-separated attribute list, dropping empties.
