@@ -102,7 +102,10 @@ func TestCapstoneE2E(t *testing.T) {
 	principal := me.Username
 	var dbDir string
 	if asRoot {
-		principal = "root"
+		// As root, FS authentication maps to the condor service account (HTCondor's
+		// FS_ROOT_TO_CONDOR / set_condor_priv), so the kafkasync client connects as
+		// condor, not root -- authorize that identity. htcondordb also drops to condor.
+		principal = "condor"
 		dbDir = shallowTempDirE2E(t, "cap-hcdb")
 		chownUserE2E(t, dbDir, "condor") // htcondordb drops to condor and writes LOG/HTCONDORDB_DIR
 	} else {
