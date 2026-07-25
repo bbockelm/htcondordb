@@ -3,18 +3,18 @@ module github.com/bbockelm/htcondordb/grafana
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.17.0
-	github.com/PelicanPlatform/classad/dbrpc v0.17.0
-	github.com/bbockelm/cedar v0.6.7
-	github.com/bbockelm/golang-htcondor v0.11.0
+	github.com/PelicanPlatform/classad v0.19.0
+	github.com/PelicanPlatform/classad/dbrpc v0.19.0
+	github.com/bbockelm/cedar v0.6.8
+	github.com/bbockelm/golang-htcondor v0.11.1
 	github.com/bbockelm/htcondordb v0.0.0
 	github.com/grafana/grafana-plugin-sdk-go v0.291.0
 )
 
 require (
 	github.com/BurntSushi/toml v1.5.0 // indirect
-	github.com/PelicanPlatform/classad/collections v0.17.0 // indirect
-	github.com/PelicanPlatform/classad/db v0.17.0 // indirect
+	github.com/PelicanPlatform/classad/collections v0.19.0 // indirect
+	github.com/PelicanPlatform/classad/db v0.19.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/apache/arrow-go/v18 v18.5.2 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
@@ -53,12 +53,12 @@ require (
 	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.19.0 // indirect
+	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/magefile/mage v1.16.1 // indirect
 	github.com/mattetti/filebuffer v1.0.1 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
-	github.com/mattn/go-isatty v0.0.21 // indirect
+	github.com/mattn/go-isatty v0.0.23 // indirect
 	github.com/mattn/go-runewidth v0.0.19 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
@@ -98,7 +98,7 @@ require (
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20260112195511-716be5621a96 // indirect
 	golang.org/x/mod v0.37.0 // indirect
-	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260625142307-59b4966ccb57 // indirect
