@@ -3,10 +3,10 @@ module github.com/bbockelm/htcondordb
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.18.1
-	github.com/PelicanPlatform/classad/collections v0.18.1
-	github.com/PelicanPlatform/classad/db v0.18.1
-	github.com/PelicanPlatform/classad/dbrpc v0.18.1
+	github.com/PelicanPlatform/classad v0.19.0
+	github.com/PelicanPlatform/classad/collections v0.19.0
+	github.com/PelicanPlatform/classad/db v0.19.0
+	github.com/PelicanPlatform/classad/dbrpc v0.19.0
 	github.com/bbockelm/cedar v0.6.7
 	github.com/bbockelm/golang-htcondor v0.11.0
 	github.com/chzyer/readline v1.5.1
