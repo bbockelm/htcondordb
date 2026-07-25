@@ -18,16 +18,16 @@ jobs:
       # go.mod's `replace ../<module>` directives resolve. Adjust the sibling refs if the
       # required features live on a non-default branch.
       - name: Checkout htcondordb
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { path: htcondordb }
       - name: Checkout classad
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: PelicanPlatform/classad, path: golang-classads }
       - name: Checkout cedar
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: bbockelm/cedar, path: golang-cedar }
       - name: Checkout golang-htcondor
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: bbockelm/golang-htcondor, path: golang-htcondor }
 
       - name: Set up Go
