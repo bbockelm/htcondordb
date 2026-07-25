@@ -2,53 +2,72 @@ package scheddsync
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-// TestEnteredHistoryTimeStamped verifies every archived record gets an EnteredHistoryTime
-// (htcondordb ingest time), that it is queryable as a range, and that re-processing does not
-// re-stamp an already-archived record.
-func TestEnteredHistoryTimeStamped(t *testing.T) {
+// TestEnteredHistoryTime verifies EnteredHistoryTime is derived from the record's own
+// history-entry time -- EnteredCurrentStatus, else CompletionDate, else the ingest clock --
+// not the time htcondordb read the record, and that it is queryable as a range.
+func TestEnteredHistoryTime(t *testing.T) {
 	arch, cleanup := newArchive(t)
 	defer cleanup()
 	dir := t.TempDir()
 	histPath := filepath.Join(dir, "history")
-	writeFile(t, histPath, histRecord(1, 0, 4)+histRecord(2, 0, 4))
 
+	// Three records exercising the derivation chain:
+	//   1: CompletionDate only            -> EnteredHistoryTime = CompletionDate
+	//   2: EnteredCurrentStatus wins over CompletionDate
+	//   3: neither                        -> EnteredHistoryTime = ingest clock (fallback)
+	rec := func(cluster int, extra string) string {
+		return fmt.Sprintf("Owner = \"user%d\"\nClusterId = %d\nProcId = 0\nJobStatus = 4\n%s*** Offset = 0 ClusterId = %d ProcId = 0\n",
+			cluster, cluster, extra, cluster)
+	}
+	writeFile(t, histPath,
+		rec(1, "CompletionDate = 1700000001\n")+
+			rec(2, "CompletionDate = 1700000002\nEnteredCurrentStatus = 1700000500\n")+
+			rec(3, ""))
+
+	ingest := time.Unix(1_800_000_000, 0)
 	s := NewHistorySync(arch, HistorySyncConfig{Filename: histPath})
-	fixed := time.Unix(1_800_000_000, 0)
-	s.now = func() time.Time { return fixed }
+	s.now = func() time.Time { return ingest }
 	if err := s.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if arch.Count() != 2 {
-		t.Fatalf("Count = %d, want 2", arch.Count())
+	if arch.Count() != 3 {
+		t.Fatalf("Count = %d, want 3", arch.Count())
 	}
 
-	// Every record carries the ingest time.
+	want := map[int64]int64{
+		1: 1700000001,    // CompletionDate
+		2: 1700000500,    // EnteredCurrentStatus wins
+		3: ingest.Unix(), // fallback
+	}
 	seq, err := arch.Query("true")
 	if err != nil {
 		t.Fatal(err)
 	}
-	n := 0
+	seen := 0
 	for ad := range seq {
-		n++
-		v, ok := ad.EvaluateAttrInt(EnteredHistoryAttr)
+		cid, _ := ad.EvaluateAttrInt("ClusterId")
+		eht, ok := ad.EvaluateAttrInt(EnteredHistoryAttr)
 		if !ok {
-			t.Fatalf("record missing %s", EnteredHistoryAttr)
+			t.Fatalf("cluster %d missing %s", cid, EnteredHistoryAttr)
 		}
-		if v != fixed.Unix() {
-			t.Errorf("%s = %d, want %d", EnteredHistoryAttr, v, fixed.Unix())
+		if eht != want[cid] {
+			t.Errorf("cluster %d: %s = %d, want %d", cid, EnteredHistoryAttr, eht, want[cid])
 		}
+		seen++
 	}
-	if n != 2 {
-		t.Fatalf("queried %d records, want 2", n)
+	if seen != 3 {
+		t.Fatalf("queried %d records, want 3", seen)
 	}
 
-	// Range query on the ingest time (the "last 24h" pattern).
-	rseq, err := arch.Query(EnteredHistoryAttr + " > " + itoa(fixed.Unix()-86400))
+	// Range query on the derived time (the "last 24h" pattern) -- the two dated records fall
+	// before the cutoff; the fallback record (ingest ~1.8e9) is after it.
+	rseq, err := arch.Query(EnteredHistoryAttr + " > " + itoa(ingest.Unix()-86400))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,8 +75,8 @@ func TestEnteredHistoryTimeStamped(t *testing.T) {
 	for range rseq {
 		matched++
 	}
-	if matched != 2 {
-		t.Errorf("range query matched %d, want 2", matched)
+	if matched != 1 {
+		t.Errorf("range query matched %d, want 1 (only the ingest-fallback record is recent)", matched)
 	}
 }
 
