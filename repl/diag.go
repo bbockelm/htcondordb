@@ -63,6 +63,8 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.maintenance(console, arg, "rotate")
 	case ".retention":
 		s.retention(console, arg)
+	case ".truncate":
+		s.truncate(console, arg)
 	case ".memory":
 		s.convertToMemory(console, arg)
 	case ".views":
@@ -730,6 +732,26 @@ func (s *session) maintenance(console io.Writer, arg, action string) {
 // otherwise it returns the current table and all tokens unchanged. This lets a maintenance
 // meta-command take an explicit `[table]` argument (e.g. `.retrain history`) while still
 // defaulting to the session's current table.
+// truncate empties a table: `.truncate <table>`. It is destructive and DAEMON-authorized
+// (the server refuses it on an unprivileged connection). A table name is required -- unlike
+// the read-only diagnostics, truncate never defaults to the current table, so a stray
+// `.truncate` can't wipe data by accident. For a history archive this drops every record and
+// the live schedd-sync tailer re-reads the history file from the start, rebuilding it (a
+// from-scratch re-sync without stopping the daemon).
+func (s *session) truncate(console io.Writer, arg string) {
+	fields := strings.Fields(arg)
+	if len(fields) == 0 {
+		fmt.Fprintln(console, "usage: .truncate <table>   (empties the table; DAEMON-authorized, destructive)")
+		return
+	}
+	table := fields[0]
+	if !s.exec.tableExists(table) {
+		fmt.Fprintf(console, "no such table: %s\n", table)
+		return
+	}
+	s.adminTable(console, table, "truncate")
+}
+
 func (s *session) peelTable(toks []string) (string, []string) {
 	if len(toks) > 0 && s.exec.tableExists(toks[0]) {
 		return toks[0], toks[1:]

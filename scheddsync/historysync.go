@@ -58,6 +58,13 @@ type HistorySync struct {
 	warnedNoFile bool        // whether we have logged that the history file is absent (log once)
 	onResync     func(ResyncEvent)
 
+	// lastArchiveCount is the archive's record count observed at the end of the previous
+	// Poll. A drop to zero while it was non-zero means the archive was emptied under us -- an
+	// admin `.truncate history` (from-scratch re-sync) or a manual wipe -- which triggers a
+	// re-read of the history file from its head (see resyncFromTruncate). Touched only by the
+	// single sync goroutine.
+	lastArchiveCount int
+
 	// resyncs / lastResync accumulate durability-gap events for the status snapshot; status
 	// holds the latest published snapshot read lock-free by Status(). All written only from the
 	// sync goroutine.
@@ -143,6 +150,12 @@ func (s *HistorySync) Poll(ctx context.Context) error {
 			return err
 		}
 		s.started = true
+	} else if s.archive.Count() == 0 && s.lastArchiveCount > 0 {
+		// The archive was emptied under a live syncer -- an admin `.truncate history`
+		// (from-scratch re-sync) or a manual wipe -- while our read position is well past the
+		// file head. A plain tail would never re-append the dropped history, so rewind and
+		// re-read the current history file from its head to rebuild the archive.
+		s.resyncFromTruncate()
 	}
 	// Detect rotation: the path now names a different file than our open handle.
 	if s.file != nil {
@@ -167,7 +180,34 @@ func (s *HistorySync) Poll(ctx context.Context) error {
 		}
 		s.warnedNoFile = false // re-arm so a later disappearance is reported again
 	}
-	return s.drainToEOF()
+	err := s.drainToEOF()
+	s.lastArchiveCount = s.archive.Count()
+	return err
+}
+
+// resyncFromTruncate rewinds the syncer to the head of the current history file after the
+// archive was emptied out from under it, so the next drain rebuilds the archive from the
+// file. It also rewinds the durable resume position to the file head, so a crash before the
+// re-read completes still resumes from the start rather than the stale post-EOF offset. This
+// mirrors a restart-time first-run resync (rotated-away files are not back-filled, exactly as
+// a fresh start would behave).
+func (s *HistorySync) resyncFromTruncate() {
+	s.log.Warn("scheddsync: history archive emptied under the syncer; re-reading history from the start", "file", s.filename)
+	s.dedup = false // the archive is empty: nothing to dedup against
+	s.lastArchiveCount = 0
+	if s.file != nil {
+		// Persist a resume point at the file head before dropping the handle, then reopen from
+		// the head on the next Poll (s.file == nil path).
+		s.offset, s.partial = 0, nil
+		s.checkpoint()
+		s.close()
+	} else if s.store != nil {
+		// No open handle to anchor a head position: clear the store so a restart is a
+		// first-run (the current file, if any, is opened at its head by Poll).
+		if err := s.store.Save(nil); err != nil {
+			s.log.Warn("scheddsync: clearing history position failed", "err", err.Error())
+		}
+	}
 }
 
 // restore positions the syncer on startup, deduping against the archive so nothing is missed
