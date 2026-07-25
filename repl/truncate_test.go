@@ -37,3 +37,22 @@ func TestTruncateMeta(t *testing.T) {
 		t.Errorf("after .truncate ads, COUNT(*) = %s, want 0", r.Rows[0][0])
 	}
 }
+
+// TestTruncateArchiveMeta verifies `.truncate history` empties an append-only archive through
+// the server's archive admin path (classad v0.20.1), the runtime "empty history, then
+// re-sync" operation, leaving it usable for fresh appends.
+func TestTruncateArchiveMeta(t *testing.T) {
+	e, cleanup := archiveExecBig(t, 50) // privileged server with a "history" archive
+	defer cleanup()
+	s := &session{exec: e, table: "history"}
+
+	if r := mustExec(t, e, "SELECT COUNT(*) FROM history"); r.Rows[0][0] != "50" {
+		t.Fatalf("setup: COUNT(*) FROM history = %s, want 50", r.Rows[0][0])
+	}
+	if out := runMeta(t, s, ".truncate", "history"); strings.Contains(out, "error") {
+		t.Fatalf(".truncate history errored: %q", out)
+	}
+	if r := mustExec(t, e, "SELECT COUNT(*) FROM history"); r.Rows[0][0] != "0" {
+		t.Errorf("after .truncate history, COUNT(*) = %s, want 0", r.Rows[0][0])
+	}
+}

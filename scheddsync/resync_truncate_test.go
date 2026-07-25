@@ -28,20 +28,19 @@ func TestHistorySyncResyncOnTruncate(t *testing.T) {
 		t.Fatalf("after initial sync Count = %d, want 3", arch.Count())
 	}
 
-	// Simulate the external truncate. The pinned classad has no in-place Archive.Truncate
-	// yet, so we swap in a fresh, empty archive: the syncer's detection keys only off
-	// Count()==0, which is exactly what a truncate produces. (Once classad ships
-	// Archive.Truncate, this can call arch.Truncate() on the same object.)
-	empty, cleanup2 := newArchive(t)
-	defer cleanup2()
-	s.archive = empty
+	// Empty the archive out from under the running syncer -- exactly what an admin
+	// `.truncate history` does at runtime.
+	arch.Truncate()
+	if arch.Count() != 0 {
+		t.Fatalf("Truncate left %d records", arch.Count())
+	}
 
 	// The next poll must rebuild the archive from the file head despite no new file bytes.
 	if err := s.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if empty.Count() != 3 {
-		t.Fatalf("after truncate-resync Count = %d, want 3 (history not re-read from head)", empty.Count())
+	if arch.Count() != 3 {
+		t.Fatalf("after truncate-resync Count = %d, want 3 (history not re-read from head)", arch.Count())
 	}
 
 	// A subsequent poll with a non-empty archive and no new file bytes must NOT re-read or
@@ -49,7 +48,7 @@ func TestHistorySyncResyncOnTruncate(t *testing.T) {
 	if err := s.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if empty.Count() != 3 {
-		t.Fatalf("steady-state poll changed Count to %d, want 3 (spurious re-read)", empty.Count())
+	if arch.Count() != 3 {
+		t.Fatalf("steady-state poll changed Count to %d, want 3 (spurious re-read)", arch.Count())
 	}
 }
