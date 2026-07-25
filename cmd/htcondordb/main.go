@@ -114,6 +114,15 @@ func run() error {
 	}
 	policyPtr.Store(policy)
 	authorize := func(perm, peerAddr, user string) bool {
+		// A CEDAR family/parent session is a pre-shared key this daemon minted and handed only
+		// to its own supervised children over a private channel (CONDOR_PRIVATE_INHERIT);
+		// possessing it proves a trusted, daemon-managed identity. Grant it DAEMON so a
+		// supervised exporter child can reach the DAEMON-gated dbrpc surface without the
+		// operator having to list condor@parent in ALLOW_DAEMON. An attacker cannot present
+		// this identity without the session key, which never leaves the child's environment.
+		if perm == "DAEMON" && (user == "condor@parent" || user == "condor@family") {
+			return true
+		}
 		return policyPtr.Load().Authorize(perm, peerAddr, user)
 	}
 	srv.Authorizer = authorize
@@ -258,6 +267,21 @@ func run() error {
 	d.OnReconfig(func(newCfg *config.Config) {
 		if serr := syncMgr.apply(newCfg); serr != nil {
 			log.Error(logging.DestinationGeneral, "reconfigure: schedd-sync not reapplied", "err", serr.Error())
+			return
+		}
+	})
+
+	// Exporter manager: launch + supervise the standalone change-data exporters (kafkasync /
+	// opensearchsync) as children, so registering an exporter (CreateExporter) is enough for the
+	// daemon to run it -- each with a fresh, standalone inherited CEDAR session, as an
+	// unprivileged user, restarted with backoff. Enabled by default (HTCONDORDB_MANAGE_EXPORTERS).
+	expMgr := &exporterManager{parent: ctx, catalog: svc.Catalog(), logger: d.Slog(), daemonAddr: advertisedAddr(d, ln)}
+	if eerr := expMgr.apply(cfg); eerr != nil {
+		return eerr
+	}
+	d.OnReconfig(func(newCfg *config.Config) {
+		if eerr := expMgr.apply(newCfg); eerr != nil {
+			log.Error(logging.DestinationGeneral, "reconfigure: exporter manager not reapplied", "err", eerr.Error())
 			return
 		}
 	})
