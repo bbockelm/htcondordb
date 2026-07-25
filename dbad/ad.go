@@ -40,37 +40,28 @@ type Capabilities struct {
 	WatchSupported               bool
 }
 
-// Input is everything BuildAd needs; it holds no live handles, so BuildAd is pure and testable.
+// Input is the HTCondorDB-specific state AddAttrs writes onto an ad. It holds no live handles,
+// so AddAttrs is pure and testable; the Augment closure fills it from the live catalog/sources.
 type Input struct {
-	// PublishBase, if set, seeds the ad with the daemon's common attributes -- identity, address,
-	// version, timing, self-monitoring, and config_fill_ad's <SUBSYS>_ATTRS -- before
-	// augmentation. It is normally (*daemon.Daemon).PublishAd; dbad adds only the
-	// HTCondorDB-specific attributes on top, rather than re-deriving identity itself.
-	PublishBase func(*classad.ClassAd)
-	// MyAddress is the daemon's authoritative reachable command address. PublishBase can only
-	// know the shared-port sinful; the caller (which has the listener) supplies the address that
-	// also covers the non-shared-port fallback, so dbad sets it after PublishBase.
+	// MyAddress is the daemon's authoritative reachable command address. The generic base ad
+	// (daemon.PublishAd) only knows the shared-port sinful; the caller (which has the listener)
+	// supplies the address that also covers the non-shared-port fallback.
 	MyAddress    string
 	Tables       []TableStat
 	Capabilities Capabilities
 	Sources      []scheddsync.SyncStatus
 	Now          time.Time
-	UpdateSeq    int64
 }
 
-// BuildAd assembles the HTCondorDB ClassAd by augmenting the daemon-produced base ad. All
+// AddAttrs augments a daemon-produced base ad with the HTCondorDB-specific attributes: the
+// reachable address, discoverable capabilities, per-table storage gauges, and per-source sync
+// health. It does NOT set MyType or UpdateSequenceNumber -- daemon.Advertise owns those. All
 // numeric attributes are chosen so a ClassAd->Prometheus exporter reads them as gauges/counters
 // directly.
-func BuildAd(in Input) *classad.ClassAd {
-	ad := classad.New()
-	if in.PublishBase != nil {
-		in.PublishBase(ad) // daemon common attrs: Name, Machine, MyAddress, version, MonitorSelf*, <SUBSYS>_ATTRS, ...
-	}
-	ad.InsertAttrString("MyType", AdType) // subsystem-specific; the daemon base ad does not set MyType
+func AddAttrs(ad *classad.ClassAd, in Input) {
 	if in.MyAddress != "" {
 		ad.InsertAttrString("MyAddress", ensureAngle(in.MyAddress))
 	}
-	ad.InsertAttr("UpdateSequenceNumber", in.UpdateSeq)
 
 	// Capabilities.
 	ad.InsertAttrBool("TimeTravelEnabled", in.Capabilities.TimeTravelEnabled)
@@ -128,7 +119,6 @@ func BuildAd(in Input) *classad.ClassAd {
 			}
 		}
 	}
-	return ad
 }
 
 // syncPrefix maps a source kind to a stable attribute prefix; "" skips an unknown kind.

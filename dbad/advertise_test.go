@@ -74,7 +74,9 @@ func TestCatalogTablesAndCapabilities(t *testing.T) {
 	}
 }
 
-func TestAdvertiserBuild(t *testing.T) {
+// TestAugment: the Augment callback reads the live catalog + sources and writes the dbad
+// attributes onto a base ad. (MyType/UpdateSequenceNumber/identity come from daemon.Advertise.)
+func TestAugment(t *testing.T) {
 	cat, err := db.OpenCatalog(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -84,23 +86,15 @@ func TestAdvertiserBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	adv := &Advertiser{
-		Catalog:     cat,
-		PublishBase: func(ad *classad.ClassAd) { ad.InsertAttrString("Name", "db@host") },
-		Sources: []StatusSource{
+	sources := func() []StatusSource {
+		return []StatusSource{
 			fakeSource{st: scheddsync.SyncStatus{Kind: "job_queue.log", Offset: 10, FileSize: 10, CaughtUp: true, LastSync: time.Unix(1000, 0)}},
 			fakeSource{st: scheddsync.SyncStatus{Kind: "history", Offset: 5, FileSize: 20, LagBytes: 15, Resyncs: 1, LastResync: time.Unix(900, 0)}},
-		},
+		}
 	}
-	adv.seq = 3
-	ad := adv.build(time.Unix(1100, 0))
+	ad := classad.New()
+	Augment(cat, sources, "")(ad)
 
-	if v, _ := ad.EvaluateAttrString("Name"); v != "db@host" {
-		t.Errorf("Name = %q", v)
-	}
-	if v, _ := ad.EvaluateAttrInt("UpdateSequenceNumber"); v != 3 {
-		t.Errorf("UpdateSequenceNumber = %d, want 3", v)
-	}
 	if v, _ := ad.EvaluateAttrInt("Table_jobs_Ads"); v != 0 {
 		t.Errorf("Table_jobs_Ads = %d, want 0 (empty table)", v)
 	}
@@ -115,9 +109,9 @@ func TestAdvertiserBuild(t *testing.T) {
 	}
 }
 
-// TestAdvertiserLiveLag: LagBytes is recomputed against the CURRENT file size at ad-build time,
-// so a syncer whose offset is frozen while the file keeps growing shows a real, growing lag.
-func TestAdvertiserLiveLag(t *testing.T) {
+// TestAugmentLiveLag: LagBytes is recomputed against the CURRENT file size at ad-build time, so
+// a syncer whose offset is frozen while the file keeps growing shows a real, growing lag.
+func TestAugmentLiveLag(t *testing.T) {
 	dir := t.TempDir()
 	histPath := filepath.Join(dir, "history")
 	if err := os.WriteFile(histPath, make([]byte, 1000), 0o644); err != nil {
@@ -129,14 +123,15 @@ func TestAdvertiserLiveLag(t *testing.T) {
 	}
 	defer cat.Close()
 
-	adv := &Advertiser{
-		Catalog: cat,
-		Sources: []StatusSource{
-			// Offset frozen at 200 while the file is 1000 bytes -> live lag 800.
+	// Offset frozen at 200 while the file is 1000 bytes -> live lag 800.
+	sources := func() []StatusSource {
+		return []StatusSource{
 			fakeSource{st: scheddsync.SyncStatus{Kind: "history", Source: histPath, Offset: 200, FileSize: 200, CaughtUp: true}},
-		},
+		}
 	}
-	ad := adv.build(time.Unix(2000, 0))
+	ad := classad.New()
+	Augment(cat, sources, "")(ad)
+
 	if v, _ := ad.EvaluateAttrInt("HistoryFileSize"); v != 1000 {
 		t.Errorf("HistoryFileSize = %d, want 1000 (live stat)", v)
 	}
