@@ -610,18 +610,18 @@ func (e *Executor) queryAdsAsOf(table, where string, limit int, asOf string) ([]
 // than every attribute of a wide job ad -- a large wire + CPU saving for narrow SELECTs.
 //
 // It applies only to the safe, common case: a current-time (non AS OF), non-DISTINCT,
-// non-star SELECT of plain columns over a mutable table. The WHERE is evaluated server-side,
+// non-star SELECT of plain columns over a mutable table or a history archive (the server
+// projection op serves both, an archive newest-first). The WHERE is evaluated server-side,
 // so only the SELECT and ORDER BY columns are read client-side and need to cross the wire.
 // SELECT *, expression columns, and time_bucket columns may reference arbitrary attributes
-// (fetch the whole ad); archives are not projectable over the wire yet; AS OF has no
-// projected query variant.
+// (fetch the whole ad); AS OF has no projected query variant.
 //
 // Projected columns are evaluated against the projected attributes (HTCondor's projection
 // semantics): an attribute whose stored value references a sibling that was not projected
 // evaluates to undefined. In practice job/history display columns are literal-valued, so the
 // result is identical to a whole-ad fetch.
 func (e *Executor) projectionAttrs(st *Statement) []string {
-	if st.AsOf != "" || st.Distinct || e.isArchive(st.Table) {
+	if st.AsOf != "" || st.Distinct {
 		return nil
 	}
 	if len(st.Items) == 0 || (len(st.Items) == 1 && st.Items[0].Star) {

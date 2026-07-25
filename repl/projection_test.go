@@ -80,3 +80,44 @@ func TestSelectProjectionEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestArchiveSelectProjection verifies projection now also serves a history archive (via the
+// classad v0.20.1 raw-project archive routing): a narrow SELECT over history ships only the
+// requested columns, applies the WHERE server-side, keeps newest-first order under LIMIT, and
+// omits unselected attributes.
+func TestArchiveSelectProjection(t *testing.T) {
+	e, cleanup := archiveExecBig(t, 100) // "history" archive: [ClusterId=i; Owner="u{i%10}"; JobStatus=4]
+	defer cleanup()
+
+	// Constrained projected SELECT: WHERE ClusterId == 42 filters server-side.
+	r, err := e.ExecString(`SELECT Owner, ClusterId FROM history WHERE ClusterId == 42`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Rows) != 1 {
+		t.Fatalf("ClusterId==42 returned %d rows, want 1", len(r.Rows))
+	}
+	if r.Rows[0][0] != "u2" || r.Rows[0][1] != "42" { // 42 % 10 == 2
+		t.Errorf("row = %v, want [u2 42]", r.Rows[0])
+	}
+	if len(r.Ads) == 1 {
+		if _, ok := r.Ads[0].Lookup("JobStatus"); ok {
+			t.Errorf("projected archive ad carries the unselected JobStatus attribute")
+		}
+	}
+
+	// Newest-first order preserved through projection + pushed-down LIMIT: the 3 newest
+	// records are ClusterId 99, 98, 97.
+	r2, err := e.ExecString(`SELECT ClusterId FROM history LIMIT 3`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r2.Rows) != 3 {
+		t.Fatalf("LIMIT 3 returned %d rows, want 3", len(r2.Rows))
+	}
+	for i, want := range []string{"99", "98", "97"} {
+		if r2.Rows[i][0] != want {
+			t.Errorf("row %d ClusterId = %q, want %q (newest-first not preserved through projection)", i, r2.Rows[i][0], want)
+		}
+	}
+}
