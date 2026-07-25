@@ -17,10 +17,12 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 )
 
-// EnteredHistoryAttr is stamped on every archived record with the Unix time (seconds) at
-// which htcondordb ingested it into the history table -- the "when did this enter history"
-// timestamp, distinct from the job's own CompletionDate. It is a zone-mapped index on the
-// archive (see the ArchiveConfig in cmd/htcondordb), so a time-range query such as
+// EnteredHistoryAttr is stamped on every archived record with the Unix time (seconds) the
+// job entered the schedd's history file -- its terminal-status transition (EnteredCurrentStatus),
+// falling back to CompletionDate, then the ingest clock (see enteredHistoryTime). This is the
+// job's own "when did it leave the queue into history" time, not when htcondordb read it, so
+// it survives a backlog drain or re-sync. It is a zone-mapped index on the archive (see the
+// ArchiveConfig in cmd/htcondordb), so a time-range query such as
 // `WHERE EnteredHistoryTime > <now-86400>` prunes whole segments instead of scanning.
 const EnteredHistoryAttr = "EnteredHistoryTime"
 
@@ -511,16 +513,33 @@ func (s *HistorySync) appendRecord(rec []byte) {
 		}
 		s.dedup = false // first record the archive lacks: caught up, everything after is new
 	}
-	// Stamp the ingest time so "when did this enter history" is queryable and indexed. Only
-	// records not already archived reach here (dedup above), so each record is stamped once,
-	// at first archive -- a later re-scan finds it present and skips it, preserving the original
-	// time. Set only if absent, so we never clobber a value already on the record.
+	// Stamp when the job entered the history file so "when did this enter history" is
+	// queryable and indexed. Set only if absent, so we never clobber a value already on the
+	// record and a re-scan that finds the record present keeps its original time.
 	if _, ok := ad.Lookup(EnteredHistoryAttr); !ok {
-		_ = ad.Set(EnteredHistoryAttr, s.now().Unix())
+		_ = ad.Set(EnteredHistoryAttr, s.enteredHistoryTime(ad))
 	}
 	if err := s.archive.Append(ad); err != nil {
 		s.log.Warn("history: append failed", "err", err.Error())
 	}
+}
+
+// enteredHistoryTime returns the Unix time (seconds) the job entered the history file: the
+// schedd writes a job to history when it leaves the queue, i.e. at its terminal-status
+// transition, so EnteredCurrentStatus is the faithful "entered history" time. It falls back
+// to CompletionDate (set when a job completes normally), then to the ingest clock only when
+// the record carries neither. Deriving from the record -- rather than stamping the ingest
+// time -- makes the value correct across a backlog drain or a from-scratch re-sync (old
+// records recover their real history-entry time), and keeps EnteredHistoryTime monotonic with
+// append order so its zone map still prunes.
+func (s *HistorySync) enteredHistoryTime(ad *classad.ClassAd) int64 {
+	if v, ok := ad.EvaluateAttrInt("EnteredCurrentStatus"); ok && v > 0 {
+		return v
+	}
+	if v, ok := ad.EvaluateAttrInt("CompletionDate"); ok && v > 0 {
+		return v
+	}
+	return s.now().Unix()
 }
 
 // alreadyArchived reports whether a completed job (keyed by ClusterId+ProcId, unique per
