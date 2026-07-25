@@ -279,6 +279,8 @@ CompletionDate); with none, the current table:
   .retention [table] [maxSegments maxBytes [attr ageSecs]]
                                                show/set an archive's retention bounds
                                                (maxBytes takes a KiB/MiB/GiB suffix; 0=none)
+  .truncate <table>                            empty a table (needs DAEMON, destructive);
+                                               a history archive re-syncs from the start
   .memory [table]                              drop a table's on-disk backing, keeping
                                                its data in RAM only (needs DAEMON)
   .timetravel on <window> [checkpoint] | off   enable/disable point-in-time queries on
