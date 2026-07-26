@@ -126,6 +126,16 @@ func connect(ctx context.Context, cfg *config.Config, addr string) (*dbrpc.Clien
 	if sec.Authentication == security.SecurityOptional {
 		sec.Authentication = security.SecurityPreferred
 	}
+	// If the htcondordb daemon's exporter manager launched us, it handed us a dedicated,
+	// standalone CEDAR session via CONDOR_PRIVATE_INHERIT. Resume that session by id instead of
+	// running a full authentication handshake -- the daemon trusts the minted identity
+	// (condor@parent) as DAEMON. GetParentSessionID (via GetSessionCache) imports the inherited
+	// session on first use; it returns "" for a normally-launched client, which keeps the full-
+	// auth path below.
+	if sid := security.GetParentSessionID(); sid != "" {
+		sec.SessionID = sid
+		sec.SessionCache = security.GetSessionCache()
+	}
 	connCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cl, err := cedarclient.ConnectAndAuthenticate(connCtx, addr, sec)
