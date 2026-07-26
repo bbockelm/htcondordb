@@ -159,6 +159,11 @@ func (r *Runner) session(ctx context.Context, st *State) error {
 	}
 	// checkpoint produces the batch, then persists the resume state (cursor + ExportSeq +
 	// KeyVersions). The produce-then-persist order is the at-least-once boundary.
+	// stampStatus refreshes the live health/progress snapshot (a wall-clock beat the daemon uses
+	// to spot a wedged exporter, plus cumulative records produced).
+	stampStatus := func() {
+		st.Status = Status{Beat: time.Now().Unix(), DocsIndexed: st.ExportSeq}
+	}
 	checkpoint := func(cursor []byte) error {
 		if err := produceBatch(); err != nil {
 			return err
@@ -166,6 +171,17 @@ func (r *Runner) session(ctx context.Context, st *State) error {
 		if len(cursor) > 0 {
 			st.WireCursor = cursor
 		}
+		stampStatus()
+		blob, err := st.encode()
+		if err != nil {
+			return err
+		}
+		return r.client.PutExporterState(ctx, r.name, blob)
+	}
+	// writeStatus persists only the refreshed status (leaving the resume cursor untouched), so the
+	// beat keeps advancing during a long snapshot replay where checkpointing the cursor is unsafe.
+	writeStatus := func() error {
+		stampStatus()
 		blob, err := st.encode()
 		if err != nil {
 			return err
@@ -185,6 +201,9 @@ func (r *Runner) session(ctx context.Context, st *State) error {
 			// memory) since there is no resumable cursor yet.
 			if inReset {
 				if err := produceBatch(); err != nil {
+					return err
+				}
+				if err := writeStatus(); err != nil { // keep the beat fresh during replay
 					return err
 				}
 			} else if err := checkpoint(lastCursor); err != nil {

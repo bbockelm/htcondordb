@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,10 +21,38 @@ import (
 	"github.com/bbockelm/htcondordb/command"
 )
 
-// exporterLister is the slice of the catalog the manager needs: the set of registered
-// exporters. Satisfied by *db.Catalog (svc.Catalog()); narrowed for testability.
-type exporterLister interface {
+// exporterCatalog is the slice of the catalog the manager needs: the registered exporters and
+// their durable state (which carries the child's live status). Satisfied by *db.Catalog
+// (svc.Catalog()); narrowed for testability.
+type exporterCatalog interface {
 	Exporters() []db.ExporterDef
+	LoadExporterState(name string) ([]byte, bool, error)
+}
+
+// childStatus is the live health/progress an exporter child writes into its durable state (the
+// "status" object). The daemon parses just this shape -- it never imports the exporter modules
+// (dep isolation), so the JSON contract is duplicated here, like the DB-session command constant.
+type childStatus struct {
+	Beat        int64  `json:"beat"` // child's unix-seconds wall clock at its last refresh
+	DocsIndexed uint64 `json:"docsIndexed"`
+	DocsSkipped uint64 `json:"docsSkipped"`
+	InFlight    int    `json:"inFlight"`
+}
+
+// loadChildStatus reads the exporter's state and extracts its status object; ok is false when no
+// state (or no status) has been written yet.
+func loadChildStatus(cat exporterCatalog, name string) (childStatus, bool) {
+	blob, present, err := cat.LoadExporterState(name)
+	if err != nil || !present || len(blob) == 0 {
+		return childStatus{}, false
+	}
+	var wrap struct {
+		Status childStatus `json:"status"`
+	}
+	if json.Unmarshal(blob, &wrap) != nil || wrap.Status.Beat == 0 {
+		return childStatus{}, false
+	}
+	return wrap.Status, true
 }
 
 // exporterManager launches and supervises the standalone change-data exporter processes
@@ -45,7 +74,7 @@ type exporterLister interface {
 //   - restarts with exponential backoff capped at 30s.
 type exporterManager struct {
 	parent     context.Context
-	catalog    exporterLister
+	catalog    exporterCatalog
 	logger     *slog.Logger
 	daemonAddr string // the address children dial back on (advertisedAddr)
 
@@ -53,6 +82,19 @@ type exporterManager struct {
 	cancel  context.CancelFunc // cancels the reconcile loop + all supervisors; nil when stopped
 	done    chan struct{}      // closed once the loop and all supervisors have exited
 	current exporterSettings
+	runtime map[string]*exporterRuntime // per-exporter live status, for the ad + metrics
+}
+
+// exporterRuntime is the daemon's view of one supervised exporter: what the daemon itself knows
+// (running, restarts, timing) plus the child's last-reported status.
+type exporterRuntime struct {
+	Kind      string
+	Running   bool
+	Restarts  int
+	LastStart time.Time
+	LastExit  time.Time
+	LastErr   string
+	Status    childStatus // last status read from the child's durable state
 }
 
 // exporterSettings is the resolved, comparable configuration of the manager. The per-Kind
@@ -65,9 +107,29 @@ type exporterSettings struct {
 	opensearchBin string
 	runAsUser     string
 	pollInterval  time.Duration
+	// livenessTimeout: a child whose status beat has not advanced within this window (and that has
+	// been running at least this long, to cover startup) is treated as wedged and restarted -- the
+	// safety net for a deadlocked-but-alive child the supervisor would otherwise never see exit.
+	livenessTimeout time.Duration
 }
 
-const defaultExporterPoll = 30 * time.Second
+const (
+	defaultExporterPoll    = 30 * time.Second
+	defaultLivenessTimeout = 90 * time.Second
+)
+
+// livenessCheckInterval picks how often to poll a child's beat: often enough relative to the
+// timeout to react promptly, capped so a long timeout doesn't poll wastefully.
+func livenessCheckInterval(timeout time.Duration) time.Duration {
+	iv := timeout / 3
+	if iv > 15*time.Second {
+		iv = 15 * time.Second
+	}
+	if iv < 100*time.Millisecond {
+		iv = 100 * time.Millisecond
+	}
+	return iv
+}
 
 func resolveExporterSettings(cfg *htconfig.Config) exporterSettings {
 	// Managed by default; an operator running the syncs externally sets this false.
@@ -82,12 +144,17 @@ func resolveExporterSettings(cfg *htconfig.Config) exporterSettings {
 	if s := configInt(cfg, "HTCONDORDB_EXPORTER_POLL_SECONDS"); s > 0 {
 		poll = time.Duration(s) * time.Second
 	}
+	live := defaultLivenessTimeout
+	if s := configInt(cfg, "HTCONDORDB_EXPORTER_LIVENESS_SECONDS"); s > 0 {
+		live = time.Duration(s) * time.Second
+	}
 	return exporterSettings{
-		enabled:       true,
-		kafkaBin:      getStr(cfg, "KAFKASYNC"),
-		opensearchBin: getStr(cfg, "OPENSEARCHSYNC"),
-		runAsUser:     runAs,
-		pollInterval:  poll,
+		enabled:         true,
+		kafkaBin:        getStr(cfg, "KAFKASYNC"),
+		opensearchBin:   getStr(cfg, "OPENSEARCHSYNC"),
+		runAsUser:       runAs,
+		pollInterval:    poll,
+		livenessTimeout: live,
 	}
 }
 
@@ -154,6 +221,7 @@ func (m *exporterManager) reconcileLoop(ctx context.Context, s exporterSettings,
 				m.logger.Info("exporter manager: exporter removed; stopping", "name", name)
 				cancel()
 				delete(supervisors, name)
+				m.forgetRuntime(name)
 			}
 		}
 		// Start supervisors for newly-registered exporters.
@@ -165,10 +233,10 @@ func (m *exporterManager) reconcileLoop(ctx context.Context, s exporterSettings,
 			supervisors[name] = scancel
 			bin := s.binaryFor(def.Kind)
 			wg.Add(1)
-			go func(name, bin string) {
+			go func(name, kind, bin string) {
 				defer wg.Done()
-				m.supervise(sctx, s, name, bin)
-			}(name, bin)
+				m.supervise(sctx, s, name, kind, bin)
+			}(name, def.Kind, bin)
 			m.logger.Info("exporter manager: supervising exporter", "name", name, "kind", def.Kind, "bin", bin)
 		}
 	}
@@ -189,12 +257,12 @@ func (m *exporterManager) reconcileLoop(ctx context.Context, s exporterSettings,
 
 // supervise runs the launch/mint/invalidate/backoff loop for one exporter until ctx is
 // cancelled.
-func (m *exporterManager) supervise(ctx context.Context, s exporterSettings, name, bin string) {
+func (m *exporterManager) supervise(ctx context.Context, s exporterSettings, name, kind, bin string) {
 	const maxBackoff = 30 * time.Second
 	backoff := time.Second
 	for ctx.Err() == nil {
 		start := time.Now()
-		err := m.runOnce(ctx, s, name, bin)
+		err := m.runOnce(ctx, s, name, kind, bin)
 		if ctx.Err() != nil {
 			return
 		}
@@ -220,17 +288,22 @@ func (m *exporterManager) supervise(ctx context.Context, s exporterSettings, nam
 	}
 }
 
-// runOnce mints a fresh session, launches the child, forwards its logs, waits for it to exit,
-// and invalidates the session. A fresh session per launch means a crashed child's credential is
-// reaped immediately.
-func (m *exporterManager) runOnce(ctx context.Context, s exporterSettings, name, bin string) error {
+// runOnce mints a fresh session, launches the child, forwards its logs, watches its liveness,
+// waits for it to exit, and invalidates the session. A fresh session per launch means a crashed
+// child's credential is reaped immediately.
+func (m *exporterManager) runOnce(ctx context.Context, s exporterSettings, name, kind, bin string) error {
 	sid, token, err := security.MintInheritableSession(m.daemonAddr, command.DBSession)
 	if err != nil {
 		return fmt.Errorf("minting session: %w", err)
 	}
 	defer security.GetSessionCache().Invalidate(sid)
 
-	cmd := exec.CommandContext(ctx, bin, "run", "-name", name, "-addr", m.daemonAddr)
+	// A child-scoped context so the liveness monitor can kill a wedged child (which exec.Cmd
+	// with this context terminates), triggering the supervisor's restart.
+	childCtx, cancelChild := context.WithCancel(ctx)
+	defer cancelChild()
+
+	cmd := exec.CommandContext(childCtx, bin, "run", "-name", name, "-addr", m.daemonAddr)
 	cmd.Env = append(os.Environ(), security.EnvCondorPrivateInherit+"="+token)
 
 	stdout, err := cmd.StdoutPipe()
@@ -248,6 +321,8 @@ func (m *exporterManager) runOnce(ctx context.Context, s exporterSettings, name,
 	if err := droppriv.StartAsUser(s.runAsUser, cmd); err != nil {
 		return fmt.Errorf("starting %s: %w", bin, err)
 	}
+	m.markStart(name, kind)
+	go m.monitorLiveness(childCtx, cancelChild, name, time.Now(), s.livenessTimeout)
 
 	var lwg sync.WaitGroup
 	lwg.Add(2)
@@ -255,7 +330,107 @@ func (m *exporterManager) runOnce(ctx context.Context, s exporterSettings, name,
 	go func() { defer lwg.Done(); m.forwardLog(name, "stderr", stderr) }()
 	lwg.Wait() // pipes close at process exit
 
-	return cmd.Wait()
+	err = cmd.Wait()
+	m.markExit(name, err)
+	return err
+}
+
+// monitorLiveness kills the child (via cancel) if it stops advancing its status beat while it
+// should be running -- catching a deadlocked-but-alive child the supervisor would never see exit.
+// It also refreshes the daemon's view of the child's progress for the ad/metrics.
+func (m *exporterManager) monitorLiveness(ctx context.Context, cancel context.CancelFunc, name string, start time.Time, timeout time.Duration) {
+	if timeout <= 0 {
+		return
+	}
+	t := time.NewTicker(livenessCheckInterval(timeout))
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			st, ok := loadChildStatus(m.catalog, name)
+			if ok {
+				m.setStatus(name, st)
+			}
+			// Grace: a child gets at least `timeout` to start up and write its first beat.
+			if now.Sub(start) < timeout {
+				continue
+			}
+			stale := !ok || now.Sub(time.Unix(st.Beat, 0)) > timeout
+			if stale {
+				m.logger.Warn("exporter manager: child unresponsive (no status beat); restarting",
+					"name", name, "up", now.Sub(start).Round(time.Second), "beat_seen", ok)
+				cancel() // terminate the child; runOnce's cmd.Wait returns and the supervisor restarts
+				return
+			}
+		}
+	}
+}
+
+// --- per-exporter runtime status (for the collector ad + Prometheus) ---
+
+// rt returns the runtime record for name, creating it. Caller holds m.mu.
+func (m *exporterManager) rt(name string) *exporterRuntime {
+	if m.runtime == nil {
+		m.runtime = map[string]*exporterRuntime{}
+	}
+	e := m.runtime[name]
+	if e == nil {
+		e = &exporterRuntime{}
+		m.runtime[name] = e
+	}
+	return e
+}
+
+func (m *exporterManager) markStart(name, kind string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.rt(name)
+	e.Kind = kind
+	e.Running = true
+	e.LastStart = time.Now()
+}
+
+func (m *exporterManager) markExit(name string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.rt(name)
+	e.Running = false
+	e.LastExit = time.Now()
+	e.Restarts++
+	if err != nil {
+		e.LastErr = err.Error()
+	}
+}
+
+func (m *exporterManager) setStatus(name string, st childStatus) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rt(name).Status = st
+}
+
+func (m *exporterManager) forgetRuntime(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.runtime, name)
+}
+
+// NamedExporterStatus is one exporter's runtime status with its name, for the ad + metrics.
+type NamedExporterStatus struct {
+	Name string
+	exporterRuntime
+}
+
+// Statuses returns a snapshot of every supervised exporter's status. Safe for concurrent use.
+func (m *exporterManager) Statuses() []NamedExporterStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]NamedExporterStatus, 0, len(m.runtime))
+	for name, e := range m.runtime {
+		out = append(out, NamedExporterStatus{Name: name, exporterRuntime: *e})
+	}
+	return out
 }
 
 // forwardLog copies a child's output stream into the daemon log line-by-line, tagged with the

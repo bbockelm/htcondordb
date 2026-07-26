@@ -16,8 +16,9 @@ import (
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 type fakeCatalog struct {
-	mu   sync.Mutex
-	defs []db.ExporterDef
+	mu    sync.Mutex
+	defs  []db.ExporterDef
+	state map[string][]byte
 }
 
 func (c *fakeCatalog) Exporters() []db.ExporterDef {
@@ -29,6 +30,12 @@ func (c *fakeCatalog) set(d []db.ExporterDef) {
 	c.mu.Lock()
 	c.defs = d
 	c.mu.Unlock()
+}
+func (c *fakeCatalog) LoadExporterState(name string) ([]byte, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b, ok := c.state[name]
+	return b, ok, nil
 }
 
 func waitForFile(t *testing.T, path string, d time.Duration) {
@@ -116,4 +123,62 @@ func waitForCount(t *testing.T, path string, want int, d time.Duration) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("count in %s did not reach %d within %s", path, want, d)
+}
+
+// TestExporterLivenessRestartsWedgedChild verifies the liveness monitor restarts a child that
+// runs but never advances its status beat (a deadlocked-but-alive process the supervisor would
+// otherwise never see exit).
+func TestExporterLivenessRestartsWedgedChild(t *testing.T) {
+	dir := t.TempDir()
+	countFile := filepath.Join(dir, "count")
+	script := filepath.Join(dir, "wedged")
+	// A child that records its launch then hangs forever without ever writing a status beat.
+	// `exec` replaces the shell so the hang is the direct child (no grandchild left holding the
+	// stdout pipe open after a kill) -- the real exporter is likewise a single process.
+	body := "#!/bin/sh\necho x >> \"" + countFile + "\"\nexec sleep 3600\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// No state written for this exporter -> the child never has a beat -> it looks wedged.
+	cat := &fakeCatalog{defs: []db.ExporterDef{{Name: "jobs", Kind: "opensearch"}}, state: map[string][]byte{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &exporterManager{parent: ctx, catalog: cat, logger: discardLogger(), daemonAddr: "<127.0.0.1:1>"}
+	s := exporterSettings{enabled: true, opensearchBin: script, runAsUser: "", pollInterval: 50 * time.Millisecond, livenessTimeout: 300 * time.Millisecond}
+
+	done := make(chan struct{})
+	go m.reconcileLoop(ctx, s, done)
+
+	// The wedged child is killed after ~livenessTimeout and relaunched, so a second launch appears.
+	waitForCount(t, countFile, 2, 8*time.Second)
+
+	// The daemon tracked at least one restart for it.
+	waitFor2(t, func() bool {
+		for _, st := range m.Statuses() {
+			if st.Name == "jobs" && st.Restarts >= 1 {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconcile loop did not shut down")
+	}
+}
+
+func waitFor2(t *testing.T, cond func() bool, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met within timeout")
 }
