@@ -1,0 +1,52 @@
+name: opensearch-integration
+
+# Runs the opensearchsync exporter tests against a REAL OpenSearch (a service container with the
+# security plugin disabled). The integration tests key off $OPENSEARCH_URL and skip when it is
+# unset, so the normal `go test` suite needs no server; here we set it so they run, alongside the
+# module's unit tests.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  integration:
+    name: OpenSearch exporter integration
+    runs-on: ubuntu-latest
+
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:2.15.0
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true"
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+          - 9200:9200
+
+    steps:
+      - name: Checkout htcondordb
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with: { path: htcondordb }
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version: '1.25' }
+
+      - name: Wait for OpenSearch
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9200 >/dev/null; then
+              echo "OpenSearch is up"; curl -s http://localhost:9200 | head -12; exit 0
+            fi
+            echo "waiting for OpenSearch ($i)..."; sleep 5
+          done
+          echo "OpenSearch did not become ready"; exit 1
+
+      - name: Run opensearchsync tests
+        working-directory: htcondordb/opensearchsync
+        env:
+          OPENSEARCH_URL: http://localhost:9200
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+        run: go test -v -count=1 -timeout 10m ./...

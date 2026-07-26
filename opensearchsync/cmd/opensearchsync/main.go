@@ -1,14 +1,15 @@
-// Command kafkasync manages and runs Kafka change-data exporters for an htcondordb
-// instance. It is a dbrpc client: exporter definitions and their resume state live in the
-// database catalog, and this process watches a table and mirrors its changes to a Kafka
-// topic. It is the only component that links a Kafka client -- the core daemon never does.
+// Command opensearchsync manages and runs OpenSearch/Elasticsearch change-data exporters for
+// an htcondordb instance. It is a dbrpc client: exporter definitions and their resume state
+// live in the database catalog, and this process watches a table, applies the condor_adstash
+// document transform, and bulk-indexes the changes. It is the only component that links an
+// OpenSearch client -- the core daemon never does.
 //
 // Usage:
 //
-//	kafkasync create -name <n> -table <t> -brokers <b1,b2> -topic <topic> [options]
-//	kafkasync list
-//	kafkasync drop -name <n>
-//	kafkasync run  -name <n>
+//	opensearchsync create -name N -table T -addresses https://h:9200 [options]
+//	opensearchsync list
+//	opensearchsync drop -name N
+//	opensearchsync run  -name N
 package main
 
 import (
@@ -30,7 +31,7 @@ import (
 	"github.com/bbockelm/cedar/security"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
-	"github.com/bbockelm/htcondordb/kafkasync"
+	"github.com/bbockelm/htcondordb/opensearchsync"
 )
 
 // dbSessionCommand is the CEDAR command for htcondordb's multiplexed dbrpc session. It must
@@ -40,7 +41,7 @@ const dbSessionCommand = 74000
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "kafkasync:", err)
+		fmt.Fprintln(os.Stderr, "opensearchsync:", err)
 		os.Exit(1)
 	}
 }
@@ -66,22 +67,21 @@ func run() error {
 }
 
 func usage() error {
-	fmt.Fprint(os.Stderr, `kafkasync -- manage and run htcondordb Kafka exporters
+	fmt.Fprint(os.Stderr, `opensearchsync -- manage and run htcondordb OpenSearch exporters
 
-  kafkasync create -name N -table T -brokers b1,b2 -topic TOPIC [options]
-  kafkasync list
-  kafkasync drop -name N
-  kafkasync run  -name N
+  opensearchsync create -name N -table T -addresses https://h1:9200,https://h2:9200 [options]
+  opensearchsync list
+  opensearchsync drop -name N
+  opensearchsync run  -name N
 
 Common: -addr HOST:PORT (else HTCONDORDB_ADDRESS_FILE / LOG/.htcondordb_address / HTCONDORDB_HOST).
 `)
 	return nil
 }
 
-// --- shared connection plumbing (mirrors htcondordb-cli's connectDB) ---
+// --- shared connection plumbing (mirrors htcondordb-cli / kafkasync) ---
 
 func loadConfig() (*config.Config, error) {
-	// Subsystem TOOL so TOOL.SEC_CLIENT_* operator config is honored, like the C++ tools.
 	return config.NewWithOptions(config.ConfigOptions{Subsystem: "TOOL"})
 }
 
@@ -121,8 +121,6 @@ func connect(ctx context.Context, cfg *config.Config, addr string) (*dbrpc.Clien
 		return nil, nil, fmt.Errorf("building client security config: %w", err)
 	}
 	sec.Command = dbSessionCommand
-	// Prefer authentication so the client maps to a DAEMON identity (the exporter ops are
-	// DAEMON-gated); OPTIONAL on both ends would negotiate to anonymous/read-only.
 	if sec.Authentication == security.SecurityOptional {
 		sec.Authentication = security.SecurityPreferred
 	}
@@ -130,8 +128,8 @@ func connect(ctx context.Context, cfg *config.Config, addr string) (*dbrpc.Clien
 	// standalone CEDAR session via CONDOR_PRIVATE_INHERIT. Resume that session by id instead of
 	// running a full authentication handshake -- the daemon trusts the minted identity
 	// (condor@parent) as DAEMON. GetParentSessionID (via GetSessionCache) imports the inherited
-	// session on first use; it returns "" for a normally-launched client, which keeps the full-
-	// auth path below.
+	// session on first use; it returns "" for a normally-launched client, keeping the full-auth
+	// path below.
 	if sid := security.GetParentSessionID(); sid != "" {
 		sec.SessionID = sid
 		sec.SessionCache = security.GetSessionCache()
@@ -146,7 +144,6 @@ func connect(ctx context.Context, cfg *config.Config, addr string) (*dbrpc.Clien
 	return dbc, func() { _ = dbc.Close(); _ = cl.Close() }, nil
 }
 
-// dial loads config, resolves the address, and connects.
 func dial(ctx context.Context, addrFlag string) (*dbrpc.Client, func(), error) {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -165,50 +162,44 @@ func cmdCreate(args []string) error {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	addr := fs.String("addr", "", "htcondordb address (host:port)")
 	name := fs.String("name", "", "exporter name (required)")
-	table := fs.String("table", "", "source table to mirror (required)")
-	brokers := fs.String("brokers", "", "comma-separated Kafka bootstrap brokers (required)")
-	topic := fs.String("topic", "", "destination topic (required)")
-	partitions := fs.Int("partitions", 1, "partitions when creating the topic")
-	replication := fs.Int("replication", 1, "replication factor when creating the topic")
-	noManageTopic := fs.Bool("no-manage-topic", false, "do not create/configure the topic (assume it exists)")
-	noCompact := fs.Bool("no-compact", false, "do not set cleanup.policy=compact on a managed topic")
-	batch := fs.Int("batch", 0, "records per flush/checkpoint during live tailing (0=default)")
-	saslUser := fs.String("sasl-user", "", "SASL username (enables SASL)")
-	saslMech := fs.String("sasl-mechanism", "", "SASL mechanism: PLAIN, SCRAM-SHA-256 (default), or SCRAM-SHA-512")
+	table := fs.String("table", "", "source table/archive to mirror, e.g. history (required)")
+	addresses := fs.String("addresses", "", "comma-separated OpenSearch node URLs (required)")
+	index := fs.String("index", opensearchsync.DefaultIndex, "target index or write alias")
+	username := fs.String("username", "", "HTTP basic auth username")
 	// Passwords are referenced, never stored: the exporter reads them at runtime.
-	saslPassFile := fs.String("sasl-password-file", "", "path the exporter reads the SASL password from")
-	saslPassEnv := fs.String("sasl-password-env", "", "env var the exporter reads the SASL password from")
-	tls := fs.Bool("tls", false, "dial the broker with TLS")
-	tlsCA := fs.String("tls-ca", "", "CA bundle to verify the broker (empty = system roots); implies -tls")
-	tlsCert := fs.String("tls-cert", "", "client certificate for mutual TLS; implies -tls")
-	tlsKey := fs.String("tls-key", "", "client private key for mutual TLS; implies -tls")
-	tlsServerName := fs.String("tls-server-name", "", "override the name verified against the broker cert")
+	passFile := fs.String("password-file", "", "path the exporter reads the password from")
+	passEnv := fs.String("password-env", "", "env var the exporter reads the password from")
+	caCert := fs.String("ca-cert", "", "CA bundle to verify the server (empty = system roots)")
+	insecure := fs.Bool("insecure", false, "skip TLS verification (test only)")
+	batch := fs.Int("batch", 0, "documents per bulk request (0=default 250)")
+	maxConc := fs.Int("max-concurrent-bulk", 0, "outstanding bulk requests (0=default 4)")
+	maxInFlight := fs.Int("max-inflight-docs", 0, "documents allowed in flight before reads block (0=default 5000)")
+	noManageIndex := fs.Bool("no-manage-index", false, "do not create the index/mappings (assume it exists)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *name == "" || *table == "" || *brokers == "" || *topic == "" {
-		return errors.New("create: -name, -table, -brokers, and -topic are all required")
+	if *name == "" || *table == "" || *addresses == "" {
+		return errors.New("create: -name, -table, and -addresses are all required")
 	}
-	cfgK := kafkasync.Config{
-		Table:             *table,
-		Brokers:           splitCSV(*brokers),
-		Topic:             *topic,
-		BatchSize:         *batch,
-		Partitions:        *partitions,
-		ReplicationFactor: *replication,
-		ManageTopic:       boolPtr(!*noManageTopic),
-		Compact:           boolPtr(!*noCompact),
+	manage := !*noManageIndex
+	cfg := opensearchsync.Config{
+		Table:              *table,
+		Addresses:          splitCSV(*addresses),
+		Index:              *index,
+		Username:           *username,
+		PasswordFile:       *passFile,
+		PasswordEnv:        *passEnv,
+		CACertFile:         *caCert,
+		InsecureSkipVerify: *insecure,
+		BatchSize:          *batch,
+		MaxConcurrentBulk:  *maxConc,
+		MaxInFlightDocs:    *maxInFlight,
+		ManageIndex:        &manage,
 	}
-	if *tls || *tlsCA != "" || *tlsCert != "" || *tlsKey != "" || *tlsServerName != "" {
-		cfgK.TLS = &kafkasync.TLSConfig{CAFile: *tlsCA, CertFile: *tlsCert, KeyFile: *tlsKey, ServerName: *tlsServerName}
-	}
-	if *saslUser != "" {
-		cfgK.SASL = &kafkasync.SASLConfig{Mechanism: *saslMech, Username: *saslUser, PasswordFile: *saslPassFile, PasswordEnv: *saslPassEnv}
-	}
-	if _, err := cfgK.Validate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	raw, err := cfgK.Marshal()
+	raw, err := cfg.Marshal()
 	if err != nil {
 		return err
 	}
@@ -219,10 +210,10 @@ func cmdCreate(args []string) error {
 		return err
 	}
 	defer cleanup()
-	if err := c.CreateExporter(ctx, db.ExporterDef{Name: *name, Kind: kafkasync.Kind, Config: raw}); err != nil {
+	if err := c.CreateExporter(ctx, db.ExporterDef{Name: *name, Kind: opensearchsync.Kind, Config: raw}); err != nil {
 		return err
 	}
-	fmt.Printf("created kafka exporter %q (table %q -> topic %q)\n", *name, *table, *topic)
+	fmt.Printf("created opensearch exporter %q (table %q -> index %q)\n", *name, *table, cfg.Index)
 	return nil
 }
 
@@ -301,7 +292,7 @@ func cmdRun(args []string) error {
 			if ctx.Err() != nil {
 				break
 			}
-			log.Warn("kafkasync: exporter stopped; reconnecting", "err", err)
+			log.Warn("opensearchsync: exporter stopped; reconnecting", "err", err)
 			select {
 			case <-ctx.Done():
 			case <-time.After(backoff):
@@ -311,13 +302,13 @@ func cmdRun(args []string) error {
 			}
 			continue
 		}
-		break // clean stop (ctx cancelled)
+		break
 	}
 	return nil
 }
 
-// runOnce dials, builds the producer, and runs the exporter until it stops. A returned
-// error means the outer loop should reconnect; nil means a clean shutdown.
+// runOnce dials, builds the OpenSearch client, ensures the index, and runs the exporter until
+// it stops. A returned error means the outer loop reconnects; nil means a clean shutdown.
 func runOnce(ctx context.Context, addrFlag, name string, log *slog.Logger) error {
 	c, cleanup, err := dial(ctx, addrFlag)
 	if err != nil {
@@ -332,18 +323,22 @@ func runOnce(ctx context.Context, addrFlag, name string, log *slog.Logger) error
 	if !ok {
 		return fmt.Errorf("no exporter named %q", name)
 	}
-	cfg, err := kafkasync.ParseConfig(def.Config)
+	cfg, err := opensearchsync.ParseConfig(def.Config)
 	if err != nil {
 		return fmt.Errorf("exporter %q: %w", name, err)
 	}
-	prod, err := kafkasync.NewProducer(ctx, cfg)
+	bulk, err := opensearchsync.NewOSBulkClient(cfg)
 	if err != nil {
 		return err
 	}
-	defer prod.Close()
+	if cfg.ManageIndexEnabled() {
+		if err := bulk.EnsureIndex(ctx, cfg.Index); err != nil {
+			return err
+		}
+	}
 
-	log.Info("kafkasync: starting exporter", "name", name, "table", cfg.Table, "topic", cfg.Topic)
-	runner := kafkasync.NewRunner(name, cfg, c, prod, log)
+	log.Info("opensearchsync: starting exporter", "name", name, "table", cfg.Table, "index", cfg.Index)
+	runner := opensearchsync.NewRunner(name, cfg, c, bulk, time.Now().Unix(), log)
 	runner.MaxConsecutiveFailures = 20 // give up so this loop re-dials with a fresh connection
 	return runner.Run(ctx)
 }
@@ -357,5 +352,3 @@ func splitCSV(s string) []string {
 	}
 	return out
 }
-
-func boolPtr(b bool) *bool { return &b }

@@ -86,4 +86,53 @@ func TestAddAttrsNoSources(t *testing.T) {
 	if v, _ := ad.EvaluateAttrInt("NumTables"); v != 0 {
 		t.Errorf("NumTables = %d, want 0", v)
 	}
+	if v, _ := ad.EvaluateAttrInt("NumExporters"); v != 0 {
+		t.Errorf("NumExporters = %d, want 0", v)
+	}
+}
+
+// TestAddAttrsExporters: exporter health is surfaced per-exporter, with SecondsSinceBeat (the
+// "is it wedged / falling behind" signal) computed against Now, and LastError only present when set.
+func TestAddAttrsExporters(t *testing.T) {
+	now := time.Unix(1_700_000_500, 0)
+	in := Input{
+		Now: now,
+		Exporters: []ExporterStatus{
+			{Name: "jobs-os", Kind: "opensearch", Running: true, Restarts: 2,
+				LastBeat: time.Unix(1_700_000_450, 0), DocsIndexed: 4200, DocsSkipped: 3, InFlight: 12},
+			{Name: "jobs-kafka", Kind: "kafka", Running: false, Restarts: 5,
+				DocsIndexed: 10, LastErr: "broker unreachable"},
+		},
+	}
+	ad := classad.New()
+	AddAttrs(ad, in)
+
+	str := func(k string) string { v, _ := ad.EvaluateAttrString(k); return v }
+	i := func(k string) int64 { v, _ := ad.EvaluateAttrInt(k); return v }
+	b := func(k string) bool { v, _ := ad.EvaluateAttrBool(k); return v }
+
+	if i("NumExporters") != 2 {
+		t.Errorf("NumExporters = %d, want 2", i("NumExporters"))
+	}
+	// The healthy OpenSearch exporter.
+	if str("Exporter_jobs_os_Kind") != "opensearch" || !b("Exporter_jobs_os_Running") {
+		t.Errorf("jobs-os kind/running wrong")
+	}
+	if i("Exporter_jobs_os_Restarts") != 2 || i("Exporter_jobs_os_DocsIndexed") != 4200 ||
+		i("Exporter_jobs_os_DocsSkipped") != 3 || i("Exporter_jobs_os_InFlight") != 12 {
+		t.Errorf("jobs-os gauges wrong")
+	}
+	if i("Exporter_jobs_os_LastBeatTime") != 1_700_000_450 || i("Exporter_jobs_os_SecondsSinceBeat") != 50 {
+		t.Errorf("jobs-os beat wrong: t=%d since=%d", i("Exporter_jobs_os_LastBeatTime"), i("Exporter_jobs_os_SecondsSinceBeat"))
+	}
+	if _, ok := ad.EvaluateAttrString("Exporter_jobs_os_LastError"); ok {
+		t.Error("healthy exporter should have no LastError attr")
+	}
+	// The failed Kafka exporter: not running, no beat, error surfaced.
+	if b("Exporter_jobs_kafka_Running") || str("Exporter_jobs_kafka_LastError") != "broker unreachable" {
+		t.Errorf("jobs-kafka running/error wrong")
+	}
+	if _, ok := ad.EvaluateAttrInt("Exporter_jobs_kafka_SecondsSinceBeat"); ok {
+		t.Error("exporter with no beat should have no SecondsSinceBeat attr")
+	}
 }
