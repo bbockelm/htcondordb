@@ -17,10 +17,10 @@ github.com/apache/arrow-go/v18 v18.5.2 h1:3uoHjoaEie5eVsxx/Bt64hKwZx4STb+beAkqKO
 github.com/apache/arrow-go/v18 v18.5.2/go.mod h1:yNoizNTT4peTciJ7V01d2EgOkE1d0fQ1vZcFOsVtFsw=
 github.com/apache/thrift v0.22.0 h1:r7mTJdj51TMDe6RtcmNdQxgn9XcyfGDOzegMDRg47uc=
 github.com/apache/thrift v0.22.0/go.mod h1:1e7J/O1Ae6ZQMTYdy9xa3w9k+XHWPfRvdPyJeynQ+/g=
-github.com/bbockelm/cedar v0.6.8 h1:Poztcrgb0h3ZUO7T0F1lySez5WCkzjYNCPOZdkUpAoA=
-github.com/bbockelm/cedar v0.6.8/go.mod h1:C4u6CKJoweg3LZniOi7Yh8avQv1KZjHs9k1vTGa1+2w=
-github.com/bbockelm/golang-htcondor v0.12.0 h1:mBEljuVDlX5jO4+OJwgwS03RdvdMzNIVbO3sgaHsFy0=
-github.com/bbockelm/golang-htcondor v0.12.0/go.mod h1:Fr9LW42uP/II6yKTW05g/A9YEP3D6NWQuGmlMOq9A4M=
+github.com/bbockelm/cedar v0.6.9 h1:bAqgpz2P3M3n9/Gz+lGTFN+jGN2/6ukdvc3pxD7OfoI=
+github.com/bbockelm/cedar v0.6.9/go.mod h1:C4u6CKJoweg3LZniOi7Yh8avQv1KZjHs9k1vTGa1+2w=
+github.com/bbockelm/golang-htcondor v0.12.1 h1:FfAIxP2aOOlPdYdaoO3qFXvGVN9Nb3/pm0xorgPsOU4=
+github.com/bbockelm/golang-htcondor v0.12.1/go.mod h1:Fr9LW42uP/II6yKTW05g/A9YEP3D6NWQuGmlMOq9A4M=
 github.com/bbockelm/gosssd v0.0.1 h1:p9wJYl+GDn29W1it2ZE2RekriwUNs/1U16aUNNro5SM=
 github.com/bbockelm/gosssd v0.0.1/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
