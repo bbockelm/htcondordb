@@ -1,0 +1,354 @@
+// Command opensearchsync manages and runs OpenSearch/Elasticsearch change-data exporters for
+// an htcondordb instance. It is a dbrpc client: exporter definitions and their resume state
+// live in the database catalog, and this process watches a table, applies the condor_adstash
+// document transform, and bulk-indexes the changes. It is the only component that links an
+// OpenSearch client -- the core daemon never does.
+//
+// Usage:
+//
+//	opensearchsync create -name N -table T -addresses https://h:9200 [options]
+//	opensearchsync list
+//	opensearchsync drop -name N
+//	opensearchsync run  -name N
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/dbrpc"
+	cedarclient "github.com/bbockelm/cedar/client"
+	"github.com/bbockelm/cedar/security"
+	htcondor "github.com/bbockelm/golang-htcondor"
+	"github.com/bbockelm/golang-htcondor/config"
+	"github.com/bbockelm/htcondordb/opensearchsync"
+)
+
+// dbSessionCommand is the CEDAR command for htcondordb's multiplexed dbrpc session. It must
+// match github.com/bbockelm/htcondordb/command.DBSession (74000); it is duplicated here so
+// this standalone module need not depend on the htcondordb daemon module.
+const dbSessionCommand = 74000
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "opensearchsync:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	if len(os.Args) < 2 {
+		return usage()
+	}
+	switch os.Args[1] {
+	case "create":
+		return cmdCreate(os.Args[2:])
+	case "drop":
+		return cmdDrop(os.Args[2:])
+	case "list":
+		return cmdList(os.Args[2:])
+	case "run":
+		return cmdRun(os.Args[2:])
+	case "-h", "--help", "help":
+		return usage()
+	default:
+		return fmt.Errorf("unknown subcommand %q (want create|drop|list|run)", os.Args[1])
+	}
+}
+
+func usage() error {
+	fmt.Fprint(os.Stderr, `opensearchsync -- manage and run htcondordb OpenSearch exporters
+
+  opensearchsync create -name N -table T -addresses https://h1:9200,https://h2:9200 [options]
+  opensearchsync list
+  opensearchsync drop -name N
+  opensearchsync run  -name N
+
+Common: -addr HOST:PORT (else HTCONDORDB_ADDRESS_FILE / LOG/.htcondordb_address / HTCONDORDB_HOST).
+`)
+	return nil
+}
+
+// --- shared connection plumbing (mirrors htcondordb-cli / kafkasync) ---
+
+func loadConfig() (*config.Config, error) {
+	return config.NewWithOptions(config.ConfigOptions{Subsystem: "TOOL"})
+}
+
+func getConfig(cfg *config.Config, key string) string {
+	v, _ := cfg.Get(key)
+	return strings.TrimSpace(v)
+}
+
+func locateDaemon(cfg *config.Config, addrFlag string) (string, error) {
+	if addrFlag != "" {
+		return addrFlag, nil
+	}
+	addrFile := getConfig(cfg, "HTCONDORDB_ADDRESS_FILE")
+	if addrFile == "" {
+		if logDir := getConfig(cfg, "LOG"); logDir != "" {
+			addrFile = filepath.Join(logDir, ".htcondordb_address")
+		}
+	}
+	if addrFile != "" {
+		if data, err := os.ReadFile(addrFile); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if line = strings.TrimSpace(line); line != "" {
+					return line, nil
+				}
+			}
+		}
+	}
+	if host := getConfig(cfg, "HTCONDORDB_HOST"); host != "" {
+		return host, nil
+	}
+	return "", fmt.Errorf("cannot locate htcondordb: pass -addr, or set HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST")
+}
+
+func connect(ctx context.Context, cfg *config.Config, addr string) (*dbrpc.Client, func(), error) {
+	sec, err := htcondor.GetSecurityConfig(cfg, dbSessionCommand, "CLIENT")
+	if err != nil {
+		return nil, nil, fmt.Errorf("building client security config: %w", err)
+	}
+	sec.Command = dbSessionCommand
+	if sec.Authentication == security.SecurityOptional {
+		sec.Authentication = security.SecurityPreferred
+	}
+	// If the htcondordb daemon's exporter manager launched us, it handed us a dedicated,
+	// standalone CEDAR session via CONDOR_PRIVATE_INHERIT. Resume that session by id instead of
+	// running a full authentication handshake -- the daemon trusts the minted identity
+	// (condor@parent) as DAEMON. GetParentSessionID (via GetSessionCache) imports the inherited
+	// session on first use; it returns "" for a normally-launched client, keeping the full-auth
+	// path below.
+	if sid := security.GetParentSessionID(); sid != "" {
+		sec.SessionID = sid
+		sec.SessionCache = security.GetSessionCache()
+	}
+	connCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cl, err := cedarclient.ConnectAndAuthenticate(connCtx, addr, sec)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connecting to %s: %w", addr, err)
+	}
+	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()))
+	return dbc, func() { _ = dbc.Close(); _ = cl.Close() }, nil
+}
+
+func dial(ctx context.Context, addrFlag string) (*dbrpc.Client, func(), error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, nil, fmt.Errorf("loading config: %w", err)
+	}
+	addr, err := locateDaemon(cfg, addrFlag)
+	if err != nil {
+		return nil, nil, err
+	}
+	return connect(ctx, cfg, addr)
+}
+
+// --- subcommands ---
+
+func cmdCreate(args []string) error {
+	fs := flag.NewFlagSet("create", flag.ContinueOnError)
+	addr := fs.String("addr", "", "htcondordb address (host:port)")
+	name := fs.String("name", "", "exporter name (required)")
+	table := fs.String("table", "", "source table/archive to mirror, e.g. history (required)")
+	addresses := fs.String("addresses", "", "comma-separated OpenSearch node URLs (required)")
+	index := fs.String("index", opensearchsync.DefaultIndex, "target index or write alias")
+	username := fs.String("username", "", "HTTP basic auth username")
+	// Passwords are referenced, never stored: the exporter reads them at runtime.
+	passFile := fs.String("password-file", "", "path the exporter reads the password from")
+	passEnv := fs.String("password-env", "", "env var the exporter reads the password from")
+	caCert := fs.String("ca-cert", "", "CA bundle to verify the server (empty = system roots)")
+	insecure := fs.Bool("insecure", false, "skip TLS verification (test only)")
+	batch := fs.Int("batch", 0, "documents per bulk request (0=default 250)")
+	maxConc := fs.Int("max-concurrent-bulk", 0, "outstanding bulk requests (0=default 4)")
+	maxInFlight := fs.Int("max-inflight-docs", 0, "documents allowed in flight before reads block (0=default 5000)")
+	noManageIndex := fs.Bool("no-manage-index", false, "do not create the index/mappings (assume it exists)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *name == "" || *table == "" || *addresses == "" {
+		return errors.New("create: -name, -table, and -addresses are all required")
+	}
+	manage := !*noManageIndex
+	cfg := opensearchsync.Config{
+		Table:              *table,
+		Addresses:          splitCSV(*addresses),
+		Index:              *index,
+		Username:           *username,
+		PasswordFile:       *passFile,
+		PasswordEnv:        *passEnv,
+		CACertFile:         *caCert,
+		InsecureSkipVerify: *insecure,
+		BatchSize:          *batch,
+		MaxConcurrentBulk:  *maxConc,
+		MaxInFlightDocs:    *maxInFlight,
+		ManageIndex:        &manage,
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	raw, err := cfg.Marshal()
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	c, cleanup, err := dial(ctx, *addr)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if err := c.CreateExporter(ctx, db.ExporterDef{Name: *name, Kind: opensearchsync.Kind, Config: raw}); err != nil {
+		return err
+	}
+	fmt.Printf("created opensearch exporter %q (table %q -> index %q)\n", *name, *table, cfg.Index)
+	return nil
+}
+
+func cmdDrop(args []string) error {
+	fs := flag.NewFlagSet("drop", flag.ContinueOnError)
+	addr := fs.String("addr", "", "htcondordb address (host:port)")
+	name := fs.String("name", "", "exporter name (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *name == "" {
+		return errors.New("drop: -name required")
+	}
+	ctx := context.Background()
+	c, cleanup, err := dial(ctx, *addr)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if err := c.DropExporter(ctx, *name); err != nil {
+		return err
+	}
+	fmt.Printf("dropped exporter %q\n", *name)
+	return nil
+}
+
+func cmdList(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	addr := fs.String("addr", "", "htcondordb address (host:port)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ctx := context.Background()
+	c, cleanup, err := dial(ctx, *addr)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	infos, err := c.ListExporters(ctx)
+	if err != nil {
+		return err
+	}
+	if len(infos) == 0 {
+		fmt.Println("no exporters")
+		return nil
+	}
+	for _, in := range infos {
+		fmt.Printf("%-24s %s\n", in.Name, in.Kind)
+	}
+	return nil
+}
+
+func cmdRun(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	addr := fs.String("addr", "", "htcondordb address (host:port)")
+	name := fs.String("name", "", "exporter name (required)")
+	debug := fs.Bool("debug", false, "verbose logging")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *name == "" {
+		return errors.New("run: -name required")
+	}
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	backoff := time.Second
+	for ctx.Err() == nil {
+		if err := runOnce(ctx, *addr, *name, log); err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			log.Warn("opensearchsync: exporter stopped; reconnecting", "err", err)
+			select {
+			case <-ctx.Done():
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		break
+	}
+	return nil
+}
+
+// runOnce dials, builds the OpenSearch client, ensures the index, and runs the exporter until
+// it stops. A returned error means the outer loop reconnects; nil means a clean shutdown.
+func runOnce(ctx context.Context, addrFlag, name string, log *slog.Logger) error {
+	c, cleanup, err := dial(ctx, addrFlag)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	def, ok, err := c.GetExporter(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no exporter named %q", name)
+	}
+	cfg, err := opensearchsync.ParseConfig(def.Config)
+	if err != nil {
+		return fmt.Errorf("exporter %q: %w", name, err)
+	}
+	bulk, err := opensearchsync.NewOSBulkClient(cfg)
+	if err != nil {
+		return err
+	}
+	if cfg.ManageIndexEnabled() {
+		if err := bulk.EnsureIndex(ctx, cfg.Index); err != nil {
+			return err
+		}
+	}
+
+	log.Info("opensearchsync: starting exporter", "name", name, "table", cfg.Table, "index", cfg.Index)
+	runner := opensearchsync.NewRunner(name, cfg, c, bulk, time.Now().Unix(), log)
+	runner.MaxConsecutiveFailures = 20 // give up so this loop re-dials with a fresh connection
+	return runner.Run(ctx)
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
