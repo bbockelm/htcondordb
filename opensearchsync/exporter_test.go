@@ -143,14 +143,16 @@ func TestRunnerEndToEnd(t *testing.T) {
 		t.Errorf("external versions should differ per document (got %d for both)", vAlice)
 	}
 
-	// State was checkpointed with a resume cursor.
+	// State was checkpointed with a resume cursor and a live status (beat + progress) the daemon
+	// reads to detect a stalled exporter.
 	waitFor(t, func() bool {
 		blob, ok, _ := c.GetExporterState(ctx, "jobs-os")
 		if !ok {
 			return false
 		}
 		st, _ := decodeState(blob)
-		return len(st.WireCursor) > 0 && st.ExportSeq >= 2
+		return len(st.WireCursor) > 0 && st.ExportSeq >= 2 &&
+			st.Status.Beat > 0 && st.Status.DocsIndexed >= 2
 	})
 
 	// Live upsert: a newly completed job flows through.
