@@ -51,15 +51,33 @@ func waitForFile(t *testing.T, path string, d time.Duration) {
 }
 
 func TestExporterBinaryResolution(t *testing.T) {
-	s := exporterSettings{kafkaBin: "/opt/kafkasync", opensearchBin: "/opt/opensearchsync"}
+	s := exporterSettings{kafkaBin: "/opt/kafkasync", opensearchBin: "/opt/opensearchsync", dropboxBin: "/opt/archivedropbox"}
 	if got := s.binaryFor("kafka"); got != "/opt/kafkasync" {
 		t.Errorf("kafka -> %q, want override", got)
 	}
 	if got := s.binaryFor("opensearch"); got != "/opt/opensearchsync" {
 		t.Errorf("opensearch -> %q, want override", got)
 	}
+	if got := s.binaryFor("dropbox"); got != "/opt/archivedropbox" {
+		t.Errorf("dropbox -> %q, want override", got)
+	}
 	if got := (exporterSettings{}).binaryFor("mystery"); got != "" {
 		t.Errorf("unknown kind -> %q, want \"\"", got)
+	}
+}
+
+// TestExporterUserFor: the dropbox kind runs as its own service account (its export dir must not be
+// nobody-writable); every other kind runs as the shared unprivileged user.
+func TestExporterUserFor(t *testing.T) {
+	s := exporterSettings{runAsUser: "nobody", dropboxUser: "condor"}
+	if got := s.userFor("opensearch"); got != "nobody" {
+		t.Errorf("opensearch user -> %q, want nobody", got)
+	}
+	if got := s.userFor("kafka"); got != "nobody" {
+		t.Errorf("kafka user -> %q, want nobody", got)
+	}
+	if got := s.userFor("dropbox"); got != "condor" {
+		t.Errorf("dropbox user -> %q, want condor", got)
 	}
 }
 
