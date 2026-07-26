@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/opensearch-project/opensearch-go/v4"
 	"github.com/opensearch-project/opensearch-go/v4/opensearchapi"
@@ -17,7 +18,18 @@ import (
 // classifies each item's status (409 conflict / 429-503 retryable / else permanent), which is
 // all the Uploader needs; the Uploader owns retry, backpressure, and the in-flight watermark.
 type osBulkClient struct {
-	api *opensearchapi.Client
+	api            *opensearchapi.Client
+	requestTimeout time.Duration // hard bound on a single request, so a stalled server can't hang the exporter
+}
+
+// withTimeout bounds a single OpenSearch request. Without it a stalled server would block a bulk
+// goroutine forever; with the uploader's in-flight cap that would wedge the whole exporter
+// (backpressure blocks the reader) and the daemon would never see it exit to restart it.
+func (c *osBulkClient) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.requestTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.requestTimeout)
 }
 
 // NewOSBulkClient builds a BulkClient (and index manager) from cfg, resolving the password from
@@ -33,6 +45,16 @@ func NewOSBulkClient(cfg Config) (*osBulkClient, error) {
 		Username:           cfg.Username,
 		Password:           password,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
+		// The Uploader owns retry/backoff (ctx-fresh per attempt), so disable the SDK's own retry
+		// layer: it would double-retry, and -- because context.DeadlineExceeded is not a net.Error
+		// -- it misclassifies a RequestTimeout cancellation as a connection failure, marking the
+		// node dead with long resurrection backoff and hanging the request far past the timeout.
+		DisableRetry: true,
+		MaxRetries:   0,
+		// Disable the SDK's background cluster-health probe: it issues its own unbounded requests
+		// (a stalled server would keep a health goroutine hitting it), and the exporter doesn't
+		// need node health -- a bad endpoint simply surfaces as a bulk error the Uploader retries.
+		HealthCheckMaxRetries: -1,
 	}
 	if cfg.CACertFile != "" {
 		pem, err := os.ReadFile(cfg.CACertFile)
@@ -45,7 +67,11 @@ func NewOSBulkClient(cfg Config) (*osBulkClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opensearchsync: building OpenSearch client: %w", err)
 	}
-	return &osBulkClient{api: api}, nil
+	rt := time.Duration(cfg.RequestTimeout)
+	if rt <= 0 {
+		rt = DefaultRequestTimeout
+	}
+	return &osBulkClient{api: api, requestTimeout: rt}, nil
 }
 
 func resolvePassword(cfg Config) (string, error) {
@@ -65,6 +91,8 @@ func resolvePassword(cfg Config) (string, error) {
 
 // Bulk implements BulkClient.
 func (c *osBulkClient) Bulk(ctx context.Context, index string, ndjson []byte) (BulkOutcome, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
 	resp, err := c.api.Bulk(ctx, opensearchapi.BulkReq{Index: index, Body: bytes.NewReader(ndjson)})
 	if err != nil {
 		return BulkOutcome{}, err
@@ -98,6 +126,8 @@ func (c *osBulkClient) Bulk(ctx context.Context, index string, ndjson []byte) (B
 // touching or narrowing existing ones (mirroring adstash's setup_index). This keeps the index in
 // step as new attributes appear in the transform's tables, and is safe to call on every start.
 func (c *osBulkClient) EnsureIndex(ctx context.Context, index string) error {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
 	exists, err := c.api.Indices.Exists(ctx, opensearchapi.IndicesExistsReq{Indices: []string{index}})
 	if err == nil && exists.StatusCode == http.StatusOK {
 		return c.patchIndexMapping(ctx, index) // present (index or alias): add missing fields
