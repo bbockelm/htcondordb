@@ -106,8 +106,13 @@ type exporterSettings struct {
 	enabled       bool
 	kafkaBin      string
 	opensearchBin string
+	dropboxBin    string
 	runAsUser     string
-	pollInterval  time.Duration
+	// dropboxUser overrides runAsUser for the archive-dropbox kind: its export directory must not
+	// be world-/nobody-writable, so the dropbox exporter runs as a real service account (default
+	// "condor") rather than the unprivileged "nobody" the network-facing exporters use.
+	dropboxUser  string
+	pollInterval time.Duration
 	// livenessTimeout: a child whose status beat has not advanced within this window (and that has
 	// been running at least this long, to cover startup) is treated as wedged and restarted -- the
 	// safety net for a deadlocked-but-alive child the supervisor would otherwise never see exit.
@@ -149,14 +154,30 @@ func resolveExporterSettings(cfg *htconfig.Config) exporterSettings {
 	if s := configInt(cfg, "HTCONDORDB_EXPORTER_LIVENESS_SECONDS"); s > 0 {
 		live = time.Duration(s) * time.Second
 	}
+	dropboxUser := getStr(cfg, "HTCONDORDB_EXPORTER_DROPBOX_USER")
+	if dropboxUser == "" {
+		dropboxUser = "condor"
+	}
 	return exporterSettings{
 		enabled:         true,
 		kafkaBin:        getStr(cfg, "KAFKASYNC"),
 		opensearchBin:   getStr(cfg, "OPENSEARCHSYNC"),
+		dropboxBin:      getStr(cfg, "ARCHIVEDROPBOX"),
 		runAsUser:       runAs,
+		dropboxUser:     dropboxUser,
 		pollInterval:    poll,
 		livenessTimeout: live,
 	}
+}
+
+// userFor resolves the unprivileged user a given exporter kind runs as. The archive-dropbox kind
+// writes a local export directory (not a network endpoint), so it runs as a real service account;
+// every other kind runs as the shared unprivileged user.
+func (s exporterSettings) userFor(kind string) string {
+	if kind == "dropbox" {
+		return s.dropboxUser
+	}
+	return s.runAsUser
 }
 
 // truthy mirrors configBool's acceptance set for a value we read directly (default-on knob).
@@ -316,10 +337,11 @@ func (m *exporterManager) runOnce(ctx context.Context, s exporterSettings, name,
 		return err
 	}
 
-	// Launch the child as the unprivileged run-as user (default "nobody") via droppriv, which
-	// elevates only the forking thread across the fork and restores it -- the daemon never runs
-	// as root. Falls back to the daemon's own user when unprivileged.
-	if err := droppriv.StartAsUser(s.runAsUser, cmd); err != nil {
+	// Launch the child as its kind's run-as user (default "nobody"; "condor" for the archive
+	// dropbox, whose export directory must not be nobody-writable) via droppriv, which elevates
+	// only the forking thread across the fork and restores it -- the daemon never runs as root.
+	// Falls back to the daemon's own user when unprivileged.
+	if err := droppriv.StartAsUser(s.userFor(kind), cmd); err != nil {
 		return fmt.Errorf("starting %s: %w", bin, err)
 	}
 	m.markStart(name, kind)
@@ -462,6 +484,8 @@ func (s exporterSettings) binaryFor(kind string) string {
 		return resolveBinary(s.kafkaBin, "kafkasync")
 	case "opensearch":
 		return resolveBinary(s.opensearchBin, "opensearchsync")
+	case "dropbox":
+		return resolveBinary(s.dropboxBin, "archivedropbox")
 	default:
 		return ""
 	}
