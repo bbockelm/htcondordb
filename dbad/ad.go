@@ -50,7 +50,23 @@ type Input struct {
 	Tables       []TableStat
 	Capabilities Capabilities
 	Sources      []scheddsync.SyncStatus
+	Exporters    []ExporterStatus
 	Now          time.Time
+}
+
+// ExporterStatus is one change-data exporter's health as the daemon's exporter manager sees it:
+// what the daemon knows (running, restarts) plus the child's last-reported progress. It lets an
+// operator spot a stuck or falling-behind exporter from the collector ad.
+type ExporterStatus struct {
+	Name        string
+	Kind        string
+	Running     bool
+	Restarts    int
+	LastBeat    time.Time // the child's last status beat (zero if none seen yet)
+	DocsIndexed uint64
+	DocsSkipped uint64
+	InFlight    int
+	LastErr     string
 }
 
 // AddAttrs augments a daemon-produced base ad with the HTCondorDB-specific attributes: the
@@ -117,6 +133,30 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 			if !s.LastResync.IsZero() {
 				ad.InsertAttr(p+"LastResyncTime", s.LastResync.Unix())
 			}
+		}
+	}
+
+	// Per-exporter health (the daemon-managed change-data syncs). SecondsSinceBeat is the key
+	// "is it stuck / falling behind" signal.
+	ad.InsertAttr("NumExporters", int64(len(in.Exporters)))
+	for _, e := range in.Exporters {
+		p := "Exporter_" + sanitize(e.Name) + "_"
+		ad.InsertAttrString(p+"Kind", e.Kind)
+		ad.InsertAttrBool(p+"Running", e.Running)
+		ad.InsertAttr(p+"Restarts", int64(e.Restarts))
+		ad.InsertAttr(p+"DocsIndexed", int64(e.DocsIndexed))
+		ad.InsertAttr(p+"DocsSkipped", int64(e.DocsSkipped))
+		ad.InsertAttr(p+"InFlight", int64(e.InFlight))
+		if !e.LastBeat.IsZero() {
+			ad.InsertAttr(p+"LastBeatTime", e.LastBeat.Unix())
+			secs := int64(in.Now.Sub(e.LastBeat).Seconds())
+			if secs < 0 {
+				secs = 0
+			}
+			ad.InsertAttr(p+"SecondsSinceBeat", secs)
+		}
+		if e.LastErr != "" {
+			ad.InsertAttrString(p+"LastError", e.LastErr)
 		}
 	}
 }

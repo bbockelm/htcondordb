@@ -290,7 +290,7 @@ func run() error {
 	// MCP) discover this database and its command address here, and the ad doubles as a metrics
 	// sink carrying per-table storage gauges and per-source sync health -- scrapable via the
 	// collector even when the daemon's own /metrics endpoint is off.
-	startCollectorAdvertise(ctx, d, cfg, svc, advertisedAddr(d, ln), syncMgr.Sources)
+	startCollectorAdvertise(ctx, d, cfg, svc, advertisedAddr(d, ln), syncMgr.Sources, expMgr.Statuses)
 
 	// Start any background HA machinery (a follower's replicator, or the raft
 	// coordinator and its command handlers in consistent mode).
@@ -306,7 +306,7 @@ func run() error {
 	// but bind it to a trusted interface.
 	if addr := getStr(cfg, "HTCONDORDB_METRICS_ADDRESS"); addr != "" {
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", metrics.Handler(svc.Catalog()))
+		mux.Handle("/metrics", metrics.Handler(svc.Catalog(), syncMgr.Sources, expMgr.Statuses))
 		// pprof (opt-in via HTCONDORDB_ENABLE_PPROF): profiling endpoints on the same
 		// trusted listener, so a memory/CPU anomaly in a live daemon is one
 		// `go tool pprof http://.../debug/pprof/heap` away instead of a blind restart.
@@ -403,18 +403,18 @@ func encryptionConfig(cfg *config.Config) (poolKeys []db.KEK, attrs []string, er
 // explicitly disabled (HTCONDORDB_ADVERTISE=false). The ad carries the daemon's command
 // address for discovery plus per-table storage gauges and per-source sync health for
 // monitoring.
-func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, addr string, sourcesFunc func() []dbad.StatusSource) {
+func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, addr string, sourcesFunc func() []dbad.StatusSource, exportersFunc func() []dbad.ExporterStatus) {
 	if v := getStr(cfg, "HTCONDORDB_ADVERTISE"); strings.TrimSpace(v) != "" && !configBool(cfg, "HTCONDORDB_ADVERTISE") {
 		return // explicitly disabled
 	}
 	// The generic daemon.Advertise owns the whole cycle -- the base ad (PublishAd: identity,
 	// version, MonitorSelf*, <SUBSYS>_ATTRS), MyType, the sequence number, DAEMON_SHUTDOWN, the
 	// COLLECTOR_HOST list, the HTCONDORDB_UPDATE_INTERVAL cadence, and INVALIDATE-on-shutdown.
-	// dbad supplies only the HTCondorDB-specific attributes (table gauges, sync health,
+	// dbad supplies only the HTCondorDB-specific attributes (table gauges, sync + exporter health,
 	// capabilities, reachable address). It is a no-op when COLLECTOR_HOST is empty.
 	go d.Advertise(ctx, daemon.AdvertiseConfig{
 		MyType:  dbad.AdType,
-		Augment: dbad.Augment(svc.Catalog(), sourcesFunc, addr),
+		Augment: dbad.Augment(svc.Catalog(), sourcesFunc, exportersFunc, addr),
 		Logger:  d.Slog(),
 	})
 }

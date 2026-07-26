@@ -42,7 +42,7 @@ func TestHandlerExposesViewMetrics(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	Handler(cat).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	Handler(cat, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}

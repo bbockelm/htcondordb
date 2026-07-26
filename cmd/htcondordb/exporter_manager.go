@@ -19,6 +19,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/droppriv"
 
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/dbad"
 )
 
 // exporterCatalog is the slice of the catalog the manager needs: the registered exporters and
@@ -416,19 +417,28 @@ func (m *exporterManager) forgetRuntime(name string) {
 	delete(m.runtime, name)
 }
 
-// NamedExporterStatus is one exporter's runtime status with its name, for the ad + metrics.
-type NamedExporterStatus struct {
-	Name string
-	exporterRuntime
-}
-
-// Statuses returns a snapshot of every supervised exporter's status. Safe for concurrent use.
-func (m *exporterManager) Statuses() []NamedExporterStatus {
+// Statuses returns a snapshot of every supervised exporter's status, in the shape the collector
+// ad + Prometheus consume. Safe for concurrent use.
+func (m *exporterManager) Statuses() []dbad.ExporterStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]NamedExporterStatus, 0, len(m.runtime))
+	out := make([]dbad.ExporterStatus, 0, len(m.runtime))
 	for name, e := range m.runtime {
-		out = append(out, NamedExporterStatus{Name: name, exporterRuntime: *e})
+		var beat time.Time
+		if e.Status.Beat > 0 {
+			beat = time.Unix(e.Status.Beat, 0)
+		}
+		out = append(out, dbad.ExporterStatus{
+			Name:        name,
+			Kind:        e.Kind,
+			Running:     e.Running,
+			Restarts:    e.Restarts,
+			LastBeat:    beat,
+			DocsIndexed: e.Status.DocsIndexed,
+			DocsSkipped: e.Status.DocsSkipped,
+			InFlight:    e.Status.InFlight,
+			LastErr:     e.LastErr,
+		})
 	}
 	return out
 }

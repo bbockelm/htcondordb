@@ -26,23 +26,29 @@ type StatusSource interface {
 // myAddress is the daemon's authoritative reachable command address (covering the non-shared-port
 // fallback that PublishAd cannot know). sources is queried each cycle so a set that changes at
 // runtime (schedd-sync tailers restarted on reconfigure) is always current.
-func Augment(cat *db.Catalog, sources func() []StatusSource, myAddress string) func(*classad.ClassAd) {
+func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []ExporterStatus, myAddress string) func(*classad.ClassAd) {
 	return func(ad *classad.ClassAd) {
+		var exp []ExporterStatus
+		if exporters != nil {
+			exp = exporters()
+		}
 		AddAttrs(ad, Input{
 			MyAddress:    myAddress,
 			Tables:       CatalogTables(cat),
 			Capabilities: CatalogCapabilities(cat),
-			Sources:      liveStatuses(sources),
+			Sources:      LiveStatuses(sources),
+			Exporters:    exp,
 			Now:          time.Now(),
 		})
 	}
 }
 
-// liveStatuses snapshots each source's status, recomputing the lag against the LIVE file size:
+// LiveStatuses snapshots each source's status, recomputing the lag against the LIVE file size:
 // a syncer's own snapshot measures lag right after a poll drains to EOF, so it reads ~0; a
 // stalled syncer whose offset is frozen while the schedd keeps appending must instead show a
-// growing LagBytes, not a misleading zero.
-func liveStatuses(sources func() []StatusSource) []scheddsync.SyncStatus {
+// growing LagBytes, not a misleading zero. Shared by the collector ad and the Prometheus
+// exporter so both report the same live-lag numbers.
+func LiveStatuses(sources func() []StatusSource) []scheddsync.SyncStatus {
 	if sources == nil {
 		return nil
 	}

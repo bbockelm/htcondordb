@@ -16,6 +16,8 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
+
+	"github.com/bbockelm/htcondordb/dbad"
 )
 
 const namespace = "htcondordb"
@@ -219,15 +221,117 @@ func (c *viewCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
+// syncCollector emits schedd-sync tailer health (label: kind, source) and the daemon-managed
+// change-data exporter health (label: exporter, kind). Both are the "is anything falling behind"
+// signals an operator alerts on -- lag_bytes climbing or an exporter's last_beat going stale.
+// The source funcs are queried per scrape (an unchecked collector: Describe emits nothing) so a
+// set that changes at runtime -- tailers restarted on reconfigure, exporters added via dbrpc --
+// is always current.
+type syncCollector struct {
+	sources   func() []dbad.StatusSource
+	exporters func() []dbad.ExporterStatus
+
+	syncLag      *prometheus.Desc
+	syncCaughtUp *prometheus.Desc
+	syncFileSize *prometheus.Desc
+	syncOffset   *prometheus.Desc
+	syncLastTime *prometheus.Desc
+	syncResyncs  *prometheus.Desc
+	expUp        *prometheus.Desc
+	expRestarts  *prometheus.Desc
+	expIndexed   *prometheus.Desc
+	expSkipped   *prometheus.Desc
+	expInFlight  *prometheus.Desc
+	expLastBeat  *prometheus.Desc
+}
+
+func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus) *syncCollector {
+	sync := []string{"kind", "source"}
+	exp := []string{"exporter", "kind"}
+	return &syncCollector{
+		sources:   sources,
+		exporters: exporters,
+		syncLag: prometheus.NewDesc(namespace+"_sync_lag_bytes",
+			"Bytes the schedd-sync tailer is behind the source file (live: source size minus committed offset), by kind and source. A climbing value means the sync is falling behind.", sync, nil),
+		syncCaughtUp: prometheus.NewDesc(namespace+"_sync_caught_up",
+			"1 if the schedd-sync tailer has consumed the source file to EOF, else 0, by kind and source.", sync, nil),
+		syncFileSize: prometheus.NewDesc(namespace+"_sync_file_bytes",
+			"Current size of the source file the schedd-sync tailer is following, by kind and source.", sync, nil),
+		syncOffset: prometheus.NewDesc(namespace+"_sync_offset_bytes",
+			"Committed byte offset the schedd-sync tailer has durably consumed, by kind and source.", sync, nil),
+		syncLastTime: prometheus.NewDesc(namespace+"_sync_last_timestamp_seconds",
+			"Unix time of the schedd-sync tailer's last successful sync, by kind and source. Staleness (now minus this) flags a wedged tailer.", sync, nil),
+		syncResyncs: prometheus.NewDesc(namespace+"_sync_resyncs_total",
+			"Number of full resyncs the history tailer has performed (a gap/rotation was detected), by kind and source.", sync, nil),
+		expUp: prometheus.NewDesc(namespace+"_exporter_up",
+			"1 if the daemon-managed change-data exporter process is running, else 0, by exporter and kind.", exp, nil),
+		expRestarts: prometheus.NewDesc(namespace+"_exporter_restarts_total",
+			"Number of times the daemon has restarted this exporter (crash or wedged-liveness), by exporter and kind.", exp, nil),
+		expIndexed: prometheus.NewDesc(namespace+"_exporter_docs_indexed_total",
+			"Cumulative documents/records the exporter has delivered downstream, by exporter and kind.", exp, nil),
+		expSkipped: prometheus.NewDesc(namespace+"_exporter_docs_skipped_total",
+			"Cumulative documents/records the exporter dropped (untransformable), by exporter and kind.", exp, nil),
+		expInFlight: prometheus.NewDesc(namespace+"_exporter_in_flight",
+			"Documents/records the exporter has sent but not yet had acknowledged downstream, by exporter and kind.", exp, nil),
+		expLastBeat: prometheus.NewDesc(namespace+"_exporter_last_beat_timestamp_seconds",
+			"Unix time of the exporter's last liveness/progress beat, by exporter and kind. Staleness (now minus this) is what the daemon's liveness monitor restarts on.", exp, nil),
+	}
+}
+
+func (c *syncCollector) Describe(chan<- *prometheus.Desc) {}
+
+func (c *syncCollector) Collect(ch chan<- prometheus.Metric) {
+	if c.sources != nil {
+		for _, s := range dbad.LiveStatuses(c.sources) {
+			g := func(d *prometheus.Desc, v float64) {
+				ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, s.Kind, s.Source)
+			}
+			g(c.syncLag, float64(s.LagBytes))
+			g(c.syncCaughtUp, b2f(s.CaughtUp))
+			g(c.syncFileSize, float64(s.FileSize))
+			g(c.syncOffset, float64(s.Offset))
+			if !s.LastSync.IsZero() {
+				g(c.syncLastTime, float64(s.LastSync.Unix()))
+			}
+			ch <- prometheus.MustNewConstMetric(c.syncResyncs, prometheus.CounterValue, float64(s.Resyncs), s.Kind, s.Source)
+		}
+	}
+	if c.exporters != nil {
+		for _, e := range c.exporters() {
+			g := func(d *prometheus.Desc, v float64) {
+				ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, e.Name, e.Kind)
+			}
+			g(c.expUp, b2f(e.Running))
+			ch <- prometheus.MustNewConstMetric(c.expRestarts, prometheus.CounterValue, float64(e.Restarts), e.Name, e.Kind)
+			ch <- prometheus.MustNewConstMetric(c.expIndexed, prometheus.CounterValue, float64(e.DocsIndexed), e.Name, e.Kind)
+			ch <- prometheus.MustNewConstMetric(c.expSkipped, prometheus.CounterValue, float64(e.DocsSkipped), e.Name, e.Kind)
+			g(c.expInFlight, float64(e.InFlight))
+			if !e.LastBeat.IsZero() {
+				g(c.expLastBeat, float64(e.LastBeat.Unix()))
+			}
+		}
+	}
+}
+
+func b2f(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // Handler returns an http.Handler serving Prometheus metrics for the catalog: the
 // per-table storage gauges and operational timing counters above, the materialized-view
-// gauges, plus the standard Go runtime and process (RSS, open FDs, ...) collectors. It uses
-// a private registry so it can be mounted without global-registry collisions.
-func Handler(cat *db.Catalog) http.Handler {
+// gauges, the schedd-sync + exporter health gauges, plus the standard Go runtime and process
+// (RSS, open FDs, ...) collectors. sources and exporters may be nil (their metric families are
+// then simply absent). It uses a private registry so it can be mounted without global-registry
+// collisions.
+func Handler(cat *db.Catalog, sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus) http.Handler {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		newCatalogCollector(cat),
 		&viewCollector{cat: cat},
+		newSyncCollector(sources, exporters),
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
