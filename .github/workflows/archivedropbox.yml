@@ -1,0 +1,36 @@
+name: archivedropbox
+
+# Builds and unit-tests the archivedropbox exporter as a standalone module (GOWORK=off, i.e. how
+# it is built and shipped), using its tagged dependencies. Pure Go with no external service, so it
+# runs fast on every change to the module. Path-filtered so it only runs on relevant changes.
+on:
+  push:
+    branches: [main]
+    paths: ['archivedropbox/**', '.github/workflows/archivedropbox.yml']
+  pull_request:
+    paths: ['archivedropbox/**', '.github/workflows/archivedropbox.yml']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: archivedropbox
+
+jobs:
+  test:
+    name: Build + test (Go)
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off" # build/test the module standalone using tagged deps
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25'
+          cache-dependency-path: archivedropbox/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -s -l .)" || { gofmt -s -l .; exit 1; }
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test -race -count=1 ./...
