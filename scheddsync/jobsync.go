@@ -233,7 +233,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	beforeUsers := s.users.Keys()
 	beforeJobsets := s.jobsets.Keys()
 	beforeClusters := s.clusters.Keys()
-	seen := make(map[string]struct{}, len(beforeJobs))
+	seen := map[*db.DB]map[string]struct{}{}
 
 	if oerr := s.parser.Open(); oerr != nil {
 		return oerr
@@ -287,7 +287,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	}
 	// Chain proc ads to their cluster ads in a second pass: the cluster ad may be written
 	// after its procs in the log, so it is only guaranteed complete once every key is flushed.
-	if err = s.chainReconciledProcs(seen); err != nil {
+	if err = s.chainReconciledProcs(seen[s.target]); err != nil {
 		return err
 	}
 	// Sweep each namespace's table: delete the pre-reload keys the current log no longer contains.
@@ -298,7 +298,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 		{s.target, beforeJobs}, {s.users, beforeUsers},
 		{s.jobsets, beforeJobsets}, {s.clusters, beforeClusters},
 	} {
-		if err = s.sweepKeys(sw.table, sw.before, seen); err != nil {
+		if err = s.sweepKeys(sw.table, sw.before, seen[sw.table]); err != nil {
 			return err
 		}
 	}
@@ -380,23 +380,37 @@ func (s *JobSync) sweepKeys(table *db.DB, before []string, seen map[string]struc
 	return commit()
 }
 
-// reconciler applies a reconcile reload's log stream one key at a time. Because the schedd
-// writes each job's ops contiguously, it accumulates the current key's ad and, when the key
-// changes (or at end of stream), compares it against the table and writes only a real delta --
-// holding just one ad at a time. Writes are buffered into a transaction committed in bounded
-// batches. The op handling mirrors JobSync.applyEntry; keep the two in sync.
+// reconciler applies a reconcile reload's log stream. It accumulates the current key's run of
+// ops and, when the key changes (or at end of stream), writes it -- comparing against the table
+// and writing only a real delta, so an unchanged job produces no write (and no watch event).
+//
+// A live (appended-to) job_queue.log is NOT contiguous per key: a job's submission block is
+// early and its runtime updates (JobStatus 1->2, RemoteHost, lease renewals, ...) are appended
+// later, far from the submission block. So a key can appear in several non-adjacent runs. The
+// FIRST run establishes the ad (a full replace, clearing any stale pre-reconcile content); a
+// LATER run for the same key MERGES its sets/deletes onto the already-written ad (read back
+// through the batch transaction, which sees the earlier flush whether committed or still
+// buffered) rather than replacing it -- otherwise the reconstructed ad would collapse to only
+// the key's last run and every submission attribute would vanish. The op handling mirrors
+// JobSync.applyEntry; keep the two in sync.
 type reconciler struct {
 	jobs, users, jobsets, clusters *db.DB
-	seen                           map[string]struct{}
-	log                            *slog.Logger
+	// seen is PER TABLE: the keys given a live ad in each table this reconcile. It must not be a
+	// single global set -- a key legitimately routed to one table (e.g. an owner "0O.-1" in users)
+	// would then protect a stale, misrouted row under the SAME key in another table (a pre-routing
+	// "0O.-1" left in jobs) from the sweep, leaving undeletable cruft. Per-table, each table's
+	// sweep drops the keys the log did not route to THAT table.
+	seen map[*db.DB]map[string]struct{}
+	log  *slog.Logger
 
 	batches map[*db.DB]*db.Txn // one buffered transaction per table touched this batch
 	n       int
 
 	curKey   string
 	curAd    *classad.ClassAd
-	curTable *db.DB // the table curKey routes to; nil for a dropped namespace
-	destroy  bool   // the current key was destroyed within the log window
+	curDels  []string // attributes DeleteAttribute'd in the current run (for a merge-flush)
+	curTable *db.DB   // the table curKey routes to; nil for a dropped namespace
+	destroy  bool     // the current key was destroyed within the log window
 }
 
 func (r *reconciler) apply(e *classadlog.LogEntry) error {
@@ -408,12 +422,12 @@ func (r *reconciler) apply(e *classadlog.LogEntry) error {
 		if err := r.flush(); err != nil {
 			return err
 		}
-		r.curKey, r.curAd, r.destroy = e.Key, classad.New(), false
+		r.curKey, r.curAd, r.curDels, r.destroy = e.Key, classad.New(), nil, false
 		r.curTable = routeTable(e.Key, r.jobs, r.users, r.jobsets, r.clusters)
 	}
 	switch e.OpType {
 	case classadlog.OpNewClassAd:
-		r.curAd, r.destroy = classad.New(), false
+		r.curAd, r.curDels, r.destroy = classad.New(), nil, false
 		if e.MyType != "" && e.MyType != "(unknown)" {
 			r.curAd.InsertAttrString("MyType", e.MyType)
 		}
@@ -433,41 +447,93 @@ func (r *reconciler) apply(e *classadlog.LogEntry) error {
 		r.destroy = false
 	case classadlog.OpDeleteAttribute:
 		r.curAd.Delete(e.Name)
+		r.curDels = append(r.curDels, e.Name)
 	}
 	return nil
 }
 
-// flush finalizes the current key: it routes the key to its table, records it as seen (so that
-// table's sweep keeps it), and writes it only when the table lacks it or holds a different ad --
-// an unchanged job produces no write and therefore no watch event. A dropped namespace (the
-// schedd header, cluster-private ads, OCU ads) is discarded without touching any table.
+// flush finalizes the current key's run of ops. A dropped namespace (the schedd header,
+// cluster-private ads, OCU ads) is discarded without touching any table. The FIRST run of a key
+// this reconcile establishes its ad (a full replace, so stale pre-reconcile content and
+// attributes the log no longer sets are cleared); a LATER, non-contiguous run MERGES its sets and
+// deletes onto the already-written ad so the submission attributes survive. Writes go through the
+// per-table batch transaction, and an unchanged first run produces no write (hence no watch event).
 func (r *reconciler) flush() error {
-	if r.curKey == "" {
+	key, ad, dels, table, destroy := r.curKey, r.curAd, r.curDels, r.curTable, r.destroy
+	r.curKey, r.curAd, r.curDels, r.curTable, r.destroy = "", nil, nil, nil, false
+	if key == "" {
 		return nil
 	}
-	if r.curTable == nil {
-		r.curKey, r.curAd, r.destroy = "", nil, false
+	if table == nil {
 		return nil
 	}
-	r.seen[r.curKey] = struct{}{}
-	// Stamp the storage key (as applyEntry does) so the reconciled row is addressable by the
-	// REPL's key attribute. Stamped before the Equal check below, so an already-stamped stored
-	// ad reconciles as unchanged.
-	if !r.destroy {
-		r.curAd.InsertAttrString(KeyAttr, r.curKey)
-	}
-	cur, ok := r.curTable.LookupClassAd(r.curKey)
-	switch {
-	case r.destroy:
-		if ok {
-			r.batchTx(r.curTable).DestroyClassAd(r.curKey)
+	tableSeen := r.seenFor(table)
+
+	if destroy {
+		// Destroyed within the log window: remove it, and drop it from seen so the post-reconcile
+		// sweep does not treat it as live. (A key created and destroyed within the window that was
+		// never in the table is a no-op.)
+		delete(tableSeen, key)
+		tx := r.batchTx(table)
+		if _, ok := tx.LookupClassAd(key); ok {
+			tx.DestroyClassAd(key)
 			r.n++
 		}
-	case !ok || !cur.Equal(r.curAd):
-		r.batchTx(r.curTable).NewClassAd(r.curKey, r.curAd)
-		r.n++
+		return r.maybeCommit()
 	}
-	r.curKey, r.curAd, r.curTable, r.destroy = "", nil, nil, false
+
+	_, reappeared := tableSeen[key]
+	tableSeen[key] = struct{}{}
+	tx := r.batchTx(table)
+
+	if !reappeared {
+		// First run: establish the ad. Stamp the storage key (as applyEntry does) so the row is
+		// addressable by the REPL's key attribute; stamped before the Equal check so an
+		// already-stamped stored ad reconciles as unchanged (no spurious write/watch event).
+		ad.InsertAttrString(KeyAttr, key)
+		if cur, ok := tx.LookupClassAd(key); !ok || !cur.Equal(ad) {
+			tx.NewClassAd(key, ad)
+			r.n++
+		}
+		return r.maybeCommit()
+	}
+
+	// A later, non-contiguous run: merge this run's sets/deletes onto the ad already written this
+	// reconcile (read back through tx, which sees the earlier flush whether committed or buffered).
+	base, ok := tx.LookupClassAd(key)
+	if !ok {
+		// Defensive: the earlier flush found the ad unchanged AND the table had no row -- treat
+		// this run as the base.
+		ad.InsertAttrString(KeyAttr, key)
+		tx.NewClassAd(key, ad)
+		r.n++
+		return r.maybeCommit()
+	}
+	for _, name := range ad.GetAttributes() {
+		if expr, ok := ad.Lookup(name); ok {
+			base.InsertExpr(name, expr)
+		}
+	}
+	for _, name := range dels {
+		base.Delete(name)
+	}
+	tx.NewClassAd(key, base)
+	r.n++
+	return r.maybeCommit()
+}
+
+// seenFor returns (creating if needed) the per-table set of keys given a live ad this reconcile.
+func (r *reconciler) seenFor(table *db.DB) map[string]struct{} {
+	m := r.seen[table]
+	if m == nil {
+		m = map[string]struct{}{}
+		r.seen[table] = m
+	}
+	return m
+}
+
+// maybeCommit commits the buffered batch once it reaches the size threshold.
+func (r *reconciler) maybeCommit() error {
 	if r.n >= reconcileBatch {
 		return r.commit()
 	}
