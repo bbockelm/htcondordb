@@ -84,7 +84,17 @@ type JobSync struct {
 
 	// status holds the latest published SyncStatus snapshot, read lock-free by Status().
 	status atomic.Pointer[SyncStatus]
+
+	// resyncReq, when set (via Resync), makes the next Poll rebuild the mirror from the current
+	// log with reconcileReload. It heals a table corrupted by an older sync without truncating
+	// (reconcile writes only real deltas), so live consumers see the corrected rows, not a blink.
+	resyncReq atomic.Bool
 }
+
+// Resync requests that the next Poll rebuild the mirror from the current job_queue.log
+// (reconcileReload). Non-destructive: it re-reads the source and writes only real deltas, so it
+// heals rows a prior sync corrupted without wiping the table. Safe to call from another goroutine.
+func (s *JobSync) Resync() { s.resyncReq.Store(true) }
 
 // reconcileBatch bounds how many buffered writes a reconciling reload commits at once, so a
 // large compaction never holds the whole delta in one transaction.
@@ -183,6 +193,12 @@ func (s *JobSync) Poll(ctx context.Context) error {
 			return err
 		}
 		s.restored = true
+	}
+	// An operator-requested resync rebuilds the mirror from the current log (heals corruption
+	// without truncating). Consume the request before probing so it runs exactly once.
+	if s.resyncReq.Swap(false) {
+		s.log.Info("scheddsync: job resync requested; rebuilding jobs mirror from the current log")
+		return s.reconcileReload(ctx)
 	}
 	// Detect rotation/compaction independently of the size-based prober: if the path now
 	// names a different inode than the file we last read, the schedd replaced the log (a

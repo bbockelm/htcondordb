@@ -143,6 +143,8 @@ func run() error {
 		// endpoint, following leader redirects. Reads still use the dbrpc session.
 		execCfg.ApplyBatch = consistentWriter(ctx, cfg, addr)
 	}
+	// `.resync <target>` reaches the daemon's sync managers over the DBSyncControl command.
+	execCfg.Resync = syncControlClient(ctx, cfg, addr)
 	exec := repl.NewExecutor(dbc, execCfg)
 
 	// One-shot mode: -e, or statements passed as arguments.
@@ -567,6 +569,49 @@ func quoteClassAd(s string) string {
 	}
 	sb.WriteByte('"')
 	return sb.String()
+}
+
+// syncControlClient builds a repl.Resync that asks the daemon to re-read/re-export a sync source
+// from the start, over the DBSyncControl command. It targets the connected daemon (the one running
+// the sync), sends a {Action=resync, Target} ClassAd, and surfaces the server's error, if any.
+func syncControlClient(ctx context.Context, cfg *config.Config, addr string) func(string) error {
+	return func(target string) error {
+		sec, err := htcondor.GetSecurityConfig(cfg, command.DBSyncControl, "CLIENT")
+		if err != nil {
+			return err
+		}
+		sec.Command = command.DBSyncControl
+		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		cl, err := cedarclient.ConnectAndAuthenticate(dctx, addr, sec)
+		if err != nil {
+			return fmt.Errorf("connecting to %s: %w", addr, err)
+		}
+		defer func() { _ = cl.Close() }()
+		s := cl.GetStream()
+		req := classad.New()
+		req.InsertAttrString("Action", "resync")
+		req.InsertAttrString("Target", target)
+		out := message.NewMessageForStream(s)
+		if err := out.PutClassAd(dctx, req); err != nil {
+			return err
+		}
+		if err := out.FinishMessage(dctx); err != nil {
+			return err
+		}
+		respAd, err := message.NewMessageFromStream(s).GetClassAd(dctx)
+		if err != nil {
+			return err
+		}
+		if ok, _ := respAd.EvaluateAttrBool("Ok"); !ok {
+			msg, _ := respAd.EvaluateAttrString("Error")
+			if msg == "" {
+				msg = "resync failed"
+			}
+			return fmt.Errorf("%s", msg)
+		}
+		return nil
+	}
 }
 
 // consistentWriter builds a repl.ApplyBatch that submits write batches to the

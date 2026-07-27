@@ -37,6 +37,19 @@ func (c *fakeCatalog) LoadExporterState(name string) ([]byte, bool, error) {
 	b, ok := c.state[name]
 	return b, ok, nil
 }
+func (c *fakeCatalog) SaveExporterState(name string, state []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == nil {
+		c.state = map[string][]byte{}
+	}
+	if state == nil {
+		delete(c.state, name)
+	} else {
+		c.state[name] = append([]byte(nil), state...)
+	}
+	return nil
+}
 
 func waitForFile(t *testing.T, path string, d time.Duration) {
 	t.Helper()

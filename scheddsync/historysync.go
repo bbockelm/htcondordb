@@ -73,7 +73,18 @@ type HistorySync struct {
 	resyncs    int64
 	lastResync time.Time
 	status     atomic.Pointer[SyncStatus]
+
+	// resyncReq, when set (via Resync), makes the next Poll re-read the current history file from
+	// its head, deduping against the archive -- so anything the archive is missing is back-filled
+	// without duplicating or dropping the records it already retains (the archive commonly keeps
+	// far more than the aggressively-rotated history files still hold).
+	resyncReq atomic.Bool
 }
+
+// Resync requests that the next Poll re-read the current history file from its head, deduping
+// against the archive (missing records are appended; the archive's richer retained set is kept).
+// Distinct from a `.truncate history` wipe. Safe to call from another goroutine.
+func (s *HistorySync) Resync() { s.resyncReq.Store(true) }
 
 // ResyncEvent reports that a durability gap was detected on restart: the history file the
 // syncer was last reading has rotated out of retention entirely, so any completed jobs that
@@ -152,6 +163,11 @@ func (s *HistorySync) Poll(ctx context.Context) error {
 			return err
 		}
 		s.started = true
+	} else if s.resyncReq.Swap(false) {
+		// Operator-requested resync: re-read the current file from the head, keeping dedup so the
+		// archive's retained records survive and only missing ones are back-filled.
+		s.log.Info("scheddsync: history resync requested; re-reading history file from the start (dedup against the archive)", "file", s.filename)
+		s.rewindToHead(true)
 	} else if s.archive.Count() == 0 && s.lastArchiveCount > 0 {
 		// The archive was emptied under a live syncer -- an admin `.truncate history`
 		// (from-scratch re-sync) or a manual wipe -- while our read position is well past the
@@ -195,8 +211,18 @@ func (s *HistorySync) Poll(ctx context.Context) error {
 // a fresh start would behave).
 func (s *HistorySync) resyncFromTruncate() {
 	s.log.Warn("scheddsync: history archive emptied under the syncer; re-reading history from the start", "file", s.filename)
-	s.dedup = false // the archive is empty: nothing to dedup against
-	s.lastArchiveCount = 0
+	s.rewindToHead(false) // the archive is empty: nothing to dedup against
+}
+
+// rewindToHead resets the reader to the head of the current history file so the next drain
+// re-reads it from the start. dedup controls whether records the archive already holds are
+// skipped: true for an operator resync (the archive commonly retains more than the shrinking
+// history files, so keep it and only back-fill what is missing), false when the archive was
+// emptied. It also rewinds the durable resume position to the head so a crash mid-re-read still
+// restarts there (rotated-away files are not back-filled, exactly as a fresh start would behave).
+func (s *HistorySync) rewindToHead(dedup bool) {
+	s.dedup = dedup
+	s.lastArchiveCount = s.archive.Count()
 	if s.file != nil {
 		// Persist a resume point at the file head before dropping the handle, then reopen from
 		// the head on the next Poll (s.file == nil path).
