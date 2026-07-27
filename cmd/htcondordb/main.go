@@ -286,6 +286,12 @@ func run() error {
 		}
 	})
 
+	// Administrative sync control (DBSyncControl): let an operator resync a schedd-sync tailer
+	// (jobs/history) or a managed exporter without a restart -- e.g. `.resync jobs` to heal a
+	// mirror from the current log, or `.resync <exporter>` to re-export from the start. Registered
+	// in every mode (unlike the HA-only DBControl).
+	registerSyncControl(srv, syncMgr, expMgr)
+
 	// Advertise a discovery/monitoring ClassAd to the collector: agents (and the htcondor-api
 	// MCP) discover this database and its command address here, and the ad doubles as a metrics
 	// sink carrying per-table storage gauges and per-source sync health -- scrapable via the

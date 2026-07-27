@@ -77,10 +77,30 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.showExporters(console)
 	case ".exporter":
 		s.showExporter(console, arg)
+	case ".resync":
+		s.resync(console, arg)
 	default:
 		return false
 	}
 	return true
+}
+
+// resync asks the daemon to re-read/re-export a sync source from the start: a schedd-sync tailer
+// ("jobs" heals the mirror from the current job_queue.log; "history" re-reads the history file,
+// deduping against the archive) or a managed exporter by name (re-export from the start). Unlike
+// `.truncate`, it is non-destructive -- it never wipes the target, only re-reads the source and
+// writes real deltas. DAEMON-authorized; delivered over the DBSyncControl command.
+func (s *session) resync(console io.Writer, arg string) {
+	target := strings.TrimSpace(arg)
+	if target == "" {
+		fmt.Fprintln(console, "usage: .resync <jobs|history|exporter-name>   (re-read/re-export a sync source from the start; non-destructive)")
+		return
+	}
+	if err := s.exec.Resync(target); err != nil {
+		fmt.Fprintln(console, "error:", err.Error())
+		return
+	}
+	fmt.Fprintf(console, "resync requested for %q\n", target)
 }
 
 // timeTravel handles ".timetravel on <window> [checkpoint] | off" for the current

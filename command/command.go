@@ -35,4 +35,10 @@ const (
 	// registration of the first N daemon-level peers. DAEMON-level for
 	// mutating operations; leader lookup is READ.
 	DBControl = Base + 3 // 74003
+
+	// DBSyncControl carries administrative control of the daemon's sync sources -- the
+	// schedd-sync tailers (jobs/history) and the managed change-data exporters -- via a ClassAd
+	// request/response protocol. Currently: resync a source (re-read/re-export from the start).
+	// DAEMON-level; registered in every mode (not just HA).
+	DBSyncControl = Base + 4 // 74004
 )

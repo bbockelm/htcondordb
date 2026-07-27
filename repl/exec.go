@@ -41,6 +41,11 @@ type ExecConfig struct {
 	// proposes the batch to raft and follows leader redirects). Reads still use
 	// the dbrpc client. When nil, writes commit locally over dbrpc.
 	ApplyBatch func([]WriteOp) error
+
+	// Resync, if set, backs the `.resync <target>` command: it asks the daemon to re-read/re-export
+	// a sync source (a schedd-sync tailer "jobs"/"history", or an exporter by name) from the start.
+	// The CLI wires it to a DBSyncControl dial. When nil, `.resync` reports it is unavailable.
+	Resync func(target string) error
 }
 
 // WriteKind identifies a mutation in a write batch.
@@ -69,6 +74,7 @@ type Executor struct {
 	keyAttr    string
 	genKey     func() string
 	applyBatch func([]WriteOp) error
+	resync     func(target string) error
 
 	// archives caches the set of append-only (history) table names, so a SELECT can be routed
 	// to the archive query path -- archives are not mutable tables and the regular query op
@@ -106,7 +112,16 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync}
+}
+
+// Resync asks the daemon to re-read/re-export the named sync source ("jobs", "history", or an
+// exporter name) from the start. Returns an error if no resync transport is configured.
+func (e *Executor) Resync(target string) error {
+	if e.resync == nil {
+		return fmt.Errorf("resync is not available in this session")
+	}
+	return e.resync(target)
 }
 
 // commit applies a batch of write ops to table: through ApplyBatch (consistent

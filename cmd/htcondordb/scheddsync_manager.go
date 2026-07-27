@@ -27,11 +27,39 @@ type scheddSyncManager struct {
 	svc    *server.Service
 	logger *slog.Logger
 
-	mu      sync.Mutex
-	cancel  context.CancelFunc  // cancels the running tailers; nil when stopped
-	done    chan struct{}       // closed once the running tailers have exited
-	current scheddSyncSettings  // settings the running tailers were started with
-	sources []dbad.StatusSource // live sources for the collector ad
+	mu        sync.Mutex
+	cancel    context.CancelFunc  // cancels the running tailers; nil when stopped
+	done      chan struct{}       // closed once the running tailers have exited
+	current   scheddSyncSettings  // settings the running tailers were started with
+	sources   []dbad.StatusSource // live sources for the collector ad
+	resyncers map[string]resyncer // "jobs"/"history" -> the running tailer, for on-demand resync
+}
+
+// resyncer is a running sync a caller can ask to re-read its source from scratch.
+type resyncer interface{ Resync() }
+
+// Resync asks the named tailer ("jobs" or "history") to re-read its source non-destructively on
+// its next poll. It errors if schedd-sync is disabled or the target is unknown.
+func (m *scheddSyncManager) Resync(target string) error {
+	m.mu.Lock()
+	r, ok := m.resyncers[target]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no such schedd-sync target %q (want jobs or history, and it must be enabled)", target)
+	}
+	r.Resync()
+	return nil
+}
+
+// ResyncTargets returns the currently-resyncable schedd-sync targets (for validation/help).
+func (m *scheddSyncManager) ResyncTargets() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.resyncers))
+	for name := range m.resyncers {
+		out = append(out, name)
+	}
+	return out
 }
 
 // scheddSyncSettings is the resolved, comparable configuration of the tailers.
@@ -95,6 +123,7 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 		m.done = nil
 	}
 	m.sources = nil
+	m.resyncers = nil
 	m.current = scheddSyncSettings{}
 
 	if !next.enabled {
@@ -102,7 +131,7 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 	}
 
 	ctx, cancel := context.WithCancel(m.parent)
-	sources, done, err := m.launch(ctx, next)
+	sources, resyncers, done, err := m.launch(ctx, next)
 	if err != nil {
 		cancel()
 		return err
@@ -110,13 +139,14 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 	m.cancel = cancel
 	m.done = done
 	m.sources = sources
+	m.resyncers = resyncers
 	m.current = next
 	return nil
 }
 
 // launch starts the tailers for settings s under ctx and returns their live
 // status sources plus a channel closed when all of them have exited.
-func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([]dbad.StatusSource, chan struct{}, error) {
+func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([]dbad.StatusSource, map[string]resyncer, chan struct{}, error) {
 	syncStore := func(name string) scheddsync.PositionStore {
 		if s.posDir == "" {
 			return nil
@@ -124,6 +154,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		return &scheddsync.FileStore{Path: filepath.Join(s.posDir, "scheddsync", name)}
 	}
 	var sources []dbad.StatusSource
+	resyncers := map[string]resyncer{}
 	var wg sync.WaitGroup
 
 	if s.jobLog != "" {
@@ -132,19 +163,19 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// user/owner records -> users. CreateTable is idempotent (returns the existing table).
 		jobs, err := m.svc.Catalog().CreateTable("jobs")
 		if err != nil {
-			return nil, nil, fmt.Errorf("schedd-sync: creating jobs table: %w", err)
+			return nil, nil, nil, fmt.Errorf("schedd-sync: creating jobs table: %w", err)
 		}
 		users, err := m.svc.Catalog().CreateTable("users")
 		if err != nil {
-			return nil, nil, fmt.Errorf("schedd-sync: creating users table: %w", err)
+			return nil, nil, nil, fmt.Errorf("schedd-sync: creating users table: %w", err)
 		}
 		jobsets, err := m.svc.Catalog().CreateTable("jobsets")
 		if err != nil {
-			return nil, nil, fmt.Errorf("schedd-sync: creating jobsets table: %w", err)
+			return nil, nil, nil, fmt.Errorf("schedd-sync: creating jobsets table: %w", err)
 		}
 		clusters, err := m.svc.Catalog().CreateTable("clusters")
 		if err != nil {
-			return nil, nil, fmt.Errorf("schedd-sync: creating clusters table: %w", err)
+			return nil, nil, nil, fmt.Errorf("schedd-sync: creating clusters table: %w", err)
 		}
 		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{
 			Filename: s.jobLog, Logger: m.logger, Store: syncStore("jobs.pos"),
@@ -153,6 +184,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		wg.Add(1)
 		go func() { defer wg.Done(); _ = js.Run(ctx) }()
 		sources = append(sources, js)
+		resyncers["jobs"] = js
 		m.logger.Info("schedd-sync: mirroring job_queue.log", "file", s.jobLog,
 			"tables", "jobs,users,jobsets,clusters")
 	}
@@ -165,7 +197,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			ZoneAttrs: []string{"CompletionDate", scheddsync.EnteredHistoryAttr},
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("schedd-sync: creating history archive: %w", err)
+			return nil, nil, nil, fmt.Errorf("schedd-sync: creating history archive: %w", err)
 		}
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
 			Filename: s.histFile,
@@ -179,10 +211,11 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		wg.Add(1)
 		go func() { defer wg.Done(); _ = hs.Run(ctx) }()
 		sources = append(sources, hs)
+		resyncers["history"] = hs
 		m.logger.Info("schedd-sync: tailing history file", "file", s.histFile, "archive", "history")
 	}
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
-	return sources, done, nil
+	return sources, resyncers, done, nil
 }

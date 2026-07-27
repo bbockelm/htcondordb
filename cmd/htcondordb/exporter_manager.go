@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -28,6 +29,7 @@ import (
 type exporterCatalog interface {
 	Exporters() []db.ExporterDef
 	LoadExporterState(name string) ([]byte, bool, error)
+	SaveExporterState(name string, state []byte) error
 }
 
 // childStatus is the live health/progress an exporter child writes into its durable state (the
@@ -96,6 +98,12 @@ type exporterRuntime struct {
 	LastExit  time.Time
 	LastErr   string
 	Status    childStatus // last status read from the child's durable state
+
+	// cancelChild cancels the currently-running child (nil when none). resetReq marks that an
+	// operator asked to reset this exporter: the supervisor clears its cursor after the child exits
+	// so the next launch re-exports from the start.
+	cancelChild context.CancelFunc
+	resetReq    bool
 }
 
 // exporterSettings is the resolved, comparable configuration of the manager. The per-Kind
@@ -117,11 +125,15 @@ type exporterSettings struct {
 	// been running at least this long, to cover startup) is treated as wedged and restarted -- the
 	// safety net for a deadlocked-but-alive child the supervisor would otherwise never see exit.
 	livenessTimeout time.Duration
+	// gracefulTimeout: on stop (reconfigure, shutdown, resync) the child is first sent SIGTERM so it
+	// can drain in-flight work, then SIGKILL if it has not exited within this window.
+	gracefulTimeout time.Duration
 }
 
 const (
-	defaultExporterPoll    = 30 * time.Second
-	defaultLivenessTimeout = 90 * time.Second
+	defaultExporterPoll     = 30 * time.Second
+	defaultLivenessTimeout  = 90 * time.Second
+	defaultGracefulShutdown = 30 * time.Second
 )
 
 // livenessCheckInterval picks how often to poll a child's beat: often enough relative to the
@@ -154,6 +166,10 @@ func resolveExporterSettings(cfg *htconfig.Config) exporterSettings {
 	if s := configInt(cfg, "HTCONDORDB_EXPORTER_LIVENESS_SECONDS"); s > 0 {
 		live = time.Duration(s) * time.Second
 	}
+	grace := defaultGracefulShutdown
+	if s := configInt(cfg, "HTCONDORDB_EXPORTER_SHUTDOWN_SECONDS"); s > 0 {
+		grace = time.Duration(s) * time.Second
+	}
 	dropboxUser := getStr(cfg, "HTCONDORDB_EXPORTER_DROPBOX_USER")
 	if dropboxUser == "" {
 		dropboxUser = "condor"
@@ -167,6 +183,7 @@ func resolveExporterSettings(cfg *htconfig.Config) exporterSettings {
 		dropboxUser:     dropboxUser,
 		pollInterval:    poll,
 		livenessTimeout: live,
+		gracefulTimeout: grace,
 	}
 }
 
@@ -288,6 +305,14 @@ func (m *exporterManager) supervise(ctx context.Context, s exporterSettings, nam
 		if ctx.Err() != nil {
 			return
 		}
+		// Operator resync: the child has now exited (gracefully, via Resync's cancel), so its
+		// cursor is safe to clear -- the next launch then re-exports from the start. Restart
+		// promptly (no backoff penalty for a deliberate reset).
+		if m.consumeReset(name) {
+			m.clearExporterState(name)
+			backoff = time.Second
+			continue
+		}
 		// A run that stayed up a while resets the backoff.
 		if time.Since(start) >= maxBackoff {
 			backoff = time.Second
@@ -320,13 +345,30 @@ func (m *exporterManager) runOnce(ctx context.Context, s exporterSettings, name,
 	}
 	defer security.GetSessionCache().Invalidate(sid)
 
-	// A child-scoped context so the liveness monitor can kill a wedged child (which exec.Cmd
-	// with this context terminates), triggering the supervisor's restart.
+	// A child-scoped context so the liveness monitor (and an operator Resync) can kill a wedged or
+	// to-be-reset child (which exec.Cmd with this context terminates), triggering the supervisor's
+	// restart. Publish it so Resync can reach the running child, and clear it on exit.
 	childCtx, cancelChild := context.WithCancel(ctx)
 	defer cancelChild()
+	m.setChildCancel(name, cancelChild)
+	defer m.setChildCancel(name, nil)
 
 	cmd := exec.CommandContext(childCtx, bin, "run", "-name", name, "-addr", m.daemonAddr)
 	cmd.Env = append(os.Environ(), security.EnvCondorPrivateInherit+"="+token)
+	// Graceful stop: on childCtx cancel (reconfigure, shutdown, liveness kill, resync) send SIGTERM
+	// so the child drains in-flight work, then SIGKILL if it does not exit within gracefulTimeout.
+	// The exporter binaries install a SIGTERM handler that cancels their run loop and drains.
+	grace := s.gracefulTimeout
+	if grace <= 0 {
+		grace = defaultGracefulShutdown
+	}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = grace
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -437,6 +479,68 @@ func (m *exporterManager) forgetRuntime(name string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.runtime, name)
+}
+
+// setChildCancel publishes (or clears, with nil) the cancel func of name's currently-running child.
+func (m *exporterManager) setChildCancel(name string, fn context.CancelFunc) {
+	m.mu.Lock()
+	m.rt(name).cancelChild = fn
+	m.mu.Unlock()
+}
+
+// consumeReset reports (and clears) whether an operator requested a reset for name.
+func (m *exporterManager) consumeReset(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rt := m.runtime[name]; rt != nil && rt.resetReq {
+		rt.resetReq = false
+		return true
+	}
+	return false
+}
+
+// clearExporterState wipes an exporter's durable cursor so its next launch re-exports from the
+// start. Called from the supervisor only after the child has exited, so the child cannot re-write
+// the cursor after the clear.
+func (m *exporterManager) clearExporterState(name string) {
+	if err := m.catalog.SaveExporterState(name, nil); err != nil {
+		m.logger.Warn("exporter manager: clearing exporter cursor for resync failed", "name", name, "err", err.Error())
+		return
+	}
+	m.logger.Info("exporter manager: resync -- cleared cursor; re-exporting from the start", "name", name)
+}
+
+// Resync asks a managed exporter to re-export from the start: it gracefully stops the running
+// child (SIGTERM, then the supervisor clears the cursor once it exits and relaunches). It errors
+// if the exporter is not managed by this daemon.
+func (m *exporterManager) Resync(name string) error {
+	m.mu.Lock()
+	rt := m.runtime[name]
+	if rt == nil {
+		m.mu.Unlock()
+		return fmt.Errorf("no such managed exporter %q (is it registered and managed by this daemon?)", name)
+	}
+	rt.resetReq = true
+	cancel := rt.cancelChild
+	m.mu.Unlock()
+	// Stop the current child gracefully; the supervisor then clears the cursor and relaunches. If
+	// no child is running (between backoffs), the pending reset is honored at the next launch.
+	if cancel != nil {
+		cancel()
+	}
+	m.logger.Info("exporter manager: resync requested", "name", name)
+	return nil
+}
+
+// ManagedExporters lists the exporter names this daemon currently tracks (for validation/help).
+func (m *exporterManager) ManagedExporters() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.runtime))
+	for name := range m.runtime {
+		out = append(out, name)
+	}
+	return out
 }
 
 // Statuses returns a snapshot of every supervised exporter's status, in the shape the collector
