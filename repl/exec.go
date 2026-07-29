@@ -1529,23 +1529,13 @@ func (e *Executor) execDelete(st *Statement) (*Result, error) {
 	return &Result{Affected: len(keys), Note: fmt.Sprintf("DELETE %d", len(keys))}, nil
 }
 
-// matchedKeys returns the primary keys of every row matching where, recovered
-// from the key attribute. It errors if a matched row lacks the key attribute
-// (UPDATE/DELETE cannot address it).
+// matchedKeys returns the real storage keys of every row matching where, resolved server-side
+// (dbrpc QueryKeys) rather than read from a self-reported key attribute on each ad. This is what
+// lets UPDATE/DELETE address rows that carry no "Key" attribute -- crufty Owner/User records, or
+// rows written before key-stamping -- which the old attribute-recovery path could not target. It
+// also avoids fetching every matching ad just to read one attribute.
 func (e *Executor) matchedKeys(table, where string) ([]string, error) {
-	ads, err := e.queryAds(table, where, 0) // UPDATE/DELETE act on every matching row
-	if err != nil {
-		return nil, err
-	}
-	keys := make([]string, 0, len(ads))
-	for _, ad := range ads {
-		v := ad.EvaluateAttr(e.keyAttr)
-		if v.IsUndefined() || v.IsError() {
-			return nil, fmt.Errorf("a matched row has no %q attribute; cannot address it for UPDATE/DELETE", e.keyAttr)
-		}
-		keys = append(keys, keyString(v))
-	}
-	return keys, nil
+	return e.c.QueryKeysTable(context.Background(), table, constraint(where)) // UPDATE/DELETE act on every matching row
 }
 
 // --- value helpers ---
