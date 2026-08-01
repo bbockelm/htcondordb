@@ -239,14 +239,15 @@ func (s *session) showArchiveIndexes(w io.Writer, d *dbrpc.Diagnostics) {
 	if d.SealedSegments > 0 {
 		fmt.Fprintf(w, "sealed segments: %d", d.SealedSegments)
 		if d.StaleIndexSegments > 0 {
-			// A sealed segment's sidecar is immutable, so .addindex/.dropindex reach only
-			// segments sealed afterwards. Say what to run rather than leaving the operator
-			// to wonder why the new index did not help.
-			fmt.Fprintf(w, " (%d still on a previous index set -- run .rewrite to rebuild them)", d.StaleIndexSegments)
+			// .addindex/.dropindex rebuild every sealed segment's sidecar as they go, so a
+			// leftover count means some rebuild did not complete. Say what to run rather
+			// than leaving the operator to wonder why the new index did not help.
+			fmt.Fprintf(w, " (%d still on a previous index set -- run .reindex to rebuild them)", d.StaleIndexSegments)
 		}
 		fmt.Fprintln(w)
 	}
-	fmt.Fprintln(w, "manage: .addindex <table> value|categorical <attr>...  |  .dropindex <table> <attr>...  |  .rewrite <table>")
+	fmt.Fprintln(w, "manage: .addindex <table> value|categorical <attr>...  |  .dropindex <table> <attr>...  |  .reindex <table>")
+	fmt.Fprintln(w, "  an index change rebuilds each segment's index sidecar in place; segment data is not rewritten")
 }
 
 func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
