@@ -579,17 +579,18 @@ func (s *session) explain(console io.Writer, arg string) {
 				sel = fmt.Sprintf("  est ~%.1f%% (~%d of %d)",
 					p.Selectivity*100, p.EstCandidates, ex.TotalAds)
 			}
-			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s%s\n", p.Attr, p.Op, state, kind, sel, bandNote(p))
+			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s%s\n", p.Attr, p.Op, state, kind, sel, mergeNote(p))
 		}
 	}
 }
 
-// bandNote marks a range conjunct the planner merged with the opposite bound on the same
-// attribute into one two-sided index probe. The selectivity printed beside it is the band's,
-// so without the note it would look implausibly low for a lone `>` or `<`.
-func bandNote(p db.ProbeExplain) string {
-	if p.Banded {
-		return "  [banded with the opposite bound]"
+// mergeNote marks a range conjunct the planner folded into another probe on the same
+// attribute -- the opposite bound, or a tighter same-side bound that subsumes it. The
+// selectivity printed beside it belongs to the merged probe, so without the note it would
+// look wrong for the conjunct as written.
+func mergeNote(p db.ProbeExplain) string {
+	if p.Coalesced {
+		return "  [merged with another bound on this attribute]"
 	}
 	return ""
 }
@@ -640,7 +641,7 @@ func (s *session) explainMatch(console io.Writer, arg string) {
 				sel = fmt.Sprintf("  est ~%.1f%% (~%d of %d)",
 					p.Selectivity*100, p.EstCandidates, ex.TotalResources)
 			}
-			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s%s\n", p.Attr, p.Op, state, kind, sel, bandNote(p))
+			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s%s\n", p.Attr, p.Op, state, kind, sel, mergeNote(p))
 		}
 	}
 	if len(ex.EvalOrder) > 0 {
