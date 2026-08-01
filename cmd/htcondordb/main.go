@@ -286,6 +286,23 @@ func run() error {
 		}
 	})
 
+	// Native-CEDAR fan-in replicators (cedarsync): mirror configured source htcondordbs'
+	// tables/archives into local targets, selectively and Src-stamped, over a normal DBSession.
+	// Reapplied on reconfigure. Off unless HTCONDORDB_REPLICATE_SOURCES is set.
+	cedarMgr := &cedarSyncManager{parent: ctx, cat: svc.Catalog(), logger: d.Slog()}
+	if cerr := cedarMgr.apply(cfg); cerr != nil {
+		return cerr
+	}
+	d.OnReconfig(func(newCfg *config.Config) {
+		if cerr := cedarMgr.apply(newCfg); cerr != nil {
+			log.Error(logging.DestinationGeneral, "reconfigure: cedar-sync not reapplied", "err", cerr.Error())
+		}
+	})
+
+	// Serve the transport-neutral HTTP/SSE change feed for external, non-CEDAR sinks (opt-in via
+	// HTCONDORDB_CHANGEFEED_ADDRESS, token-gated). No-op when unset.
+	startChangeFeed(ctx, d, cfg, svc)
+
 	// Administrative sync control (DBSyncControl): let an operator resync a schedd-sync tailer
 	// (jobs/history) or a managed exporter without a restart -- e.g. `.resync jobs` to heal a
 	// mirror from the current log, or `.resync <exporter>` to re-export from the start. Registered
