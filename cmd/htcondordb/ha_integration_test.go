@@ -107,6 +107,13 @@ HTCONDORDB_ADDRESS_FILE = %s
 // startNode starts the daemon binary with the given config, capturing its stderr, and
 // returns its advertised address once the address file is written.
 func startNode(t *testing.T, bin, dir, cfgPath string) string {
+	addr, _ := startNodeCmd(t, bin, dir, cfgPath)
+	return addr
+}
+
+// startNodeCmd is startNode but also returns the running process, so a caller can signal it
+// (e.g. SIGHUP to reconfigure).
+func startNodeCmd(t *testing.T, bin, dir, cfgPath string) (string, *exec.Cmd) {
 	t.Helper()
 	logFile, err := os.Create(filepath.Join(dir, "stderr.log"))
 	if err != nil {
@@ -139,7 +146,7 @@ func startNode(t *testing.T, bin, dir, cfgPath string) string {
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if b, err := os.ReadFile(addrPath); err == nil && len(strings.TrimSpace(string(b))) > 0 {
-			return strings.TrimSpace(string(b))
+			return strings.TrimSpace(string(b)), cmd
 		}
 		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
 			t.Fatalf("node %s exited before writing its address file", filepath.Base(dir))
@@ -147,7 +154,7 @@ func startNode(t *testing.T, bin, dir, cfgPath string) string {
 		time.Sleep(150 * time.Millisecond)
 	}
 	t.Fatalf("node %s did not write its address file", filepath.Base(dir))
-	return ""
+	return "", nil
 }
 
 // dbClient opens an authenticated dbrpc client to a node's advertised address, using FS
