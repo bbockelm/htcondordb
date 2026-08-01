@@ -28,14 +28,18 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		// archive-aware), so both render through showStats (which adapts for an archive).
 		s.withDiag(console, s.tableArg(arg), s.showStats)
 	case ".indexes", ".index":
+		// Archives report their index set over the wire like any other table; only the
+		// rendering differs (zone maps and sealed-segment reach instead of a hot set and
+		// demand-based suggestions).
 		if t := s.tableArg(arg); s.exec.isArchive(t) {
-			s.showArchiveIndexes(console, t)
+			s.withDiag(console, t, s.showArchiveIndexes)
 		} else {
 			s.withDiag(console, t, s.showIndexes)
 		}
 	case ".hot":
 		if t := s.tableArg(arg); s.exec.isArchive(t) {
-			s.showArchiveIndexes(console, t) // archives have no hot set; explain like .indexes
+			fmt.Fprintf(console, "%s is an append-only history archive: it has no hot set.\n", t)
+			fmt.Fprintf(console, "Its per-segment hot header is fixed at creation; see .indexes %s for its indexes.\n", t)
 		} else {
 			s.withDiag(console, t, s.showHot)
 		}
@@ -214,14 +218,35 @@ func (s *session) retention(console io.Writer, arg string) {
 	s.adminTable(console, table, "retention.set", rest...)
 }
 
-// showArchiveIndexes explains the fixed index layout of a history archive -- its value indexes
-// and zone maps are set when the archive is created and are not queryable over the wire, unlike
-// a mutable table's runtime-managed indexes.
-func (s *session) showArchiveIndexes(w io.Writer, table string) {
-	fmt.Fprintf(w, "%s is an append-only history archive.\n", table)
-	fmt.Fprintln(w, "Its indexes and zone maps are fixed at creation and not enumerable over the wire.")
-	fmt.Fprintln(w, "For schedd-synced history, CompletionDate and EnteredHistoryTime are zone-mapped, so range")
-	fmt.Fprintln(w, "queries on them (e.g. WHERE EnteredHistoryTime > <t>) prune whole segments.")
+// showArchiveIndexes renders an append-only history archive's index configuration: the
+// per-segment attribute indexes, the zone-mapped attributes (whose range queries prune whole
+// segments, not just postings), the sidecar footprint, and how much of the archive a runtime
+// index change has actually reached. Unlike a mutable table there is no hot set and no
+// demand-based suggestion pass, so those sections are omitted rather than shown empty.
+func (s *session) showArchiveIndexes(w io.Writer, d *dbrpc.Diagnostics) {
+	fmt.Fprintln(w, "append-only history archive")
+	fmt.Fprintf(w, "categorical (string eq/membership): %s\n", orNone(d.CategoricalIndexes))
+	fmt.Fprintf(w, "value       (numeric + range):      %s\n", orNone(d.ValueIndexes))
+	fmt.Fprintf(w, "zone-mapped (whole-segment prune):  %s\n", orNone(d.ZoneAttrs))
+	if len(d.ZoneAttrs) > 0 {
+		fmt.Fprintln(w, "  a range query on a zone-mapped attribute skips segments whose [min,max] cannot match")
+	}
+	printIndexSizes(w, d.IndexSizes)
+	if d.SidecarSizes.MappedBytes > 0 {
+		fmt.Fprintf(w, "sidecar index: %s mapped (sealed segments; pageable, off-heap)\n",
+			humanBytes(d.SidecarSizes.MappedBytes))
+	}
+	if d.SealedSegments > 0 {
+		fmt.Fprintf(w, "sealed segments: %d", d.SealedSegments)
+		if d.StaleIndexSegments > 0 {
+			// A sealed segment's sidecar is immutable, so .addindex/.dropindex reach only
+			// segments sealed afterwards. Say what to run rather than leaving the operator
+			// to wonder why the new index did not help.
+			fmt.Fprintf(w, " (%d still on a previous index set -- run .rewrite to rebuild them)", d.StaleIndexSegments)
+		}
+		fmt.Fprintln(w)
+	}
+	fmt.Fprintln(w, "manage: .addindex <table> value|categorical <attr>...  |  .dropindex <table> <attr>...  |  .rewrite <table>")
 }
 
 func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
@@ -368,23 +393,29 @@ func histLine(buckets []int64) string {
 func (s *session) showIndexes(w io.Writer, d *dbrpc.Diagnostics) {
 	fmt.Fprintf(w, "categorical (string eq/membership): %s\n", orNone(d.CategoricalIndexes))
 	fmt.Fprintf(w, "value       (numeric + range):      %s\n", orNone(d.ValueIndexes))
-	sz := d.IndexSizes
-	if len(sz.PerIndex) > 0 {
-		fmt.Fprintf(w, "index memory: %s total, %.1f%% of %s live data\n",
-			humanBytes(sz.TotalBytes), sz.Frac*100, humanBytes(sz.DataBytes))
-		fmt.Fprintln(w, "  attribute                 kind         owner  size        pct-data")
-		for _, s := range sz.PerIndex {
-			owner := "human"
-			if s.Auto {
-				owner = "auto"
-			}
-			fmt.Fprintf(w, "  %-25s %-12s %-6s %-11s %.1f%%\n",
-				s.Attr, s.Kind, owner, humanBytes(s.Bytes), s.Frac*100)
-		}
-	}
+	printIndexSizes(w, d.IndexSizes)
 	if len(d.Suggestions) > 0 {
 		fmt.Fprintln(w, "suggested indexes (by observed demand):")
 		printSuggestions(w, d.Suggestions)
+	}
+}
+
+// printIndexSizes renders the per-attribute index footprint against live data. Shared by
+// the mutable-table and archive index views, which report the same accounting.
+func printIndexSizes(w io.Writer, sz db.IndexSizes) {
+	if len(sz.PerIndex) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "index memory: %s total, %.1f%% of %s live data\n",
+		humanBytes(sz.TotalBytes), sz.Frac*100, humanBytes(sz.DataBytes))
+	fmt.Fprintln(w, "  attribute                 kind         owner  size        pct-data")
+	for _, s := range sz.PerIndex {
+		owner := "human"
+		if s.Auto {
+			owner = "auto"
+		}
+		fmt.Fprintf(w, "  %-25s %-12s %-6s %-11s %.1f%%\n",
+			s.Attr, s.Kind, owner, humanBytes(s.Bytes), s.Frac*100)
 	}
 }
 
@@ -547,9 +578,19 @@ func (s *session) explain(console io.Writer, arg string) {
 				sel = fmt.Sprintf("  est ~%.1f%% (~%d of %d)",
 					p.Selectivity*100, p.EstCandidates, ex.TotalAds)
 			}
-			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s\n", p.Attr, p.Op, state, kind, sel)
+			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s%s\n", p.Attr, p.Op, state, kind, sel, bandNote(p))
 		}
 	}
+}
+
+// bandNote marks a range conjunct the planner merged with the opposite bound on the same
+// attribute into one two-sided index probe. The selectivity printed beside it is the band's,
+// so without the note it would look implausibly low for a lone `>` or `<`.
+func bandNote(p db.ProbeExplain) string {
+	if p.Banded {
+		return "  [banded with the opposite bound]"
+	}
+	return ""
 }
 
 // explainMatch handles `.explain MATCH ... TO ...`: it parses the MATCH statement and
@@ -598,7 +639,7 @@ func (s *session) explainMatch(console io.Writer, arg string) {
 				sel = fmt.Sprintf("  est ~%.1f%% (~%d of %d)",
 					p.Selectivity*100, p.EstCandidates, ex.TotalResources)
 			}
-			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s\n", p.Attr, p.Op, state, kind, sel)
+			fmt.Fprintf(console, "  %-20s %-4s %-6s (%s)%s%s\n", p.Attr, p.Op, state, kind, sel, bandNote(p))
 		}
 	}
 	if len(ex.EvalOrder) > 0 {
