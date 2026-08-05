@@ -17,8 +17,8 @@ func sqlStringLiteral(v string) string {
 }
 
 // newPersistentExec is newTestExec over an ON-DISK store, which is what the daemon runs.
-// The distinction matters: the two disagree about string escaping (see
-// TestPersistentStoreDoublesBackslashes).
+// The distinction matters: the two render raw text through different code, and have
+// diverged twice (classad #134, #135). Read paths worth trusting are tested against both.
 func newPersistentExec(t *testing.T) (*Executor, func()) {
 	t.Helper()
 	d, err := db.Open(filepath.Join(t.TempDir(), "store"))
@@ -102,23 +102,14 @@ func TestInsertPreservesEmbeddedQuotes(t *testing.T) {
 	}
 }
 
-// The persistent store still doubles a backslash or tab, where the in-memory store does
-// not -- so the same INSERT is correct in one and corrupt in the other.
+// Both storage representations round-trip a backslash or tab identically.
 //
-// This is below the SQL layer: the value reaches the store correct (the in-memory case
-// proves the quoting above is right), and comes back doubled only after a round trip
-// through persistence. The durable representation renders a string with new-ClassAd
-// escaping and reads it back with old-ClassAd rules, which do no unescaping, so every
-// pass doubles. Embedded quotes survive because that IS the one sequence old format
-// processes.
-//
-// It needs a fix in classad's storage layer, not here, and it is the reason the Python
-// integration tests still carry an xfail for backslash round trips: those run against a
-// real (persistent) daemon.
-func TestPersistentStoreDoublesBackslashes(t *testing.T) {
-	t.Skip("known classad storage bug: a persistent store double-escapes backslashes and " +
-		"tabs on the round trip; see the comment above")
-
+// They did not: the raw text a read renders was quoted for new-ClassAd rules and read back
+// with old-ClassAd ones, which do no unescaping, so every pass doubled (classad #134). The
+// in-memory store escaped this only because a top-level string took a separate,
+// correctly-quoting fast path. Kept as a matrix because the two representations render
+// through different code and have now diverged twice.
+func TestBackslashRoundTripMatchesAcrossStores(t *testing.T) {
 	for _, v := range []string{`back\slash`, "tab\there"} {
 		mem, cleanupMem := newTestExec(t)
 		disk, cleanupDisk := newPersistentExec(t)

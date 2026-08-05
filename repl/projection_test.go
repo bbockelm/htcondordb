@@ -15,30 +15,22 @@ func starValue(t *testing.T, e *Executor, attr string) string {
 	return ""
 }
 
-// A narrow SELECT of an expression-valued attribute must agree with SELECT *. The
+// A narrow SELECT of an expression-valued attribute must agree with SELECT *: the
 // projection has to carry the siblings the expression reads, or it evaluates to undefined.
 //
-// It does on an in-memory store, and does NOT on a persistent one: chaseRefs is
-// unsupported for inline-name (persistent) collections, whose expressions reference
-// attributes by name rather than id, so the projection is served exactly
-// (collections/rawprojected.go, renderInline). A daemon runs a persistent store, so this
-// is the case that matters -- it needs a classad fix, and until then the Python
-// integration tests carry a matching xfail.
+// Both representations are covered because reference chasing was for a while a no-op on
+// inline-name (persistent) collections, whose expressions reference attributes by name
+// rather than id (classad #135) -- and a daemon runs a persistent store, so an
+// in-memory-only test passed while the real thing was broken.
 func TestProjectedSelectAgreesWithStar(t *testing.T) {
 	for _, tc := range []struct {
 		mode    string
 		newExec func(*testing.T) (*Executor, func())
-		works   bool
 	}{
-		{"memory", newTestExec, true},
-		{"persistent", newPersistentExec, false},
+		{"memory", newTestExec},
+		{"persistent", newPersistentExec},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
-			if !tc.works {
-				t.Skip("known classad gap: chaseRefs is a no-op on an inline-name " +
-					"(persistent) collection, so the projection drops the siblings the " +
-					"expression reads; see the comment above")
-			}
 			e, cleanup := tc.newExec(t)
 			defer cleanup()
 

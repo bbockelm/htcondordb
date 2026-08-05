@@ -160,17 +160,18 @@ class TestTypes:
         cursor.execute(f"SELECT Owner FROM {table} WHERE Key = ?", ("row1",))
         assert cursor.fetchone() == (value,)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="the PERSISTENT store double-escapes backslashes and tabs on the round "
-        "trip; the in-memory store does not, so this is below the SQL layer (whose "
-        "old-format quoting is fixed and covered by repl/oldquote_test.go). The durable "
-        "representation renders strings with new-ClassAd escaping and reads them back "
-        "with old-ClassAd rules, which do no unescaping. Needs a classad storage fix; "
-        "these tests run against a real, persistent daemon.",
+    @pytest.mark.parametrize(
+        "value",
+        ["back\\slash", "tab\there", "C:\\Users\\alice", "^\\d+$", "a\\\\b"],
     )
-    @pytest.mark.parametrize("value", ["back\\slash", "tab\there"])
     def test_backslash_round_trip(self, connection, table, value):
+        """Backslashes and tabs survive a write through SQL against a real daemon.
+
+        They used to multiply: the SQL layer quoted INSERT values for new-ClassAd rules
+        and wrote them into old-ClassAd text (fixed in #106), and separately the store
+        rendered raw text with new-ClassAd string quoting that its old-ClassAd reader
+        never unescaped (classad #134).
+        """
         cursor = connection.cursor()
         cursor.execute(f"INSERT INTO {table} (Key, Owner) VALUES (?, ?)", ("row1", value))
         cursor.execute(f"SELECT Owner FROM {table} WHERE Key = ?", ("row1",))
