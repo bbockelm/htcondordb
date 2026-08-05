@@ -16,9 +16,15 @@ LDFLAGS := -X main.version=$(VERSION)
 GOENV := GOWORK=off GOFLAGS=-mod=mod \
          GOPRIVATE=github.com/bbockelm,github.com/PelicanPlatform \
          GOPROXY=direct
+PYTHON ?= python3
 GO    ?= go
 
-.PHONY: all build daemon cli test vet tidy clean version
+# Shared-library suffix for the ./capi client (dlopen'd by the Python driver in python/).
+# macOS wants .dylib; every other platform we build on wants .so.
+LIB_EXT ?= $(if $(filter Darwin,$(shell uname -s)),dylib,so)
+LIB     := $(BIN_DIR)/libhtcondordb_client.$(LIB_EXT)
+
+.PHONY: all build daemon cli lib archive python-test test vet tidy clean version
 
 all: build
 
@@ -29,6 +35,15 @@ daemon: ## Build the htcondordb daemon
 
 cli: ## Build the htcondordb-cli shell/loader
 	$(GOENV) $(GO) build -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/htcondordb-cli ./cmd/htcondordb-cli
+
+lib: ## Build the C client as a shared library (for the Python driver / dlopen callers)
+	$(GOENV) $(GO) build -buildmode=c-shared -ldflags '$(LDFLAGS)' -o $(LIB) ./capi
+
+archive: ## Build the C client as a static archive (for C/C++ callers to link)
+	$(GOENV) $(GO) build -buildmode=c-archive -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/libhtcondordb_client.a ./capi
+
+python-test: lib ## Run the Python driver's test suite against the freshly built library
+	HTCONDORDB_LIBRARY=$(abspath $(LIB)) $(PYTHON) -m pytest python/tests -v
 
 version: ## Print the version that would be stamped
 	@echo $(VERSION)
