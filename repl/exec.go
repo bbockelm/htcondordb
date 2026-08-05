@@ -263,6 +263,11 @@ func viewSpecFromSelect(st *Statement) (db.ViewSpec, error) {
 		return db.ViewSpec{}, fmt.Errorf("a materialized view SELECT may not use WHERE, ORDER BY, or LIMIT")
 	}
 
+	// A view stores raw metrics that the reader combines later, so a metric must be a plain
+	// aggregate -- there is nowhere to put the surrounding arithmetic.
+	if err := rejectAggExprs(sel.Items, "a materialized view"); err != nil {
+		return db.ViewSpec{}, err
+	}
 	var groups []db.ViewGroupCol
 	var metrics []db.ViewMetric
 	for _, it := range sel.Items {
@@ -796,10 +801,12 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	return res, nil
 }
 
-// hasAggregate reports whether any selected item is an aggregate.
+// hasAggregate reports whether any selected item is computed per group -- a bare aggregate
+// or an expression with aggregates lifted out of it -- so the statement takes an aggregate
+// execution path rather than a row scan.
 func hasAggregate(st *Statement) bool {
 	for _, it := range st.Items {
-		if it.IsAggregate() {
+		if it.GroupLevel() {
 			return true
 		}
 	}
@@ -876,7 +883,8 @@ func (e *Executor) archiveRowCount(table string) (int, error) {
 	return strconv.Atoi(rows[0].Values[0])
 }
 
-// aggSpecs builds the aggregate specs (in item order) and the group-column index map for a
+// aggSpecs builds the aggregate specs (flattened in item order, so an expression over
+// several aggregates contributes each of them) and the group-column index map for a
 // GROUP BY / aggregate SELECT.
 func aggSpecs(st *Statement, groupBy []string) ([]dbrpc.AggSpec, map[string]int) {
 	groupIdx := map[string]int{}
@@ -885,41 +893,55 @@ func aggSpecs(st *Statement, groupBy []string) ([]dbrpc.AggSpec, map[string]int)
 	}
 	var aggs []dbrpc.AggSpec
 	for _, it := range st.Items {
-		if it.IsAggregate() {
-			aggs = append(aggs, dbrpc.AggSpec{Func: aggFunc(it.Agg), Arg: it.Col})
+		for _, a := range it.aggCalls() {
+			aggs = append(aggs, dbrpc.AggSpec{Func: aggFunc(a.Func), Arg: a.Arg})
 		}
 	}
 	return aggs, groupIdx
 }
 
+// namedGroupProjector wires the SELECT items to a group tuple addressed BY NAME (the server
+// aggregate returns the GROUP BY columns in their declared order).
+func namedGroupProjector(st *Statement, groupBy []string, groupIdx map[string]int) (*aggProjector, error) {
+	groupAt := make([]int, len(st.Items))
+	for i, it := range st.Items {
+		groupAt[i] = -1
+		if !it.GroupLevel() {
+			if idx, ok := groupIdx[strings.ToLower(it.Col)]; ok {
+				groupAt[i] = idx
+			}
+		}
+	}
+	return newAggProjector(st.Items, groupAt, groupBy)
+}
+
+// positionalGroupProjector wires the SELECT items to a group tuple addressed BY POSITION:
+// the bucketed aggregate groups by the projected non-aggregate items in order, so the i'th
+// such item is the i'th group column.
+func positionalGroupProjector(st *Statement) (*aggProjector, error) {
+	groupAt := make([]int, len(st.Items))
+	var groupCol []string
+	for i, it := range st.Items {
+		groupAt[i] = -1
+		if it.GroupLevel() {
+			continue
+		}
+		groupAt[i] = len(groupCol)
+		groupCol = append(groupCol, it.Col)
+	}
+	return newAggProjector(st.Items, groupAt, groupCol)
+}
+
 // formatAggResult assembles server-side aggregate rows into the SELECT's column order, then
 // applies ORDER BY and LIMIT.
 func formatAggResult(st *Statement, groupIdx map[string]int, rows []dbrpc.AggRow) (*Result, error) {
-	res := &Result{IsSelect: true}
-	for _, it := range st.Items {
-		res.Columns = append(res.Columns, it.header())
+	proj, err := namedGroupProjector(st, st.GroupBy, groupIdx)
+	if err != nil {
+		return nil, err
 	}
+	res := &Result{IsSelect: true, Columns: proj.columns()}
 	for _, gr := range rows {
-		row := make([]string, 0, len(st.Items))
-		aggN := 0
-		for _, it := range st.Items {
-			if it.IsAggregate() {
-				if aggN < len(gr.Values) {
-					row = append(row, gr.Values[aggN])
-				} else {
-					row = append(row, "")
-				}
-				aggN++
-				continue
-			}
-			// Plain group column: pull from the group tuple by its position.
-			if idx, ok := groupIdx[strings.ToLower(it.Col)]; ok && idx < len(gr.Group) {
-				row = append(row, gr.Group[idx])
-			} else {
-				row = append(row, "")
-			}
-		}
-		res.Rows = append(res.Rows, row)
+		res.Rows = append(res.Rows, proj.row(gr.Group, gr.Values))
 	}
 	if len(st.OrderBy) > 0 {
 		if err := sortRows(res, st.OrderBy); err != nil {
@@ -972,23 +994,14 @@ func (e *Executor) execAggregateAsOf(st *Statement, groupBy []string) (*Result, 
 		buckets[""] = &bucket{}
 	}
 
-	res := &Result{IsSelect: true}
-	for _, it := range st.Items {
-		res.Columns = append(res.Columns, it.header())
+	proj, err := namedGroupProjector(st, groupBy, groupIdx)
+	if err != nil {
+		return nil, err
 	}
+	res := &Result{IsSelect: true, Columns: proj.columns()}
 	for _, key := range order {
 		b := buckets[key]
-		row := make([]string, 0, len(st.Items))
-		for _, it := range st.Items {
-			if it.IsAggregate() {
-				row = append(row, aggregateAds(it, b.ads))
-			} else if idx, ok := groupIdx[strings.ToLower(it.Col)]; ok && idx < len(b.group) {
-				row = append(row, b.group[idx])
-			} else {
-				row = append(row, "")
-			}
-		}
-		res.Rows = append(res.Rows, row)
+		res.Rows = append(res.Rows, proj.row(b.group, reduceAggs(st, b.ads)))
 	}
 	if len(st.OrderBy) > 0 {
 		if err := sortRows(res, st.OrderBy); err != nil {
@@ -1018,11 +1031,14 @@ func hasBucket(st *Statement) bool {
 // driven by the projected non-aggregate items (as in execAggregateBucket), so the
 // returned group tuple lines up positionally with the output columns.
 func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
+	proj, err := positionalGroupProjector(st)
+	if err != nil {
+		return nil, err
+	}
 	var groups []dbrpc.GroupCol
-	var aggs []dbrpc.AggSpec
+	aggs := proj.specs()
 	for _, it := range st.Items {
-		if it.IsAggregate() {
-			aggs = append(aggs, dbrpc.AggSpec{Func: aggFunc(it.Agg), Arg: it.Col})
+		if it.GroupLevel() {
 			continue
 		}
 		// A plain group column has BucketWidth 0; a time_bucket item carries its width.
@@ -1032,31 +1048,9 @@ func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	res := &Result{IsSelect: true}
-	for _, it := range st.Items {
-		res.Columns = append(res.Columns, it.header())
-	}
+	res := &Result{IsSelect: true, Columns: proj.columns()}
 	for _, gr := range rows {
-		row := make([]string, 0, len(st.Items))
-		gi, ai := 0, 0
-		for _, it := range st.Items {
-			if it.IsAggregate() {
-				if ai < len(gr.Values) {
-					row = append(row, gr.Values[ai])
-				} else {
-					row = append(row, "")
-				}
-				ai++
-				continue
-			}
-			if gi < len(gr.Group) {
-				row = append(row, gr.Group[gi])
-			} else {
-				row = append(row, "")
-			}
-			gi++
-		}
-		res.Rows = append(res.Rows, row)
+		res.Rows = append(res.Rows, proj.row(gr.Group, gr.Values))
 	}
 	if len(st.OrderBy) > 0 {
 		if err := sortRows(res, st.OrderBy); err != nil {
@@ -1118,23 +1112,14 @@ func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 		g.ads = append(g.ads, ad)
 	}
 
-	res := &Result{IsSelect: true}
-	for _, it := range st.Items {
-		res.Columns = append(res.Columns, it.header())
+	proj, err := positionalGroupProjector(st)
+	if err != nil {
+		return nil, err
 	}
+	res := &Result{IsSelect: true, Columns: proj.columns()}
 	for _, key := range order {
 		g := groups[key]
-		row := make([]string, 0, len(st.Items))
-		gi := 0
-		for _, it := range st.Items {
-			if it.IsAggregate() {
-				row = append(row, aggregateAds(it, g.ads))
-				continue
-			}
-			row = append(row, g.vals[gi])
-			gi++
-		}
-		res.Rows = append(res.Rows, row)
+		res.Rows = append(res.Rows, proj.row(g.vals, reduceAggs(st, g.ads)))
 	}
 	if len(st.OrderBy) > 0 {
 		if err := sortRows(res, st.OrderBy); err != nil {
@@ -1158,16 +1143,18 @@ func bucketFloor(sec float64, width int64) string {
 	return strconv.FormatInt(b, 10)
 }
 
-// aggregateAds reduces one aggregate item over a group's ads (client-side, for AS OF).
-func aggregateAds(it SelectItem, ads []*classad.ClassAd) string {
-	switch strings.ToUpper(it.Agg) {
+// aggregateAds reduces one aggregate call over a group's ads (client-side, for AS OF and
+// time_bucket). It takes the call rather than the SELECT item so a bare aggregate and one
+// lifted out of an expression reduce through the same code.
+func aggregateAds(it AggCall, ads []*classad.ClassAd) string {
+	switch strings.ToUpper(it.Func) {
 	case "COUNT":
-		if it.Col == "*" || it.Col == "" {
+		if it.Arg == "*" || it.Arg == "" {
 			return strconv.Itoa(len(ads))
 		}
 		n := 0
 		for _, ad := range ads {
-			if v := ad.EvaluateAttr(it.Col); !v.IsUndefined() && !v.IsError() {
+			if v := ad.EvaluateAttr(it.Arg); !v.IsUndefined() && !v.IsError() {
 				n++
 			}
 		}
@@ -1176,7 +1163,7 @@ func aggregateAds(it SelectItem, ads []*classad.ClassAd) string {
 		var sum, min, max float64
 		n := 0
 		for _, ad := range ads {
-			f, ok := numValue(ad.EvaluateAttr(it.Col))
+			f, ok := numValue(ad.EvaluateAttr(it.Arg))
 			if !ok {
 				continue
 			}
@@ -1192,7 +1179,7 @@ func aggregateAds(it SelectItem, ads []*classad.ClassAd) string {
 		if n == 0 {
 			return "" // no numeric values
 		}
-		switch strings.ToUpper(it.Agg) {
+		switch strings.ToUpper(it.Func) {
 		case "SUM":
 			return trimFloat(sum)
 		case "AVG":

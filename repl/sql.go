@@ -18,6 +18,17 @@
 // GROUP BY time_bucket(QDate, '1h'). This grouping is computed client-side (the
 // server aggregate groups by raw attribute value only).
 //
+// CASE WHEN <cond> THEN <v> [WHEN ...] [ELSE <v>] END (and the CASE <expr> WHEN <value>
+// form) is accepted anywhere an expression is: it becomes the equivalent ClassAd ?: chain,
+// with a missing ELSE yielding undefined (SQL's NULL).
+//
+// A projected column may be any ClassAd expression, and aggregates may appear inside one:
+// SELECT 2 * COUNT(*), SELECT SUM(Cpus) / COUNT(*) AS avg, SELECT MAX(m) - MIN(m),
+// SELECT COUNT(*) > 1000 ? "busy" : "quiet". The aggregates are lifted out and computed by
+// the store as usual; the surrounding expression is evaluated once per group by the ClassAd
+// engine, so the whole ClassAd language (?:, strcat, member(), comparisons) is available over
+// aggregate results. COUNT(*) is SQL's spelling, not ClassAd's, and is accepted as such.
+//
 // A WHERE clause (and an UPDATE assignment's right-hand side) is a *ClassAd*
 // expression, captured verbatim and evaluated by the store's expression engine
 // -- the full ClassAd language is available (==, =?=, =!=, undefined, member(),
@@ -31,8 +42,10 @@
 // UPDATE/DELETE can recover the key of every row a WHERE clause matches. WHERE
 // and assignment right-hand sides are translated to ClassAd expressions and
 // evaluated by the store's expression engine, so the full ClassAd operator set
-// is available; the translation only adapts SQL spellings (`=`, `<>`, AND/OR,
-// single-quoted strings).
+// is available; the translation only adapts SQL spellings that ClassAd has no
+// reading for -- `=`, `<>`, AND/OR/NOT, IS [NOT] NULL, single-quoted strings, and
+// CASE WHEN ... THEN ... ELSE ... END (see sqlexpr.go). Everything else is passed
+// through byte for byte.
 package repl
 
 import (
@@ -141,6 +154,12 @@ type SelectItem struct {
 	// empty for a plain column (Col holds the attribute name) and for aggregates.
 	Expr string
 
+	// Aggs are the aggregate calls lifted out of Expr, in source order. Expr refers to
+	// each as __agg_0, __agg_1, ... so `2 * COUNT(*)` runs one COUNT per group and
+	// evaluates the arithmetic over its result. Empty for a bare aggregate (Agg is set
+	// instead) and for a per-row expression.
+	Aggs []AggCall
+
 	// Bucket marks a time_bucket(Col, 'width') expression -- a non-aggregate
 	// grouping column that floors the epoch-seconds attribute Col to BucketWidth
 	// (see parseBucketWidth). It groups a time axis into fixed-width buckets.
@@ -148,8 +167,34 @@ type SelectItem struct {
 	BucketWidth int64 // seconds; >0 when Bucket
 }
 
-// IsAggregate reports whether this item is an aggregate function.
+// AggCall is one aggregate function call: COUNT/SUM/AVG/MIN/MAX over an attribute, or
+// COUNT over "*".
+type AggCall struct {
+	Func string
+	Arg  string
+}
+
+// aggPlaceholderPrefix names the attribute an aggregate is bound to when it is lifted out of
+// a SELECT expression. Double-underscored so it cannot collide with an ad's own attributes.
+const aggPlaceholderPrefix = "__agg_"
+
+// IsAggregate reports whether this item is a bare aggregate call, whose value comes straight
+// from the aggregate result vector.
 func (it SelectItem) IsAggregate() bool { return it.Agg != "" }
+
+// GroupLevel reports whether the item's value is computed per GROUP rather than per row --
+// a bare aggregate, or an expression with aggregates lifted out of it. These are the items
+// that may not be mixed with plain columns outside a GROUP BY.
+func (it SelectItem) GroupLevel() bool { return it.Agg != "" || len(it.Aggs) > 0 }
+
+// aggCalls returns the aggregates this item needs evaluated, whether it is a bare call or an
+// expression over several.
+func (it SelectItem) aggCalls() []AggCall {
+	if it.Agg != "" {
+		return []AggCall{{Func: it.Agg, Arg: it.Col}}
+	}
+	return it.Aggs
+}
 
 // Assignment is one UPDATE ... SET column = expr.
 type Assignment struct {
@@ -329,6 +374,9 @@ type parser struct {
 	toks []token
 	pos  int
 	src  string // original source, for verbatim WHERE / SET expression capture
+	// inOrderBy marks that the SELECT-item grammar is being reused for an ORDER BY term,
+	// where DESC/ASC/LIMIT terminate the term (see atSelectItemEnd).
+	inOrderBy bool
 }
 
 func (p *parser) atEnd() bool { return p.pos >= len(p.toks) }
@@ -422,7 +470,7 @@ func (p *parser) parseWatch() (*Statement, error) {
 		if err != nil {
 			return nil, err
 		}
-		if it.IsAggregate() {
+		if it.GroupLevel() {
 			return nil, fmt.Errorf("WATCH does not support aggregates")
 		}
 		st.Items = append(st.Items, it)
@@ -852,28 +900,28 @@ func (p *parser) parseSelectItem() (SelectItem, error) {
 	}
 	// Aggregate?  IDENT '(' ... ')'
 	if agg := strings.ToUpper(t.text); isAggName(agg) && p.peekAheadPunct(1, "(") {
-		p.pos += 2 // ident + '('
-		var arg string
-		if pk := p.peek(); pk.kind == tOp && pk.text == "*" {
-			arg = "*"
-			p.pos++
-		} else {
-			col, err := p.parseIdent()
-			if err != nil {
-				return SelectItem{}, err
-			}
-			arg = col
-		}
-		if err := p.expectPunct(")"); err != nil {
+		save := p.pos
+		call, err := p.parseAggCall()
+		if err != nil {
 			return SelectItem{}, err
 		}
-		if agg == "COUNT" && arg != "*" {
-			// COUNT(col) counts rows where col is defined; we treat it like COUNT(*)
-			// for simplicity but keep the argument for the header.
+		// A BARE aggregate ends the item here. An OPERATOR after it -- `SUM(Cpus) /
+		// COUNT(*)`, `MAX(m) - MIN(m)`, `COUNT(*) > 3 ? ...` -- means the call is only the
+		// first leaf of an expression, so rewind and parse the whole item as one (lifting
+		// every aggregate out of it). Testing for an operator rather than for a terminator
+		// keeps ORDER BY working: `SUM(Cpus) DESC` ends at the identifier DESC.
+		if p.aggCallContinues() {
+			p.pos = save
+			return p.parseSelectExpr()
 		}
-		it := SelectItem{Agg: agg, Col: arg}
+		it := SelectItem{Agg: call.Func, Col: call.Arg}
 		it.Alias = p.parseOptionalAlias()
 		return it, nil
+	}
+	// CASE ... END is an expression, not a column: route it to the expression path (a lone
+	// identifier would otherwise be taken as a column name and stop at WHEN).
+	if p.isKeyword("CASE") {
+		return p.parseSelectExpr()
 	}
 	// time_bucket(attr, 'width') grouping expression.
 	if strings.EqualFold(t.text, "time_bucket") && p.peekAheadPunct(1, "(") {
@@ -897,23 +945,96 @@ func (p *parser) parseSelectItem() (SelectItem, error) {
 	return it, nil
 }
 
-// parseSelectExpr captures a general ClassAd expression SELECT item verbatim (up to a
-// top-level comma, FROM, or AS) and evaluates it per row. An alias needs the explicit AS form,
-// since a trailing bare identifier would be ambiguous with the expression itself.
+// parseSelectExpr captures a general ClassAd expression SELECT item (up to a top-level
+// comma, FROM, or AS). Aggregate calls inside it are lifted out (see captureSelectExpr), so
+// `2 * COUNT(*)` becomes the expression `2 * __agg_0` over one COUNT aggregate. Without any,
+// the expression is evaluated per row as before. An alias needs the explicit AS form, since a
+// trailing bare identifier would be ambiguous with the expression itself.
 func (p *parser) parseSelectExpr() (SelectItem, error) {
-	raw, err := p.captureRawExpr(func() bool {
-		if p.atEnd() {
-			return true
-		}
-		pk := p.peek()
-		return (pk.kind == tPunct && pk.text == ",") || p.isKeyword("FROM") || p.isKeyword("AS")
-	})
+	expr, aggs, raw, err := p.captureSelectExpr(p.atSelectItemEnd)
 	if err != nil {
 		return SelectItem{}, err
 	}
-	it := SelectItem{Expr: raw, Col: raw}
+	it := SelectItem{Expr: expr, Col: raw, Aggs: aggs}
 	it.Alias = p.parseOptionalAlias()
 	return it, nil
+}
+
+// aggCallContinues reports whether the token after a complete aggregate call carries it into
+// a larger expression. Only an operator can: `SUM(a) / COUNT(*)`, `MAX(m) - MIN(m)`,
+// `COUNT(*) > 3 ? ...`. An identifier (an AS alias, ORDER BY's DESC, FROM, LIMIT), a comma,
+// or end of input ends the item and leaves a bare aggregate.
+func (p *parser) aggCallContinues() bool {
+	return !p.atEnd() && p.peek().kind == tOp
+}
+
+// atSelectItemEnd reports whether the parser sits at the end of a SELECT item: a comma, FROM,
+// AS, or end of input. Anything else continues the current expression.
+//
+// In an ORDER BY the sort direction terminates the term too, so `ORDER BY 2 * COUNT(*) DESC`
+// does not swallow DESC into the expression. That is only safe in ORDER BY context, where
+// DESC/ASC are keywords rather than possible attribute names.
+func (p *parser) atSelectItemEnd() bool {
+	if p.atEnd() {
+		return true
+	}
+	pk := p.peek()
+	if p.inOrderBy && (p.isKeyword("DESC") || p.isKeyword("ASC") || p.isKeyword("LIMIT")) {
+		return true
+	}
+	return (pk.kind == tPunct && pk.text == ",") || p.isKeyword("FROM") || p.isKeyword("AS")
+}
+
+// captureSelectExpr captures a SELECT expression and lifts every aggregate call out of it,
+// returning the expression with each call replaced by a placeholder attribute (__agg_0,
+// __agg_1, ... in source order), the lifted calls, and the original source text for the
+// column header.
+//
+// The lifting happens at the token level rather than by rewriting the captured string,
+// because `COUNT(*)` is not valid ClassAd syntax: handing the raw text to the ClassAd parser
+// would fail before anything could be substituted. Consuming each call whole also keeps its
+// parentheses out of the depth counter that decides where the item ends.
+func (p *parser) captureSelectExpr(stop func() bool) (expr string, aggs []AggCall, raw string, err error) {
+	lift := []AggCall{}
+	expr, raw, err = p.captureExpr(stop, &lift)
+	if err != nil {
+		return "", nil, "", err
+	}
+	if len(lift) == 0 {
+		lift = nil
+	}
+	return expr, lift, raw, nil
+}
+
+// parseAggCall consumes an aggregate call `NAME ( * | ident )` and returns it. The caller has
+// already established that the next two tokens are an aggregate name and '('.
+func (p *parser) parseAggCall() (AggCall, error) {
+	name := strings.ToUpper(p.peek().text)
+	p.pos += 2 // name + '('
+	var arg string
+	if pk := p.peek(); pk.kind == tOp && pk.text == "*" {
+		arg = "*"
+		p.pos++
+	} else {
+		col, err := p.parseIdent()
+		if err != nil {
+			return AggCall{}, fmt.Errorf("%s(...): %w", name, err)
+		}
+		arg = col
+	}
+	// The store aggregates over an ATTRIBUTE, so the argument has to be a bare name: there
+	// is no way to push `SUM(CASE ... END)` or `SUM(a + b)` down to it. Say so plainly
+	// rather than reporting a missing parenthesis.
+	if !p.atPunct(")") {
+		return AggCall{}, fmt.Errorf("%s(...) takes an attribute name, not an expression", name)
+	}
+	if err := p.expectPunct(")"); err != nil {
+		return AggCall{}, err
+	}
+	if arg == "*" && name != "COUNT" {
+		return AggCall{}, fmt.Errorf("%s(*) is not valid; %s needs an attribute", name, name)
+	}
+	return AggCall{Func: name, Arg: arg}, nil
 }
 
 // peekAt returns the token n positions ahead (or a zero token past the end).
@@ -1070,41 +1191,20 @@ func (p *parser) parseWhere() (string, error) {
 	})
 }
 
-// captureRawExpr returns the source text of the expression starting at the
-// current token and running until stop() is true at the top paren level (or end
-// of input), advancing past it. The text is handed to the ClassAd engine
-// unchanged -- no SQL-to-ClassAd translation.
+// captureRawExpr captures an expression that is NOT a SELECT item -- a WHERE clause, an
+// UPDATE assignment's right-hand side, a MATCH filter, an INSERT value. SQL spellings are
+// translated for the ClassAd engine (see captureExpr); aggregates are not lifted, since only
+// a SELECT list can contain them.
 func (p *parser) captureRawExpr(stop func() bool) (string, error) {
-	if p.atEnd() || stop() {
-		return "", fmt.Errorf("empty expression")
-	}
-	start := p.peek().pos
-	end := start
-	depth := 0
-	for !p.atEnd() {
-		if depth == 0 && stop() {
-			break
-		}
-		t := p.next()
-		end = t.end
-		if t.kind == tPunct {
-			if t.text == "(" {
-				depth++
-			} else if t.text == ")" {
-				depth--
-			}
-		}
-	}
-	raw := strings.TrimSpace(p.src[start:end])
-	if raw == "" {
-		return "", fmt.Errorf("empty expression")
-	}
-	return raw, nil
+	expr, _, err := p.captureExpr(stop, nil)
+	return expr, err
 }
 
 // parseOrderBy parses "term [ASC|DESC] (, term [ASC|DESC])*". Each term is a
 // column or aggregate (reusing the SELECT-item grammar).
 func (p *parser) parseOrderBy() ([]OrderTerm, error) {
+	p.inOrderBy = true
+	defer func() { p.inOrderBy = false }()
 	var terms []OrderTerm
 	for {
 		it, err := p.parseSelectItem()
@@ -1343,7 +1443,7 @@ func validateSelect(st *Statement) error {
 	var aggs, plains, buckets int
 	for _, it := range st.Items {
 		switch {
-		case it.IsAggregate():
+		case it.GroupLevel(): // a bare aggregate, or an expression over aggregates
 			aggs++
 		case it.Bucket:
 			buckets++
@@ -1371,7 +1471,7 @@ func validateSelect(st *Statement) error {
 		if it.Star {
 			return fmt.Errorf("`*` cannot be used with GROUP BY")
 		}
-		if it.IsAggregate() {
+		if it.GroupLevel() {
 			continue
 		}
 		key := groupItemKey(it)
