@@ -52,15 +52,25 @@ class TestExplicitTransactions:
         connection.rollback()
         assert rowcount(connection, table) == 0
 
-    def test_reads_see_committed_state_only(self, connection, table):
-        # The transaction's own uncommitted writes are invisible to a query. Pinned so a
-        # future protocol change that makes reads transaction-aware shows up here.
+    def test_reads_see_the_transactions_own_writes(self, connection, table):
         connection.autocommit = False
         cursor = connection.cursor()
         cursor.execute(f"INSERT INTO {table} (Key, Owner) VALUES ('j1', 'alice')")
-        assert rowcount(connection, table) == 0
+        assert rowcount(connection, table) == 1
         connection.commit()
         assert rowcount(connection, table) == 1
+
+    def test_another_connection_does_not_see_them_until_commit(self, daemon_address, connection, table):
+        connection.autocommit = False
+        connection.cursor().execute(f"INSERT INTO {table} (Key, Owner) VALUES ('j1', 'alice')")
+
+        other = htcondordb.connect(daemon_address)
+        try:
+            assert rowcount(other, table) == 0
+            connection.commit()
+            assert rowcount(other, table) == 1
+        finally:
+            other.close()
 
     def test_a_new_transaction_opens_after_commit(self, connection, table):
         connection.autocommit = False
@@ -109,9 +119,9 @@ class TestExplicitTransactions:
             [("j1", "alice"), ("j2", "bob"), ("j3", "carol")],
         )
         assert cursor.rowcount == 3
-        assert rowcount(connection, table) == 0  # nothing applied yet
+        assert rowcount(connection, table) == 3  # visible to the transaction itself
         connection.rollback()
-        assert rowcount(connection, table) == 0
+        assert rowcount(connection, table) == 0  # and applied for nobody
 
 
 class TestTransactionContextManager:

@@ -39,18 +39,16 @@ func TestTransactionRollbackDiscards(t *testing.T) {
 	}
 }
 
-// Uncommitted writes are invisible to a SELECT: queries carry no transaction id and read
-// the committed store (dbrpc opQuery). This is a real limitation of the transaction, not
-// an accident of the executor, so it is pinned -- if a future protocol change makes reads
-// transaction-aware, this test should be the one that fails and gets updated.
-func TestTransactionSelectSeesCommittedStateOnly(t *testing.T) {
+// A SELECT inside a transaction sees the transaction's own uncommitted writes, and the
+// committed store still does not until COMMIT.
+func TestTransactionSelectSeesOwnWrites(t *testing.T) {
 	e, cleanup := newTestExec(t)
 	defer cleanup()
 
 	mustExec(t, e, "BEGIN")
 	mustExec(t, e, "INSERT INTO ads (Key, Owner) VALUES ('1.0', 'alice')")
-	if got := count(t, e, "ads"); got != "0" {
-		t.Fatalf("inside the transaction, COUNT(*) = %s, want 0 (reads see committed state)", got)
+	if got := count(t, e, "ads"); got != "1" {
+		t.Fatalf("inside the transaction, COUNT(*) = %s, want 1 (its own insert is invisible)", got)
 	}
 	mustExec(t, e, "COMMIT")
 	if got := count(t, e, "ads"); got != "1" {
@@ -58,9 +56,44 @@ func TestTransactionSelectSeesCommittedStateOnly(t *testing.T) {
 	}
 }
 
-// UPDATE and DELETE inside a transaction address rows by key, which the executor resolves
-// with a query -- so they operate on committed state too, and compose with staged inserts
-// only after a commit. Covered because it is the shape most likely to surprise.
+// A rolled-back transaction's reads were of rows that never existed.
+func TestTransactionSelectAfterRollback(t *testing.T) {
+	e, cleanup := newTestExec(t)
+	defer cleanup()
+
+	mustExec(t, e, "BEGIN")
+	mustExec(t, e, "INSERT INTO ads (Key, Owner) VALUES ('1.0', 'alice')")
+	if got := count(t, e, "ads"); got != "1" {
+		t.Fatalf("inside the transaction, COUNT(*) = %s, want 1", got)
+	}
+	mustExec(t, e, "ROLLBACK")
+	if got := count(t, e, "ads"); got != "0" {
+		t.Fatalf("after ROLLBACK, COUNT(*) = %s, want 0", got)
+	}
+}
+
+// A SELECT against a table the transaction did not bind to reads committed state: a dbrpc
+// transaction covers one table, so there is nothing transactional to read there.
+func TestTransactionSelectOnAnotherTableIsCommitted(t *testing.T) {
+	e, cleanup := newCatalogExec(t)
+	defer cleanup()
+
+	mustExec(t, e, "CREATE TABLE other")
+	mustExec(t, e, "INSERT INTO other (Key, Owner) VALUES ('seed', 'carol')")
+
+	mustExec(t, e, "BEGIN")
+	mustExec(t, e, "INSERT INTO ads (Key, Owner) VALUES ('1.0', 'alice')")
+	if got := count(t, e, "other"); got != "1" {
+		t.Errorf("COUNT(*) on the unbound table = %s, want 1", got)
+	}
+	if got := count(t, e, "ads"); got != "1" {
+		t.Errorf("COUNT(*) on the transaction's table = %s, want 1", got)
+	}
+	mustExec(t, e, "ROLLBACK")
+}
+
+// UPDATE and DELETE inside a transaction address rows by key, resolved through the
+// transaction -- so they compose with the transaction's own staged inserts.
 func TestTransactionUpdateAndDelete(t *testing.T) {
 	e, cleanup := newTestExec(t)
 	defer cleanup()
@@ -215,8 +248,9 @@ func TestTransactionBatchesManyWrites(t *testing.T) {
 	for _, key := range []string{"1.0", "2.0", "3.0", "4.0", "5.0"} {
 		mustExec(t, e, "INSERT INTO ads (Key, Owner) VALUES ('"+key+"', 'alice')")
 	}
-	if got := count(t, e, "ads"); got != "0" {
-		t.Fatalf("mid-transaction COUNT(*) = %s, want 0", got)
+	// Visible to the transaction itself, and to nobody else until COMMIT.
+	if got := count(t, e, "ads"); got != "5" {
+		t.Fatalf("mid-transaction COUNT(*) = %s, want 5", got)
 	}
 	mustExec(t, e, "COMMIT")
 	if got := count(t, e, "ads"); got != "5" {
