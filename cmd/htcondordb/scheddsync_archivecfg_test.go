@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -141,5 +142,59 @@ func TestReconcileArchiveIndexesNeverDrops(t *testing.T) {
 	}
 	if !slices.Contains(c, "Owner") {
 		t.Errorf("categorical = %v, want Owner retained", c)
+	}
+}
+
+// TestReconcileArchiveIndexesSurvivesRestart is the property the reconciliation depends on
+// and could not have before classad v0.23.1: AddIndex now folds its result into
+// archiveconfig.json, which is authoritative on reopen. Without that the daemon would find
+// the attribute missing again on every start and re-run the full backfill -- minutes on a
+// young archive, hours on a mature one.
+func TestReconcileArchiveIndexesSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	cat, err := db.OpenCatalog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hist, err := cat.CreateArchiveTable("history", db.ArchiveConfig{ValueAttrs: []string{"ClusterId"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if err := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nOwner = \"alice\"", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &scheddSyncManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
+	m.reconcileArchiveIndexes(context.Background(), hist, s)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if c, _ := hist.IndexedAttrs(); slices.Contains(c, "Owner") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Owner was not backfilled")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cat.Close()
+
+	// Restart: the index must still be there, and reconciliation must find nothing to do.
+	cat2, err := db.OpenCatalog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat2.Close()
+	h2, ok := cat2.ArchiveTable("history")
+	if !ok {
+		t.Fatal("archive not recovered")
+	}
+	if c, _ := h2.IndexedAttrs(); !slices.Contains(c, "Owner") {
+		t.Fatalf("after restart categorical = %v, want Owner retained", c)
+	}
+	if h2.AddIndex([]string{"Owner"}, nil) {
+		t.Error("re-adding the persisted index reported a change; the daemon would re-backfill every restart")
 	}
 }

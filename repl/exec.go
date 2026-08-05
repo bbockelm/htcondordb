@@ -711,14 +711,16 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 		// bucketing for an AS OF read (the server aggregate has no time-travel
 		// variant) or against a server too old to implement the bucketed opcode.
 		if hasBucket(st) || groupByHasBucket(st) {
-			// The server aggregate pushdown is current-time, mutable-table only. Archives (and
-			// AS OF) bucket client-side.
-			if st.AsOf == "" && !e.isArchive(st.Table) {
+			// Both table kinds push the bucketing down; only an AS OF read has no server-side
+			// aggregate variant and must bucket client-side. On an archive this is what makes
+			// "jobs per group per day" answerable from the per-segment indexes instead of by
+			// decompressing every record.
+			if st.AsOf == "" {
 				res, err := e.execAggregateBucketServer(st)
 				if err == nil {
 					return res, nil
 				}
-				if !errors.Is(err, dbrpc.ErrBucketedUnsupported) {
+				if !bucketPushdownUnsupported(err) {
 					return nil, err
 				}
 			}
@@ -1043,6 +1045,17 @@ func hasBucket(st *Statement) bool {
 // server is too old, so the caller falls back to client-side bucketing. Grouping is
 // driven by the projected non-aggregate items (as in execAggregateBucket), so the
 // returned group tuple lines up positionally with the output columns.
+// bucketPushdownUnsupported reports whether err means the server cannot do the bucketed
+// aggregate itself -- an opcode it does not implement -- so the caller should reduce
+// client-side instead of failing the query. Mutable tables and archives signal this with
+// their own sentinels, and a filtered aggregate has a third: it must never be silently
+// retried without its filters.
+func bucketPushdownUnsupported(err error) bool {
+	return errors.Is(err, dbrpc.ErrBucketedUnsupported) ||
+		errors.Is(err, dbrpc.ErrArchiveAggregateUnsupported) ||
+		errors.Is(err, dbrpc.ErrFilteredAggregateUnsupported)
+}
+
 func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
 	proj, err := positionalGroupProjector(st)
 	if err != nil {
@@ -1057,7 +1070,14 @@ func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
 		// A plain group column has BucketWidth 0; a time_bucket item carries its width.
 		groups = append(groups, dbrpc.GroupCol{Attr: it.Col, BucketWidth: it.BucketWidth})
 	}
-	rows, err := e.c.AggregateBucketedTable(context.Background(), st.Table, constraint(st.Where), groups, aggs)
+	// Archives and mutable tables have separate aggregate opcodes; both carry group bucket
+	// widths, so the only difference here is which one to call.
+	var rows []dbrpc.AggRow
+	if e.isArchive(st.Table) {
+		rows, err = e.c.ArchiveAggregateBucketed(context.Background(), st.Table, constraint(st.Where), groups, aggs)
+	} else {
+		rows, err = e.c.AggregateBucketedTable(context.Background(), st.Table, constraint(st.Where), groups, aggs)
+	}
 	if err != nil {
 		return nil, err
 	}
