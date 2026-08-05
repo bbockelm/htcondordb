@@ -3,11 +3,11 @@ module github.com/bbockelm/htcondordb
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.21.4
-	github.com/PelicanPlatform/classad/changefeed v0.21.4
-	github.com/PelicanPlatform/classad/collections v0.21.4
-	github.com/PelicanPlatform/classad/db v0.21.4
-	github.com/PelicanPlatform/classad/dbrpc v0.21.4
+	github.com/PelicanPlatform/classad v0.23.0
+	github.com/PelicanPlatform/classad/changefeed v0.23.0
+	github.com/PelicanPlatform/classad/collections v0.23.0
+	github.com/PelicanPlatform/classad/db v0.23.0
+	github.com/PelicanPlatform/classad/dbrpc v0.23.0
 	github.com/bbockelm/cedar v0.6.9
 	github.com/bbockelm/golang-htcondor v0.12.1
 	github.com/chzyer/readline v1.5.1
@@ -25,6 +25,7 @@ require (
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/dgraph-io/ristretto/v2 v2.4.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/glebarez/go-sqlite v1.22.0 // indirect

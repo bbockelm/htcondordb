@@ -3,8 +3,8 @@ module github.com/bbockelm/htcondordb/grafana
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.21.4
-	github.com/PelicanPlatform/classad/dbrpc v0.21.4
+	github.com/PelicanPlatform/classad v0.23.0
+	github.com/PelicanPlatform/classad/dbrpc v0.23.0
 	github.com/bbockelm/cedar v0.6.9
 	github.com/bbockelm/golang-htcondor v0.12.1
 	github.com/bbockelm/htcondordb v0.0.0
@@ -13,8 +13,8 @@ require (
 
 require (
 	github.com/BurntSushi/toml v1.5.0 // indirect
-	github.com/PelicanPlatform/classad/collections v0.21.4 // indirect
-	github.com/PelicanPlatform/classad/db v0.21.4 // indirect
+	github.com/PelicanPlatform/classad/collections v0.23.0 // indirect
+	github.com/PelicanPlatform/classad/db v0.23.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/apache/arrow-go/v18 v18.5.2 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
@@ -26,6 +26,8 @@ require (
 	github.com/clipperhouse/displaywidth v0.10.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.6.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
+	github.com/dgraph-io/ristretto/v2 v2.4.2 // indirect
+	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
