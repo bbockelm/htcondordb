@@ -181,7 +181,7 @@ func New(cfg Config) (*Service, error) {
 	// Background self-tuning (index auto-tune + hot-set refresh + dictionary retrain),
 	// unless disabled. Stopped by Close (via rpc.Close).
 	if !cfg.DisableMaintenance {
-		opts := db.MaintainOptions{HotTopN: 32, Retrain: true, MinIndexDemand: 10, IndexBudgetHighFrac: 0.10}
+		opts := defaultMaintainOptions()
 		if cfg.Maintenance != nil {
 			opts = *cfg.Maintenance
 		}
@@ -193,6 +193,22 @@ func New(cfg Config) (*Service, error) {
 	// unreaped server leaks live heap for the life of the connection. Always on.
 	svc.stopReaper = svc.rpc.StartTxnReaper(time.Minute, 5*time.Minute)
 	return svc, nil
+}
+
+// defaultMaintainOptions is the background self-tuning a server runs when the caller supplies no
+// cfg.Maintenance. SchemaScanHotTopN mirrors HotTopN so the per-segment columnar accelerator --
+// CountConstraint's fast path for COUNT(*) WHERE <numeric> -- is ON BY DEFAULT over the same
+// demand-hot set. It was previously left at 0, so the accelerator (shipped in classad v0.23.0)
+// never engaged.
+func defaultMaintainOptions() db.MaintainOptions {
+	const hotTopN = 32
+	return db.MaintainOptions{
+		HotTopN:             hotTopN,
+		SchemaScanHotTopN:   hotTopN,
+		Retrain:             true,
+		MinIndexDemand:      10,
+		IndexBudgetHighFrac: 0.10,
+	}
 }
 
 // Catalog returns the table catalog.
