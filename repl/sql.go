@@ -1518,6 +1518,17 @@ func (p *parser) parseValueList() ([]string, error) {
 // captured verbatim -- so an attribute can be assigned an expression such as
 // Requirements = TARGET.Cpus >= RequestCpus or Rank = TARGET.Cpus.
 func (p *parser) parseValue() (string, error) {
+	// A lone string the old-ClassAd format cannot hold is reported here rather than left
+	// to fall through to expression capture, which would quote it for new-ClassAd rules
+	// and store a mangled value instead of failing.
+	if t := p.peek(); t.kind == tString {
+		if _, terminates := p.peekValueTerminator(); terminates {
+			if _, ok := quoteClassAdOld(t.text); !ok {
+				return "", fmt.Errorf("string value cannot be written in old-ClassAd format: " +
+					"it contains a newline, or ends in a backslash")
+			}
+		}
+	}
 	if lit, ok := p.tryLiteralValue(); ok {
 		return lit, nil
 	}
@@ -1526,6 +1537,16 @@ func (p *parser) parseValue() (string, error) {
 	return p.captureRawExpr(func() bool {
 		return p.atEnd() || p.atPunct(",") || p.atPunct(")")
 	})
+}
+
+// peekValueTerminator reports whether the token after the current one ends a VALUES item,
+// i.e. whether the current token is a lone literal rather than the start of an expression.
+func (p *parser) peekValueTerminator() (token, bool) {
+	if p.pos+1 >= len(p.toks) {
+		return token{}, false
+	}
+	t := p.toks[p.pos+1]
+	return t, t.kind == tPunct && (t.text == "," || t.text == ")")
 }
 
 // tryLiteralValue consumes a lone literal value (string/number/[+-]number/bool/
@@ -1547,7 +1568,13 @@ func (p *parser) literalToken() (string, bool) {
 	t := p.next()
 	switch t.kind {
 	case tString:
-		return quoteClassAd(t.text), true
+		// An INSERT value is rendered into old-ClassAd text by execInsert, so it takes
+		// old-format quoting. A value that format cannot hold is reported by the caller.
+		lit, ok := quoteClassAdOld(t.text)
+		if !ok {
+			return "", false
+		}
+		return lit, true
 	case tNumber:
 		return t.text, true
 	case tOp:
@@ -1856,6 +1883,57 @@ func groupByHasBucket(st *Statement) bool {
 		}
 	}
 	return false
+}
+
+// quoteClassAdOld renders s as a string literal for OLD-ClassAd text, where the escaping
+// rules are not the ones quoteClassAd uses.
+//
+// The old-ClassAd tokenizer does no escape processing (C++ Lexer::tokenizeStringOld): a
+// backslash is a literal backslash, and the only special sequence is a backslash directly
+// before the closing quote, which makes that quote part of the value. So escaping a
+// backslash here -- as quoteClassAd does, correctly, for an expression the store parses
+// with new-ClassAd rules -- writes two characters where the reader will see two, turning
+// one backslash into two on every pass through the format.
+//
+// ok is false when s cannot be represented at all, which old-ClassAd format has two of:
+// a newline or carriage return would end the attribute mid-string, since the format is
+// newline-separated; and a value ending in a backslash is unreadable, because that
+// backslash lands directly before the closing quote and so makes the quote part of the
+// value, running the string on to the end of the ad. C++ has both limitations. The caller
+// reports them rather than writing an ad that fails to parse on the way back.
+func quoteClassAdOld(s string) (string, bool) {
+	if strings.ContainsAny(s, "\n\r") || strings.HasSuffix(s, `\`) {
+		return "", false
+	}
+	var sb strings.Builder
+	sb.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' {
+			sb.WriteByte('\\')
+		}
+		sb.WriteByte(s[i])
+	}
+	sb.WriteByte('"')
+	return sb.String(), true
+}
+
+// unquoteClassAdOld is the inverse of quoteClassAdOld: only a backslash-escaped quote is
+// a sequence; every other byte, backslash included, is literal.
+func unquoteClassAdOld(lit string) string {
+	if len(lit) < 2 || lit[0] != '"' || lit[len(lit)-1] != '"' {
+		return lit
+	}
+	inner := lit[1 : len(lit)-1]
+	var sb strings.Builder
+	for i := 0; i < len(inner); i++ {
+		if inner[i] == '\\' && i+1 < len(inner) && inner[i+1] == '"' {
+			sb.WriteByte('"')
+			i++
+			continue
+		}
+		sb.WriteByte(inner[i])
+	}
+	return sb.String()
 }
 
 // quoteClassAd renders s as a ClassAd double-quoted string literal.

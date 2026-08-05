@@ -1628,7 +1628,11 @@ func (e *Executor) execInsert(st *Statement) (*Result, error) {
 	}
 	if !haveKeyAttr {
 		key = e.genKey()
-		fmt.Fprintf(&sb, "%s = %s\n", e.keyAttr, quoteClassAd(key))
+		lit, ok := quoteClassAdOld(key)
+		if !ok {
+			return nil, fmt.Errorf("INSERT: generated key %q cannot be written in old-ClassAd format", key)
+		}
+		fmt.Fprintf(&sb, "%s = %s\n", e.keyAttr, lit)
 	}
 	if key == "" {
 		return nil, fmt.Errorf("INSERT: empty primary key")
@@ -1753,7 +1757,10 @@ func keyString(v classad.Value) string {
 func keyFromLiteral(lit string) string {
 	lit = strings.TrimSpace(lit)
 	if len(lit) >= 2 && lit[0] == '"' && lit[len(lit)-1] == '"' {
-		return unquoteClassAd(lit)
+		// INSERT values are quoted for old-ClassAd text (quoteClassAdOld), so the key is
+		// recovered with the matching inverse -- unquoteClassAd would eat backslashes the
+		// value legitimately contains.
+		return unquoteClassAdOld(lit)
 	}
 	return lit
 }
