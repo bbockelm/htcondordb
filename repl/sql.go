@@ -18,6 +18,10 @@
 // GROUP BY time_bucket(QDate, '1h'). This grouping is computed client-side (the
 // server aggregate groups by raw attribute value only).
 //
+// CASE WHEN <cond> THEN <v> [WHEN ...] [ELSE <v>] END (and the CASE <expr> WHEN <value>
+// form) is accepted anywhere an expression is: it becomes the equivalent ClassAd ?: chain,
+// with a missing ELSE yielding undefined (SQL's NULL).
+//
 // A projected column may be any ClassAd expression, and aggregates may appear inside one:
 // SELECT 2 * COUNT(*), SELECT SUM(Cpus) / COUNT(*) AS avg, SELECT MAX(m) - MIN(m),
 // SELECT COUNT(*) > 1000 ? "busy" : "quiet". The aggregates are lifted out and computed by
@@ -38,8 +42,10 @@
 // UPDATE/DELETE can recover the key of every row a WHERE clause matches. WHERE
 // and assignment right-hand sides are translated to ClassAd expressions and
 // evaluated by the store's expression engine, so the full ClassAd operator set
-// is available; the translation only adapts SQL spellings (`=`, `<>`, AND/OR,
-// single-quoted strings).
+// is available; the translation only adapts SQL spellings that ClassAd has no
+// reading for -- `=`, `<>`, AND/OR/NOT, IS [NOT] NULL, single-quoted strings, and
+// CASE WHEN ... THEN ... ELSE ... END (see sqlexpr.go). Everything else is passed
+// through byte for byte.
 package repl
 
 import (
@@ -912,6 +918,11 @@ func (p *parser) parseSelectItem() (SelectItem, error) {
 		it.Alias = p.parseOptionalAlias()
 		return it, nil
 	}
+	// CASE ... END is an expression, not a column: route it to the expression path (a lone
+	// identifier would otherwise be taken as a column name and stop at WHEN).
+	if p.isKeyword("CASE") {
+		return p.parseSelectExpr()
+	}
 	// time_bucket(attr, 'width') grouping expression.
 	if strings.EqualFold(t.text, "time_bucket") && p.peekAheadPunct(1, "(") {
 		attr, secs, err := p.parseBucketCall()
@@ -974,8 +985,8 @@ func (p *parser) atSelectItemEnd() bool {
 	return (pk.kind == tPunct && pk.text == ",") || p.isKeyword("FROM") || p.isKeyword("AS")
 }
 
-// captureSelectExpr captures a SELECT expression and lifts every aggregate call out of it.
-// It returns the expression with each call replaced by a placeholder attribute (__agg_0,
+// captureSelectExpr captures a SELECT expression and lifts every aggregate call out of it,
+// returning the expression with each call replaced by a placeholder attribute (__agg_0,
 // __agg_1, ... in source order), the lifted calls, and the original source text for the
 // column header.
 //
@@ -984,47 +995,15 @@ func (p *parser) atSelectItemEnd() bool {
 // would fail before anything could be substituted. Consuming each call whole also keeps its
 // parentheses out of the depth counter that decides where the item ends.
 func (p *parser) captureSelectExpr(stop func() bool) (expr string, aggs []AggCall, raw string, err error) {
-	if p.atEnd() || stop() {
-		return "", nil, "", fmt.Errorf("empty expression")
+	lift := []AggCall{}
+	expr, raw, err = p.captureExpr(stop, &lift)
+	if err != nil {
+		return "", nil, "", err
 	}
-	start := p.peek().pos
-	end, written := start, start
-	var b strings.Builder
-	depth := 0
-	for !p.atEnd() {
-		if depth == 0 && stop() {
-			break
-		}
-		t := p.peek()
-		if t.kind == tIdent && isAggName(strings.ToUpper(t.text)) && p.peekAheadPunct(1, "(") {
-			call, cerr := p.parseAggCall()
-			if cerr != nil {
-				return "", nil, "", cerr
-			}
-			b.WriteString(p.src[written:t.pos])
-			fmt.Fprintf(&b, "%s%d", aggPlaceholderPrefix, len(aggs))
-			aggs = append(aggs, call)
-			end = p.toks[p.pos-1].end // the closing ')'
-			written = end
-			continue
-		}
-		p.pos++
-		end = t.end
-		if t.kind == tPunct {
-			if t.text == "(" {
-				depth++
-			} else if t.text == ")" {
-				depth--
-			}
-		}
+	if len(lift) == 0 {
+		lift = nil
 	}
-	b.WriteString(p.src[written:end])
-	raw = strings.TrimSpace(p.src[start:end])
-	expr = strings.TrimSpace(b.String())
-	if raw == "" || expr == "" {
-		return "", nil, "", fmt.Errorf("empty expression")
-	}
-	return expr, aggs, raw, nil
+	return expr, lift, raw, nil
 }
 
 // parseAggCall consumes an aggregate call `NAME ( * | ident )` and returns it. The caller has
@@ -1042,6 +1021,12 @@ func (p *parser) parseAggCall() (AggCall, error) {
 			return AggCall{}, fmt.Errorf("%s(...): %w", name, err)
 		}
 		arg = col
+	}
+	// The store aggregates over an ATTRIBUTE, so the argument has to be a bare name: there
+	// is no way to push `SUM(CASE ... END)` or `SUM(a + b)` down to it. Say so plainly
+	// rather than reporting a missing parenthesis.
+	if !p.atPunct(")") {
+		return AggCall{}, fmt.Errorf("%s(...) takes an attribute name, not an expression", name)
 	}
 	if err := p.expectPunct(")"); err != nil {
 		return AggCall{}, err
@@ -1206,36 +1191,13 @@ func (p *parser) parseWhere() (string, error) {
 	})
 }
 
-// captureRawExpr returns the source text of the expression starting at the
-// current token and running until stop() is true at the top paren level (or end
-// of input), advancing past it. The text is handed to the ClassAd engine
-// unchanged -- no SQL-to-ClassAd translation.
+// captureRawExpr captures an expression that is NOT a SELECT item -- a WHERE clause, an
+// UPDATE assignment's right-hand side, a MATCH filter, an INSERT value. SQL spellings are
+// translated for the ClassAd engine (see captureExpr); aggregates are not lifted, since only
+// a SELECT list can contain them.
 func (p *parser) captureRawExpr(stop func() bool) (string, error) {
-	if p.atEnd() || stop() {
-		return "", fmt.Errorf("empty expression")
-	}
-	start := p.peek().pos
-	end := start
-	depth := 0
-	for !p.atEnd() {
-		if depth == 0 && stop() {
-			break
-		}
-		t := p.next()
-		end = t.end
-		if t.kind == tPunct {
-			if t.text == "(" {
-				depth++
-			} else if t.text == ")" {
-				depth--
-			}
-		}
-	}
-	raw := strings.TrimSpace(p.src[start:end])
-	if raw == "" {
-		return "", fmt.Errorf("empty expression")
-	}
-	return raw, nil
+	expr, _, err := p.captureExpr(stop, nil)
+	return expr, err
 }
 
 // parseOrderBy parses "term [ASC|DESC] (, term [ASC|DESC])*". Each term is a
