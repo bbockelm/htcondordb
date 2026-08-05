@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -62,17 +64,52 @@ func (m *scheddSyncManager) ResyncTargets() []string {
 	return out
 }
 
-// scheddSyncSettings is the resolved, comparable configuration of the tailers.
+// defaultArchiveCategoricalAttrs are the history archive's categorical (string equality)
+// indexes when HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS is unset. Owner is the one grouping
+// dimension every pool has. Sites that group by AccountingGroup, ProjectName, or a custom
+// attribute should name them too: an unindexed GROUP BY is a full scan of every segment the
+// zone maps cannot prune, and the cost of adding an index later grows with the archive
+// (the backfill decompresses every record once).
+const defaultArchiveCategoricalAttrs = "Owner"
+
+// scheddSyncSettings is the resolved, comparable configuration of the tailers. Every field
+// must stay comparable -- apply() reconciles by struct equality -- so attribute lists are
+// carried as their canonical config strings and split at the point of use.
 type scheddSyncSettings struct {
 	enabled  bool
 	jobLog   string
 	histFile string
 	posDir   string
+
+	// History-archive tuning. archiveSegSize applies only when the archive is first
+	// created (archiveconfig.json is authoritative on reopen); the index attributes are
+	// reconciled onto an existing archive at startup. See launch.
+	archiveSegSize  int
+	archiveCatAttrs string
+	archiveValAttrs string
 }
 
 func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 	if !configBool(cfg, "HTCONDORDB_SYNC_SCHEDD") {
 		return scheddSyncSettings{}
+	}
+	// Unset leaves SegmentSize zero, i.e. the library default (8 MiB). Deliberately not
+	// overridden: a small sealed segment is what keeps the tail of the archive queryable,
+	// since the active segment carries no sidecar index and is scanned linearly until it
+	// seals -- and recent history is the hot query path. The cure for segment count at
+	// scale is merging cold segments in the background, not sealing large ones up front,
+	// which would trade the hot path for the cold one.
+	//
+	// Raising it is still useful for a deployment that knows its ingest rate. The
+	// structural ceiling is 4 GiB (segment offsets are uint32 throughout the record and
+	// sidecar formats); going near it is untested.
+	segSize := configInt(cfg, "HTCONDORDB_ARCHIVE_SEGMENT_SIZE")
+	if segSize < 0 {
+		segSize = 0
+	}
+	catAttrs := getStr(cfg, "HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS")
+	if strings.TrimSpace(catAttrs) == "" {
+		catAttrs = defaultArchiveCategoricalAttrs
 	}
 	return scheddSyncSettings{
 		enabled:  true,
@@ -82,7 +119,78 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		// (HTCONDORDB_DIR or $(SPOOL)/htcondordb) -- not HTCONDORDB_DIR alone, which left
 		// SPOOL-configured deployments with no persisted resume position.
 		posDir: resolveDBDir(cfg),
+
+		archiveSegSize:  segSize,
+		archiveCatAttrs: canonicalAttrList(catAttrs),
+		archiveValAttrs: canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS"), "ClusterId")),
 	}
+}
+
+// canonicalAttrList normalizes a comma- and/or space-separated attribute list to a stable
+// comma-joined form, so two spellings of the same list compare equal in scheddSyncSettings
+// and a reconfig that only reformats the list does not restart the tailers.
+func canonicalAttrList(s string) string {
+	return strings.Join(splitAttrList(s), ",")
+}
+
+// reconcileArchiveIndexes brings an existing history archive's index set up to the
+// configured one, in the background. It only ever ADDS: an attribute that was indexed but
+// is no longer configured is left alone, so a index added by hand (via the repl) is not
+// silently discarded by a config that predates it.
+//
+// The rebuild is not interruptible once started -- AddIndex reindexes synchronously -- so
+// ctx is only consulted before beginning. That is acceptable because the work is
+// idempotent: an interrupted rebuild leaves segments stale, StaleIndexSegments reports
+// them, and the next startup (or a Reindex) retries just those.
+//
+// REQUIRES a classad release in which ArchiveTable.AddIndex folds its result back into
+// archiveconfig.json. Without that, the reopen path restores the creation-time index set,
+// this reconciliation finds the attribute missing again on every restart, and the backfill
+// re-runs each time -- growing from minutes to hours as the archive matures.
+func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, hist *db.ArchiveTable, s scheddSyncSettings) {
+	haveCat, haveVal := hist.IndexedAttrs()
+	missing := func(want []string, have []string) []string {
+		var out []string
+		for _, w := range want {
+			if !slices.ContainsFunc(have, func(h string) bool { return strings.EqualFold(h, w) }) {
+				out = append(out, w)
+			}
+		}
+		return out
+	}
+	addCat := missing(splitAttrList(s.archiveCatAttrs), haveCat)
+	addVal := missing(splitAttrList(s.archiveValAttrs), haveVal)
+	if len(addCat) == 0 && len(addVal) == 0 {
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	go func() {
+		stale, sealed := hist.StaleIndexSegments()
+		m.logger.Info("schedd-sync: backfilling history archive indexes",
+			"categorical", addCat, "value", addVal, "segments", sealed, "stale_before", stale)
+		if !hist.AddIndex(addCat, addVal) {
+			return
+		}
+		stale, sealed = hist.StaleIndexSegments()
+		m.logger.Info("schedd-sync: history archive index backfill finished",
+			"categorical", addCat, "value", addVal, "segments", sealed, "stale_after", stale)
+	}()
+}
+
+// splitAttrList splits a comma- and/or space-separated attribute list, dropping empties.
+func splitAttrList(s string) []string {
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // Sources returns the tailers currently running, for the collector ad's live
@@ -190,7 +298,9 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	}
 	if s.histFile != "" {
 		hist, err := m.svc.Catalog().CreateArchiveTable("history", db.ArchiveConfig{
-			ValueAttrs: []string{"ClusterId"},
+			SegmentSize:      s.archiveSegSize,
+			CategoricalAttrs: splitAttrList(s.archiveCatAttrs),
+			ValueAttrs:       splitAttrList(s.archiveValAttrs),
 			// Zone-map both the job's completion time and htcondordb's ingest time
 			// (EnteredHistoryTime, stamped per record), so range queries on either prune whole
 			// segments instead of scanning -- e.g. "jobs that entered history in the last 24h".
@@ -199,6 +309,14 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("schedd-sync: creating history archive: %w", err)
 		}
+		// The config above only takes effect when the archive is created: archiveconfig.json
+		// is authoritative on reopen, so an existing archive keeps the index set it was made
+		// with. Reconcile the configured attributes onto it explicitly, in the background --
+		// the backfill decompresses every record once, which is minutes on a young archive
+		// and hours on a mature one, and must not hold up daemon startup. AddIndex is correct
+		// immediately (segments full-scan for the new attribute until their sidecars are
+		// rebuilt), so serving during the backfill is safe.
+		m.reconcileArchiveIndexes(ctx, hist, s)
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
 			Filename: s.histFile,
 			Logger:   m.logger,
