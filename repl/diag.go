@@ -298,6 +298,20 @@ func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 	if d.Archive && d.Retention != nil {
 		fmt.Fprintf(w, "retention:  %s\n", retentionSummary(*d.Retention))
 	}
+	if !d.Archive {
+		// The per-segment columnar accelerator: whether a numeric COUNT(*) WHERE takes the
+		// columnar fast path instead of a row scan, and how much of the table it covers.
+		if ss := d.SchemaScan; ss.Enabled {
+			fmt.Fprintf(w, "columnar:   on — %d/%d sealed segments covered, %d schema fields\n",
+				ss.CoveredSegments, ss.SealedSegments, ss.SchemaFields)
+			if len(ss.HotFields) > 0 {
+				fmt.Fprintf(w, "  hot cols: %s (COUNT(*) WHERE on these takes the columnar fast path)\n",
+					strings.Join(ss.HotFields, ", "))
+			}
+		} else {
+			fmt.Fprintln(w, "columnar:   off (numeric COUNT(*) WHERE uses the row path; enabled by maintenance / .analyze)")
+		}
+	}
 	showOpStats(w, d.OpStats)
 }
 
