@@ -1167,6 +1167,12 @@ func bucketFloor(sec float64, width int64) string {
 // time_bucket). It takes the call rather than the SELECT item so a bare aggregate and one
 // lifted out of an expression reduce through the same code.
 func aggregateAds(it AggCall, ads []*classad.ClassAd) string {
+	// A conditional aggregate sees only its own rows. The client-side paths reduce over ads
+	// rather than projected values, so the filter is applied here -- if it were skipped the
+	// AS OF and time_bucket paths would quietly answer the unfiltered question.
+	if it.Filter != "" {
+		ads = filterAds(it.Filter, ads)
+	}
 	switch strings.ToUpper(it.Func) {
 	case "COUNT":
 		if it.Arg == "*" || it.Arg == "" {

@@ -29,6 +29,20 @@
 // reference that is neither grouped nor aggregated is refused rather than silently evaluating
 // to undefined and dropping every group.
 //
+// An aggregate may carry FILTER (WHERE <cond>), restricting THAT aggregate to the rows of
+// its group where the condition holds -- so one pass answers several differently-conditioned
+// questions:
+//
+//	SELECT Owner, COUNT(*) AS total,
+//	       COUNT(*) FILTER (WHERE JobStatus == 2) AS running,
+//	       COUNT(*) FILTER (WHERE JobStatus == 1) AS idle
+//	FROM jobs GROUP BY Owner
+//
+// The portable spelling SUM(CASE WHEN c THEN 1 ELSE 0 END) lowers onto the same thing, as
+// does SUM(CASE WHEN c THEN <attr> ELSE 0 END) and the ELSE-less form. Shapes that are not
+// provably the same question (a non-zero ELSE, an arithmetic THEN, a second WHEN) are
+// refused with a pointer to FILTER rather than guessed at.
+//
 // A projected column may be any ClassAd expression, and aggregates may appear inside one:
 // SELECT 2 * COUNT(*), SELECT SUM(Cpus) / COUNT(*) AS avg, SELECT MAX(m) - MIN(m),
 // SELECT COUNT(*) > 1000 ? "busy" : "quiet". The aggregates are lifted out and computed by
@@ -172,6 +186,10 @@ type SelectItem struct {
 	// empty for a plain column (Col holds the attribute name) and for aggregates.
 	Expr string
 
+	// AggFilter is a bare aggregate's `FILTER (WHERE ...)` condition (see AggCall.Filter).
+	// An aggregate inside an expression carries its own filter in Aggs instead.
+	AggFilter string
+
 	// Aggs are the aggregate calls lifted out of Expr, in source order. Expr refers to
 	// each as __agg_0, __agg_1, ... so `2 * COUNT(*)` runs one COUNT per group and
 	// evaluates the arithmetic over its result. Empty for a bare aggregate (Agg is set
@@ -186,10 +204,13 @@ type SelectItem struct {
 }
 
 // AggCall is one aggregate function call: COUNT/SUM/AVG/MIN/MAX over an attribute, or
-// COUNT over "*".
+// COUNT over "*". Filter, when set, is a conditional aggregate -- `FILTER (WHERE ...)`, or
+// the `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` spelling lowered onto it -- restricting THIS
+// aggregate to the rows of its group where the expression holds.
 type AggCall struct {
-	Func string
-	Arg  string
+	Func   string
+	Arg    string
+	Filter string
 }
 
 // aggPlaceholderPrefix names the attribute an aggregate is bound to when it is lifted out of
@@ -209,7 +230,7 @@ func (it SelectItem) GroupLevel() bool { return it.Agg != "" || len(it.Aggs) > 0
 // expression over several.
 func (it SelectItem) aggCalls() []AggCall {
 	if it.Agg != "" {
-		return []AggCall{{Func: it.Agg, Arg: it.Col}}
+		return []AggCall{{Func: it.Agg, Arg: it.Col, Filter: it.AggFilter}}
 	}
 	return it.Aggs
 }
@@ -235,7 +256,11 @@ func (it SelectItem) header() string {
 		return "*"
 	}
 	if it.Agg != "" {
-		return it.Agg + "(" + it.Col + ")"
+		h := it.Agg + "(" + it.Col + ")"
+		if it.AggFilter != "" {
+			h += " FILTER (WHERE " + it.AggFilter + ")"
+		}
+		return h
 	}
 	if it.Bucket {
 		return "time_bucket(" + it.Col + ", " + strconv.FormatInt(it.BucketWidth, 10) + ")"
@@ -941,7 +966,7 @@ func (p *parser) parseSelectItem() (SelectItem, error) {
 			p.pos = save
 			return p.parseSelectExpr()
 		}
-		it := SelectItem{Agg: call.Func, Col: call.Arg}
+		it := SelectItem{Agg: call.Func, Col: call.Arg, AggFilter: call.Filter}
 		it.Alias = p.parseOptionalAlias()
 		return it, nil
 	}
@@ -1038,6 +1063,11 @@ func (p *parser) captureSelectExpr(stop func() bool) (expr string, aggs []AggCal
 func (p *parser) parseAggCall() (AggCall, error) {
 	name := strings.ToUpper(p.peek().text)
 	p.pos += 2 // name + '('
+	// A CASE argument is a conditional aggregate in the portable spelling; it lowers onto a
+	// filtered one (see parseCaseAggCall) rather than being refused.
+	if p.isKeyword("CASE") {
+		return p.parseCaseAggCall(name)
+	}
 	var arg string
 	if pk := p.peek(); pk.kind == tOp && pk.text == "*" {
 		arg = "*"
@@ -1050,10 +1080,11 @@ func (p *parser) parseAggCall() (AggCall, error) {
 		arg = col
 	}
 	// The store aggregates over an ATTRIBUTE, so the argument has to be a bare name: there
-	// is no way to push `SUM(CASE ... END)` or `SUM(a + b)` down to it. Say so plainly
-	// rather than reporting a missing parenthesis.
+	// is no way to push `SUM(a + b)` down to it. Say so plainly rather than reporting a
+	// missing parenthesis.
 	if !p.atPunct(")") {
-		return AggCall{}, fmt.Errorf("%s(...) takes an attribute name, not an expression", name)
+		return AggCall{}, fmt.Errorf("%s(...) takes an attribute name, not an expression "+
+			"(for a conditional aggregate use %s(...) FILTER (WHERE ...))", name, name)
 	}
 	if err := p.expectPunct(")"); err != nil {
 		return AggCall{}, err
@@ -1061,7 +1092,155 @@ func (p *parser) parseAggCall() (AggCall, error) {
 	if arg == "*" && name != "COUNT" {
 		return AggCall{}, fmt.Errorf("%s(*) is not valid; %s needs an attribute", name, name)
 	}
-	return AggCall{Func: name, Arg: arg}, nil
+	call := AggCall{Func: name, Arg: arg}
+	filter, err := p.parseAggFilter(name)
+	if err != nil {
+		return AggCall{}, err
+	}
+	call.Filter = filter
+	return call, nil
+}
+
+// parseAggFilter parses an optional `FILTER (WHERE <expr>)` after an aggregate call, the SQL
+// spelling of a conditional aggregate: the aggregate sees only the rows of its group where
+// the expression holds. The expression is captured with the same SQL-to-ClassAd translation
+// as a WHERE clause, so 'text', AND/OR, IS NULL and CASE all read the same way.
+func (p *parser) parseAggFilter(name string) (string, error) {
+	if !p.takeKeyword("FILTER") {
+		return "", nil
+	}
+	if err := p.expectPunct("("); err != nil {
+		return "", fmt.Errorf("%s(...) FILTER: expected (WHERE ...): %w", name, err)
+	}
+	if !p.takeKeyword("WHERE") {
+		return "", fmt.Errorf("%s(...) FILTER: expected WHERE, got %q", name, p.peek().text)
+	}
+	expr, err := p.captureRawExpr(func() bool { return p.atEnd() || p.atPunct(")") })
+	if err != nil {
+		return "", fmt.Errorf("%s(...) FILTER (WHERE ...): %w", name, err)
+	}
+	if err := p.expectPunct(")"); err != nil {
+		return "", fmt.Errorf("%s(...) FILTER (WHERE ...): %w", name, err)
+	}
+	return expr, nil
+}
+
+// parseCaseAggCall lowers the portable conditional-aggregate spelling onto a filtered
+// aggregate:
+//
+//	SUM(CASE WHEN c THEN 1 ELSE 0 END)     ->  COUNT(*) FILTER (WHERE c)
+//	SUM(CASE WHEN c THEN Attr ELSE 0 END)  ->  SUM(Attr) FILTER (WHERE c)
+//	COUNT(CASE WHEN c THEN Attr END)       ->  COUNT(Attr) FILTER (WHERE c)
+//
+// Only these shapes lower, because only these are provably the same question: one WHEN arm,
+// a THEN that is a bare attribute or the literal 1, and an ELSE that is absent or the
+// literal 0 (SUM skips undefined, and adding zero changes nothing). Anything else -- a
+// second arm, an arithmetic THEN, a non-zero ELSE -- is reported rather than guessed at,
+// since a wrong lowering would return a plausible number.
+func (p *parser) parseCaseAggCall(name string) (AggCall, error) {
+	expr, aggs, raw, err := p.captureSelectExpr(func() bool { return p.atEnd() || p.atPunct(")") })
+	if err != nil {
+		return AggCall{}, fmt.Errorf("%s(CASE ...): %w", name, err)
+	}
+	if err := p.expectPunct(")"); err != nil {
+		return AggCall{}, err
+	}
+	if len(aggs) > 0 {
+		return AggCall{}, fmt.Errorf("%s(...): an aggregate cannot appear inside another", name)
+	}
+	cond, then, els, ok := simpleCaseArms(expr)
+	if !ok {
+		return AggCall{}, fmt.Errorf("%s(%s) is not a conditional aggregate this store can "+
+			"push down; use %s(...) FILTER (WHERE ...)", name, raw, name)
+	}
+	if els != "" && els != "0" && els != "undefined" {
+		return AggCall{}, fmt.Errorf("%s(CASE ...) lowers to a filtered aggregate only with "+
+			"ELSE 0 (or no ELSE); got ELSE %s", name, els)
+	}
+	arg := then
+	if then == "1" {
+		if name != "SUM" && name != "COUNT" {
+			return AggCall{}, fmt.Errorf("%s(CASE WHEN ... THEN 1 ...) is only meaningful for SUM or COUNT", name)
+		}
+		return AggCall{Func: "COUNT", Arg: "*", Filter: cond}, nil
+	}
+	if !isBareIdent(arg) {
+		return AggCall{}, fmt.Errorf("%s(CASE WHEN ... THEN %s ...): THEN must be an attribute "+
+			"or the literal 1; use %s(...) FILTER (WHERE ...) instead", name, then, name)
+	}
+	return AggCall{Func: name, Arg: arg, Filter: cond}, nil
+}
+
+// simpleCaseArms decomposes the single-arm conditional the CASE translation produces --
+// `((cond) ? (then) : (else))` -- back into its parts. It works on the TRANSLATED text
+// (parseCaseExpr's output shape) rather than re-parsing, so anything with a second arm
+// nests another conditional in the else slot and is rejected by the callers' checks.
+func simpleCaseArms(expr string) (cond, then, els string, ok bool) {
+	s := strings.TrimSpace(expr)
+	if !strings.HasPrefix(s, "(") || !strings.HasSuffix(s, ")") {
+		return "", "", "", false
+	}
+	s = strings.TrimSpace(s[1 : len(s)-1])
+	cond, rest, ok := splitParen(s, " ? ")
+	if !ok {
+		return "", "", "", false
+	}
+	then, els, ok = splitParen(rest, " : ")
+	if !ok {
+		return "", "", "", false
+	}
+	return unwrap(cond), unwrap(then), unwrap(els), true
+}
+
+// splitParen splits s at the first occurrence of sep that sits outside parentheses.
+func splitParen(s, sep string) (before, after string, ok bool) {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		if depth == 0 && strings.HasPrefix(s[i:], sep) {
+			return strings.TrimSpace(s[:i+1]), strings.TrimSpace(s[i+len(sep):]), true
+		}
+	}
+	return "", "", false
+}
+
+// unwrap strips one balanced enclosing paren pair.
+func unwrap(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return s
+	}
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i != len(s)-1 {
+				return s // the parens do not enclose the whole string
+			}
+		}
+	}
+	return strings.TrimSpace(s[1 : len(s)-1])
+}
+
+// isBareIdent reports whether s is a single attribute name.
+func isBareIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !isIdentPart(s[i]) {
+			return false
+		}
+	}
+	return !isDigit(s[0])
 }
 
 // peekAt returns the token n positions ahead (or a zero token past the end).

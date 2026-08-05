@@ -64,11 +64,16 @@ func TestCaseOverAggregates(t *testing.T) {
 		t.Errorf("per-group CASE = %v, want alice light and bob heavy", got)
 	}
 
-	// An aggregate is not pushable through a CASE argument: the store aggregates over an
-	// attribute, so say so rather than failing on a parenthesis.
-	_, err := e.ExecString(`SELECT SUM(CASE WHEN Cpus > 2 THEN 1 ELSE 0 END) FROM jobs`)
-	if err == nil || !strings.Contains(err.Error(), "takes an attribute name") {
-		t.Errorf("SUM(CASE ...) error = %v, want it to explain the attribute requirement", err)
+	// SUM(CASE WHEN c THEN 1 ELSE 0 END) is the portable conditional-aggregate spelling; it
+	// lowers onto a filtered aggregate (see TestConditionalAggregateLowering). A shape that
+	// cannot lower is still refused with a message pointing at FILTER.
+	r = mustExec(t, e, `SELECT SUM(CASE WHEN Cpus > 2 THEN 1 ELSE 0 END) AS n FROM jobs`)
+	if len(r.Rows) != 1 || r.Rows[0][0] != "2" { // alice 4 and bob 8 exceed 2
+		t.Errorf("SUM(CASE ...) = %v, want one row of 2", r.Rows)
+	}
+	_, err := e.ExecString(`SELECT SUM(CASE WHEN Cpus > 2 THEN Cpus + 1 ELSE 0 END) FROM jobs`)
+	if err == nil || !strings.Contains(err.Error(), "FILTER") {
+		t.Errorf("un-lowerable SUM(CASE ...) error = %v, want it to point at FILTER", err)
 	}
 }
 
