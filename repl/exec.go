@@ -82,6 +82,16 @@ type Executor struct {
 	// list error just retries next time.
 	archives   map[string]bool
 	archivesOK bool
+
+	// Explicit-transaction state, set by BEGIN and cleared by COMMIT/ROLLBACK. txActive
+	// is the flag BEGIN sets; tx is the server-side transaction, opened lazily on the
+	// first write because a dbrpc transaction needs a table and BEGIN does not name one;
+	// txTable is the table it bound to. txBuf accumulates ops in consistent mode, where
+	// there is no server-side transaction to hold open. See stage.
+	txActive bool
+	tx       *dbrpc.Tx
+	txTable  string
+	txBuf    []WriteOp
 }
 
 // isArchive reports whether table is an append-only history table, loading (and caching) the
@@ -124,9 +134,13 @@ func (e *Executor) Resync(target string) error {
 	return e.resync(target)
 }
 
-// commit applies a batch of write ops to table: through ApplyBatch (consistent
-// mode) if configured, else as one local dbrpc transaction on that table.
+// commit applies a batch of write ops to table. Inside an explicit transaction (BEGIN)
+// the ops are staged and applied at COMMIT; otherwise each statement commits on its own,
+// through ApplyBatch (consistent mode) if configured, else as one local dbrpc transaction.
 func (e *Executor) commit(table string, ops []WriteOp) error {
+	if e.txActive {
+		return e.stage(table, ops)
+	}
 	if e.applyBatch != nil {
 		return e.applyBatch(ops)
 	}
@@ -134,7 +148,17 @@ func (e *Executor) commit(table string, ops []WriteOp) error {
 	if err != nil {
 		return err
 	}
+	if err := applyOps(tx, ops); err != nil {
+		_ = tx.Abort(context.Background())
+		return err
+	}
+	return tx.Commit(context.Background())
+}
+
+// applyOps issues a batch of write ops against an open transaction, without committing.
+func applyOps(tx *dbrpc.Tx, ops []WriteOp) error {
 	for _, op := range ops {
+		var err error
 		switch op.Kind {
 		case WNewClassAd:
 			err = tx.NewClassAd(context.Background(), op.Key, op.Value)
@@ -144,11 +168,106 @@ func (e *Executor) commit(table string, ops []WriteOp) error {
 			err = tx.DestroyClassAd(context.Background(), op.Key)
 		}
 		if err != nil {
-			_ = tx.Abort(context.Background())
 			return err
 		}
 	}
-	return tx.Commit(context.Background())
+	return nil
+}
+
+// --- explicit transactions (BEGIN / COMMIT / ROLLBACK) ---
+
+// stage adds a statement's writes to the open transaction.
+//
+// The transaction binds to the first table written, not to BEGIN: a dbrpc transaction is
+// scoped to one table (opBegin carries the table name), and BEGIN does not name one. A
+// later statement against a different table is refused rather than silently split across
+// two transactions, which would not be atomic.
+func (e *Executor) stage(table string, ops []WriteOp) error {
+	if e.txTable == "" {
+		e.txTable = table
+	} else if !strings.EqualFold(e.txTable, table) {
+		return fmt.Errorf(
+			"this transaction is writing to table %q; a transaction cannot span tables "+
+				"(COMMIT or ROLLBACK before writing to %q)", e.txTable, table)
+	}
+
+	// Consistent mode proposes a whole batch to raft at once, so there is no server-side
+	// transaction to hold open; accumulate and propose the lot at COMMIT instead.
+	if e.applyBatch != nil {
+		e.txBuf = append(e.txBuf, ops...)
+		return nil
+	}
+
+	if e.tx == nil {
+		tx, err := e.c.BeginTable(context.Background(), table)
+		if err != nil {
+			return err
+		}
+		e.tx = tx
+	}
+	return applyOps(e.tx, ops)
+}
+
+// execBegin opens an explicit transaction.
+func (e *Executor) execBegin() (*Result, error) {
+	if e.txActive {
+		return nil, fmt.Errorf("a transaction is already open (COMMIT or ROLLBACK it first); nested transactions are not supported")
+	}
+	e.txActive = true
+	return &Result{Note: "BEGIN"}, nil
+}
+
+// execCommit applies the open transaction's writes.
+//
+// A transaction that wrote nothing commits successfully without any server round trip --
+// there is no transaction to apply, and failing would penalize the common
+// BEGIN/SELECT/COMMIT shape a connection in non-autocommit mode produces.
+func (e *Executor) execCommit() (*Result, error) {
+	if !e.txActive {
+		return nil, fmt.Errorf("no transaction is open (COMMIT without BEGIN)")
+	}
+	tx, buf := e.tx, e.txBuf
+	e.resetTxn()
+
+	switch {
+	case tx != nil:
+		if err := tx.Commit(context.Background()); err != nil {
+			return nil, err
+		}
+	case len(buf) > 0:
+		if err := e.applyBatch(buf); err != nil {
+			return nil, err
+		}
+	}
+	return &Result{Note: "COMMIT"}, nil
+}
+
+// execRollback discards the open transaction's writes.
+func (e *Executor) execRollback() (*Result, error) {
+	if !e.txActive {
+		return nil, fmt.Errorf("no transaction is open (ROLLBACK without BEGIN)")
+	}
+	tx := e.tx
+	e.resetTxn()
+
+	if tx != nil {
+		// The transaction is discarded either way: a failed Abort leaves it for the
+		// server's idle reaper (or the connection close), and reporting the error would
+		// only make a caller believe its writes might still land.
+		_ = tx.Abort(context.Background())
+	}
+	return &Result{Note: "ROLLBACK"}, nil
+}
+
+// InTransaction reports whether an explicit transaction is open.
+func (e *Executor) InTransaction() bool { return e.txActive }
+
+// resetTxn clears transaction state, leaving the executor in autocommit mode.
+func (e *Executor) resetTxn() {
+	e.txActive = false
+	e.tx = nil
+	e.txTable = ""
+	e.txBuf = nil
 }
 
 // Result is the outcome of executing a statement.
@@ -194,6 +313,12 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 		return e.execDropView(st)
 	case StmtMatch:
 		return e.execMatch(st)
+	case StmtBegin:
+		return e.execBegin()
+	case StmtCommit:
+		return e.execCommit()
+	case StmtRollback:
+		return e.execRollback()
 	default:
 		return nil, fmt.Errorf("unknown statement kind")
 	}
@@ -1548,14 +1673,19 @@ func (e *Executor) execDelete(st *Statement) (*Result, error) {
 	// rows written before key-stamping -- and Owner/User records -- do not have, so
 	// `DELETE FROM jobs WHERE MyType =?= "Owner"` failed to address them. It also avoids
 	// round-tripping every matched ad just to delete it.
-	if e.applyBatch == nil {
+	//
+	// Not inside a transaction, though: the bulk op commits on its own (it carries no
+	// transaction id), so taking it there would apply the delete immediately and let a
+	// later ROLLBACK silently fail to undo it. Staging keys is slower but is the only
+	// path the transaction can discard.
+	if e.applyBatch == nil && !e.txActive {
 		n, err := e.c.DeleteWhereTable(context.Background(), st.Table, constraint(st.Where))
 		if err != nil {
 			return nil, fmt.Errorf("deleting: %w", err)
 		}
 		return &Result{Affected: n, Note: fmt.Sprintf("DELETE %d", n)}, nil
 	}
-	// Batch/embedded mode (writes captured client-side): fall back to match-keys + destroy.
+	// Batch/embedded mode, or an open transaction: resolve keys and stage a destroy per row.
 	keys, err := e.matchedKeys(st.Table, st.Where)
 	if err != nil {
 		return nil, err

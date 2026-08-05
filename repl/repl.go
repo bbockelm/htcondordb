@@ -207,6 +207,9 @@ a row's primary key lives in the "Key" attribute.
   DELETE FROM jobs WHERE JobStatus == 4;
   DROP INDEX ON machines (Cpus);   DROP TABLE machines;
 
+  BEGIN;  INSERT INTO jobs ...;  INSERT INTO jobs ...;  COMMIT;   -- one atomic apply
+  BEGIN;  DELETE FROM jobs WHERE JobStatus == 4;  ROLLBACK;       -- discard the writes
+
   CREATE MATERIALIZED VIEW cluster_usage AS
     SELECT Owner AS label_owner, JobStatus AS label_status,
            COUNT(*) AS metric_jobs, SUM(RequestMemory) AS metric_memory
@@ -240,6 +243,11 @@ Notes:
   - HAVING filters groups after aggregation (WHERE filters rows before it):
     SELECT Owner, SUM(Cpus) FROM jobs GROUP BY Owner HAVING SUM(Cpus) > 100;
   - JOIN and subqueries are not supported; matchmaking is MATCH, not a join.
+  - BEGIN batches the writes of the statements up to COMMIT into one atomic apply;
+    ROLLBACK discards them. Two limits, both from the store: a transaction covers
+    one table (it binds to the first table written), and SELECT -- along with the
+    row matching that UPDATE and DELETE do -- reads committed state, so it does not
+    see the transaction's own uncommitted writes. DDL is not transactional.
   - CREATE INDEX kind is VALUE (numeric+range) or CATEGORICAL (string eq).
   - MATCH <requests> TO <resources>: greedy assignment, one resource per request.
     Each request (in table order) takes its best-ranked bilaterally-matching

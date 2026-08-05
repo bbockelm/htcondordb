@@ -97,6 +97,11 @@ const (
 	StmtWatch
 	StmtCreateView
 	StmtDropView
+	// Transaction control. A transaction batches the writes of the statements between
+	// BEGIN and COMMIT into one atomic apply; see Executor.Exec for what it covers.
+	StmtBegin
+	StmtCommit
+	StmtRollback
 )
 
 // Statement is one parsed SQL-like statement.
@@ -499,9 +504,25 @@ func (p *parser) parseStatement() (*Statement, error) {
 		return p.parseMatch()
 	case p.takeKeyword("WATCH"):
 		return p.parseWatch()
+	case p.takeKeyword("BEGIN"), p.takeKeyword("START"):
+		return p.parseTransaction(StmtBegin)
+	case p.takeKeyword("COMMIT"), p.takeKeyword("END"):
+		return p.parseTransaction(StmtCommit)
+	case p.takeKeyword("ROLLBACK"), p.takeKeyword("ABORT"):
+		return p.parseTransaction(StmtRollback)
 	default:
-		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, MATCH, or WATCH)", p.peek().text)
+		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, MATCH, WATCH, BEGIN, COMMIT, or ROLLBACK)", p.peek().text)
 	}
+}
+
+// parseTransaction parses a transaction-control statement. The noise words SQL allows
+// after the verb -- BEGIN TRANSACTION, COMMIT WORK, ROLLBACK TRANSACTION -- are accepted
+// and ignored, so statements copied from another dialect parse. Savepoints are not
+// supported: the store has no nested-transaction concept to map them onto.
+func (p *parser) parseTransaction(kind StmtKind) (*Statement, error) {
+	p.takeKeyword("TRANSACTION")
+	p.takeKeyword("WORK")
+	return &Statement{Kind: kind}, nil
 }
 
 // parseWatch parses:

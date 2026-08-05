@@ -5,5 +5,13 @@
 *.test
 *.out
 
+# Python driver
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+# A wheel build stages the shared library here; the checkout should not carry it.
+python/htcondordb/_lib/
+
 # Editor / OS
 .DS_Store

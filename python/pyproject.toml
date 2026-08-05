@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "htcondordb"
+version = "0.1.0"
+description = "PEP 249 (DB-API 2.0) driver for htcondordb, over HTCondor's CEDAR protocol"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Brian Bockelman" }]
+keywords = ["htcondor", "classad", "database", "dbapi", "sql"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: System :: Distributed Computing",
+]
+
+# cffi is the only hard requirement: it loads the shared library in ABI mode, so nothing
+# here needs a C compiler at install time.
+dependencies = ["cffi>=1.15"]
+
+[project.optional-dependencies]
+# classad2 (from HTCondor's Python bindings) is needed only by Cursor.fetchads(); every
+# other part of the driver works without it.
+classad = ["htcondor"]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/bbockelm/htcondordb"
+Source = "https://github.com/bbockelm/htcondordb"
+
+[tool.setuptools.packages.find]
+include = ["htcondordb*"]
+
+# A wheel may carry the shared library at htcondordb/_lib/; a plain source install does
+# not, and finds it through HTCONDORDB_LIBRARY or the loader's search path instead.
+[tool.setuptools.package-data]
+htcondordb = ["_lib/*.so", "_lib/*.dylib", "_lib/*.dll"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
