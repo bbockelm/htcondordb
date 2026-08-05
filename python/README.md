@@ -176,28 +176,28 @@ The fix is server-side: chase each projected expression's attribute references.
 `db.QueryRawProjected` hard-codes it `false`, which is right for an HTCondor-protocol relay
 (the protocol says send exactly the requested attributes) and wrong for SQL.
 
-## Known issue: backslashes and control characters on write
+## Known issue: backslashes and tabs through the persistent store
 
-Writing a string containing a backslash, tab, or newline through SQL corrupts it: one
-backslash comes back as four.
+Writing a string containing a backslash or a tab and reading it back doubles it: one
+backslash comes back as two.
 
-This is **upstream of the driver** and reproduces identically in `htcondordb-cli`:
+The SQL layer is not the cause — its old-format quoting is correct, and an in-memory store
+round-trips these values exactly. The corruption appears only after a round trip through
+**persistence**, which is what a real daemon uses: the durable representation renders
+strings with new-ClassAd escaping and reads them back with old-ClassAd rules, which do no
+unescaping at all (matching HTCondor's C++ `Lexer::tokenizeStringOld`). Embedded quotes
+survive, because an escaped quote is the one sequence old format does process.
 
-```
-$ htcondordb-cli -e "INSERT INTO t (Key,V) VALUES ('k','a\b')"
-$ htcondordb-cli -e "SELECT V FROM t"
-a\\\\b
-```
+It needs a fix in the classad storage layer. Pinned by a strict xfail in
+`test_integration.py` and by `repl/oldquote_test.go::TestPersistentStoreDoublesBackslashes`,
+which contrasts the two stores directly.
 
-The cause is in the classad library: `classad.ParseOld` unescapes `\"` in an old-format
-string literal but not `\\` or `\t`, while the SQL layer's `quoteClassAd` escapes all three.
-The mismatch doubles on each pass, and INSERT makes two passes where UPDATE makes one.
+### Values that cannot be stored at all
 
-Reads are unaffected — a backslash already in the store comes back exactly. Since reporting
-clients almost only read, this is rarely hit in practice, but it does mean the driver should
-not be used to load data containing Windows paths or regexes until the upstream fix lands.
-`test_integration.py::TestTypes::test_backslash_round_trip` is a strict `xfail` and will
-start failing (flagging the fix) once it is corrected.
+Old-ClassAd text is newline-separated, and a value ending in a backslash puts that
+backslash directly before the closing quote — where it makes the quote part of the value
+and runs the string on. Both are refused with a clear error rather than silently mangled;
+HTCondor's own old-format writer has the same two limitations.
 
 ## Testing
 

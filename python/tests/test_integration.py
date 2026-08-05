@@ -161,18 +161,35 @@ class TestTypes:
         assert cursor.fetchone() == (value,)
 
     @pytest.mark.xfail(
-        reason="upstream: classad.ParseOld does not unescape \\\\ or \\t in old-format "
-        "string literals (it only handles \\\"), so a backslash, tab, or newline written "
-        "through SQL comes back multiplied. Reproduces identically in htcondordb-cli, so "
-        "it is not a driver bug -- see the note in python/README.md.",
         strict=True,
+        reason="the PERSISTENT store double-escapes backslashes and tabs on the round "
+        "trip; the in-memory store does not, so this is below the SQL layer (whose "
+        "old-format quoting is fixed and covered by repl/oldquote_test.go). The durable "
+        "representation renders strings with new-ClassAd escaping and reads them back "
+        "with old-ClassAd rules, which do no unescaping. Needs a classad storage fix; "
+        "these tests run against a real, persistent daemon.",
     )
-    @pytest.mark.parametrize("value", ["back\\slash", "tab\there", "nl\nhere"])
+    @pytest.mark.parametrize("value", ["back\\slash", "tab\there"])
     def test_backslash_round_trip(self, connection, table, value):
         cursor = connection.cursor()
         cursor.execute(f"INSERT INTO {table} (Key, Owner) VALUES (?, ?)", ("row1", value))
         cursor.execute(f"SELECT Owner FROM {table} WHERE Key = ?", ("row1",))
         assert cursor.fetchone() == (value,)
+
+    @pytest.mark.parametrize("value", ["a\nb", "a\r\nb", "trailing\\"])
+    def test_values_old_format_cannot_hold_are_refused(self, connection, table, value):
+        """Two shapes old-ClassAd text cannot represent, refused rather than mangled.
+
+        The format is newline-separated, so a newline ends the attribute mid-string; and a
+        value ending in a backslash puts that backslash directly before the closing quote,
+        where it makes the quote part of the value and runs the string on. HTCondor's own
+        old-format writer has both limitations.
+        """
+        cursor = connection.cursor()
+        with pytest.raises(htcondordb.ProgrammingError, match="old-ClassAd format"):
+            cursor.execute(
+                f"INSERT INTO {table} (Key, Owner) VALUES (?, ?)", ("row1", value)
+            )
 
     def test_reading_a_backslash_written_outside_sql_is_faithful(self, connection, table):
         """The corruption is on the write path only; reads are exact.
