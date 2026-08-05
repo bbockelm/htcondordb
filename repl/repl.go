@@ -232,6 +232,13 @@ Notes:
     (evaluated server-side); DISTINCT and ORDER BY (ASC/DESC) are supported.
     A projected column may be an expression over aggregates, e.g.
     SELECT SUM(Cpus) / COUNT(*) AS avg_cpus FROM jobs.
+  - Ranking windows: ROW_NUMBER()/RANK()/DENSE_RANK() OVER (PARTITION BY cols
+    ORDER BY cols), filtered with QUALIFY -- "top N per group":
+    SELECT Owner, ClusterId,
+      ROW_NUMBER() OVER (PARTITION BY Owner ORDER BY QDate DESC) AS n
+      FROM jobs QUALIFY n <= 5;
+    ORDER BY inside OVER is required; the ranking is client-side over the whole
+    match, so narrow it with WHERE rather than LIMIT.
   - COUNT(DISTINCT attr) counts distinct values, exactly; it keeps one entry per
     distinct value per group during the scan, so use it on bounded-cardinality
     attributes rather than a unique-per-row one over a large history.
