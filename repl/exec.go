@@ -710,12 +710,15 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 		// read (only the grouped rows cross the wire). Fall back to client-side
 		// bucketing for an AS OF read (the server aggregate has no time-travel
 		// variant) or against a server too old to implement the bucketed opcode.
-		if hasBucket(st) || groupByHasBucket(st) {
+		if hasBucket(st) || groupByHasBucket(st) || groupByHasExpr(st) {
 			// Both table kinds push the bucketing down; only an AS OF read has no server-side
 			// aggregate variant and must bucket client-side. On an archive this is what makes
 			// "jobs per group per day" answerable from the per-segment indexes instead of by
 			// decompressing every record.
-			if st.AsOf == "" {
+			//
+			// A computed group key is the exception whichever table it is: the server groups
+			// by raw attribute values, so an expression key cannot be pushed down at all.
+			if st.AsOf == "" && !groupByHasExpr(st) {
 				res, err := e.execAggregateBucketServer(st)
 				if err == nil {
 					return res, nil
@@ -1131,6 +1134,14 @@ func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 					break
 				}
 				vals = append(vals, bucketFloor(sec, it.BucketWidth))
+				continue
+			}
+			if it.Expr != "" {
+				ex, perr := classad.ParseExpr(it.Expr)
+				if perr != nil {
+					return nil, fmt.Errorf("GROUP BY expression %q: %w", it.Col, perr)
+				}
+				vals = append(vals, valueDisplay(ex.Eval(ad)))
 				continue
 			}
 			vals = append(vals, valueDisplay(ad.EvaluateAttr(it.Col)))

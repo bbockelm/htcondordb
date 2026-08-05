@@ -10,6 +10,12 @@
 // (hash-map GROUP BY). JOIN and subqueries are intentionally unsupported and
 // rejected with a clear error; cross-table work is matchmaking, not a join.
 //
+// A GROUP BY term may be a computed key rather than an attribute: an expression, or the AS
+// alias of a projected one -- SELECT CASE WHEN Memory > 4096 THEN 'big' ELSE 'small' END AS
+// sz, COUNT(*) FROM jobs GROUP BY sz. The server aggregate groups by raw attribute values, so
+// a computed key is grouped client-side (as time_bucket is), which means every GROUP BY term
+// must also be selected.
+//
 // A GROUP BY term may be time_bucket(<attr>, '<width>'): it floors a unix-epoch
 // attribute (e.g. QDate) to a fixed width -- '30s', '5m', '1h', '1d', '1w', or a
 // bare integer number of seconds -- aligning buckets to the epoch. Selecting it
@@ -900,6 +906,7 @@ func (p *parser) parseSelect() (*Statement, error) {
 			return nil, err
 		}
 		st.GroupBy = cols
+		resolveGroupAliases(st)
 	}
 	if p.takeKeyword("HAVING") {
 		having, aggs, _, err := p.captureSelectExpr(func() bool {
@@ -1574,13 +1581,24 @@ func isAggName(up string) bool {
 func (p *parser) parseGroupCols() ([]string, error) {
 	var cols []string
 	for {
-		if t := p.peek(); strings.EqualFold(t.text, "time_bucket") && p.peekAheadPunct(1, "(") {
+		t := p.peek()
+		switch {
+		case strings.EqualFold(t.text, "time_bucket") && p.peekAheadPunct(1, "("):
 			attr, secs, err := p.parseBucketCall()
 			if err != nil {
 				return nil, err
 			}
 			cols = append(cols, canonicalBucketKey(attr, secs))
-		} else {
+		case p.groupTermIsExpr():
+			// A computed group key -- `GROUP BY CASE WHEN ... END`. Captured and translated
+			// exactly as the matching SELECT item is, so the two texts compare equal and the
+			// term can be resolved to the column it groups.
+			expr, _, _, err := p.captureSelectExpr(p.atGroupTermEnd)
+			if err != nil {
+				return nil, fmt.Errorf("GROUP BY: %w", err)
+			}
+			cols = append(cols, expr)
+		default:
 			id, err := p.parseIdent()
 			if err != nil {
 				return nil, err
@@ -1603,13 +1621,101 @@ func canonicalBucketKey(attr string, secs int64) string {
 	return "time_bucket(" + strings.ToLower(attr) + "," + strconv.FormatInt(secs, 10) + ")"
 }
 
+// groupTermIsExpr reports whether the GROUP BY term at the cursor is a computed expression
+// rather than a plain attribute name: it starts with something other than an identifier, or
+// the identifier is followed by an operator or a call. A lone identifier -- possibly a SELECT
+// alias -- stays a name, so it can be resolved against the projection.
+func (p *parser) groupTermIsExpr() bool {
+	t := p.peek()
+	if t.kind != tIdent || p.isKeyword("CASE") {
+		return true
+	}
+	nt := p.peekAt(1)
+	return nt.kind == tOp || (nt.kind == tPunct && nt.text == "(")
+}
+
+// atGroupTermEnd reports whether the parser sits at the end of a GROUP BY term.
+func (p *parser) atGroupTermEnd() bool {
+	if p.atEnd() {
+		return true
+	}
+	pk := p.peek()
+	return (pk.kind == tPunct && pk.text == ",") || p.isKeyword("HAVING") ||
+		p.isKeyword("ORDER") || p.isKeyword("LIMIT")
+}
+
 // groupItemKey is a select item's identity for GROUP BY matching: the canonical
 // bucket key for a time_bucket item, else the lower-cased column name.
 func groupItemKey(it SelectItem) string {
 	if it.Bucket {
 		return canonicalBucketKey(it.Col, it.BucketWidth)
 	}
+	if it.Expr != "" {
+		return strings.ToLower(it.Expr) // the translated text, as parseGroupCols stores it
+	}
 	return strings.ToLower(it.Col)
+}
+
+// resolveGroupAliases rewrites a GROUP BY term that names a projected column's AS alias into
+// the thing the alias stands for, so everything downstream sees one spelling: an attribute
+// name the server can group by, or the expression the client-side grouping evaluates.
+//
+// Without this, `SELECT Owner AS o, COUNT(*) FROM jobs GROUP BY o` would pass validation on
+// the alias and then ask the server to group by an attribute named "o" -- which no ad has,
+// giving one group with an empty key and every row in it. Silently, which is the point.
+func resolveGroupAliases(st *Statement) {
+	for i, g := range st.GroupBy {
+		for _, it := range st.Items {
+			if it.GroupLevel() || it.Alias == "" || !strings.EqualFold(g, it.Alias) {
+				continue
+			}
+			st.GroupBy[i] = groupTermFor(it)
+			break
+		}
+	}
+}
+
+// groupTermFor is the GROUP BY spelling of a projected item.
+func groupTermFor(it SelectItem) string {
+	if it.Bucket {
+		return canonicalBucketKey(it.Col, it.BucketWidth)
+	}
+	if it.Expr != "" {
+		return it.Expr
+	}
+	return it.Col
+}
+
+// groupItemMatches reports whether a GROUP BY term names this projected item. A term may be
+// the attribute name, the item's AS alias, or -- for a computed column -- the expression
+// itself, so both of these say the same thing:
+//
+//	SELECT CASE WHEN Memory > 4096 THEN 'big' ELSE 'small' END AS sz, COUNT(*)
+//	  FROM jobs GROUP BY sz
+//	  FROM jobs GROUP BY CASE WHEN Memory > 4096 THEN 'big' ELSE 'small' END
+func groupItemMatches(it SelectItem, term string) bool {
+	t := strings.ToLower(term)
+	if t == groupItemKey(it) {
+		return true
+	}
+	return it.Alias != "" && t == strings.ToLower(it.Alias)
+}
+
+// groupByHasExpr reports whether any GROUP BY term is a computed key rather than a plain
+// attribute -- an expression, or an alias standing for one. The server aggregate groups by
+// raw attribute values only, so such a query is grouped client-side (as time_bucket is).
+func groupByHasExpr(st *Statement) bool {
+	for _, it := range st.Items {
+		if it.GroupLevel() || it.Expr == "" {
+			continue
+		}
+		for _, g := range st.GroupBy {
+			if groupItemMatches(it, g) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // parseBucketWidth parses a time_bucket width literal into whole seconds. It
@@ -1657,8 +1763,8 @@ func validateSelect(st *Statement) error {
 			plains++
 		}
 	}
-	bucketing := buckets > 0 || groupByHasBucket(st)
-	if bucketing && len(st.GroupBy) == 0 {
+	bucketing := buckets > 0 || groupByHasBucket(st) || groupByHasExpr(st)
+	if (buckets > 0 || groupByHasBucket(st)) && len(st.GroupBy) == 0 {
 		return fmt.Errorf("time_bucket(...) requires a matching GROUP BY")
 	}
 	if len(st.GroupBy) == 0 {
@@ -1689,8 +1795,15 @@ func validateSelect(st *Statement) error {
 			continue
 		}
 		key := groupItemKey(it)
+		matched := false
+		for _, g := range st.GroupBy {
+			if groupItemMatches(it, g) {
+				itemKeys[strings.ToLower(g)] = true
+				matched = true
+			}
+		}
 		itemKeys[key] = true
-		if !inGroup[key] {
+		if !matched {
 			if it.Bucket {
 				return fmt.Errorf("time_bucket(%s, ...) must appear in GROUP BY", it.Col)
 			}
@@ -1700,10 +1813,13 @@ func validateSelect(st *Statement) error {
 	// A time_bucket query aggregates client-side over the projected group columns
 	// (§ Phase 0), so every GROUP BY term must be one of them -- no grouping by a
 	// column that isn't selected.
+	// The client-side grouping paths (time_bucket, computed keys) group by the PROJECTED
+	// non-aggregate items, so every GROUP BY term has to be one of them.
 	if bucketing {
 		for g := range inGroup {
 			if !itemKeys[g] {
-				return fmt.Errorf("GROUP BY term %q must also be selected when using time_bucket", g)
+				return fmt.Errorf("GROUP BY term %q must also be selected when grouping by "+
+					"time_bucket or an expression", g)
 			}
 		}
 	}
