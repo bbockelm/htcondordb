@@ -63,6 +63,11 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.maintenance(console, arg, "rewrite")
 	case ".retrain":
 		s.maintenance(console, arg, "codec.retrain")
+	case ".analyze":
+		// On-demand self-tuning: refresh the hot set from query demand, reconcile
+		// auto-indexes, and roll out selectivity histograms (an archive just reindexes).
+		// ANALYZE decides; .rewrite realizes (re-encodes ads under the refreshed hot set).
+		s.maintenance(console, arg, "analyze")
 	case ".rotate":
 		s.maintenance(console, arg, "rotate")
 	case ".retention":

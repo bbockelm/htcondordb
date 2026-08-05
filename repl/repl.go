@@ -278,6 +278,7 @@ CompletionDate); with none, the current table:
   .reindex [table|-all]                                rebuild indexes
   .addhot <attr>[, ...]                        pin hot attributes
   .refreshhot [-all] [<sampleMax> <topN>]      recompute the hot set
+  .analyze [table|-all] [<topN>]               self-tune now: hot set + indexes + histograms
   .rewrite [table|-all]                        re-encode all ads with the hot set
   .compact [table|-all]                        reclaim dead space
   .retrain [table|-all] [<sampleMax>]          train/refresh ZSTD compression
