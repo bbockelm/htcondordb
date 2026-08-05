@@ -108,22 +108,27 @@ class Cursor:
     ) -> "Cursor":
         """Run *operation* once per parameter sequence.
 
-        Each execution is independent and commits on its own -- there is no transaction to
-        group them, so a failure partway through leaves the earlier ones applied. The rows
-        of the final execution are what remains fetchable; ``rowcount`` is the sum of the
-        affected counts, which is what a caller batching writes wants to see.
+        Atomic when the connection is in a transaction: every execution stages into it, so
+        a failure partway through leaves nothing applied once the caller rolls back. In
+        autocommit mode each execution commits on its own and a failure partway through
+        leaves the earlier ones applied -- wrap the call in
+        :meth:`~htcondordb.connection.Connection.transaction` if that matters.
+
+        The rows of the final execution are what remains fetchable; ``rowcount`` is the
+        sum of the affected counts, which is what a caller batching writes wants to see.
 
         PEP 249 notes that ``executemany`` on a row-returning statement is undefined
         behaviour; this driver allows it but only the last result set survives.
         """
         self._check_open()
         total = 0
-        last: Cursor | None = None
+        ran = False
         for parameters in seq_of_parameters:
-            last = self.execute(operation, parameters)
+            self.execute(operation, parameters)
+            ran = True
             if self._rowcount > 0:
                 total += self._rowcount
-        if last is not None:
+        if ran:
             self._rowcount = total
         return self
 
@@ -282,6 +287,10 @@ class Cursor:
 
     def _load(self, document: dict) -> None:
         """Populate the cursor from a decoded result document."""
+        # Every result reports whether a transaction is open afterwards, so the connection
+        # tracks it from the server's answer rather than inferring it from what was sent.
+        self._connection._note_transaction_state(bool(document.get("in_transaction", False)))
+
         if not document.get("select", False):
             # DML/DDL: no rows, and rowcount is what was written.
             self._rowcount = int(document.get("affected", 0))

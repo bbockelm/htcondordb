@@ -86,12 +86,17 @@ threadsafety = 2
 paramstyle = "qmark"
 
 
-def connect(address: str, **kwargs) -> Connection:
+def connect(address: str, autocommit: bool = True, **kwargs) -> Connection:
     """Open an authenticated session with an htcondordb daemon.
 
     Args:
         address: The daemon's address -- ``host:port``, or an HTCondor sinful string
             (``<1.2.3.4:9618?sock=...>``), including a shared-port or CCB one.
+        autocommit: When true (the default), each statement commits as it runs. Pass
+            ``False`` to open a transaction immediately and batch writes until
+            :meth:`~htcondordb.connection.Connection.commit`. See
+            :class:`~htcondordb.connection.Connection` for the two constraints a
+            transaction carries -- reads do not join it, and it cannot span tables.
 
     Returns:
         A :class:`~htcondordb.connection.Connection`.
@@ -113,7 +118,7 @@ def connect(address: str, **kwargs) -> Connection:
             "Credentials come from the HTCondor configuration (CONDOR_CONFIG), not from "
             "connect() arguments."
         )
-    return Connection(address)
+    return Connection(address, autocommit=autocommit)
 
 
 __all__ = [

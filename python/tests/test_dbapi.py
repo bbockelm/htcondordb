@@ -129,6 +129,9 @@ class TestCursorWithoutExecute:
             def _forget(self, cursor):
                 pass
 
+            def _note_transaction_state(self, in_transaction):
+                pass
+
         return Cursor(_StubConnection())
 
     def test_initial_state(self):

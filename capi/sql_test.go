@@ -133,7 +133,7 @@ func TestValueJSONComposites(t *testing.T) {
 // The JSON document is this library's contract with non-Go callers: an empty result still
 // carries columns and rows as arrays (never null), so a client can index them unguarded.
 func TestBuildResultEmptySelect(t *testing.T) {
-	doc := buildResult(&repl.Result{IsSelect: true}, 0)
+	doc := buildResult(&repl.Result{IsSelect: true}, 0, false)
 	b, err := json.Marshal(doc)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -161,7 +161,7 @@ func TestBuildResultEmptySelect(t *testing.T) {
 
 // A DML result reports its affected count and note, and is not a SELECT.
 func TestBuildResultDML(t *testing.T) {
-	doc := buildResult(&repl.Result{Affected: 3, Note: "UPDATE 3", Duration: 250 * time.Microsecond}, 0)
+	doc := buildResult(&repl.Result{Affected: 3, Note: "UPDATE 3", Duration: 250 * time.Microsecond}, 0, false)
 	if doc.Select {
 		t.Error("select = true for a DML result")
 	}
@@ -183,10 +183,10 @@ func TestBuildResultAdsOption(t *testing.T) {
 		Rows:     [][]string{{"alice"}},
 		Ads:      []*classad.ClassAd{ad},
 	}
-	if doc := buildResult(r, 0); doc.Ads != nil {
+	if doc := buildResult(r, 0, false); doc.Ads != nil {
 		t.Errorf("ads emitted without the option: %v", doc.Ads)
 	}
-	doc := buildResult(r, hcdbSQLAds)
+	doc := buildResult(r, hcdbSQLAds, false)
 	if len(doc.Ads) != 1 {
 		t.Fatalf("got %d ads, want 1", len(doc.Ads))
 	}

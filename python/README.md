@@ -72,8 +72,7 @@ Standard DB-API, with a few things worth knowing:
 |---|---|
 | `paramstyle` | `qmark` — `?` placeholders, positional |
 | `threadsafety` | `2` — connections are shareable across threads, cursors are not |
-| `commit()` | No-op. Each statement commits as it runs. |
-| `rollback()` | Raises `NotSupportedError` — there is no transaction to undo |
+| `autocommit` | Defaults to `True` — see [Transactions](#transactions) |
 | `description` | 7-tuples; only `name` and `type_code` are meaningful (ClassAd is dynamically typed) |
 
 **Always use placeholders.** The daemon has no server-side bind parameters, so the driver
@@ -101,6 +100,38 @@ and `Cursor.execute_with_ads()` plus `Cursor.fetchads()` return whole rows as
 
 A statement's whole result is materialized when `execute()` returns — the daemon's executor
 builds it in full before replying — so bound large queries with `LIMIT`.
+
+## Transactions
+
+The connection starts in **autocommit** mode: each statement commits as it runs, `commit()`
+is a no-op, and `rollback()` raises. Opt into a transaction with the context manager:
+
+```python
+with conn.transaction():
+    cur = conn.cursor()
+    cur.executemany("INSERT INTO jobs (Key, Owner) VALUES (?, ?)", rows)
+# committed here; rolled back instead if the block raised
+```
+
+or by setting `conn.autocommit = False` (also available as `connect(..., autocommit=False)`),
+after which `commit()` and `rollback()` are real and a fresh transaction opens after each.
+
+Autocommit is the default here, unlike most DB-API drivers, because a transaction carries
+two constraints you should opt into knowingly. Neither is a driver limitation — a dbrpc
+transaction is scoped to one table, and queries carry no transaction id:
+
+- **Reads do not join the transaction.** A `SELECT` always reads committed state, so it will
+  not see the transaction's own uncommitted writes. `UPDATE` and `DELETE` pick their rows
+  with a query, so they also act on committed state.
+- **A transaction cannot span tables.** It binds to the first table written; a write to a
+  second table raises `ProgrammingError` and leaves the transaction open and usable for its
+  own table.
+
+DDL (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, views) is not transactional and applies
+immediately, as in most databases.
+
+The main reason to want a transaction is bulk writes: `executemany` inside one applies
+atomically and in a single commit, instead of a begin/commit round trip per row.
 
 ## Known issue: backslashes and control characters on write
 

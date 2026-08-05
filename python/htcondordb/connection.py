@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import threading
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from . import _errors, _library
-from ._errors import InterfaceError, NotSupportedError, OperationalError
+from ._errors import (
+    InterfaceError,
+    NotSupportedError,
+    OperationalError,
+    ProgrammingError,
+)
 from .cursor import Cursor
 
 
@@ -18,9 +24,22 @@ class Connection:
     duration of each one); cursors on the same connection are safe to use from several
     threads, but they will not run concurrently.
 
-    Transactions: htcondordb commits each statement as it executes and exposes no
-    transaction to the SQL layer, so :meth:`commit` is a no-op and :meth:`rollback` raises
-    ``NotSupportedError``. The connection is effectively always in autocommit mode.
+    **Transactions.** The connection starts in autocommit mode, where each statement
+    commits as it runs, :meth:`commit` is a no-op, and :meth:`rollback` raises. Setting
+    :attr:`autocommit` to ``False`` -- or using the :meth:`transaction` context manager --
+    opens a real transaction that batches writes until :meth:`commit` or :meth:`rollback`.
+
+    Autocommit defaults to ``True``, unlike most DB-API drivers, because a transaction here
+    has two constraints worth opting into deliberately rather than inheriting silently:
+
+    * **Reads do not join the transaction.** A ``SELECT`` always reads committed state, so
+      it will not see the transaction's own uncommitted writes. ``UPDATE`` and ``DELETE``
+      choose their rows with a query, so they too act on committed state.
+    * **A transaction cannot span tables.** It binds to the first table written; a write
+      to a second table raises ``ProgrammingError``.
+
+    Neither is a driver limitation -- a dbrpc transaction is scoped to one table, and
+    queries carry no transaction id.
     """
 
     # PEP 249 optional extension: the exception classes are reachable from the connection,
@@ -36,11 +55,14 @@ class Connection:
     ProgrammingError = _errors.ProgrammingError
     NotSupportedError = _errors.NotSupportedError
 
-    def __init__(self, address: str) -> None:
+    def __init__(self, address: str, autocommit: bool = True) -> None:
         self._address = address
         self._lib = _library.load()
         self._lock = threading.Lock()
         self._cursors: set[Cursor] = set()
+        self._autocommit = True
+        #: Whether a transaction is open, tracked from each statement's reported state.
+        self._in_transaction = False
 
         ffi, lib = self._lib.ffi, self._lib.lib
         err = ffi.new("char **")
@@ -50,14 +72,31 @@ class Connection:
             raise OperationalError(f"connecting to {address}: {reason}")
         self._handle = handle
 
+        # Set through the property so a False opens the first transaction, exactly as a
+        # later assignment would.
+        if not autocommit:
+            self.autocommit = False
+
     # --- PEP 249 interface ---
 
     def close(self) -> None:
         """Close the connection and every cursor on it.
 
+        An open transaction is rolled back, as PEP 249 requires -- closing without
+        committing must not apply the pending writes. (The daemon aborts open
+        transactions when the connection drops, so this is belt and braces, but it makes
+        the behaviour deterministic rather than dependent on server-side cleanup.)
+
         Closing twice is not an error. Any later use of the connection or one of its
         cursors raises ``InterfaceError``.
         """
+        if self._in_transaction and self._handle != 0:
+            self._autocommit = True  # do not reopen a transaction we are about to drop
+            try:
+                self._end_transaction("ROLLBACK")
+            except Exception:
+                pass  # closing must succeed regardless
+
         with self._lock:
             if self._handle == 0:
                 return
@@ -68,23 +107,120 @@ class Connection:
         self._lib.lib.hcdb_close(handle)
 
     def commit(self) -> None:
-        """No-op: every statement has already committed as it ran.
+        """Commit the open transaction.
 
-        PEP 249 requires the method to exist, and requires a driver without transaction
-        support to make it a no-op rather than an error -- code that calls it defensively
-        after a write must keep working.
-        """
-
-    def rollback(self) -> None:
-        """Unsupported: there is no open transaction to undo.
+        A no-op in autocommit mode, where each statement has already committed. PEP 249
+        requires that: code calling ``commit()`` defensively after a write must keep
+        working whether or not a transaction was open.
 
         Raises:
-            NotSupportedError: always. Raising is deliberate -- silently doing nothing
-                would let a caller believe a failed batch had been undone.
+            DatabaseError: if the commit failed -- notably ``OperationalError`` when a
+                write lost a write-write race, whose message names the conflicted keys.
+                The transaction is over either way; it is not left open to retry.
         """
-        raise NotSupportedError(
-            "htcondordb commits each statement as it runs; there is no transaction to roll back"
-        )
+        self._check_open()
+        self._end_transaction("COMMIT")
+
+    def rollback(self) -> None:
+        """Discard the open transaction's writes.
+
+        Raises:
+            NotSupportedError: in autocommit mode, where each statement has already
+                committed and there is nothing to undo. Raising rather than silently
+                doing nothing is deliberate: a caller rolling back after a failed batch
+                must not be left believing the batch was undone. Set
+                :attr:`autocommit` to ``False`` first, or use :meth:`transaction`.
+        """
+        self._check_open()
+        if not self._in_transaction:
+            raise NotSupportedError(
+                "no transaction is open, so there is nothing to roll back. This "
+                "connection is in autocommit mode: set connection.autocommit = False, "
+                "or use 'with connection.transaction():', to batch writes into a "
+                "transaction that can be rolled back."
+            )
+        self._end_transaction("ROLLBACK")
+
+    # --- transactions ---
+
+    @property
+    def autocommit(self) -> bool:
+        """Whether each statement commits as it runs (the default).
+
+        Setting this to ``False`` opens a transaction immediately, and a fresh one after
+        every :meth:`commit` or :meth:`rollback`. Setting it back to ``True`` commits any
+        transaction currently open -- matching what other DB-API drivers do, and matching
+        what "stop batching, apply my work" means.
+        """
+        return self._autocommit
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        self._check_open()
+        value = bool(value)
+        if value == self._autocommit:
+            return
+        if value:
+            # Flip the mode first: _end_transaction reopens a transaction while the
+            # connection is still non-autocommit, which is exactly what we do not want
+            # on the way out of transactional mode.
+            self._autocommit = True
+            # Leaving transactional mode applies what is pending rather than discarding it.
+            if self._in_transaction:
+                self._end_transaction("COMMIT")
+        else:
+            self._autocommit = False
+            self._begin()
+
+    @property
+    def in_transaction(self) -> bool:
+        """Whether a transaction is currently open."""
+        return self._in_transaction
+
+    @contextmanager
+    def transaction(self) -> Iterator["Connection"]:
+        """Run a block inside a transaction, committing on success.
+
+        Commits when the block finishes, rolls back if it raises::
+
+            with conn.transaction():
+                cur = conn.cursor()
+                for row in rows:
+                    cur.execute("INSERT INTO jobs (Key, Owner) VALUES (?, ?)", row)
+
+        Restores the connection's previous autocommit setting on the way out, so the
+        block composes with a connection already in either mode. Nesting raises
+        ``ProgrammingError``: the store has no savepoints to build a nested transaction
+        on, and a silently flattened inner block would make an inner rollback a lie.
+        """
+        self._check_open()
+        if self._in_transaction:
+            raise ProgrammingError(
+                "a transaction is already open; nested transactions are not supported"
+            )
+        previous = self._autocommit
+        self._autocommit = False
+        self._begin()
+        try:
+            yield self
+        except BaseException:
+            # Restore the mode before ending, so a connection that was in autocommit mode
+            # leaves the block in autocommit mode rather than with a fresh transaction
+            # reopened under it. A connection that was already transactional does get a
+            # fresh one, which is what it wants.
+            self._autocommit = previous
+            # Best effort: the statement that raised may itself have been a failed COMMIT,
+            # which already ended the transaction. Losing a rollback error here would hide
+            # the original exception, which is the one worth seeing.
+            try:
+                if self._in_transaction:
+                    self._end_transaction("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        self._autocommit = previous
+        if self._in_transaction:
+            self._end_transaction("COMMIT")
 
     def cursor(self) -> Cursor:
         """Return a new :class:`~htcondordb.cursor.Cursor` on this connection."""
@@ -145,3 +281,40 @@ class Connection:
     def _forget(self, cursor: Cursor) -> None:
         """Drop a closed cursor's registration so it is not closed twice."""
         self._cursors.discard(cursor)
+
+    def _control(self, statement: str) -> None:
+        """Run a transaction-control statement on a throwaway cursor."""
+        cursor = Cursor(self)
+        try:
+            cursor.execute(statement)
+        finally:
+            cursor.close()
+
+    def _begin(self) -> None:
+        self._control("BEGIN")
+
+    def _end_transaction(self, statement: str) -> None:
+        """Run COMMIT or ROLLBACK, then reopen a transaction if still in that mode.
+
+        The flag is cleared *before* the statement runs because the executor ends the
+        transaction whether or not it succeeds -- a COMMIT that hits a write-write
+        conflict is over, not retryable. Leaving the flag set on failure would strand the
+        connection believing in a transaction the daemon has already discarded.
+        """
+        if not self._in_transaction:
+            return
+        self._in_transaction = False
+        try:
+            self._control(statement)
+        finally:
+            # Reopen even if the statement failed: the caller is still in non-autocommit
+            # mode and its next write belongs in a transaction, not silently committed.
+            if not self._autocommit and self._handle != 0:
+                try:
+                    self._begin()
+                except Exception:
+                    pass
+
+    def _note_transaction_state(self, in_transaction: bool) -> None:
+        """Record the transaction state a statement reported (see Cursor._load)."""
+        self._in_transaction = in_transaction

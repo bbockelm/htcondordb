@@ -68,6 +68,11 @@ type sqlResult struct {
 	// Ads carries each row's whole ClassAd as old-format text, when the caller passed
 	// hcdbSQLAds and the result has ads.
 	Ads []string `json:"ads,omitempty"`
+	// InTransaction reports whether an explicit transaction is open on the connection
+	// after this statement. Reported on every result so a caller tracks the connection's
+	// transaction state from the server's answer rather than modelling it locally, where
+	// it would drift the first time a statement failed partway.
+	InTransaction bool `json:"in_transaction"`
 }
 
 // Runs one SQL statement on the connection and writes a JSON result document to *out -- a C
@@ -100,6 +105,9 @@ func hcdb_sql(h C.uintptr_t, sql *C.char, opts C.int, out **C.char) C.int {
 	start := time.Now()
 	res, err := c.ex.Exec(st)
 	elapsed := time.Since(start)
+	// Read the transaction flag under the same lock as the statement that may have
+	// changed it, so the answer belongs to this statement and not a concurrent one.
+	inTxn := c.ex.InTransaction()
 	c.mu.Unlock()
 
 	if err != nil {
@@ -118,7 +126,7 @@ func hcdb_sql(h C.uintptr_t, sql *C.char, opts C.int, out **C.char) C.int {
 	}
 	res.Duration = elapsed
 
-	doc, err := json.Marshal(buildResult(res, int(opts)))
+	doc, err := json.Marshal(buildResult(res, int(opts), inTxn))
 	if err != nil {
 		*out = C.CString("encoding result: " + err.Error())
 		return hcdbErr
@@ -128,14 +136,15 @@ func hcdb_sql(h C.uintptr_t, sql *C.char, opts C.int, out **C.char) C.int {
 }
 
 // buildResult converts an executor Result into the JSON document shape.
-func buildResult(r *repl.Result, opts int) *sqlResult {
+func buildResult(r *repl.Result, opts int, inTxn bool) *sqlResult {
 	doc := &sqlResult{
-		Select:     r.IsSelect,
-		Columns:    r.Columns,
-		Affected:   r.Affected,
-		Note:       r.Note,
-		DurationNS: r.Duration.Nanoseconds(),
-		Star:       r.Star,
+		Select:        r.IsSelect,
+		Columns:       r.Columns,
+		Affected:      r.Affected,
+		Note:          r.Note,
+		DurationNS:    r.Duration.Nanoseconds(),
+		Star:          r.Star,
+		InTransaction: inTxn,
 	}
 	if doc.Columns == nil {
 		doc.Columns = []string{} // marshal as [], not null
