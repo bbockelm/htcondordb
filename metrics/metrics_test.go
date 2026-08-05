@@ -100,3 +100,53 @@ func TestHandlerExposesSyncAndExporterMetrics(t *testing.T) {
 		t.Error("exporter with zero LastBeat should emit no last_beat sample")
 	}
 }
+
+// TestHandlerExposesArchiveMetrics is the regression for a silent blind spot: archive tables
+// live in their own catalog namespace, so a collector that iterates only cat.Tables() omits
+// them entirely -- and an archive is precisely where segment count matters, because an
+// append-only table never compacts and every sealed segment costs a memory mapping at open.
+// Without these series, running out of mappings (a fail-to-start) is invisible until it
+// happens.
+func TestHandlerExposesArchiveMetrics(t *testing.T) {
+	cat, err := db.OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	hist, err := cat.CreateArchiveTable("history", db.ArchiveConfig{SegmentSize: 1 << 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 400; i++ {
+		if err := hist.AppendOld(
+			"ClusterId = 1\nOwner = \"u\"\nPad = \"" + strings.Repeat("p", 80) + "\""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	Handler(cat, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+
+	for _, want := range []string{
+		`htcondordb_segments{table="history"}`,
+		`htcondordb_used_bytes{table="history"}`,
+		`htcondordb_ads{table="history"}`,
+		`htcondordb_stale_index_segments{table="history"}`,
+		`htcondordb_estimated_mmaps{table="history"}`,
+		`htcondordb_op_seconds_total{op=`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output is missing %s", want)
+		}
+	}
+
+	// The segment gauge has to carry a real value: a zero here would report an archive
+	// that cannot exhaust its mapping budget, which is the opposite of the truth.
+	if strings.Contains(body, `htcondordb_segments{table="history"} 0`) {
+		t.Error("archive segment count reported as 0 despite multiple segments")
+	}
+}
