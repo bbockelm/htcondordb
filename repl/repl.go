@@ -201,6 +201,7 @@ a row's primary key lives in the "Key" attribute.
   SELECT * FROM machines WHERE Cpus >= 8 ORDER BY Cpus DESC LIMIT 10;
   SELECT DISTINCT Owner FROM jobs ORDER BY Owner;
   SELECT Owner, COUNT(*), AVG(Cpus) FROM jobs GROUP BY Owner ORDER BY COUNT(*) DESC;
+  SELECT Owner, SUM(Cpus) AS c FROM jobs GROUP BY Owner HAVING SUM(Cpus) > 100;
   INSERT INTO machines (Key, Name, Cpus) VALUES ('slot1', 'slot1@ep', 8);
   UPDATE jobs SET JobStatus = 2 WHERE Owner == "alice";
   DELETE FROM jobs WHERE JobStatus == 4;
@@ -222,9 +223,14 @@ a row's primary key lives in the "Key" attribute.
 
 Notes:
   - WHERE is a ClassAd expression (==, =?=, =!=, undefined, regexp(), ...),
-    evaluated by the store; string literals use double quotes.
+    evaluated by the store. SQL spellings are accepted too: 'text', =, <>,
+    AND/OR/NOT, IS [NOT] NULL, and CASE WHEN ... THEN ... ELSE ... END.
   - Aggregates: COUNT, SUM, AVG, MIN, MAX, with GROUP BY over one+ columns
     (evaluated server-side); DISTINCT and ORDER BY (ASC/DESC) are supported.
+    A projected column may be an expression over aggregates, e.g.
+    SELECT SUM(Cpus) / COUNT(*) AS avg_cpus FROM jobs.
+  - HAVING filters groups after aggregation (WHERE filters rows before it):
+    SELECT Owner, SUM(Cpus) FROM jobs GROUP BY Owner HAVING SUM(Cpus) > 100;
   - JOIN and subqueries are not supported; matchmaking is MATCH, not a join.
   - CREATE INDEX kind is VALUE (numeric+range) or CATEGORICAL (string eq).
   - MATCH <requests> TO <resources>: greedy assignment, one resource per request.
