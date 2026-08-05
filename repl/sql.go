@@ -4,7 +4,7 @@
 // The store is a single keyed collection of ClassAds -- there are no tables to
 // join -- so the language is deliberately the join-free subset of SQL: SELECT
 // (with a WHERE filter, column projection, DISTINCT, the COUNT/SUM/AVG/MIN/MAX
-// aggregates, GROUP BY over one or more columns, ORDER BY, and LIMIT), INSERT,
+// aggregates, GROUP BY over one or more columns, HAVING, ORDER BY, and LIMIT), INSERT,
 // UPDATE, and DELETE, plus CREATE/DROP TABLE, CREATE/DROP INDEX, and MATCH
 // (matchmaking between two tables). Aggregation is evaluated server-side
 // (hash-map GROUP BY). JOIN and subqueries are intentionally unsupported and
@@ -21,6 +21,13 @@
 // CASE WHEN <cond> THEN <v> [WHEN ...] [ELSE <v>] END (and the CASE <expr> WHEN <value>
 // form) is accepted anywhere an expression is: it becomes the equivalent ClassAd ?: chain,
 // with a missing ELSE yielding undefined (SQL's NULL).
+//
+// HAVING filters GROUPS after aggregation, where WHERE filters ROWS before it:
+// SELECT Owner, SUM(Cpus) FROM jobs GROUP BY Owner HAVING SUM(Cpus) > 100. It accepts the
+// same expressions a projected column does (aggregates, CASE, group columns), and applies
+// before ORDER BY and LIMIT. With no GROUP BY it filters the single implicit group. A
+// reference that is neither grouped nor aggregated is refused rather than silently evaluating
+// to undefined and dropping every group.
 //
 // A projected column may be any ClassAd expression, and aggregates may appear inside one:
 // SELECT 2 * COUNT(*), SELECT SUM(Cpus) / COUNT(*) AS avg, SELECT MAX(m) - MIN(m),
@@ -127,6 +134,17 @@ type Statement struct {
 	// Where is the translated ClassAd constraint ("" = match all). Used by
 	// SELECT, UPDATE, DELETE.
 	Where string
+
+	// Having is the post-aggregation filter: a ClassAd expression evaluated once per
+	// GROUP, over that group's aggregate results and its group columns. HavingAggs are the
+	// aggregate calls lifted out of it (as for a SELECT item), which Having refers to as
+	// __agg_0, __agg_1, ... continuing the numbering past the projection's own.
+	//
+	// WHERE filters ROWS before grouping; HAVING filters GROUPS after. Writing one where
+	// the other is meant gives a different, plausible-looking answer, which is why the two
+	// are kept distinct rather than folded together.
+	Having     string
+	HavingAggs []AggCall
 
 	// Since is the WATCH start point: "now" (default; live changes only) or
 	// "beginning" (replay the current contents, then live).
@@ -858,7 +876,16 @@ func (p *parser) parseSelect() (*Statement, error) {
 		}
 		st.GroupBy = cols
 	}
-	// Validate the projection against the (now known) GROUP BY.
+	if p.takeKeyword("HAVING") {
+		having, aggs, _, err := p.captureSelectExpr(func() bool {
+			return p.atEnd() || p.isKeyword("ORDER") || p.isKeyword("LIMIT")
+		})
+		if err != nil {
+			return nil, fmt.Errorf("HAVING: %w", err)
+		}
+		st.Having, st.HavingAggs = having, aggs
+	}
+	// Validate the projection against the (now known) GROUP BY and HAVING.
 	if err := validateSelect(st); err != nil {
 		return nil, err
 	}
@@ -1186,8 +1213,8 @@ func (p *parser) parseDelete() (*Statement, error) {
 // statements never use it, so listing it here is harmless for them.
 func (p *parser) parseWhere() (string, error) {
 	return p.captureRawExpr(func() bool {
-		return p.atEnd() || p.isKeyword("GROUP") || p.isKeyword("ORDER") ||
-			p.isKeyword("LIMIT") || p.isKeyword("SINCE")
+		return p.atEnd() || p.isKeyword("GROUP") || p.isKeyword("HAVING") ||
+			p.isKeyword("ORDER") || p.isKeyword("LIMIT") || p.isKeyword("SINCE")
 	})
 }
 
@@ -1459,7 +1486,15 @@ func validateSelect(st *Statement) error {
 		if aggs > 0 && plains > 0 {
 			return fmt.Errorf("cannot mix aggregates with plain columns without GROUP BY")
 		}
-		return nil
+		// HAVING with no GROUP BY filters the single implicit group, so a plain column
+		// would have no defined value -- the same rule as mixing one with an aggregate.
+		if st.Having != "" && plains > 0 {
+			return fmt.Errorf("cannot use HAVING with plain columns without GROUP BY")
+		}
+		return validateHaving(st)
+	}
+	if err := validateHaving(st); err != nil {
+		return err
 	}
 	// GROUP BY present.
 	inGroup := map[string]bool{}
