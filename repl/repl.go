@@ -229,6 +229,10 @@ Notes:
     (evaluated server-side); DISTINCT and ORDER BY (ASC/DESC) are supported.
     A projected column may be an expression over aggregates, e.g.
     SELECT SUM(Cpus) / COUNT(*) AS avg_cpus FROM jobs.
+  - An aggregate may carry FILTER (WHERE cond) -- a conditional aggregate, so one
+    query can pivot by status:  SELECT Owner, COUNT(*) AS total,
+    COUNT(*) FILTER (WHERE JobStatus == 2) AS running FROM jobs GROUP BY Owner.
+    SUM(CASE WHEN cond THEN 1 ELSE 0 END) is accepted and means the same.
   - HAVING filters groups after aggregation (WHERE filters rows before it):
     SELECT Owner, SUM(Cpus) FROM jobs GROUP BY Owner HAVING SUM(Cpus) > 100;
   - JOIN and subqueries are not supported; matchmaking is MATCH, not a join.

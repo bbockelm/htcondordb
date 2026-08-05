@@ -101,7 +101,7 @@ func aggSpecsFor(st *Statement) []dbrpc.AggSpec {
 	}
 	out := make([]dbrpc.AggSpec, len(calls))
 	for i, a := range calls {
-		out[i] = dbrpc.AggSpec{Func: aggFunc(a.Func), Arg: a.Arg}
+		out[i] = dbrpc.AggSpec{Func: aggFunc(a.Func), Arg: a.Arg, Filter: a.Filter}
 	}
 	return out
 }
@@ -257,4 +257,22 @@ func validateHaving(st *Statement) error {
 			"(did you mean WHERE, which filters rows before grouping?)", a)
 	}
 	return nil
+}
+
+// filterAds narrows a group's ads to those satisfying a per-aggregate FILTER, for the
+// client-side reductions (AS OF and time_bucket). A filter that fails to compile drops
+// every row rather than silently admitting them all; the server rejects such a filter
+// outright, so this only guards the paths that never reach it.
+func filterAds(filter string, ads []*classad.ClassAd) []*classad.ClassAd {
+	q, err := vm.Parse(filter)
+	if err != nil {
+		return nil
+	}
+	out := make([]*classad.ClassAd, 0, len(ads))
+	for _, ad := range ads {
+		if q.Matches(ad) {
+			out = append(out, ad)
+		}
+	}
+	return out
 }
