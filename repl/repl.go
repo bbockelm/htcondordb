@@ -232,6 +232,9 @@ Notes:
     (evaluated server-side); DISTINCT and ORDER BY (ASC/DESC) are supported.
     A projected column may be an expression over aggregates, e.g.
     SELECT SUM(Cpus) / COUNT(*) AS avg_cpus FROM jobs.
+  - COUNT(DISTINCT attr) counts distinct values, exactly; it keeps one entry per
+    distinct value per group during the scan, so use it on bounded-cardinality
+    attributes rather than a unique-per-row one over a large history.
   - An aggregate may carry FILTER (WHERE cond) -- a conditional aggregate, so one
     query can pivot by status:  SELECT Owner, COUNT(*) AS total,
     COUNT(*) FILTER (WHERE JobStatus == 2) AS running FROM jobs GROUP BY Owner.

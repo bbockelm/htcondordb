@@ -1341,6 +1341,16 @@ func aggregateAds(it AggCall, ads []*classad.ClassAd) string {
 			}
 		}
 		return strconv.Itoa(n)
+	case aggCountDistinct:
+		// Keyed on the rendered value, as the server's reducer and the group tuple both are,
+		// so all three agree on what "the same value" is. Undefined is not a value.
+		seen := map[string]struct{}{}
+		for _, ad := range ads {
+			if v := ad.EvaluateAttr(it.Arg); !v.IsUndefined() && !v.IsError() {
+				seen[valueDisplay(v)] = struct{}{}
+			}
+		}
+		return strconv.Itoa(len(seen))
 	case "SUM", "AVG", "MIN", "MAX":
 		var sum, min, max float64
 		n := 0
@@ -1422,6 +1432,8 @@ func aggFunc(name string) dbrpc.AggFunc {
 		return dbrpc.AggMin
 	case "MAX":
 		return dbrpc.AggMax
+	case aggCountDistinct:
+		return dbrpc.AggCountDistinct
 	default:
 		return dbrpc.AggCount
 	}

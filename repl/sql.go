@@ -35,6 +35,11 @@
 // reference that is neither grouped nor aggregated is refused rather than silently evaluating
 // to undefined and dropping every group.
 //
+// COUNT(DISTINCT <attr>) counts distinct defined values rather than rows, and is exact --
+// the store keeps one entry per distinct value per group while the scan runs, so point it at
+// an attribute with bounded cardinality (an owner, a host, a status), not at a unique-per-row
+// one over a large history. DISTINCT is only meaningful for COUNT.
+//
 // An aggregate may carry FILTER (WHERE <cond>), restricting THAT aggregate to the rows of
 // its group where the condition holds -- so one pass answers several differently-conditioned
 // questions:
@@ -214,6 +219,10 @@ type SelectItem struct {
 	BucketWidth int64 // seconds; >0 when Bucket
 }
 
+// aggCountDistinct is the internal Func name for COUNT(DISTINCT attr). It is not spellable
+// as a bare function, so it cannot collide with a user-written call.
+const aggCountDistinct = "COUNT DISTINCT"
+
 // AggCall is one aggregate function call: COUNT/SUM/AVG/MIN/MAX over an attribute, or
 // COUNT over "*". Filter, when set, is a conditional aggregate -- `FILTER (WHERE ...)`, or
 // the `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` spelling lowered onto it -- restricting THIS
@@ -268,6 +277,9 @@ func (it SelectItem) header() string {
 	}
 	if it.Agg != "" {
 		h := it.Agg + "(" + it.Col + ")"
+		if it.Agg == aggCountDistinct {
+			h = "COUNT(DISTINCT " + it.Col + ")"
+		}
 		if it.AggFilter != "" {
 			h += " FILTER (WHERE " + it.AggFilter + ")"
 		}
@@ -1096,6 +1108,14 @@ func (p *parser) parseAggCall() (AggCall, error) {
 	if p.isKeyword("CASE") {
 		return p.parseCaseAggCall(name)
 	}
+	// COUNT(DISTINCT attr): the number of distinct defined values, rather than of rows.
+	distinct := false
+	if p.takeKeyword("DISTINCT") {
+		if name != "COUNT" {
+			return AggCall{}, fmt.Errorf("DISTINCT is only supported for COUNT, not %s", name)
+		}
+		distinct = true
+	}
 	var arg string
 	if pk := p.peek(); pk.kind == tOp && pk.text == "*" {
 		arg = "*"
@@ -1119,6 +1139,12 @@ func (p *parser) parseAggCall() (AggCall, error) {
 	}
 	if arg == "*" && name != "COUNT" {
 		return AggCall{}, fmt.Errorf("%s(*) is not valid; %s needs an attribute", name, name)
+	}
+	if distinct {
+		if arg == "*" {
+			return AggCall{}, fmt.Errorf("COUNT(DISTINCT *) is not meaningful; name an attribute")
+		}
+		name = aggCountDistinct
 	}
 	call := AggCall{Func: name, Arg: arg}
 	filter, err := p.parseAggFilter(name)
