@@ -233,6 +233,10 @@ Notes:
     query can pivot by status:  SELECT Owner, COUNT(*) AS total,
     COUNT(*) FILTER (WHERE JobStatus == 2) AS running FROM jobs GROUP BY Owner.
     SUM(CASE WHEN cond THEN 1 ELSE 0 END) is accepted and means the same.
+  - GROUP BY accepts an expression or a projected column's AS alias, e.g.
+    SELECT CASE WHEN Memory > 4096 THEN 'big' ELSE 'small' END AS sz, COUNT(*)
+    FROM jobs GROUP BY sz;  such a key is grouped client-side, so every GROUP BY
+    term must also be selected.
   - HAVING filters groups after aggregation (WHERE filters rows before it):
     SELECT Owner, SUM(Cpus) FROM jobs GROUP BY Owner HAVING SUM(Cpus) > 100;
   - JOIN and subqueries are not supported; matchmaking is MATCH, not a join.
