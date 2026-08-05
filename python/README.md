@@ -155,26 +155,26 @@ because their elements may themselves be expressions and there is no lossless ma
 Python list. Binding a Python list as a parameter works in both directions — as a `VALUES`
 item and, more usefully, in a `member(Owner, ?)` membership test.
 
-### Known issue: projected columns drop expression dependencies
+### Known issue: projected columns drop expression dependencies (persistent stores)
 
-`SELECT Requirements FROM machines` and `SELECT * FROM machines` disagree. The server
-projects the stored ad down to the named attributes, so an expression attribute loses the
-siblings it references and evaluates to `undefined`:
+`SELECT Requirements FROM machines` and `SELECT * FROM machines` still disagree when the
+daemon runs a persistent store, which it normally does:
 
 ```
-SELECT * FROM machines            -->  Req = True     (correct)
-SELECT Memory, Req FROM machines  -->  Req = True     (correct: the sibling came along)
-SELECT Req FROM machines          -->  Req = None     (wrong)
+SELECT * FROM machines            -->  Req = True     correct
+SELECT Memory, Req FROM machines  -->  Req = True     correct: the sibling came along
+SELECT Req FROM machines          -->  Req = None     wrong, on a persistent store
 ```
 
-This reproduces identically in `htcondordb-cli`, so it is not a driver bug — but HTCondor
-data hits it constantly. Until it is fixed, **select an expression attribute's dependencies
-alongside it, or use `SELECT *`**. Pinned by a strict xfail in `test_value_shapes.py`.
+The driver now asks the server for a projection that carries the attributes the projected
+expressions reference, which fixes this for an in-memory store. It is a no-op on a
+persistent (inline-name) collection, whose expressions reference attributes by name rather
+than id — so the projection is served exactly, and the expression loses its siblings. That
+needs a classad fix.
 
-The fix is server-side: chase each projected expression's attribute references.
-`collections.QueryRawProjected` already takes a `chaseRefs` flag for exactly this;
-`db.QueryRawProjected` hard-codes it `false`, which is right for an HTCondor-protocol relay
-(the protocol says send exactly the requested attributes) and wrong for SQL.
+Until then: **select an expression attribute's dependencies alongside it, or use
+`SELECT *`.** Pinned by a strict xfail in `test_value_shapes.py` and by
+`repl/projection_test.go`, which contrasts the two stores directly.
 
 ## Known issue: backslashes and tabs through the persistent store
 

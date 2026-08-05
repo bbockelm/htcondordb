@@ -152,14 +152,13 @@ class TestHeterogeneousColumns:
         assert cursor.description[0][1] in (htcondordb.NUMBER, htcondordb.STRING)
 
 
-class TestProjectionDropsExpressionDependencies:
-    """A projected SELECT disagrees with SELECT * for expression-valued attributes.
+class TestProjectionKeepsExpressionDependencies:
+    """A projected SELECT agrees with SELECT * for expression-valued attributes.
 
-    The server projects the stored ad down to the named attributes, so an expression
-    attribute loses the siblings it references and evaluates to undefined. The same query
-    through htcondordb-cli shows the same disagreement, so this is not a driver bug -- but
-    it is the shape HTCondor data hits constantly, since Requirements, Rank and friends
-    are expressions over sibling attributes.
+    The server projection carries the attributes the projected expressions reference, so
+    an expression attribute keeps the siblings it reads. It used to drop them and evaluate
+    to undefined -- the shape HTCondor data hits constantly, since Requirements, Rank and
+    friends are expressions over siblings.
     """
 
     @pytest.fixture
@@ -183,11 +182,12 @@ class TestProjectionDropsExpressionDependencies:
 
     @pytest.mark.xfail(
         strict=True,
-        reason="projection pushdown drops the siblings an expression attribute references, "
-        "so the column evaluates to undefined. Reproduces in htcondordb-cli. Fix is to "
-        "chase the projected expressions' attribute references server-side "
-        "(collections.QueryRawProjected already takes chaseRefs; db.QueryRawProjected "
-        "hard-codes it false, which is right for an HTCondor-protocol relay and wrong for SQL).",
+        reason="the refs-chasing projection is a no-op on a PERSISTENT (inline-name) "
+        "collection, which is what a daemon runs: collections/rawprojected.go states "
+        "chaseRefs is unsupported for inline ads because their expressions reference "
+        "attributes by name rather than id, so the projection is served exactly. It works "
+        "on an in-memory store -- see repl/projection_test.go, which contrasts the two. "
+        "Needs a classad fix before this can pass.",
     )
-    def test_projection_without_the_dependency_should_agree(self, connection, rows):
+    def test_projection_without_the_dependency_agrees(self, connection, rows):
         assert one(connection, f"SELECT Req FROM {rows}") is True

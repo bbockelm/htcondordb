@@ -259,6 +259,17 @@ func (e *Executor) execRollback() (*Result, error) {
 	return &Result{Note: "ROLLBACK"}, nil
 }
 
+// txReads reports whether a read of table should go through the open transaction.
+//
+// Only the transaction's own table: a dbrpc transaction is scoped to one table, and it
+// binds to the first table WRITTEN, so a SELECT against any other table has to read the
+// committed store. Consistent mode buffers writes client-side rather than opening a
+// server-side transaction (e.tx stays nil), so a read there also sees committed state --
+// a statement cannot observe writes the raft proposal has not carried yet.
+func (e *Executor) txReads(table string) bool {
+	return e.tx != nil && strings.EqualFold(e.txTable, table)
+}
+
 // InTransaction reports whether an explicit transaction is open.
 func (e *Executor) InTransaction() bool { return e.txActive }
 
@@ -733,6 +744,13 @@ func (e *Executor) queryAdsAsOf(table, where string, limit int, asOf string) ([]
 		}
 		texts, err = e.c.ArchiveQuery(context.Background(), table, constraint(where), limit)
 	case asOf == "":
+		// Inside a transaction, read through it so the statement sees the transaction's
+		// own uncommitted writes -- the connection-level op reads the committed store and
+		// would report an INSERT made moments earlier as missing.
+		if e.txReads(table) {
+			texts, err = e.tx.Query(context.Background(), constraint(where), limit)
+			break
+		}
 		texts, err = e.c.QueryTable(context.Background(), table, constraint(where), limit)
 	default:
 		var at time.Time
@@ -808,7 +826,15 @@ func (e *Executor) projectionAttrs(st *Statement) []string {
 // server-side projection op (QueryRawProject), which streams the old-ClassAd render of the
 // projected subset. limit > 0 caps the scan server-side.
 func (e *Executor) queryAdsProjected(table, where string, attrs []string, limit int) ([]*classad.ClassAd, error) {
-	texts, err := e.c.QueryRawProject(context.Background(), table, constraint(where), attrs, limit)
+	// The refs-chasing projection, not the plain one: a projected attribute may hold an
+	// expression over its siblings (Requirements, Rank, ...), and projecting to exactly
+	// the named attributes drops those siblings, so the expression evaluates to undefined
+	// here. Against a server without the opcode, fall back to the plain projection --
+	// same results for literal attributes, the old undefined for expression ones.
+	texts, err := e.c.QueryRawProjectRefs(context.Background(), table, constraint(where), attrs, limit)
+	if errors.Is(err, dbrpc.ErrProjectRefsUnsupported) {
+		texts, err = e.c.QueryRawProject(context.Background(), table, constraint(where), attrs, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -977,7 +1003,11 @@ func (e *Executor) execAggregate(st *Statement, groupBy []string) (*Result, erro
 	// Point-in-time aggregates are computed client-side over the AS OF rows (the
 	// server aggregate pushdown is current-time only). Fetch the historical rows and
 	// group/reduce locally.
-	if st.AsOf != "" {
+	// Likewise inside a transaction: the server aggregate reduces over the COMMITTED
+	// store, so a COUNT(*) after an INSERT in the same transaction would not count it.
+	// Fetch through the transaction and reduce locally instead -- the same fetch-and-
+	// reduce path AS OF uses.
+	if st.AsOf != "" || e.txReads(st.Table) {
 		return e.execAggregateAsOf(st, groupBy)
 	}
 	aggs, groupIdx := aggSpecs(st, groupBy)
@@ -1713,6 +1743,11 @@ func (e *Executor) execDelete(st *Statement) (*Result, error) {
 // rows written before key-stamping -- which the old attribute-recovery path could not target. It
 // also avoids fetching every matching ad just to read one attribute.
 func (e *Executor) matchedKeys(table, where string) ([]string, error) {
+	// Inside a transaction, match through it: an UPDATE or DELETE must be able to address
+	// a row the same transaction created, which the committed-state op cannot see.
+	if e.txReads(table) {
+		return e.tx.KeysWhere(context.Background(), constraint(where))
+	}
 	return e.c.QueryKeysTable(context.Background(), table, constraint(where)) // UPDATE/DELETE act on every matching row
 }
 

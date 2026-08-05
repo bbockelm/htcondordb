@@ -105,35 +105,3 @@ func TestBraceInsideStringLiteralIsNotNesting(t *testing.T) {
 		t.Errorf("Note = %q, want %q", got, "}")
 	}
 }
-
-// A projected SELECT must agree with SELECT * about every cell. It does not: the server
-// projects the stored ad down to the named attributes, so an expression attribute loses
-// the siblings it references and evaluates to undefined.
-//
-// This is a correctness bug in the projection pushdown, not in the caller: the same
-// query through htcondordb-cli shows the same disagreement. It matters for HTCondor data
-// specifically, where Requirements, Rank and friends are expressions over sibling
-// attributes -- `SELECT Name, Requirements FROM machines` reports undefined for rows that
-// SELECT * reports true for. The fix is to have the projection chase each projected
-// expression's attribute references (collections.QueryRawProjected already takes a
-// chaseRefs flag; db.QueryRawProjected hard-codes it false for HTCondor
-// protocol-compatibility, which is right for a relay and wrong for SQL).
-func TestProjectedSelectAgreesWithStar(t *testing.T) {
-	t.Skip("known bug: the projection pushdown drops the siblings an expression attribute " +
-		"references, so a projected column evaluates to undefined; see the comment above")
-
-	e, cleanup := newTestExec(t)
-	defer cleanup()
-	mustExec(t, e, "INSERT INTO ads (Key, Memory, Req) VALUES ('big', 2048, Memory > 1024)")
-
-	star := mustExec(t, e, "SELECT * FROM ads")
-	var want string
-	for i, col := range star.Columns {
-		if strings.EqualFold(col, "Req") {
-			want = star.Rows[0][i]
-		}
-	}
-	if got := cell(t, e, "SELECT Req FROM ads"); got != want {
-		t.Errorf("SELECT Req = %q but SELECT * reports %q", got, want)
-	}
-}

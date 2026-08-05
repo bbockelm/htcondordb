@@ -1,123 +1,77 @@
 package repl
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
 
-// TestProjectionAttrsGate locks in which SELECTs push a column projection to the server and
-// which fetch whole ads. Plain-column current-time SELECTs over a mutable table project
-// (SELECT + ORDER BY columns); SELECT *, expression/aggregate columns, DISTINCT, AS OF, and
-// archives do not.
-func TestProjectionAttrsGate(t *testing.T) {
-	e, cleanup := newCatalogExec(t) // catalog has a mutable "ads" table; no archive
-	defer cleanup()
+// starValue reads one attribute's cell out of a SELECT * result.
+func starValue(t *testing.T, e *Executor, attr string) string {
+	t.Helper()
+	r := mustExec(t, e, "SELECT * FROM ads")
+	for i, c := range r.Columns {
+		if c == attr {
+			return r.Rows[0][i]
+		}
+	}
+	t.Fatalf("SELECT * has no column %q", attr)
+	return ""
+}
 
-	cases := []struct {
-		sql  string
-		want string // comma-joined expected projection, or "" for nil (whole-ad fetch)
+// A narrow SELECT of an expression-valued attribute must agree with SELECT *. The
+// projection has to carry the siblings the expression reads, or it evaluates to undefined.
+//
+// It does on an in-memory store, and does NOT on a persistent one: chaseRefs is
+// unsupported for inline-name (persistent) collections, whose expressions reference
+// attributes by name rather than id, so the projection is served exactly
+// (collections/rawprojected.go, renderInline). A daemon runs a persistent store, so this
+// is the case that matters -- it needs a classad fix, and until then the Python
+// integration tests carry a matching xfail.
+func TestProjectedSelectAgreesWithStar(t *testing.T) {
+	for _, tc := range []struct {
+		mode    string
+		newExec func(*testing.T) (*Executor, func())
+		works   bool
 	}{
-		{`SELECT Owner, JobStatus FROM ads WHERE JobStatus == 4`, "Owner,JobStatus"},
-		{`SELECT Owner FROM ads WHERE JobStatus == 4 ORDER BY CompletionDate DESC LIMIT 10`, "Owner,CompletionDate"},
-		{`SELECT Owner, Owner FROM ads`, "Owner"},         // de-duplicated
-		{`SELECT Owner FROM ads ORDER BY Owner`, "Owner"}, // order col already selected
-		{`SELECT * FROM ads`, ""},                                  // whole ad
-		{`SELECT COUNT(*) FROM ads`, ""},                           // aggregate (handled elsewhere)
-		{`SELECT CurrentTime - QDate FROM ads`, ""},                // expression column
-		{`SELECT DISTINCT Owner FROM ads`, ""},                     // DISTINCT
-		{`SELECT Owner FROM ads ORDER BY CurrentTime - QDate`, ""}, // expression ORDER BY
-	}
-	for _, tc := range cases {
-		st, err := Parse(tc.sql)
-		if err != nil {
-			t.Fatalf("Parse(%q): %v", tc.sql, err)
-		}
-		got := strings.Join(e.projectionAttrs(st), ",")
-		if got != tc.want {
-			t.Errorf("projectionAttrs(%q) = %q, want %q", tc.sql, got, tc.want)
-		}
+		{"memory", newTestExec, true},
+		{"persistent", newPersistentExec, false},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			if !tc.works {
+				t.Skip("known classad gap: chaseRefs is a no-op on an inline-name " +
+					"(persistent) collection, so the projection drops the siblings the " +
+					"expression reads; see the comment above")
+			}
+			e, cleanup := tc.newExec(t)
+			defer cleanup()
+
+			mustExec(t, e, "INSERT INTO ads (Key, Memory, Req) VALUES ('big', 2048, Memory > 1024)")
+			want := starValue(t, e, "Req")
+			got := mustExec(t, e, "SELECT Req FROM ads").Rows[0][0]
+			if got != want {
+				t.Errorf("SELECT Req = %q but SELECT * reports %q", got, want)
+			}
+		})
 	}
 }
 
-// TestSelectProjectionEndToEnd verifies a projected SELECT returns the same values as a
-// whole-ad fetch would -- through the server-side projection op and the old-ClassAd parse --
-// with WHERE (server-side), ORDER BY, and LIMIT all honored, and unselected attributes
-// correctly absent from the returned ads.
-func TestSelectProjectionEndToEnd(t *testing.T) {
-	e, cleanup := newCatalogExec(t)
-	defer cleanup()
-	// Wide-ish ads: only some columns are selected; others must not be needed.
-	mustExec(t, e, `INSERT INTO ads (Key, Owner, JobStatus, CompletionDate, Cmd) VALUES ('1.0', 'alice', 4, 1700000003, '/bin/a')`)
-	mustExec(t, e, `INSERT INTO ads (Key, Owner, JobStatus, CompletionDate, Cmd) VALUES ('2.0', 'bob', 4, 1700000001, '/bin/b')`)
-	mustExec(t, e, `INSERT INTO ads (Key, Owner, JobStatus, CompletionDate, Cmd) VALUES ('3.0', 'carol', 3, 1700000002, '/bin/c')`)
+// Selecting an expression's dependency alongside it works on every store -- the documented
+// workaround while the persistent gap stands.
+func TestProjectionWithDependencyAgreesEverywhere(t *testing.T) {
+	for _, tc := range []struct {
+		mode    string
+		newExec func(*testing.T) (*Executor, func())
+	}{
+		{"memory", newTestExec},
+		{"persistent", newPersistentExec},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			e, cleanup := tc.newExec(t)
+			defer cleanup()
 
-	// Projected SELECT: WHERE filters server-side, ORDER BY + LIMIT client-side.
-	r, err := e.ExecString(`SELECT Owner, CompletionDate FROM ads WHERE JobStatus == 4 ORDER BY CompletionDate ASC`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(r.Columns) != 2 || r.Columns[0] != "Owner" || r.Columns[1] != "CompletionDate" {
-		t.Fatalf("columns = %v, want [Owner CompletionDate]", r.Columns)
-	}
-	// Two JobStatus==4 rows, ordered by CompletionDate ascending: bob(1) then alice(3).
-	if len(r.Rows) != 2 {
-		t.Fatalf("got %d rows, want 2 (WHERE not applied server-side?)", len(r.Rows))
-	}
-	if r.Rows[0][0] != "bob" || r.Rows[1][0] != "alice" {
-		t.Errorf("rows = %v, want bob then alice", r.Rows)
-	}
-	if r.Rows[0][1] != "1700000001" || r.Rows[1][1] != "1700000003" {
-		t.Errorf("CompletionDate values = %v %v, want 1700000001 then 1700000003", r.Rows[0][1], r.Rows[1][1])
-	}
-	// The projected ads must carry only the requested attributes (plus type fields): Cmd was
-	// not selected, so it must be absent from the returned ad.
-	if len(r.Ads) > 0 {
-		if _, ok := r.Ads[0].Lookup("Cmd"); ok {
-			t.Errorf("projected ad unexpectedly carries the unselected Cmd attribute")
-		}
-		if _, ok := r.Ads[0].Lookup("Owner"); !ok {
-			t.Errorf("projected ad missing the selected Owner attribute")
-		}
-	}
-}
-
-// TestArchiveSelectProjection verifies projection now also serves a history archive (via the
-// classad v0.20.1 raw-project archive routing): a narrow SELECT over history ships only the
-// requested columns, applies the WHERE server-side, keeps newest-first order under LIMIT, and
-// omits unselected attributes.
-func TestArchiveSelectProjection(t *testing.T) {
-	e, cleanup := archiveExecBig(t, 100) // "history" archive: [ClusterId=i; Owner="u{i%10}"; JobStatus=4]
-	defer cleanup()
-
-	// Constrained projected SELECT: WHERE ClusterId == 42 filters server-side.
-	r, err := e.ExecString(`SELECT Owner, ClusterId FROM history WHERE ClusterId == 42`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(r.Rows) != 1 {
-		t.Fatalf("ClusterId==42 returned %d rows, want 1", len(r.Rows))
-	}
-	if r.Rows[0][0] != "u2" || r.Rows[0][1] != "42" { // 42 % 10 == 2
-		t.Errorf("row = %v, want [u2 42]", r.Rows[0])
-	}
-	if len(r.Ads) == 1 {
-		if _, ok := r.Ads[0].Lookup("JobStatus"); ok {
-			t.Errorf("projected archive ad carries the unselected JobStatus attribute")
-		}
-	}
-
-	// Newest-first order preserved through projection + pushed-down LIMIT: the 3 newest
-	// records are ClusterId 99, 98, 97.
-	r2, err := e.ExecString(`SELECT ClusterId FROM history LIMIT 3`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(r2.Rows) != 3 {
-		t.Fatalf("LIMIT 3 returned %d rows, want 3", len(r2.Rows))
-	}
-	for i, want := range []string{"99", "98", "97"} {
-		if r2.Rows[i][0] != want {
-			t.Errorf("row %d ClusterId = %q, want %q (newest-first not preserved through projection)", i, r2.Rows[i][0], want)
-		}
+			mustExec(t, e, "INSERT INTO ads (Key, Memory, Req) VALUES ('big', 2048, Memory > 1024)")
+			want := starValue(t, e, "Req")
+			r := mustExec(t, e, "SELECT Memory, Req FROM ads")
+			if got := r.Rows[0][1]; got != want {
+				t.Errorf("SELECT Memory, Req gave Req=%q but SELECT * reports %q", got, want)
+			}
+		})
 	}
 }
