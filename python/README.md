@@ -133,6 +133,49 @@ immediately, as in most databases.
 The main reason to want a transaction is bulk writes: `executemany` inside one applies
 atomically and in a single commit, instead of a begin/commit round trip per row.
 
+## ClassAd value shapes
+
+A ClassAd column is not scalars-only, and is not homogeneous: two rows of the same column
+can hold different types. Three things are worth knowing before writing a report.
+
+**Stored expressions are evaluated, not returned.** A ClassAd attribute can hold an
+unevaluated expression over its siblings — `Requirements`, `Rank`, `WithinResourceLimits`
+and friends all do. A `SELECT` reports the *evaluated result* per row, so
+`SELECT Requirements FROM jobs` answers `True`/`False`/`None`, never the expression text.
+To see the expression itself, fetch the whole ad with `execute_with_ads()` and read it from
+`ad_text` or `fetchads()`.
+
+**Undefined and error both arrive as `None`.** They are distinct to the engine — an
+unresolved reference versus a faulting one — but a reporting client treats both as a
+missing cell and Python has one spelling for that. The visible consequence: a `GROUP BY`
+over a column holding both produces two separate `None` groups.
+
+**Composite values keep their ClassAd text.** Lists and nested ads come back as strings,
+because their elements may themselves be expressions and there is no lossless mapping to a
+Python list. Binding a Python list as a parameter works in both directions — as a `VALUES`
+item and, more usefully, in a `member(Owner, ?)` membership test.
+
+### Known issue: projected columns drop expression dependencies
+
+`SELECT Requirements FROM machines` and `SELECT * FROM machines` disagree. The server
+projects the stored ad down to the named attributes, so an expression attribute loses the
+siblings it references and evaluates to `undefined`:
+
+```
+SELECT * FROM machines            -->  Req = True     (correct)
+SELECT Memory, Req FROM machines  -->  Req = True     (correct: the sibling came along)
+SELECT Req FROM machines          -->  Req = None     (wrong)
+```
+
+This reproduces identically in `htcondordb-cli`, so it is not a driver bug — but HTCondor
+data hits it constantly. Until it is fixed, **select an expression attribute's dependencies
+alongside it, or use `SELECT *`**. Pinned by a strict xfail in `test_value_shapes.py`.
+
+The fix is server-side: chase each projected expression's attribute references.
+`collections.QueryRawProjected` already takes a `chaseRefs` flag for exactly this;
+`db.QueryRawProjected` hard-codes it `false`, which is right for an HTCondor-protocol relay
+(the protocol says send exactly the requested attributes) and wrong for SQL.
+
 ## Known issue: backslashes and control characters on write
 
 Writing a string containing a backslash, tab, or newline through SQL corrupts it: one

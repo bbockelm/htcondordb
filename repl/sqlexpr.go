@@ -58,10 +58,18 @@ func (p *parser) captureExpr(stop func() bool, lift *[]AggCall) (expr, raw strin
 		}
 		p.pos++
 		end = t.end
-		if t.kind == tPunct {
-			if t.text == "(" {
+		// Nesting: parentheses, and ClassAd list braces. Braces count because a list
+		// literal contains commas -- `VALUES ('k', {1, 2, 3})` is two values, not four --
+		// and the stop predicate for a VALUES item or a SELECT column fires on a
+		// top-level comma. The lexer emits '{' and '}' as single-char operators (it only
+		// treats ( ) , as punctuation), so both token kinds have to be considered --
+		// but NOT tString, whose text is the unquoted content: `Owner == '{'` must not
+		// open a nesting level.
+		if t.kind == tPunct || t.kind == tOp {
+			switch t.text {
+			case "(", "{":
 				depth++
-			} else if t.text == ")" {
+			case ")", "}":
 				depth--
 			}
 		}
