@@ -62,7 +62,7 @@ func TestArchiveBucketedGroupBy(t *testing.T) {
 	defer cleanup()
 
 	res, err := e.ExecString(
-		`SELECT Owner, time_bucket(CompletionDate, '1d') AS day, COUNT(*) `+
+		`SELECT Owner, time_bucket(CompletionDate, '1d') AS day, COUNT(*) ` +
 			`FROM history GROUP BY Owner, time_bucket(CompletionDate, '1d')`)
 	if err != nil {
 		t.Fatalf("bucketed archive GROUP BY: %v", err)

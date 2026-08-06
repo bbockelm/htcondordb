@@ -150,12 +150,12 @@ func TestInsertAutoKey(t *testing.T) {
 func TestParseRejectsUnsupported(t *testing.T) {
 	cases := []string{
 		"SELECT * FROM a JOIN b ON a.x = b.x",
-		"SELECT Owner, COUNT(*) FROM ads",           // mix without GROUP BY
-		"SELECT * FROM ads GROUP BY Owner",          // star with GROUP BY
-		"SELECT Cpus FROM ads GROUP BY Owner",       // non-grouped, non-agg column
-		"SELECT * FROM a, b",                        // comma join
-		"SELECT *, Owner FROM ads",                  // star + column
-		"MERGE INTO ads",                            // unknown verb
+		"SELECT Owner, COUNT(*) FROM ads",     // mix without GROUP BY
+		"SELECT * FROM ads GROUP BY Owner",    // star with GROUP BY
+		"SELECT Cpus FROM ads GROUP BY Owner", // non-grouped, non-agg column
+		"SELECT * FROM a, b",                  // comma join
+		"SELECT *, Owner FROM ads",            // star + column
+		"MERGE INTO ads",                      // unknown verb
 	}
 	for _, c := range cases {
 		if _, err := Parse(c); err == nil {
@@ -350,9 +350,9 @@ func TestParseFormat(t *testing.T) {
 // ClassAd expression (no SQL translation), so the full ClassAd language works.
 func TestWhereIsVerbatimClassAd(t *testing.T) {
 	cases := map[string]string{
-		`SELECT * FROM ads WHERE Owner == "alice" && Cpus >= 4`: `Owner == "alice" && Cpus >= 4`,
-		`SELECT * FROM ads WHERE foo =?= undefined`:             `foo =?= undefined`,
-		`SELECT * FROM ads WHERE regexp("a.*", Name) LIMIT 5`:   `regexp("a.*", Name)`,
+		`SELECT * FROM ads WHERE Owner == "alice" && Cpus >= 4`:     `Owner == "alice" && Cpus >= 4`,
+		`SELECT * FROM ads WHERE foo =?= undefined`:                 `foo =?= undefined`,
+		`SELECT * FROM ads WHERE regexp("a.*", Name) LIMIT 5`:       `regexp("a.*", Name)`,
 		`SELECT Owner FROM ads WHERE (A || B) && !C GROUP BY Owner`: `(A || B) && !C`,
 	}
 	for in, wantWhere := range cases {
