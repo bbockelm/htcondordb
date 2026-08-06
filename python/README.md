@@ -155,49 +155,18 @@ because their elements may themselves be expressions and there is no lossless ma
 Python list. Binding a Python list as a parameter works in both directions — as a `VALUES`
 item and, more usefully, in a `member(Owner, ?)` membership test.
 
-### Known issue: projected columns drop expression dependencies (persistent stores)
-
-`SELECT Requirements FROM machines` and `SELECT * FROM machines` still disagree when the
-daemon runs a persistent store, which it normally does:
-
-```
-SELECT * FROM machines            -->  Req = True     correct
-SELECT Memory, Req FROM machines  -->  Req = True     correct: the sibling came along
-SELECT Req FROM machines          -->  Req = None     wrong, on a persistent store
-```
-
-The driver now asks the server for a projection that carries the attributes the projected
-expressions reference, which fixes this for an in-memory store. It is a no-op on a
-persistent (inline-name) collection, whose expressions reference attributes by name rather
-than id — so the projection is served exactly, and the expression loses its siblings. That
-needs a classad fix.
-
-Until then: **select an expression attribute's dependencies alongside it, or use
-`SELECT *`.** Pinned by a strict xfail in `test_value_shapes.py` and by
-`repl/projection_test.go`, which contrasts the two stores directly.
-
-## Known issue: backslashes and tabs through the persistent store
-
-Writing a string containing a backslash or a tab and reading it back doubles it: one
-backslash comes back as two.
-
-The SQL layer is not the cause — its old-format quoting is correct, and an in-memory store
-round-trips these values exactly. The corruption appears only after a round trip through
-**persistence**, which is what a real daemon uses: the durable representation renders
-strings with new-ClassAd escaping and reads them back with old-ClassAd rules, which do no
-unescaping at all (matching HTCondor's C++ `Lexer::tokenizeStringOld`). Embedded quotes
-survive, because an escaped quote is the one sequence old format does process.
-
-It needs a fix in the classad storage layer. Pinned by a strict xfail in
-`test_integration.py` and by `repl/oldquote_test.go::TestPersistentStoreDoublesBackslashes`,
-which contrasts the two stores directly.
-
 ### Values that cannot be stored at all
 
 Old-ClassAd text is newline-separated, and a value ending in a backslash puts that
 backslash directly before the closing quote — where it makes the quote part of the value
 and runs the string on. Both are refused with a clear error rather than silently mangled;
 HTCondor's own old-format writer has the same two limitations.
+
+Everything else round-trips, backslashes and tabs included. Two escaping bugs used to
+corrupt them (one in the SQL layer's quoting, one in the store's raw-text rendering); both
+are fixed as of classad v0.24.1, and `SELECT` of an expression-valued attribute now carries
+the siblings that expression reads, so a narrow `SELECT Requirements` agrees with
+`SELECT *`.
 
 ## Testing
 

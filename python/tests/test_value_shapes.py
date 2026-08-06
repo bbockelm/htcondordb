@@ -180,14 +180,7 @@ class TestProjectionKeepsExpressionDependencies:
         cursor.execute(f"SELECT Memory, Req FROM {rows}")
         assert cursor.fetchone() == (2048, True)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="the refs-chasing projection is a no-op on a PERSISTENT (inline-name) "
-        "collection, which is what a daemon runs: collections/rawprojected.go states "
-        "chaseRefs is unsupported for inline ads because their expressions reference "
-        "attributes by name rather than id, so the projection is served exactly. It works "
-        "on an in-memory store -- see repl/projection_test.go, which contrasts the two. "
-        "Needs a classad fix before this can pass.",
-    )
     def test_projection_without_the_dependency_agrees(self, connection, rows):
+        # The projection carries the attributes the projected expressions reference, so a
+        # narrow SELECT evaluates to what SELECT * reports.
         assert one(connection, f"SELECT Req FROM {rows}") is True
