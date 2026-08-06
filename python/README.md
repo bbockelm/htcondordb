@@ -48,7 +48,9 @@ toolchain, no `make lib`, no `HTCONDORDB_LIBRARY`. `cffi` is the only dependency
 One wheel serves every Python 3 on a given OS and architecture: the driver uses cffi in ABI
 mode and opens the library with `dlopen`, so no CPython ABI is linked. Linux wheels are
 built in `manylinux_2_28` (EL8 and newer) and are checked to install and run on a different
-distribution from the one they were built in.
+distribution from the one they were built in. macOS wheels are tagged for the SDK they were
+built against rather than an older floor, so they do not claim support for releases nothing
+has run on.
 
 Building one yourself:
 

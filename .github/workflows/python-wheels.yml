@@ -49,7 +49,11 @@ jobs:
           GOFLAGS: -mod=mod
         run: |
           mkdir -p python/htcondordb/_lib
-          go build -buildmode=c-shared -o python/htcondordb/_lib/libhtcondordb_client.so ./capi
+          # -buildvcs=false: the checkout inside the container is owned by another uid, so
+          # git refuses it as "dubious ownership" and Go's VCS stamping fails the build.
+          # Nothing here needs the stamp.
+          go build -buildvcs=false -buildmode=c-shared \
+            -o python/htcondordb/_lib/libhtcondordb_client.so ./capi
 
       - name: Build and repair the wheel
         run: |
@@ -75,8 +79,10 @@ jobs:
         include:
           - arch: arm64
             runner: macos-14
+            host_platform: macosx-11.0-arm64   # version is overridden from the binary; arch is what matters
           - arch: x86_64
             runner: macos-13
+            host_platform: macosx-11.0-x86_64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -90,15 +96,22 @@ jobs:
         env:
           GOWORK: "off"
           GOFLAGS: -mod=mod
-          # Keep the wheel installable on older macOS than the runner happens to be.
-          MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: |
           mkdir -p python/htcondordb/_lib
-          go build -buildmode=c-shared -o python/htcondordb/_lib/libhtcondordb_client.dylib ./capi
+          go build -buildvcs=false -buildmode=c-shared \
+            -o python/htcondordb/_lib/libhtcondordb_client.dylib ./capi
 
       - name: Build the wheel
         env:
-          MACOSX_DEPLOYMENT_TARGET: '11.0'
+          # setup-python ships a universal2 interpreter, so setuptools would tag the wheel
+          # universal2 while the dylib is single-arch, and delocate fails hunting for the
+          # architecture that is not there. This fixes the ARCHITECTURE in the tag.
+          #
+          # The macOS VERSION in the tag is not taken from here: wheel reads it out of the
+          # built binary. So the tag reports the SDK floor the dylib actually has, which is
+          # the runner's, and no MACOSX_DEPLOYMENT_TARGET is set -- lowering it would make
+          # the wheel claim support for macOS releases nothing has been tested on.
+          _PYTHON_HOST_PLATFORM: ${{ matrix.host_platform }}
         run: |
           python -m pip install -q --upgrade build setuptools wheel delocate
           cd python && python -m build --wheel --no-isolation
