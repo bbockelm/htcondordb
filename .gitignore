@@ -6,6 +6,8 @@
 *.out
 
 # Python driver
+python/dist/
+python/build/
 __pycache__/
 *.py[cod]
 *.egg-info/

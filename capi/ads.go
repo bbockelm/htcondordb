@@ -7,6 +7,10 @@ package main
 
 /*
 #include <stdlib.h>
+// stdint.h for uintptr_t: glibc does not pull it in via stdlib.h the way macOS does, so
+// without this the package builds on a Mac and fails on Linux with "could not determine
+// what C.uintptr_t refers to".
+#include <stdint.h>
 */
 import "C"
 

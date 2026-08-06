@@ -38,20 +38,33 @@ exist, so a string attribute whose text happens to be `0042` comes back as `"004
 
 ## Installing
 
-Build the shared library first — it is not on PyPI and there are no wheels yet:
-
 ```sh
-make lib                    # writes bin/libhtcondordb_client.{so,dylib}
-pip install ./python
-export HTCONDORDB_LIBRARY=$PWD/bin/libhtcondordb_client.so
+pip install htcondordb-*.whl
 ```
 
-The driver searches, in order: `$HTCONDORDB_LIBRARY`, a copy bundled inside the installed
-package (`htcondordb/_lib/`), the repo's `bin/` for an editable checkout, then the dynamic
-loader's own search path.
+The wheel bundles `libhtcondordb_client`, so that is the whole installation — no Go
+toolchain, no `make lib`, no `HTCONDORDB_LIBRARY`. `cffi` is the only dependency.
 
-`cffi` is the only hard dependency. HTCondor's `classad2` bindings are optional and needed
-only by `Cursor.fetchads()`.
+One wheel serves every Python 3 on a given OS and architecture: the driver uses cffi in ABI
+mode and opens the library with `dlopen`, so no CPython ABI is linked. Linux wheels are
+built in `manylinux_2_28` (EL8 and newer) and are checked to install and run on a different
+distribution from the one they were built in.
+
+Building one yourself:
+
+```sh
+make wheel           # for this host
+make wheel-linux     # manylinux_2_28, in a container (the shipping artifact)
+make wheel-validate  # install it in a clean container and run real SQL through it
+```
+
+For development, skip the wheel entirely: `make lib` and point `HTCONDORDB_LIBRARY` at
+`bin/libhtcondordb_client.{so,dylib}`. The driver searches that first, then a bundled copy,
+then the repo's `bin/`, then the loader's own path.
+
+`conn.ads()` additionally needs HTCondor's `classad2` bindings (`pip install htcondor`).
+Those have Linux wheels but no macOS distribution, so on a Mac that path needs a local
+HTCondor build; everything else works either way.
 
 ## Authentication
 
