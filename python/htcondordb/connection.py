@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 from . import _errors, _library
 from ._errors import (
@@ -14,6 +14,9 @@ from ._errors import (
     ProgrammingError,
 )
 from .cursor import Cursor
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .adstream import AdStream
 
 
 class Connection:
@@ -257,6 +260,37 @@ class Connection:
             cursor.close()
             raise
         return cursor
+
+    def ads(self, operation: str, parameters: Any = None) -> "AdStream":
+        """Run a SELECT and iterate its rows as ``classad2.ClassAd`` objects.
+
+        The counterpart to :meth:`execute` for callers who want ads rather than rows. A
+        column select evaluates, so ``SELECT Requirements`` answers True/False; iterating
+        ads keeps the expression, reachable as ``ad.lookup("Requirements")``::
+
+            for ad in conn.ads("SELECT * FROM machines WHERE Cpus > ?", (4,)):
+                print(ad["Name"], ad.lookup("Requirements"))
+
+        Rows stream: the next ad is fetched when it is asked for, so abandoning the
+        iterator stops the query rather than draining it, and a large table costs one ad
+        rather than the whole set.
+
+        Parameters bind exactly as in :meth:`execute` -- same ``?`` placeholders, same
+        quoting -- because the same code builds the statement text.
+
+        Requires HTCondor's ``classad2`` bindings; without them this raises
+        ``InterfaceError`` rather than falling back to text.
+
+        ORDER BY, DISTINCT and aggregates cannot stream (none can emit a correct first row
+        before seeing the last), so those are computed whole and then iterated. An
+        aggregate has no ads of its own: one is synthesized per group row, with attribute
+        names derived from the column headers -- ``COUNT(*)`` becomes ``Count``,
+        ``SUM(RequestMemory)`` becomes ``SumRequestMemory``, and an ``AS`` alias is used
+        as-is when it is a legal attribute name.
+        """
+        from .adstream import ads as _ads
+
+        return _ads(self, operation, parameters)
 
     # --- context manager ---
 
