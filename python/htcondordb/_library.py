@@ -39,6 +39,9 @@ uintptr_t hcdb_query(uintptr_t h, char *table, char *constraint);
 int hcdb_query_next(uintptr_t qh, char **out);
 void hcdb_query_free(uintptr_t qh);
 int hcdb_sql(uintptr_t h, char *sql, int opts, char **out);
+uintptr_t hcdb_sql_ads(uintptr_t h, char *sql, char **err);
+int hcdb_sql_ads_next(uintptr_t ch, char **out);
+void hcdb_sql_ads_free(uintptr_t ch);
 void hcdb_close(uintptr_t h);
 void hcdb_free(char *p);
 """
@@ -144,7 +147,13 @@ def load() -> _Library:
             # surfacing as an AttributeError from inside a query.
             missing = [
                 name
-                for name in ("hcdb_connect_err", "hcdb_sql", "hcdb_close", "hcdb_free")
+                for name in (
+                    "hcdb_connect_err",
+                    "hcdb_sql",
+                    "hcdb_sql_ads",
+                    "hcdb_close",
+                    "hcdb_free",
+                )
                 if not hasattr(lib, name)
             ]
             if missing:

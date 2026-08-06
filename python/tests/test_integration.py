@@ -344,8 +344,15 @@ class TestAds:
             f"INSERT INTO {table} (Key, Owner, RequestMemory) VALUES (?, ?, ?)",
             ("j1", "alice", 2048),
         )
+        # A projected select carries only what was asked for, so assert the whole ad
+        # separately rather than expecting an unprojected attribute to survive it.
         cursor.execute_with_ads(f"SELECT Owner FROM {table}")
         (ad,) = cursor.fetchads()
         assert isinstance(ad, classad2.ClassAd)
         assert ad["Owner"] == "alice"
-        assert ad["RequestMemory"] == 2048
+        assert "RequestMemory" not in ad
+
+        cursor.execute_with_ads(f"SELECT * FROM {table}")
+        (whole,) = cursor.fetchads()
+        assert whole["Owner"] == "alice"
+        assert whole["RequestMemory"] == 2048

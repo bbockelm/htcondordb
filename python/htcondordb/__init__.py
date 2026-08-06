@@ -64,6 +64,7 @@ from ._types import (
     Timestamp,
     TimestampFromTicks,
 )
+from .adstream import AdStream
 from .connection import Connection
 from .cursor import Cursor
 
@@ -154,6 +155,7 @@ __all__ = [
     # driver objects and helpers
     "Connection",
     "Cursor",
+    "AdStream",
     "LIBRARY_ENV",
     "library_path",
     "__version__",

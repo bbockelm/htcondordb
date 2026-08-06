@@ -27,8 +27,8 @@ import (
 
 // hcdb_sql option bits (see capi.h).
 const (
-	// hcdbSQLAds adds the "ads" member: each result row's whole ClassAd in old
-	// (newline-separated) format. Only a non-aggregate SELECT has ads; an aggregate
+	// hcdbSQLAds adds the "ads" member: each result row's whole ClassAd in new
+	// (bracketed) format. Only a non-aggregate SELECT has ads; an aggregate
 	// computes rows that were never ads, and omits the member.
 	hcdbSQLAds = 1 << 0
 )
@@ -65,8 +65,8 @@ type sqlResult struct {
 	// Star reports that the statement was SELECT *, so Columns is the union of the
 	// matched ads' attributes rather than a list the caller wrote.
 	Star bool `json:"star,omitempty"`
-	// Ads carries each row's whole ClassAd as old-format text, when the caller passed
-	// hcdbSQLAds and the result has ads.
+	// Ads carries each row's whole ClassAd as new-ClassAd (bracketed) text, when the
+	// caller passed hcdbSQLAds and the result has ads.
 	Ads []string `json:"ads,omitempty"`
 	// InTransaction reports whether an explicit transaction is open on the connection
 	// after this statement. Reported on every result so a caller tracks the connection's
@@ -155,7 +155,10 @@ func buildResult(r *repl.Result, opts int, inTxn bool) *sqlResult {
 	}
 	if opts&hcdbSQLAds != 0 {
 		for _, ad := range r.Ads {
-			doc.Ads = append(doc.Ads, ad.MarshalOldWithPrivate())
+			// New-ClassAd (bracketed) form, same as the streaming cursor: it is what a
+			// ClassAd library's string constructor takes, and it round-trips escapes
+			// losslessly where old format cannot.
+			doc.Ads = append(doc.Ads, ad.StringWithPrivate())
 		}
 	}
 	return doc

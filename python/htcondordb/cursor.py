@@ -207,11 +207,16 @@ class Cursor:
                 "fetchads() needs HTCondor's classad2 bindings "
                 "(pip install htcondor); cursor.ad_text has the unparsed text"
             ) from exc
-        return [classad2.parseOne(text) for text in self._ads]
+        return [classad2.ClassAd(text) for text in self._ads]
 
     @property
     def ad_text(self) -> list[str]:
-        """Each row's whole ClassAd as old-format text, after :meth:`execute_with_ads`."""
+        """Each row's whole ClassAd as new-ClassAd (bracketed) text, after
+        :meth:`execute_with_ads`.
+
+        The same form :meth:`~htcondordb.connection.Connection.ads` streams, and what
+        ``classad2.ClassAd(text)`` parses.
+        """
         return list(self._ads)
 
     # --- iteration (PEP 249 optional extension) ---
