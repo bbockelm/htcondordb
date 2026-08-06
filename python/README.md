@@ -133,6 +133,54 @@ immediately, as in most databases.
 The main reason to want a transaction is bulk writes: `executemany` inside one applies
 atomically and in a single commit, instead of a begin/commit round trip per row.
 
+## Iterating ClassAds
+
+A column select *evaluates*: `SELECT Requirements` answers `True`/`False`, because that is
+what a result cell can hold. When you want the expression itself, iterate ads instead:
+
+```python
+for ad in conn.ads("SELECT * FROM machines WHERE Cpus > ?", (4,)):
+    print(ad["Name"])                    # "slot1@ep1"
+    print(ad["Requirements"])            # (Start && WithinResourceLimits)  -- an ExprTree
+    print(ad.eval("Requirements"))       # True                             -- evaluated
+```
+
+Rows **stream**: the next ad is fetched when you ask for it, so walking a large table costs
+one ad rather than the whole set, and abandoning the iterator stops the query instead of
+draining it. Close it explicitly (or use it as a context manager) if you stop early and want
+the server released at a known moment.
+
+This is what makes real matchmaking analysis possible from Python, which no arrangement of
+result columns can express:
+
+```python
+import classad2
+job  = classad2.ClassAd({"RequestCpus": 8})
+fits = classad2.ExprTree("Cpus >= TARGET.RequestCpus")
+
+eligible = [ad["Name"] for ad in conn.ads("SELECT * FROM machines")
+            if fits.eval(scope=ad, target=job)]
+```
+
+`ad.lookup("Requirements").simplify(scope=ad)` folds away everything the machine already
+settles and leaves what genuinely depends on the job.
+
+Notes:
+
+- **Parameters bind exactly as in `execute()`** — same `?` placeholders, same quoting, same
+  rejections. The statement text is built by the same code before it reaches the library.
+- **Requires `classad2`.** Without HTCondor's bindings this raises `InterfaceError` rather
+  than falling back to text; live expressions are the whole point. `Cursor.ad_text` gives
+  the unparsed text if that is what you want.
+- **`ORDER BY`, `DISTINCT` and aggregates cannot stream** — none can emit a correct first row
+  before seeing the last — so those are computed whole and then iterated.
+- **An aggregate has no ads**, so one is synthesized per group row. Attribute names are
+  derived from the headers: `COUNT(*)` becomes `Count`, `SUM(RequestMemory)` becomes
+  `SumRequestMemory`, and an `AS` alias is used as-is when it is a legal attribute name. Give
+  computed columns an alias if you care what they are called.
+- Only `SELECT` is accepted; anything else raises immediately rather than on first
+  iteration.
+
 ## ClassAd value shapes
 
 A ClassAd column is not scalars-only, and is not homogeneous: two rows of the same column
