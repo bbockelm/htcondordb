@@ -805,7 +805,11 @@ func (e *Executor) projectionAttrs(st *Statement) []string {
 		}
 	}
 	plainCol := func(it SelectItem) bool {
-		return !it.Star && !it.IsAggregate() && !it.Bucket && it.Expr == "" && it.Col != ""
+		// A window column's Col is the call as written, not an attribute, and the window
+		// itself reads whatever PARTITION BY / ORDER BY name -- so a windowed SELECT fetches
+		// whole ads rather than a projection.
+		return !it.Star && !it.IsAggregate() && !it.Bucket && it.Window == "" &&
+			it.Expr == "" && it.Col != ""
 	}
 	for _, it := range st.Items {
 		if !plainCol(it) {
@@ -887,6 +891,10 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 			return e.execArchiveAggregate(st, groupBy)
 		}
 		return e.execAggregate(st, groupBy)
+	}
+
+	if hasWindow(st) {
+		return e.execSelectWindow(st)
 	}
 
 	// Push LIMIT to the server only when the final row set is a prefix of the scan

@@ -35,6 +35,15 @@
 // reference that is neither grouped nor aggregated is refused rather than silently evaluating
 // to undefined and dropping every group.
 //
+// ROW_NUMBER(), RANK() and DENSE_RANK() are supported as ranking window functions:
+// SELECT Owner, ClusterId, ROW_NUMBER() OVER (PARTITION BY Owner ORDER BY QDate DESC) AS n
+// FROM jobs QUALIFY n <= 5 -- the "top five per owner" query. ORDER BY inside OVER is
+// required (without it the numbering would follow an arbitrary row order), and QUALIFY is the
+// clause that filters on the result: WHERE runs before the window exists, so a window column
+// there is refused with a pointer to QUALIFY. A windowed query is ranked client-side over the
+// whole match, so LIMIT is not pushed to the server -- constrain it with WHERE. Frame clauses
+// and aggregate windows (SUM(x) OVER (...)) are not supported.
+//
 // COUNT(DISTINCT <attr>) counts distinct defined values rather than rows, and is exact --
 // the store keeps one entry per distinct value per group while the scan runs, so point it at
 // an attribute with bounded cardinality (an owner, a host, a status), not at a unique-per-row
@@ -165,6 +174,12 @@ type Statement struct {
 	// SELECT, UPDATE, DELETE.
 	Where string
 
+	// Qualify is the post-window filter: a ClassAd expression over the window columns only
+	// (see validateQualify). It is SQL's QUALIFY, which exists because a window column does
+	// not exist yet when WHERE runs -- `WHERE n <= 5` over a window alias is not legal SQL,
+	// and here would silently read an undefined attribute.
+	Qualify string
+
 	// Having is the post-aggregation filter: a ClassAd expression evaluated once per
 	// GROUP, over that group's aggregate results and its group columns. HavingAggs are the
 	// aggregate calls lifted out of it (as for a SELECT item), which Having refers to as
@@ -201,6 +216,13 @@ type SelectItem struct {
 	// "CurrentTime - EnteredHistoryTime"), evaluated per row against each ad. It is
 	// empty for a plain column (Col holds the attribute name) and for aggregates.
 	Expr string
+
+	// Window is the ranking function for a window column -- ROW_NUMBER, RANK or DENSE_RANK
+	// -- with WinPartition the PARTITION BY attributes (empty = one partition) and WinOrder
+	// the ordering the numbering follows. Col holds the call as written, for the header.
+	Window       string
+	WinPartition []string
+	WinOrder     []OrderTerm
 
 	// AggFilter is a bare aggregate's `FILTER (WHERE ...)` condition (see AggCall.Filter).
 	// An aggregate inside an expression carries its own filter in Aggs instead.
@@ -287,6 +309,9 @@ func (it SelectItem) header() string {
 	}
 	if it.Bucket {
 		return "time_bucket(" + it.Col + ", " + strconv.FormatInt(it.BucketWidth, 10) + ")"
+	}
+	if it.Window != "" {
+		return it.windowText()
 	}
 	return it.Col
 }
@@ -943,12 +968,22 @@ func (p *parser) parseSelect() (*Statement, error) {
 	}
 	if p.takeKeyword("HAVING") {
 		having, aggs, _, err := p.captureSelectExpr(func() bool {
-			return p.atEnd() || p.isKeyword("ORDER") || p.isKeyword("LIMIT")
+			return p.atEnd() || p.isKeyword("QUALIFY") || p.isKeyword("ORDER") ||
+				p.isKeyword("LIMIT")
 		})
 		if err != nil {
 			return nil, fmt.Errorf("HAVING: %w", err)
 		}
 		st.Having, st.HavingAggs = having, aggs
+	}
+	if p.takeKeyword("QUALIFY") {
+		qual, err := p.captureRawExpr(func() bool {
+			return p.atEnd() || p.isKeyword("ORDER") || p.isKeyword("LIMIT")
+		})
+		if err != nil {
+			return nil, fmt.Errorf("QUALIFY: %w", err)
+		}
+		st.Qualify = qual
 	}
 	// Validate the projection against the (now known) GROUP BY and HAVING.
 	if err := validateSelect(st); err != nil {
@@ -989,6 +1024,10 @@ func (p *parser) parseSelectItem() (SelectItem, error) {
 		// A leading non-identifier (e.g. "(a - b)", "-x", a literal) begins a general
 		// expression rather than a column/aggregate; capture and evaluate it per row.
 		return p.parseSelectExpr()
+	}
+	// A ranking window function: IDENT '(' ')' OVER '(' ... ')'
+	if isWindowName(strings.ToUpper(t.text)) && p.peekAheadPunct(1, "(") {
+		return p.parseWindowItem()
 	}
 	// Aggregate?  IDENT '(' ... ')'
 	if agg := strings.ToUpper(t.text); isAggName(agg) && p.peekAheadPunct(1, "(") {
@@ -1447,7 +1486,8 @@ func (p *parser) parseDelete() (*Statement, error) {
 func (p *parser) parseWhere() (string, error) {
 	return p.captureRawExpr(func() bool {
 		return p.atEnd() || p.isKeyword("GROUP") || p.isKeyword("HAVING") ||
-			p.isKeyword("ORDER") || p.isKeyword("LIMIT") || p.isKeyword("SINCE")
+			p.isKeyword("QUALIFY") || p.isKeyword("ORDER") || p.isKeyword("LIMIT") ||
+			p.isKeyword("SINCE")
 	})
 }
 
@@ -1826,6 +1866,9 @@ func parseBucketWidth(s string) (int64, error) {
 // GROUP BY, aggregates cannot mix with plain columns; with GROUP BY, every plain
 // column must appear in the GROUP BY list and `*` is not allowed.
 func validateSelect(st *Statement) error {
+	if err := validateWindow(st); err != nil {
+		return err
+	}
 	var aggs, plains, buckets int
 	for _, it := range st.Items {
 		switch {
