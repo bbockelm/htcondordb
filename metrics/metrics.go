@@ -49,6 +49,14 @@ type catalogCollector struct {
 	opSeconds *prometheus.Desc
 	opOps     *prometheus.Desc
 	opMax     *prometheus.Desc
+
+	// Archive-only backlog gauges. An append-only table never compacts, so its segment
+	// count only grows, and every sealed segment costs an mmap at open (plus a second for
+	// its sidecar). Running out of mappings is a fail-to-START, so segment count is the
+	// signal worth alerting on -- and it is invisible without these, because an archive is
+	// not one of cat.Tables().
+	staleIndex *prometheus.Desc
+	mappings   *prometheus.Desc
 }
 
 func newCatalogCollector(cat *db.Catalog) *catalogCollector {
@@ -72,6 +80,10 @@ func newCatalogCollector(cat *db.Catalog) *catalogCollector {
 			"Cumulative wall time spent in each store stall point (shard write lock wait/hold, segment allocation, durability sync, compaction/retrain/reindex, snapshot lock), by table and op.", tblOp, nil),
 		opOps: prometheus.NewDesc(namespace+"_op_ops_total",
 			"Cumulative number of times each store stall point ran, by table and op. Divide op_seconds_total by this for mean latency.", tblOp, nil),
+		staleIndex: prometheus.NewDesc(namespace+"_stale_index_segments",
+			"Sealed segments whose index was built under a superseded configuration and awaits rebuild, by table. Normally zero; a persistent non-zero value means a reindex is failing or never runs.", tbl, nil),
+		mappings: prometheus.NewDesc(namespace+"_estimated_mmaps",
+			"Estimated memory mappings a table holds: one per sealed segment plus one per sidecar. Compare against vm.max_map_count (65530 by default, shared process-wide across every table) -- exhausting it prevents the daemon from STARTING, not merely from querying.", tbl, nil),
 		opMax: prometheus.NewDesc(namespace+"_op_max_seconds",
 			"Longest single occurrence of each store stall point (worst-case latency since start), by table and op. The mean (op_seconds_total/op_ops_total) hides tail stalls; this surfaces them.", tblOp, nil),
 	}
@@ -87,6 +99,8 @@ func (c *catalogCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.opSeconds
 	ch <- c.opOps
 	ch <- c.opMax
+	ch <- c.staleIndex
+	ch <- c.mappings
 }
 
 func (c *catalogCollector) Collect(ch chan<- prometheus.Metric) {
@@ -106,11 +120,45 @@ func (c *catalogCollector) Collect(ch chan<- prometheus.Metric) {
 		gauge(c.dead, float64(st.DeadBytes))
 		gauge(c.segments, float64(st.Segments))
 
-		for _, e := range opStatList(t.OpStats()) {
-			ch <- prometheus.MustNewConstMetric(c.opOps, prometheus.CounterValue, float64(e.stat.Count), name, e.op)
-			ch <- prometheus.MustNewConstMetric(c.opSeconds, prometheus.CounterValue, float64(e.stat.Nanos)/1e9, name, e.op)
-			ch <- prometheus.MustNewConstMetric(c.opMax, prometheus.GaugeValue, float64(e.stat.MaxNanos)/1e9, name, e.op)
+		c.collectOpStats(ch, name, t.OpStats())
+	}
+
+	// Archive (history) tables are a separate namespace in the catalog, so iterating
+	// cat.Tables() alone silently omits them -- and they are exactly where segment count
+	// matters, since an append-only table never compacts and its segments only accumulate.
+	for _, name := range c.cat.ArchiveTables() {
+		a, ok := c.cat.ArchiveTable(name)
+		if !ok {
+			continue
 		}
+		st := a.Stats()
+		gauge := func(d *prometheus.Desc, v float64) {
+			ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, name)
+		}
+		gauge(c.ads, float64(st.Ads))
+		gauge(c.arena, float64(st.ArenaBytes))
+		gauge(c.used, float64(st.UsedBytes))
+		gauge(c.live, float64(st.LiveBytes()))
+		gauge(c.dead, float64(st.DeadBytes))
+		gauge(c.segments, float64(st.Segments))
+
+		stale, sealed := a.StaleIndexSegments()
+		gauge(c.staleIndex, float64(stale))
+		// One mapping per sealed segment, plus one per sidecar once a query touches it.
+		// Reported as the ceiling case, since that is the number that runs out.
+		gauge(c.mappings, float64(sealed*2))
+
+		c.collectOpStats(ch, name, a.OpStats())
+	}
+}
+
+// collectOpStats emits the {seconds_total, ops_total, max_seconds} triple per stall point,
+// shared by mutable and archive tables so both report timings on the same terms.
+func (c *catalogCollector) collectOpStats(ch chan<- prometheus.Metric, name string, o db.OpStats) {
+	for _, e := range opStatList(o) {
+		ch <- prometheus.MustNewConstMetric(c.opOps, prometheus.CounterValue, float64(e.stat.Count), name, e.op)
+		ch <- prometheus.MustNewConstMetric(c.opSeconds, prometheus.CounterValue, float64(e.stat.Nanos)/1e9, name, e.op)
+		ch <- prometheus.MustNewConstMetric(c.opMax, prometheus.GaugeValue, float64(e.stat.MaxNanos)/1e9, name, e.op)
 	}
 }
 
