@@ -51,6 +51,7 @@ type Input struct {
 	Capabilities Capabilities
 	Sources      []scheddsync.SyncStatus
 	Exporters    []ExporterStatus
+	Importers    []ImporterStatus
 	Now          time.Time
 }
 
@@ -67,6 +68,23 @@ type ExporterStatus struct {
 	DocsSkipped uint64
 	InFlight    int
 	LastErr     string
+}
+
+// ImporterStatus is one history-import job's health as the daemon's importer
+// manager sees it: what the daemon knows (running, restarts) plus the runner's
+// last-reported progress. SecondsSinceBeat is the "is it stuck" signal;
+// ImportedTotal and the last cycle's Schedds/Failures show whether it is making
+// progress across the pool.
+type ImporterStatus struct {
+	Name          string
+	Running       bool
+	Restarts      int
+	LastBeat      time.Time // the runner's last status beat (zero if none seen yet)
+	LastCycle     time.Time // the last completed import cycle (zero if none yet)
+	Schedds       int       // schedds imported in the last cycle
+	Failures      int       // schedds that errored in the last cycle
+	ImportedTotal uint64    // cumulative records imported since the runner started
+	LastErr       string
 }
 
 // AddAttrs augments a daemon-produced base ad with the HTCondorDB-specific attributes: the
@@ -157,6 +175,31 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 		}
 		if e.LastErr != "" {
 			ad.InsertAttrString(p+"LastError", e.LastErr)
+		}
+	}
+
+	// Per-import-job health (the daemon-managed remote-history importers).
+	ad.InsertAttr("NumImportJobs", int64(len(in.Importers)))
+	for _, im := range in.Importers {
+		p := "ImportJob_" + sanitize(im.Name) + "_"
+		ad.InsertAttrBool(p+"Running", im.Running)
+		ad.InsertAttr(p+"Restarts", int64(im.Restarts))
+		ad.InsertAttr(p+"Schedds", int64(im.Schedds))
+		ad.InsertAttr(p+"Failures", int64(im.Failures))
+		ad.InsertAttr(p+"ImportedTotal", int64(im.ImportedTotal))
+		if !im.LastBeat.IsZero() {
+			ad.InsertAttr(p+"LastBeatTime", im.LastBeat.Unix())
+			secs := int64(in.Now.Sub(im.LastBeat).Seconds())
+			if secs < 0 {
+				secs = 0
+			}
+			ad.InsertAttr(p+"SecondsSinceBeat", secs)
+		}
+		if !im.LastCycle.IsZero() {
+			ad.InsertAttr(p+"LastCycleTime", im.LastCycle.Unix())
+		}
+		if im.LastErr != "" {
+			ad.InsertAttrString(p+"LastError", im.LastErr)
 		}
 	}
 }

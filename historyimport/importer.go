@@ -69,6 +69,10 @@ type Importer struct {
 	Cur  Cursors
 	Log  *slog.Logger
 	Now  func() time.Time // injectable clock; defaults to time.Now
+
+	// OnCycle, if set, is called after each RunLoop cycle with its stats and error
+	// (the runner uses it to publish a status beat). Ignored by a bare RunJob.
+	OnCycle func(Stats, error)
 }
 
 // Stats reports one RunJob cycle's outcome.
@@ -109,6 +113,9 @@ func (im *Importer) RunLoop(ctx context.Context, j Job) error {
 		} else {
 			im.log().Info("historyimport: cycle complete",
 				"job", j.Name, "schedds", st.Schedds, "failures", st.Failures, "imported", st.Imported)
+		}
+		if im.OnCycle != nil {
+			im.OnCycle(st, err)
 		}
 		select {
 		case <-ctx.Done():

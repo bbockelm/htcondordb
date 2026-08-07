@@ -40,6 +40,10 @@ import (
 // htcondordb command package, matching kafkasync.
 const dbSessionCommand = 74000
 
+// statusBeatInterval is how often the runner refreshes its liveness beat. It must
+// be well under the manager's liveness timeout so a healthy runner is never killed.
+const statusBeatInterval = 20 * time.Second
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "history-import:", err)
@@ -78,6 +82,7 @@ func cmdRun(args []string) error {
 	addr := fs.String("addr", "", "htcondordb address (host:port)")
 	name := fs.String("name", "", "import job name (required)")
 	cursorFile := fs.String("cursor-file", "", "path to the durable cursor file")
+	statusFile := fs.String("status-file", "", "path to the status/liveness file (the manager sets this)")
 	debug := fs.Bool("debug", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -126,11 +131,20 @@ func cmdRun(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// The status beater publishes liveness + progress for the daemon's importer
+	// manager. It runs for the whole process lifetime (across DB reconnects) so a
+	// transient DB outage does not read as a wedged child.
+	var beater *historyimport.StatusBeater
+	if *statusFile != "" {
+		beater = historyimport.NewStatusBeater(*statusFile)
+		go beater.Run(ctx, statusBeatInterval)
+	}
+
 	// The DB write connection is re-dialed by the outer loop so a transient DB
 	// outage backs off and reconnects rather than killing the importer.
 	backoff := time.Second
 	for ctx.Err() == nil {
-		err := runJob(ctx, cfg, *addr, job, cursors, log)
+		err := runJob(ctx, cfg, *addr, job, cursors, beater, log)
 		if err == nil || ctx.Err() != nil {
 			break // clean shutdown
 		}
@@ -148,7 +162,7 @@ func cmdRun(args []string) error {
 
 // runJob dials the DB, builds the importer, and runs the job's loop until the DB
 // connection drops (returns the error to reconnect) or ctx is cancelled (nil).
-func runJob(ctx context.Context, cfg *config.Config, addrFlag string, job historyimport.Job, cursors historyimport.Cursors, log *slog.Logger) error {
+func runJob(ctx context.Context, cfg *config.Config, addrFlag string, job historyimport.Job, cursors historyimport.Cursors, beater *historyimport.StatusBeater, log *slog.Logger) error {
 	client, cleanup, err := dial(ctx, cfg, addrFlag)
 	if err != nil {
 		return err
@@ -161,6 +175,9 @@ func runJob(ctx context.Context, cfg *config.Config, addrFlag string, job histor
 		W:    &historyimport.DBWriter{Client: client},
 		Cur:  cursors,
 		Log:  log,
+	}
+	if beater != nil {
+		im.OnCycle = beater.RecordCycle
 	}
 	log.Info("history-import: starting", "job", job.Name, "pool", job.Pool, "table", job.Table, "interval", job.Interval)
 	return im.RunLoop(ctx, job)

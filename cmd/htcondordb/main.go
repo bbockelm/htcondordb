@@ -327,7 +327,7 @@ func run() error {
 	// MCP) discover this database and its command address here, and the ad doubles as a metrics
 	// sink carrying per-table storage gauges and per-source sync health -- scrapable via the
 	// collector even when the daemon's own /metrics endpoint is off.
-	startCollectorAdvertise(ctx, d, cfg, svc, advertisedAddr(d, ln), syncMgr.Sources, expMgr.Statuses)
+	startCollectorAdvertise(ctx, d, cfg, svc, advertisedAddr(d, ln), syncMgr.Sources, expMgr.Statuses, impMgr.Statuses)
 
 	// Start any background HA machinery (a follower's replicator, or the raft
 	// coordinator and its command handlers in consistent mode).
@@ -440,7 +440,7 @@ func encryptionConfig(cfg *config.Config) (poolKeys []db.KEK, attrs []string, er
 // explicitly disabled (HTCONDORDB_ADVERTISE=false). The ad carries the daemon's command
 // address for discovery plus per-table storage gauges and per-source sync health for
 // monitoring.
-func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, addr string, sourcesFunc func() []dbad.StatusSource, exportersFunc func() []dbad.ExporterStatus) {
+func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, addr string, sourcesFunc func() []dbad.StatusSource, exportersFunc func() []dbad.ExporterStatus, importersFunc func() []dbad.ImporterStatus) {
 	if v := getStr(cfg, "HTCONDORDB_ADVERTISE"); strings.TrimSpace(v) != "" && !configBool(cfg, "HTCONDORDB_ADVERTISE") {
 		return // explicitly disabled
 	}
@@ -451,7 +451,7 @@ func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.
 	// capabilities, reachable address). It is a no-op when COLLECTOR_HOST is empty.
 	go d.Advertise(ctx, daemon.AdvertiseConfig{
 		MyType:  dbad.AdType,
-		Augment: dbad.Augment(svc.Catalog(), sourcesFunc, exportersFunc, addr),
+		Augment: dbad.Augment(svc.Catalog(), sourcesFunc, exportersFunc, importersFunc, addr),
 		Logger:  d.Slog(),
 	})
 }

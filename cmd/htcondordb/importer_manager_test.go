@@ -1,13 +1,96 @@
 package main
 
 import (
+	"context"
+	"io"
+	"log/slog"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/bbockelm/golang-htcondor/config"
+
+	"github.com/bbockelm/htcondordb/historyimport"
 )
+
+func quietManager() *importerManager {
+	return &importerManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+}
+
+// TestImporterLivenessRestartsStaleBeat: a runner whose status beat has gone stale
+// is cancelled (which drives the supervisor's restart), and its last-read status
+// is recorded for the ad.
+func TestImporterLivenessRestartsStaleBeat(t *testing.T) {
+	statusFile := filepath.Join(t.TempDir(), "s.json")
+	if err := historyimport.WriteStatusFile(statusFile, historyimport.Status{Beat: time.Now().Add(-time.Hour).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	m := quietManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	restarted := make(chan struct{})
+	timeout := 300 * time.Millisecond
+	// start in the past so the grace window has already elapsed.
+	go m.monitorLiveness(ctx, func() { close(restarted) }, "j", statusFile, time.Now().Add(-timeout), timeout)
+
+	select {
+	case <-restarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stale beat did not trigger a restart")
+	}
+	if ss := m.Statuses(); len(ss) != 1 || ss[0].Name != "j" {
+		t.Errorf("expected the stale runner's status recorded, got %+v", ss)
+	}
+}
+
+// TestImporterLivenessKeepsBeatingChild: a runner that keeps beating is never
+// restarted.
+func TestImporterLivenessKeepsBeatingChild(t *testing.T) {
+	statusFile := filepath.Join(t.TempDir(), "s.json")
+	m := quietManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A goroutine that keeps the beat fresh, like a live runner. The beat is whole
+	// seconds (the on-wire contract), so the liveness timeout must sit comfortably
+	// above one second of truncation error -- as it does in production (90s).
+	beatCtx, stopBeat := context.WithCancel(context.Background())
+	beatDone := make(chan struct{})
+	go func() {
+		defer close(beatDone)
+		tk := time.NewTicker(250 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			_ = historyimport.WriteStatusFile(statusFile, historyimport.Status{Beat: time.Now().Unix()})
+			select {
+			case <-beatCtx.Done():
+				return
+			case <-tk.C:
+			}
+		}
+	}()
+
+	restarted := make(chan struct{})
+	go m.monitorLiveness(ctx, func() { close(restarted) }, "j", statusFile, time.Now(), 2*time.Second)
+
+	var failed bool
+	select {
+	case <-restarted:
+		failed = true
+	case <-time.After(3 * time.Second):
+		// good: survived well past the liveness timeout while beating
+	}
+	// Stop the beat goroutine and wait for it before t.TempDir cleanup runs, so no
+	// write lands in the temp dir mid-removal.
+	stopBeat()
+	<-beatDone
+	if failed {
+		t.Fatal("a continuously-beating runner should not be restarted")
+	}
+}
 
 func importerCfg(t *testing.T, body string) *config.Config {
 	t.Helper()
