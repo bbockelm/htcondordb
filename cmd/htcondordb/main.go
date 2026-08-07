@@ -299,6 +299,20 @@ func run() error {
 		}
 	})
 
+	// History importers (historyimport): pull completed-job history from every schedd of a pool
+	// (remote condor_history) into an archive table, one supervised subprocess per configured job,
+	// running as a service account with pool credentials. Reapplied on reconfigure. Off unless
+	// HTCONDORDB_HISTORY_IMPORT names jobs.
+	impMgr := newImporterManager(ctx, d.Slog(), advertisedAddr(d, ln))
+	if ierr := impMgr.apply(cfg); ierr != nil {
+		return ierr
+	}
+	d.OnReconfig(func(newCfg *config.Config) {
+		if ierr := impMgr.apply(newCfg); ierr != nil {
+			log.Error(logging.DestinationGeneral, "reconfigure: importer manager not reapplied", "err", ierr.Error())
+		}
+	})
+
 	// Serve the transport-neutral HTTP/SSE change feed for external, non-CEDAR sinks (opt-in via
 	// HTCONDORDB_CHANGEFEED_ADDRESS, token-gated). No-op when unset.
 	startChangeFeed(ctx, d, cfg, svc)
