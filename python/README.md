@@ -298,33 +298,6 @@ are fixed as of classad v0.24.1, and `SELECT` of an expression-valued attribute 
 the siblings that expression reads, so a narrow `SELECT Requirements` agrees with
 `SELECT *`.
 
-## Releasing
-
-Wheels publish to PyPI from GitHub Actions using **Trusted Publishing** — PyPI mints a
-short-lived, project-scoped token from the workflow's OIDC identity, so there is no API
-token stored in the repository to leak or rotate.
-
-Cutting a release:
-
-1. Publish a GitHub release on a `vX.Y.Z` tag.
-2. Approve the `pypi` environment when the run pauses for it.
-
-There is no version to bump. It is derived from the tag by `setuptools-scm` — the same
-tags `release.yml` builds the Go artifacts from and the Makefile stamps into their
-`-version` output — so the package cannot be released under a number that disagrees with
-what was tagged, and there is no step to forget. A build off any other commit is a
-`.devN+g<sha>` prerelease.
-
-The publish job builds nothing and checks out nothing: it uploads exactly the artifacts the
-build jobs produced and the smoke job installed. It refuses to run on anything but a
-published release, and refuses to upload a development version — which is what a build that
-did not happen on a tag would produce.
-
-Uploads carry PEP 740 attestations, signed with the same workflow identity, so an installer
-can verify a file came from this workflow in this repository.
-
-One-time setup is described in `.github/workflows/python-wheels.yml`.
-
 ## Testing
 
 ```sh
