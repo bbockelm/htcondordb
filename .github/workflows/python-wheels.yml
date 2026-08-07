@@ -9,6 +9,18 @@ name: python wheels
 # Linux wheels build inside manylinux rather than on the runner, because cgo links the
 # build host's glibc and a wheel built on current Ubuntu will not install on the EL8/EL9
 # machines this is for.
+#
+# ONE-TIME SETUP for publishing (see the publish job):
+#
+#   1. On PyPI, add a Trusted Publisher for the project (a "pending publisher" works before
+#      the project exists) with owner `bbockelm`, repository `htcondordb`, workflow
+#      `python-wheels.yml`, environment `pypi`. The workflow FILENAME is part of the trust
+#      relationship -- renaming this file breaks publishing until PyPI is updated.
+#   2. On GitHub, create an environment named `pypi` with required reviewers, and restrict
+#      its deployment branches to tags matching `v*`. That is the human gate: PyPI trusts
+#      this workflow, and the environment decides who may run it.
+#
+# No API token is created or stored at any point.
 on:
   push:
     branches: [main]
@@ -19,13 +31,16 @@ on:
   release:
     types: [published]
 
-permissions:
-  contents: read
+# No workflow-wide permissions: each job is granted only what it needs, so nothing here
+# can mint the publish job's OIDC token by accident.
+permissions: {}
 
 jobs:
   linux:
     name: manylinux ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +88,8 @@ jobs:
   macos:
     name: macos ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -129,6 +146,8 @@ jobs:
     name: install on a clean distro
     needs: linux
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -146,3 +165,58 @@ jobs:
           print(\"version\", htcondordb.__version__)
           print(\"bundled library\", htcondordb.library_path())
           "'
+
+  publish:
+    name: publish to PyPI
+    # Only for a published release. Never on a push or a pull request -- a fork's PR must
+    # not be able to reach this job, since the artifacts would be built from that fork.
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: [linux, macos, smoke]
+    runs-on: ubuntu-latest
+
+    # The environment is the human gate. Configure it with required reviewers and a
+    # deployment-branch rule limited to v* tags, so publishing cannot happen without an
+    # approval recorded against a tag.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/htcondordb
+
+    permissions:
+      # Trusted Publishing: PyPI mints a short-lived, project-scoped token from this OIDC
+      # claim. No API token is stored in the repository at all, so there is no long-lived
+      # credential to leak, rotate or mis-scope.
+      id-token: write
+      # PEP 740 attestations, signed with the same identity, so an installer can verify a
+      # file came from this workflow in this repository.
+      attestations: write
+
+    steps:
+      # Deliberately no checkout: this job builds nothing, so it needs none of the
+      # repository's code. It uploads exactly what the build jobs produced and the smoke
+      # job installed.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Check the release tag matches the package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          # Wheels are named htcondordb-<version>-...; all must agree with the tag, or a
+          # release cuts the previous version's artifacts under a new name.
+          for whl in dist/*.whl; do
+            version="$(basename "$whl" | cut -d- -f2)"
+            if [ "$version" != "$tag" ]; then
+              echo "release tag $GITHUB_REF_NAME does not match wheel version $version" >&2
+              echo "bump version in python/pyproject.toml before tagging" >&2
+              exit 1
+            fi
+          done
+          ls -la dist
+
+      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          attestations: true
+          print-hash: true

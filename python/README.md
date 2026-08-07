@@ -231,6 +231,29 @@ are fixed as of classad v0.24.1, and `SELECT` of an expression-valued attribute 
 the siblings that expression reads, so a narrow `SELECT Requirements` agrees with
 `SELECT *`.
 
+## Releasing
+
+Wheels publish to PyPI from GitHub Actions using **Trusted Publishing** — PyPI mints a
+short-lived, project-scoped token from the workflow's OIDC identity, so there is no API
+token stored in the repository to leak or rotate.
+
+Cutting a release:
+
+1. Bump `version` in `python/pyproject.toml` and merge it.
+2. Publish a GitHub release on the matching `vX.Y.Z` tag.
+3. Approve the `pypi` environment when the run pauses for it.
+
+The publish job builds nothing and checks out nothing: it uploads exactly the artifacts the
+build jobs produced and the smoke job installed. It refuses to run on anything but a
+published release, and it verifies the tag matches the version in every wheel before
+uploading — so a release cannot quietly ship the previous version's artifacts under a new
+name.
+
+Uploads carry PEP 740 attestations, signed with the same workflow identity, so an installer
+can verify a file came from this workflow in this repository.
+
+One-time setup is described in `.github/workflows/python-wheels.yml`.
+
 ## Testing
 
 ```sh
