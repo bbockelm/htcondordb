@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 )
@@ -826,6 +827,97 @@ func (e *Executor) projectionAttrs(st *Statement) []string {
 	return attrs
 }
 
+// scanAttrs returns the attributes a client-side scan actually reads from each fetched row --
+// the group keys, the aggregate arguments and their filters, the window's partition/order
+// terms -- or nil to fetch whole ads.
+//
+// The client-side paths (a computed GROUP BY key, a time_bucket fallback, a ranking window)
+// cannot push their work to the server, so every matching row crosses the wire and is parsed
+// here. On a wide job ad that parse IS the query: grouping 20k ads by a CASE expression spent
+// 90% of its time in the ClassAd parser, ~50x the cost of the same grouping over a plain
+// attribute (which the server does). Projecting to the few attributes actually read shrinks
+// both the wire and the parse.
+//
+// Returning nil is always safe -- it is the old whole-ad fetch -- so anything not analyzable
+// (SELECT *, AS OF, an expression this can't parse) falls back rather than guessing at an
+// attribute set. Guessing short would not fail loudly; it would quietly group by undefined.
+func (e *Executor) scanAttrs(st *Statement) []string {
+	if st.AsOf != "" {
+		return nil // the point-in-time query has no projected variant
+	}
+	seen := map[string]bool{}
+	var attrs []string
+	add := func(name string) {
+		if k := strings.ToLower(name); name != "" && name != "*" && !seen[k] {
+			seen[k] = true
+			attrs = append(attrs, name)
+		}
+	}
+	analyzable := true
+	addExpr := func(src string) {
+		q, err := vm.Parse(src)
+		if err != nil {
+			analyzable = false // let the whole-ad path parse it and report the error
+			return
+		}
+		for _, a := range q.ReadAttrs() {
+			add(a)
+		}
+	}
+	addItem := func(it SelectItem) {
+		switch {
+		case it.Star:
+			analyzable = false // every attribute
+		case it.Expr != "":
+			addExpr(it.Expr)
+		default:
+			add(it.Col)
+		}
+	}
+	for _, it := range st.Items {
+		if it.Window != "" {
+			for _, p := range it.WinPartition {
+				add(p)
+			}
+			for _, t := range it.WinOrder {
+				addItem(t.Item)
+			}
+			continue
+		}
+		if it.IsAggregate() {
+			continue // its argument and filter come from aggCallOrder below
+		}
+		addItem(it)
+	}
+	// Aggregates from the items AND from HAVING, in the one canonical order.
+	for _, a := range aggCallOrder(st) {
+		add(a.Arg)
+		if a.Filter != "" {
+			addExpr(a.Filter)
+		}
+	}
+	for _, t := range st.OrderBy {
+		// A window column is ordered by its computed value; naming it here would only add an
+		// attribute no ad has. QUALIFY is window columns only (validateQualify), likewise.
+		if t.Item.Window == "" {
+			addItem(t.Item)
+		}
+	}
+	if !analyzable || len(attrs) == 0 {
+		return nil
+	}
+	return attrs
+}
+
+// queryAdsForClientScan fetches the rows a client-side reduction will consume, projected to
+// the attributes it reads when scanAttrs can determine them.
+func (e *Executor) queryAdsForClientScan(st *Statement) ([]*classad.ClassAd, error) {
+	if attrs := e.scanAttrs(st); attrs != nil {
+		return e.queryAdsProjected(st.Table, st.Where, attrs, 0)
+	}
+	return e.queryAdsAsOf(st.Table, st.Where, 0, st.AsOf)
+}
+
 // queryAdsProjected fetches only the projection attributes of each matching row via the
 // server-side projection op (QueryRawProject), which streams the old-ClassAd render of the
 // projected subset. limit > 0 caps the scan server-side.
@@ -1273,9 +1365,23 @@ func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
 // those are exactly the GROUP BY terms when bucketing), so the group tuple lines up
 // with the output columns positionally.
 func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
-	ads, err := e.queryAdsAsOf(st.Table, st.Where, 0, st.AsOf)
+	ads, err := e.queryAdsForClientScan(st)
 	if err != nil {
 		return nil, err
+	}
+	// Compile each computed group key ONCE. Parsing it per ad made a grouped CASE query
+	// spend most of its time in the ClassAd parser -- 50x the cost of grouping by a plain
+	// attribute over the same rows.
+	groupExpr := make([]*classad.Expr, len(st.Items))
+	for j, it := range st.Items {
+		if it.GroupLevel() || it.Bucket || it.Expr == "" {
+			continue
+		}
+		ex, perr := classad.ParseExpr(it.Expr)
+		if perr != nil {
+			return nil, fmt.Errorf("GROUP BY expression %q: %w", it.Col, perr)
+		}
+		groupExpr[j] = ex
 	}
 	type group struct {
 		vals []string
@@ -1286,7 +1392,7 @@ func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 	for _, ad := range ads {
 		vals := make([]string, 0, len(st.Items))
 		drop := false
-		for _, it := range st.Items {
+		for j, it := range st.Items {
 			if it.IsAggregate() {
 				continue
 			}
@@ -1299,12 +1405,8 @@ func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 				vals = append(vals, bucketFloor(sec, it.BucketWidth))
 				continue
 			}
-			if it.Expr != "" {
-				ex, perr := classad.ParseExpr(it.Expr)
-				if perr != nil {
-					return nil, fmt.Errorf("GROUP BY expression %q: %w", it.Col, perr)
-				}
-				vals = append(vals, valueDisplay(ex.Eval(ad)))
+			if groupExpr[j] != nil {
+				vals = append(vals, valueDisplay(groupExpr[j].Eval(ad)))
 				continue
 			}
 			vals = append(vals, valueDisplay(ad.EvaluateAttr(it.Col)))

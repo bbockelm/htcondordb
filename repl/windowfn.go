@@ -249,6 +249,12 @@ func windowValues(st *Statement, ads []*classad.ClassAd) ([][]string, error) {
 		if it.Window == "" {
 			continue
 		}
+		// Render the ordering key of every ad up front, so the per-partition sorts below just
+		// compare strings.
+		keys, err := orderKeys(ads, it.WinOrder)
+		if err != nil {
+			return nil, err
+		}
 		// Index the ads by partition so each partition can be ordered independently.
 		parts := map[string][]int{}
 		var order []string
@@ -261,18 +267,10 @@ func windowValues(st *Statement, ads []*classad.ClassAd) ([][]string, error) {
 		}
 		for _, key := range order {
 			idx := parts[key]
-			var serr error
 			sort.SliceStable(idx, func(a, b int) bool {
-				less, err := adsLess(ads[idx[a]], ads[idx[b]], it.WinOrder)
-				if err != nil && serr == nil {
-					serr = err
-				}
-				return less
+				return keysLess(keys[idx[a]], keys[idx[b]], it.WinOrder)
 			})
-			if serr != nil {
-				return nil, serr
-			}
-			assignRanks(it.Window, idx, ads, it.WinOrder, out, j)
+			assignRanks(it.Window, idx, keys, out, j)
 		}
 	}
 	return out, nil
@@ -283,10 +281,10 @@ func windowValues(st *Statement, ads []*classad.ClassAd) ([][]string, error) {
 //	ROW_NUMBER  1,2,3,4  -- always distinct
 //	RANK        1,1,3,4  -- ties share a number, and skip the ones they consumed
 //	DENSE_RANK  1,1,2,3  -- ties share a number, and the next is the next integer
-func assignRanks(fn string, idx []int, ads []*classad.ClassAd, terms []OrderTerm, out [][]string, col int) {
+func assignRanks(fn string, idx []int, keys [][]string, out [][]string, col int) {
 	rank, dense := 0, 0
 	for pos, adIdx := range idx {
-		tied := pos > 0 && sameOrderKey(ads[idx[pos-1]], ads[adIdx], terms)
+		tied := pos > 0 && sameOrderKey(keys[idx[pos-1]], keys[adIdx])
 		switch fn {
 		case winRowNumber:
 			rank = pos + 1
@@ -317,42 +315,63 @@ func partitionKey(ad *classad.ClassAd, cols []string) string {
 	return strings.Join(parts, "\x00")
 }
 
-// sameOrderKey reports whether two ads compare equal on every window ORDER BY term -- a tie,
-// which RANK and DENSE_RANK give the same number.
-func sameOrderKey(a, b *classad.ClassAd, terms []OrderTerm) bool {
-	for _, t := range terms {
-		if compareCells(orderCell(a, t), orderCell(b, t)) != 0 {
+// sameOrderKey reports whether two precomputed ORDER BY tuples compare equal -- a tie, which
+// RANK and DENSE_RANK give the same number.
+func sameOrderKey(a, b []string) bool {
+	for k := range a {
+		if compareCells(a[k], b[k]) != 0 {
 			return false
 		}
 	}
 	return true
 }
 
-// adsLess orders two ads by the window's ORDER BY terms.
-func adsLess(a, b *classad.ClassAd, terms []OrderTerm) (bool, error) {
-	for _, t := range terms {
-		c := compareCells(orderCell(a, t), orderCell(b, t))
+// orderKeys renders each ad's window ORDER BY tuple, once.
+//
+// Computing them inside the comparator instead cost O(n log n) attribute evaluations and
+// string renders per partition -- and, for an expression term, an O(n log n) ClassAd parse,
+// since the term was compiled afresh on every comparison. Decorating first makes it O(n).
+func orderKeys(ads []*classad.ClassAd, terms []OrderTerm) ([][]string, error) {
+	compiled := make([]*classad.Expr, len(terms))
+	for k, t := range terms {
+		if t.Item.Expr == "" {
+			continue
+		}
+		ex, err := classad.ParseExpr(t.Item.Expr)
+		if err != nil {
+			return nil, fmt.Errorf("window ORDER BY %q: %w", t.Item.Expr, err)
+		}
+		compiled[k] = ex
+	}
+	keys := make([][]string, len(ads))
+	cells := make([]string, len(ads)*len(terms)) // one backing array, re-sliced per ad
+	for i, ad := range ads {
+		row := cells[i*len(terms) : (i+1)*len(terms) : (i+1)*len(terms)]
+		for k, t := range terms {
+			if compiled[k] != nil {
+				row[k] = valueDisplay(compiled[k].Eval(ad))
+			} else {
+				row[k] = valueDisplay(ad.EvaluateAttr(t.Item.Col))
+			}
+		}
+		keys[i] = row
+	}
+	return keys, nil
+}
+
+// keysLess orders two precomputed ORDER BY tuples.
+func keysLess(a, b []string, terms []OrderTerm) bool {
+	for k, t := range terms {
+		c := compareCells(a[k], b[k])
 		if c == 0 {
 			continue
 		}
 		if t.Desc {
-			return c > 0, nil
+			return c > 0
 		}
-		return c < 0, nil
+		return c < 0
 	}
-	return false, nil
-}
-
-// orderCell renders one ORDER BY term for an ad: an expression term is evaluated, a plain
-// column read by name.
-func orderCell(ad *classad.ClassAd, t OrderTerm) string {
-	if t.Item.Expr != "" {
-		if ex, err := classad.ParseExpr(t.Item.Expr); err == nil {
-			return valueDisplay(ex.Eval(ad))
-		}
-		return ""
-	}
-	return valueDisplay(ad.EvaluateAttr(t.Item.Col))
+	return false
 }
 
 // qualifyKeep filters rows by the QUALIFY expression, which reads only window columns (see
@@ -394,7 +413,7 @@ func qualifyKeep(st *Statement, ads []*classad.ClassAd, win [][]string) ([]*clas
 // statement's own ORDER BY / LIMIT apply last -- so `ORDER BY n` sorts by the window column,
 // as it should.
 func (e *Executor) execSelectWindow(st *Statement) (*Result, error) {
-	ads, err := e.queryAdsAsOf(st.Table, st.Where, 0, st.AsOf)
+	ads, err := e.queryAdsForClientScan(st)
 	if err != nil {
 		return nil, err
 	}
