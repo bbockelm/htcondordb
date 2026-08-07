@@ -241,15 +241,19 @@ token stored in the repository to leak or rotate.
 
 Cutting a release:
 
-1. Bump `version` in `python/pyproject.toml` and merge it.
-2. Publish a GitHub release on the matching `vX.Y.Z` tag.
-3. Approve the `pypi` environment when the run pauses for it.
+1. Publish a GitHub release on a `vX.Y.Z` tag.
+2. Approve the `pypi` environment when the run pauses for it.
+
+There is no version to bump. It is derived from the tag by `setuptools-scm` — the same
+tags `release.yml` builds the Go artifacts from and the Makefile stamps into their
+`-version` output — so the package cannot be released under a number that disagrees with
+what was tagged, and there is no step to forget. A build off any other commit is a
+`.devN+g<sha>` prerelease.
 
 The publish job builds nothing and checks out nothing: it uploads exactly the artifacts the
 build jobs produced and the smoke job installed. It refuses to run on anything but a
-published release, and it verifies the tag matches the version in every wheel before
-uploading — so a release cannot quietly ship the previous version's artifacts under a new
-name.
+published release, and refuses to upload a development version — which is what a build that
+did not happen on a tag would produce.
 
 Uploads carry PEP 740 attestations, signed with the same workflow identity, so an installer
 can verify a file came from this workflow in this repository.

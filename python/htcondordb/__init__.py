@@ -68,7 +68,22 @@ from .adstream import AdStream
 from .connection import Connection
 from .cursor import Cursor
 
-__version__ = "0.1.0"
+def _installed_version() -> str:
+    """The installed distribution's version.
+
+    Read from package metadata rather than written here: the version comes from the
+    repository's git tag at build time, and a literal in this file would be a second
+    number to keep in step -- exactly the drift the dynamic version removes.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("htcondordb")
+    except PackageNotFoundError:  # running from a source tree, never installed
+        return "0.0.0+unknown"
+
+
+__version__ = _installed_version()
 
 #: PEP 249: the supported DB-API level.
 apilevel = "2.0"
