@@ -1,20 +1,22 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "htcondordb"
-version = "0.1.0"
+# Derived from the repository's git tag rather than written here, so it cannot be
+# forgotten at release time and cannot disagree with what was tagged. See
+# [tool.setuptools_scm] below.
+dynamic = ["version"]
 description = "PEP 249 (DB-API 2.0) driver for htcondordb, over HTCondor's CEDAR protocol"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 authors = [{ name = "Brian Bockelman" }]
 keywords = ["htcondor", "classad", "database", "dbapi", "sql"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Topic :: Database :: Front-Ends",
     "Topic :: System :: Distributed Computing",
@@ -33,6 +35,16 @@ test = ["pytest>=7"]
 [project.urls]
 Homepage = "https://github.com/bbockelm/htcondordb"
 Source = "https://github.com/bbockelm/htcondordb"
+
+# The version comes from the repository's v* tags -- the same ones release.yml builds the
+# Go artifacts from, and the same ones the Makefile stamps into their -version output. One
+# version for the project rather than a second number maintained by hand in this file.
+#
+# A build off a tag is exactly that version; anything else is a .devN+g<sha> prerelease,
+# which PyPI refuses to accept -- so a wheel built from an untagged commit cannot be
+# published by accident.
+[tool.setuptools_scm]
+root = ".."
 
 [tool.setuptools.packages.find]
 include = ["htcondordb*"]

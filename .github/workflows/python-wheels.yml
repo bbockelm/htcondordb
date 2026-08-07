@@ -24,9 +24,31 @@ name: python wheels
 on:
   push:
     branches: [main]
-    paths: ['python/**', 'capi/**', 'repl/**', '.github/workflows/python-wheels.yml']
+    # Wider than just python/: the integration tests start a real daemon, so a change to
+    # the daemon, the server or the dependency set can break them without touching a line
+    # of Python.
+    paths:
+      - 'python/**'
+      - 'capi/**'
+      - 'repl/**'
+      - 'cmd/**'
+      - 'server/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/python-wheels.yml'
   pull_request:
-    paths: ['python/**', 'capi/**', 'repl/**', '.github/workflows/python-wheels.yml']
+    # Wider than just python/: the integration tests start a real daemon, so a change to
+    # the daemon, the server or the dependency set can break them without touching a line
+    # of Python.
+    paths:
+      - 'python/**'
+      - 'capi/**'
+      - 'repl/**'
+      - 'cmd/**'
+      - 'server/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/python-wheels.yml'
   workflow_dispatch:
   release:
     types: [published]
@@ -36,8 +58,49 @@ on:
 permissions: {}
 
 jobs:
+  tests:
+    name: python tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Build the library and the daemon
+        env:
+          GOWORK: "off"
+          GOFLAGS: -mod=mod
+        run: make lib daemon
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install -q --upgrade pip
+          python -m pip install -q pytest cffi
+          # classad2 comes from HTCondor's own wheels, which exist for Linux. It is what
+          # the conn.ads() and write_ads() tests need; without it they skip, so a failure
+          # to install must not fail the job -- but on Linux it should succeed, and the
+          # step reports which way it went.
+          if python -m pip install -q htcondor; then
+            echo "classad2 available: the ClassAd tests will run"
+          else
+            echo "::warning::htcondor bindings unavailable; ClassAd tests will skip"
+          fi
+
+      - name: Run the suite
+        # The integration tests start a real daemon on a free port with a throwaway config
+        # and store, so this exercises the whole stack -- cffi, the C client, CEDAR, the
+        # SQL layer -- not just the pure-Python parts.
+        run: make python-test
+
   linux:
     name: manylinux ${{ matrix.arch }}
+    needs: tests
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -54,6 +117,14 @@ jobs:
     container: quay.io/pypa/manylinux_2_28_${{ matrix.image_arch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # setuptools-scm derives the version from the tag history, which a shallow
+          # checkout does not have.
+          fetch-depth: 0
+      - name: Let git read the checkout inside the container
+        # Same dubious-ownership refusal that -buildvcs=false sidesteps for Go: here
+        # setuptools-scm needs git to answer, so trust the path instead.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.25'
@@ -72,7 +143,7 @@ jobs:
 
       - name: Build and repair the wheel
         run: |
-          /opt/python/cp312-cp312/bin/python -m pip install -q --upgrade build setuptools wheel auditwheel
+          /opt/python/cp312-cp312/bin/python -m pip install -q --upgrade build setuptools setuptools-scm wheel auditwheel
           cd python && /opt/python/cp312-cp312/bin/python -m build --wheel --no-isolation
           # auditwheel checks the wheel's external library dependencies and retags it to
           # the real glibc floor, which for the Go runtime is far below the build image's.
@@ -87,11 +158,14 @@ jobs:
 
   macos:
     name: macos universal2
+    needs: tests
     runs-on: macos-14
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # setuptools-scm derives the version from the tag history
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.25'
@@ -129,7 +203,7 @@ jobs:
           # SDK floor the dylib actually has and claims nothing untested.
           _PYTHON_HOST_PLATFORM: macosx-11.0-universal2
         run: |
-          python -m pip install -q --upgrade build setuptools wheel delocate
+          python -m pip install -q --upgrade build setuptools setuptools-scm wheel delocate
           cd python && python -m build --wheel --no-isolation
           # delocate bundles any non-system dylib the library needs, and verifies every
           # architecture the tag claims is actually present.
@@ -170,7 +244,7 @@ jobs:
     # Only for a published release. Never on a push or a pull request -- a fork's PR must
     # not be able to reach this job, since the artifacts would be built from that fork.
     if: github.event_name == 'release' && github.event.action == 'published'
-    needs: [linux, macos, smoke]
+    needs: [tests, linux, macos, smoke]
     runs-on: ubuntu-latest
 
     # The environment is the human gate. Configure it with required reviewers and a
@@ -199,19 +273,23 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Check the release tag matches the package version
+      - name: Refuse anything but a clean tagged version
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          # Wheels are named htcondordb-<version>-...; all must agree with the tag, or a
-          # release cuts the previous version's artifacts under a new name.
+          # The version is derived from the git tag by setuptools-scm, so it cannot
+          # disagree with what was tagged. What it CAN be is a .devN+g<sha> prerelease,
+          # which means the build did not happen on a tag -- publishing that would ship a
+          # snapshot as a release. PyPI would reject the local segment anyway; failing here
+          # says why.
           for whl in dist/*.whl; do
             version="$(basename "$whl" | cut -d- -f2)"
-            if [ "$version" != "$tag" ]; then
-              echo "release tag $GITHUB_REF_NAME does not match wheel version $version" >&2
-              echo "bump version in python/pyproject.toml before tagging" >&2
-              exit 1
-            fi
+            case "$version" in
+              *dev*|*+*)
+                echo "$whl is a development build ($version), not a tagged release" >&2
+                echo "the build did not run against a v* tag" >&2
+                exit 1
+                ;;
+            esac
           done
           ls -la dist
 
