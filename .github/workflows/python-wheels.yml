@@ -54,6 +54,14 @@ jobs:
     container: quay.io/pypa/manylinux_2_28_${{ matrix.image_arch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # setuptools-scm derives the version from the tag history, which a shallow
+          # checkout does not have.
+          fetch-depth: 0
+      - name: Let git read the checkout inside the container
+        # Same dubious-ownership refusal that -buildvcs=false sidesteps for Go: here
+        # setuptools-scm needs git to answer, so trust the path instead.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.25'
@@ -72,7 +80,7 @@ jobs:
 
       - name: Build and repair the wheel
         run: |
-          /opt/python/cp312-cp312/bin/python -m pip install -q --upgrade build setuptools wheel auditwheel
+          /opt/python/cp312-cp312/bin/python -m pip install -q --upgrade build setuptools setuptools-scm wheel auditwheel
           cd python && /opt/python/cp312-cp312/bin/python -m build --wheel --no-isolation
           # auditwheel checks the wheel's external library dependencies and retags it to
           # the real glibc floor, which for the Go runtime is far below the build image's.
@@ -92,6 +100,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # setuptools-scm derives the version from the tag history
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.25'
@@ -129,7 +139,7 @@ jobs:
           # SDK floor the dylib actually has and claims nothing untested.
           _PYTHON_HOST_PLATFORM: macosx-11.0-universal2
         run: |
-          python -m pip install -q --upgrade build setuptools wheel delocate
+          python -m pip install -q --upgrade build setuptools setuptools-scm wheel delocate
           cd python && python -m build --wheel --no-isolation
           # delocate bundles any non-system dylib the library needs, and verifies every
           # architecture the tag claims is actually present.
@@ -199,19 +209,23 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Check the release tag matches the package version
+      - name: Refuse anything but a clean tagged version
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          # Wheels are named htcondordb-<version>-...; all must agree with the tag, or a
-          # release cuts the previous version's artifacts under a new name.
+          # The version is derived from the git tag by setuptools-scm, so it cannot
+          # disagree with what was tagged. What it CAN be is a .devN+g<sha> prerelease,
+          # which means the build did not happen on a tag -- publishing that would ship a
+          # snapshot as a release. PyPI would reject the local segment anyway; failing here
+          # says why.
           for whl in dist/*.whl; do
             version="$(basename "$whl" | cut -d- -f2)"
-            if [ "$version" != "$tag" ]; then
-              echo "release tag $GITHUB_REF_NAME does not match wheel version $version" >&2
-              echo "bump version in python/pyproject.toml before tagging" >&2
-              exit 1
-            fi
+            case "$version" in
+              *dev*|*+*)
+                echo "$whl is a development build ($version), not a tagged release" >&2
+                echo "the build did not run against a v* tag" >&2
+                exit 1
+                ;;
+            esac
           done
           ls -la dist
 
