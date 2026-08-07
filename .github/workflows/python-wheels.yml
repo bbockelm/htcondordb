@@ -86,20 +86,10 @@ jobs:
           path: python/dist/repaired/*.whl
 
   macos:
-    name: macos ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
+    name: macos universal2
+    runs-on: macos-14
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-14
-            host_platform: macosx-11.0-arm64   # version is overridden from the binary; arch is what matters
-          - arch: x86_64
-            runner: macos-13
-            host_platform: macosx-11.0-x86_64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -109,37 +99,46 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Build the shared library
+      - name: Build the shared library for both architectures
         env:
           GOWORK: "off"
           GOFLAGS: -mod=mod
         run: |
+          set -euo pipefail
           mkdir -p python/htcondordb/_lib
-          go build -buildvcs=false -buildmode=c-shared \
-            -o python/htcondordb/_lib/libhtcondordb_client.dylib ./capi
+          # One universal2 wheel rather than a job per architecture: the Intel macOS
+          # runners are gone, so an x86_64 job has nothing to run on. cgo cross-compiles
+          # to x86_64 from an arm64 host because the macOS SDK is universal -- clang just
+          # needs the target arch -- and lipo joins the two slices.
+          #
+          # It is also what the interpreter expects: setup-python is universal2, so a
+          # universal2 library is the honest match rather than something delocate has to
+          # be told to overlook.
+          go build -buildvcs=false -buildmode=c-shared -o /tmp/arm64.dylib ./capi
+          CGO_ENABLED=1 GOARCH=amd64 CC="clang -arch x86_64" \
+            go build -buildvcs=false -buildmode=c-shared -o /tmp/amd64.dylib ./capi
+          lipo -create /tmp/arm64.dylib /tmp/amd64.dylib \
+            -output python/htcondordb/_lib/libhtcondordb_client.dylib
+          file python/htcondordb/_lib/libhtcondordb_client.dylib
 
       - name: Build the wheel
         env:
-          # setup-python ships a universal2 interpreter, so setuptools would tag the wheel
-          # universal2 while the dylib is single-arch, and delocate fails hunting for the
-          # architecture that is not there. This fixes the ARCHITECTURE in the tag.
-          #
-          # The macOS VERSION in the tag is not taken from here: wheel reads it out of the
-          # built binary. So the tag reports the SDK floor the dylib actually has, which is
-          # the runner's, and no MACOSX_DEPLOYMENT_TARGET is set -- lowering it would make
-          # the wheel claim support for macOS releases nothing has been tested on.
-          _PYTHON_HOST_PLATFORM: ${{ matrix.host_platform }}
+          # setup-python is universal2, and so now is the library, so this only pins the
+          # tag rather than papering over a mismatch. The macOS VERSION in the tag is not
+          # taken from here: wheel reads it out of the built binary, so the tag reports the
+          # SDK floor the dylib actually has and claims nothing untested.
+          _PYTHON_HOST_PLATFORM: macosx-11.0-universal2
         run: |
           python -m pip install -q --upgrade build setuptools wheel delocate
           cd python && python -m build --wheel --no-isolation
-          # delocate bundles any non-system dylib the library needs. The Go runtime links
-          # only system frameworks, so this normally changes nothing and verifies that.
+          # delocate bundles any non-system dylib the library needs, and verifies every
+          # architecture the tag claims is actually present.
           delocate-wheel -w dist/repaired -v dist/*.whl
           ls -la dist/repaired
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wheel-macos-${{ matrix.arch }}
+          name: wheel-macos-universal2
           path: python/dist/repaired/*.whl
 
   smoke:

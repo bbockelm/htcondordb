@@ -27,7 +27,7 @@ GO    ?= go
 LIB_EXT ?= $(if $(filter Darwin,$(shell uname -s)),dylib,so)
 LIB     := $(BIN_DIR)/libhtcondordb_client.$(LIB_EXT)
 
-.PHONY: all build daemon cli lib archive python-test wheel wheel-linux wheel-validate wheel-clean test vet tidy clean version
+.PHONY: all build daemon cli lib archive python-test wheel wheel-macos wheel-linux wheel-validate wheel-clean test vet tidy clean version
 
 all: build
 
@@ -54,6 +54,17 @@ wheel: lib ## Build a platform wheel for THIS host (bundles the shared library)
 	cp $(LIB) python/htcondordb/_lib/
 	cd python && $(PYTHON) -m build --wheel --no-isolation
 	@echo
+	@ls -la python/dist/*.whl
+
+wheel-macos: ## Build the universal2 macOS wheel (both architectures in one binary)
+	rm -rf python/dist python/build python/htcondordb/_lib
+	mkdir -p python/htcondordb/_lib
+	$(GOENV) $(GO) build -buildvcs=false -buildmode=c-shared -o /tmp/hcdb-arm64.dylib ./capi
+	$(GOENV) CGO_ENABLED=1 GOARCH=amd64 CC="clang -arch x86_64" \
+		$(GO) build -buildvcs=false -buildmode=c-shared -o /tmp/hcdb-amd64.dylib ./capi
+	lipo -create /tmp/hcdb-arm64.dylib /tmp/hcdb-amd64.dylib \
+		-output python/htcondordb/_lib/libhtcondordb_client.dylib
+	cd python && _PYTHON_HOST_PLATFORM=macosx-11.0-universal2 $(PYTHON) -m build --wheel --no-isolation
 	@ls -la python/dist/*.whl
 
 wheel-linux: ## Build a manylinux_2_28 wheel in a container (the shipping artifact)
