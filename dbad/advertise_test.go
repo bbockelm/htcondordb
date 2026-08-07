@@ -93,7 +93,7 @@ func TestAugment(t *testing.T) {
 		}
 	}
 	ad := classad.New()
-	Augment(cat, sources, nil, "")(ad)
+	Augment(cat, sources, nil, nil, "")(ad)
 
 	if v, _ := ad.EvaluateAttrInt("Table_jobs_Ads"); v != 0 {
 		t.Errorf("Table_jobs_Ads = %d, want 0 (empty table)", v)
@@ -130,7 +130,7 @@ func TestAugmentLiveLag(t *testing.T) {
 		}
 	}
 	ad := classad.New()
-	Augment(cat, sources, nil, "")(ad)
+	Augment(cat, sources, nil, nil, "")(ad)
 
 	if v, _ := ad.EvaluateAttrInt("HistoryFileSize"); v != 1000 {
 		t.Errorf("HistoryFileSize = %d, want 1000 (live stat)", v)

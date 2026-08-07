@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"sync"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/droppriv"
 
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/dbad"
 	"github.com/bbockelm/htcondordb/historyimport"
 )
 
@@ -37,18 +39,33 @@ type importerManager struct {
 	cancel  context.CancelFunc
 	done    chan struct{}
 	current importerSettings
+	runtime map[string]*importerRuntime // per-job live status, for liveness + the ad
+}
+
+// importerRuntime is the daemon's view of one supervised import job: what the
+// daemon knows (running, restarts, timing) plus the runner's last-reported status.
+type importerRuntime struct {
+	Running   bool
+	Restarts  int
+	LastStart time.Time
+	LastExit  time.Time
+	LastErr   string
+	Status    historyimport.Status
 }
 
 type importerSettings struct {
 	enabled         bool
 	user            string
 	binOverride     string
+	logDir          string
 	jobs            []string
+	livenessTimeout time.Duration
 	gracefulTimeout time.Duration
 }
 
 func (s importerSettings) equal(o importerSettings) bool {
 	return s.enabled == o.enabled && s.user == o.user && s.binOverride == o.binOverride &&
+		s.logDir == o.logDir && s.livenessTimeout == o.livenessTimeout &&
 		s.gracefulTimeout == o.gracefulTimeout && slices.Equal(s.jobs, o.jobs)
 }
 
@@ -84,11 +101,21 @@ func resolveImporterSettings(cfg *config.Config) importerSettings {
 	if s := configInt(cfg, "HTCONDORDB_HISTORY_IMPORT_SHUTDOWN_SECONDS"); s > 0 {
 		grace = time.Duration(s) * time.Second
 	}
+	live := defaultLivenessTimeout
+	if s := configInt(cfg, "HTCONDORDB_HISTORY_IMPORT_LIVENESS_SECONDS"); s > 0 {
+		live = time.Duration(s) * time.Second
+	}
+	logDir := getStr(cfg, "LOG")
+	if logDir == "" {
+		logDir = os.TempDir()
+	}
 	return importerSettings{
 		enabled:         true,
 		user:            user,
 		binOverride:     getStr(cfg, "HISTORY_IMPORT"),
+		logDir:          logDir,
 		jobs:            names,
+		livenessTimeout: live,
 		gracefulTimeout: grace,
 	}
 }
@@ -124,6 +151,18 @@ func (m *importerManager) apply(cfg *config.Config) error {
 		m.logger.Warn("importer manager: history-import binary not found; leaving import jobs to an external runner",
 			"jobs", next.jobs)
 		return nil
+	}
+
+	// Drop runtime status for jobs no longer configured, so the ad stops
+	// advertising them.
+	keep := make(map[string]bool, len(next.jobs))
+	for _, n := range next.jobs {
+		keep[n] = true
+	}
+	for n := range m.runtime {
+		if !keep[n] {
+			delete(m.runtime, n)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(m.parent)
@@ -195,7 +234,13 @@ func (m *importerManager) runOnce(ctx context.Context, s importerSettings, name,
 	childCtx, cancelChild := context.WithCancel(ctx)
 	defer cancelChild()
 
-	cmd := exec.CommandContext(childCtx, bin, "run", "-name", name, "-addr", m.daemonAddr)
+	// The manager owns the cursor + status file paths (under $(LOG)) so it knows
+	// where to read the child's liveness beat.
+	cursorFile := filepath.Join(s.logDir, "history-import-"+name+".cursors.json")
+	statusFile := filepath.Join(s.logDir, "history-import-"+name+".status.json")
+
+	cmd := exec.CommandContext(childCtx, bin, "run", "-name", name, "-addr", m.daemonAddr,
+		"-cursor-file", cursorFile, "-status-file", statusFile)
 	cmd.Env = append(os.Environ(), security.EnvCondorPrivateInherit+"="+token)
 	// Graceful stop: on childCtx cancel send SIGTERM so the child drains, then
 	// SIGKILL after gracefulTimeout. history-import installs a SIGTERM handler.
@@ -227,6 +272,8 @@ func (m *importerManager) runOnce(ctx context.Context, s importerSettings, name,
 	if err := droppriv.StartAsUser(s.user, cmd); err != nil {
 		return fmt.Errorf("starting %s: %w", bin, err)
 	}
+	m.markStart(name)
+	go m.monitorLiveness(childCtx, cancelChild, name, statusFile, time.Now(), s.livenessTimeout)
 
 	var lwg sync.WaitGroup
 	lwg.Add(2)
@@ -234,7 +281,115 @@ func (m *importerManager) runOnce(ctx context.Context, s importerSettings, name,
 	go func() { defer lwg.Done(); forwardChildLog(m.logger, name, "stderr", stderr) }()
 	lwg.Wait() // pipes close at process exit
 
-	return cmd.Wait()
+	err = cmd.Wait()
+	m.markExit(name, err)
+	return err
+}
+
+// monitorLiveness restarts a child whose status beat has gone stale -- a
+// deadlocked-but-alive runner the supervisor would otherwise never see exit. It
+// also refreshes the daemon's view of the runner's progress for the ad/metrics.
+func (m *importerManager) monitorLiveness(ctx context.Context, cancel context.CancelFunc, name, statusFile string, start time.Time, timeout time.Duration) {
+	if timeout <= 0 {
+		return
+	}
+	t := time.NewTicker(livenessCheckInterval(timeout))
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			st, ok := historyimport.ReadStatusFile(statusFile)
+			if ok {
+				m.setStatus(name, st)
+			}
+			if now.Sub(start) < timeout {
+				continue // grace: the runner gets `timeout` to start and write its first beat
+			}
+			if !ok || now.Sub(time.Unix(st.Beat, 0)) > timeout {
+				m.logger.Warn("importer manager: runner unresponsive (no status beat); restarting",
+					"name", name, "up", now.Sub(start).Round(time.Second), "beat_seen", ok)
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+// --- per-job runtime status (for the collector ad + Prometheus) ---
+
+// rt returns the runtime record for name, creating it. Caller holds m.mu.
+func (m *importerManager) rt(name string) *importerRuntime {
+	if m.runtime == nil {
+		m.runtime = map[string]*importerRuntime{}
+	}
+	e := m.runtime[name]
+	if e == nil {
+		e = &importerRuntime{}
+		m.runtime[name] = e
+	}
+	return e
+}
+
+func (m *importerManager) markStart(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.rt(name)
+	e.Running = true
+	e.LastStart = time.Now()
+}
+
+func (m *importerManager) markExit(name string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.rt(name)
+	e.Running = false
+	e.LastExit = time.Now()
+	e.Restarts++
+	if err != nil {
+		e.LastErr = err.Error()
+	}
+}
+
+func (m *importerManager) setStatus(name string, st historyimport.Status) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rt(name).Status = st
+}
+
+// Statuses returns each supervised job's health for the collector ad and metrics.
+func (m *importerManager) Statuses() []dbad.ImporterStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]dbad.ImporterStatus, 0, len(m.runtime))
+	for name, e := range m.runtime {
+		var beat, cyc time.Time
+		if e.Status.Beat > 0 {
+			beat = time.Unix(e.Status.Beat, 0)
+		}
+		if e.Status.LastCycleUnix > 0 {
+			cyc = time.Unix(e.Status.LastCycleUnix, 0)
+		}
+		// A cycle-level failure (the runner still alive) is more informative than a
+		// past process-exit error, so prefer it.
+		lastErr := e.Status.LastError
+		if lastErr == "" {
+			lastErr = e.LastErr
+		}
+		out = append(out, dbad.ImporterStatus{
+			Name:          name,
+			Running:       e.Running,
+			Restarts:      e.Restarts,
+			LastBeat:      beat,
+			LastCycle:     cyc,
+			Schedds:       e.Status.Schedds,
+			Failures:      e.Status.Failures,
+			ImportedTotal: e.Status.ImportedTotal,
+			LastErr:       lastErr,
+		})
+	}
+	return out
 }
 
 // forwardChildLog relays a child's output stream into the daemon log, one line per

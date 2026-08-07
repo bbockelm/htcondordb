@@ -26,11 +26,15 @@ type StatusSource interface {
 // myAddress is the daemon's authoritative reachable command address (covering the non-shared-port
 // fallback that PublishAd cannot know). sources is queried each cycle so a set that changes at
 // runtime (schedd-sync tailers restarted on reconfigure) is always current.
-func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []ExporterStatus, myAddress string) func(*classad.ClassAd) {
+func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []ExporterStatus, importers func() []ImporterStatus, myAddress string) func(*classad.ClassAd) {
 	return func(ad *classad.ClassAd) {
 		var exp []ExporterStatus
 		if exporters != nil {
 			exp = exporters()
+		}
+		var imp []ImporterStatus
+		if importers != nil {
+			imp = importers()
 		}
 		AddAttrs(ad, Input{
 			MyAddress:    myAddress,
@@ -38,6 +42,7 @@ func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []
 			Capabilities: CatalogCapabilities(cat),
 			Sources:      LiveStatuses(sources),
 			Exporters:    exp,
+			Importers:    imp,
 			Now:          time.Now(),
 		})
 	}

@@ -91,6 +91,52 @@ func TestAddAttrsNoSources(t *testing.T) {
 	}
 }
 
+// TestAddAttrsImporters: history-import job health is surfaced per-job, with
+// SecondsSinceBeat computed against Now and LastError only present when set.
+func TestAddAttrsImporters(t *testing.T) {
+	now := time.Unix(1_700_000_500, 0)
+	in := Input{
+		Now: now,
+		Importers: []ImporterStatus{
+			{Name: "ospool", Running: true, Restarts: 1,
+				LastBeat: time.Unix(1_700_000_470, 0), LastCycle: time.Unix(1_700_000_400, 0),
+				Schedds: 8, Failures: 1, ImportedTotal: 9123},
+			{Name: "cm-east", Running: false, LastErr: "collector unreachable"},
+		},
+	}
+	ad := classad.New()
+	AddAttrs(ad, in)
+
+	i := func(k string) int64 { v, _ := ad.EvaluateAttrInt(k); return v }
+	b := func(k string) bool { v, _ := ad.EvaluateAttrBool(k); return v }
+	str := func(k string) string { v, _ := ad.EvaluateAttrString(k); return v }
+
+	if i("NumImportJobs") != 2 {
+		t.Errorf("NumImportJobs = %d, want 2", i("NumImportJobs"))
+	}
+	if !b("ImportJob_ospool_Running") || i("ImportJob_ospool_Restarts") != 1 ||
+		i("ImportJob_ospool_Schedds") != 8 || i("ImportJob_ospool_Failures") != 1 ||
+		i("ImportJob_ospool_ImportedTotal") != 9123 {
+		t.Errorf("ospool gauges wrong")
+	}
+	if i("ImportJob_ospool_LastBeatTime") != 1_700_000_470 || i("ImportJob_ospool_SecondsSinceBeat") != 30 {
+		t.Errorf("ospool beat wrong: t=%d since=%d", i("ImportJob_ospool_LastBeatTime"), i("ImportJob_ospool_SecondsSinceBeat"))
+	}
+	if i("ImportJob_ospool_LastCycleTime") != 1_700_000_400 {
+		t.Errorf("ospool LastCycleTime = %d, want 1700000400", i("ImportJob_ospool_LastCycleTime"))
+	}
+	if _, ok := ad.EvaluateAttrString("ImportJob_ospool_LastError"); ok {
+		t.Error("healthy import job should have no LastError attr")
+	}
+	// sanitize maps '-' to '_', so cm-east's attrs use ImportJob_cm_east_*.
+	if b("ImportJob_cm_east_Running") {
+		t.Error("cm-east should not be running")
+	}
+	if str("ImportJob_cm_east_LastError") != "collector unreachable" {
+		t.Errorf("cm-east error not surfaced: %q", str("ImportJob_cm_east_LastError"))
+	}
+}
+
 // TestAddAttrsExporters: exporter health is surfaced per-exporter, with SecondsSinceBeat (the
 // "is it wedged / falling behind" signal) computed against Now, and LastError only present when set.
 func TestAddAttrsExporters(t *testing.T) {
