@@ -21,9 +21,67 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import sys
 from typing import Any, Sequence
 
 from ._errors import DataError, ProgrammingError
+
+class Expr:
+    """A parameter that is ClassAd EXPRESSION text, not a string value.
+
+    Every other parameter is data: a str binds as a quoted string, so passing
+    ``"Start && WithinResourceLimits"`` stores those 30 characters rather than the
+    expression. Wrapping it says otherwise::
+
+        conn.execute("INSERT INTO machines (Key, Requirements) VALUES (?, ?)",
+                     ("slot1", Expr("Start && WithinResourceLimits")))
+
+    The text is emitted verbatim -- it is not escaped, quoted or validated here, because
+    the whole point is to pass something the ClassAd parser will read as code. **Never
+    build one from untrusted input**; it is the one place in this driver where a parameter
+    is not automatically safe. Build it from literals, or from
+    ``classad2.ExprTree``/``ClassAd``, which bind directly and need no wrapper.
+    """
+
+    __slots__ = ("text",)
+
+    def __init__(self, text) -> None:
+        if isinstance(text, Expr):
+            text = text.text
+        self.text = str(text)
+
+    def __repr__(self) -> str:
+        return f"Expr({self.text!r})"
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, Expr) and other.text == self.text
+
+    def __hash__(self) -> int:
+        return hash(("htcondordb.Expr", self.text))
+
+
+def _classad_literal(value):
+    """Render a classad2 object as ClassAd text, or return None if it is not one.
+
+    classad2 is optional, so this imports lazily and only when a value is not one of the
+    plain Python types -- an installation without the bindings never pays for it and never
+    needs it.
+    """
+    module = sys.modules.get("classad2")
+    if module is None:
+        return None
+    if isinstance(value, module.Value):
+        # Checked BEFORE int: Value is an IntEnum, so Value.Undefined would otherwise bind
+        # as the integer 2.
+        return "UNDEFINED" if value == module.Value.Undefined else "error"
+    if isinstance(value, module.ExprTree):
+        return str(value)
+    if isinstance(value, module.ClassAd):
+        # repr is the compact single-line form; str pretty-prints across lines, which
+        # old-ClassAd text (newline-separated) cannot hold.
+        return repr(value)
+    return None
+
 
 #: ClassAd integers are 64-bit; a Python int outside this range cannot be represented.
 _INT64_MIN = -(2**63)
@@ -45,6 +103,10 @@ def render_literal(value: Any) -> str:
     ``str``                       single-quoted string
     ``datetime``, ``date``        Unix epoch seconds, as an integer
     ``list``, ``tuple``           ClassAd list literal, ``{...}``
+    ``Expr``                      expression text, verbatim
+    ``classad2.ExprTree``         expression text, verbatim
+    ``classad2.ClassAd``          nested-ad literal, ``[...]``
+    ``classad2.Value``            ``UNDEFINED`` / ``error``
     ============================  ==========================================
 
     ``datetime`` maps to epoch seconds because that is how HTCondor stores times
@@ -55,6 +117,14 @@ def render_literal(value: Any) -> str:
         DataError: for a value ClassAd cannot represent -- ``bytes`` (there is no binary
             type), a non-finite float, or an int wider than 64 bits.
     """
+    # Expression-valued parameters first: a classad2.Value is an IntEnum and would
+    # otherwise bind as a number, and an ExprTree is not a str but means code.
+    if isinstance(value, Expr):
+        return value.text
+    literal = _classad_literal(value)
+    if literal is not None:
+        return literal
+
     # bool before int: bool is a subclass of int, and `true` is not `1` to the engine.
     if value is None:
         return "UNDEFINED"

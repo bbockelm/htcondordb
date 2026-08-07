@@ -198,6 +198,71 @@ Notes:
 - Only `SELECT` is accepted; anything else raises immediately rather than on first
   iteration.
 
+## Writing ClassAds
+
+The counterpart to `conn.ads()`. Expressions stay expressions in both directions, so a
+read-modify-write round trip does not flatten `Requirements` into whatever it evaluated to:
+
+```python
+updated = []
+for ad in conn.ads("SELECT * FROM machines WHERE Cpus > 4"):
+    ad["Checked"] = True
+    updated.append(ad)
+
+conn.write_ads("machines", updated, key="Name")
+```
+
+It is also how to bulk load. `ads` is an **iterable**, consumed lazily and batched as it
+goes, so a generator over a million ads never materializes:
+
+```python
+res = conn.write_ads("machines", (ad for ad in parse_slots(stream)))
+print(res.written, res.rejects, res.conflicts)
+```
+
+One write per batch, against a statement parse and a round trip per row through `execute()`.
+
+**It is an upsert, and it REPLACES.** An existing ad at a key is overwritten whole, so an
+attribute the new ad omits is deleted. Writing back ads from a *projected* `SELECT` will
+therefore drop everything you did not select — read with `SELECT *` if you intend to write
+back, or use `UPDATE` to change a subset of attributes in place.
+
+Notes:
+
+- **Keys** come from the `Name` attribute by default (matching `htcondordb-cli -key`); pass
+  `key="Key"` for a table written by SQL `INSERT`, or a callable for anything else.
+- **A bad ad does not lose the batch.** Rejects come back by position in your input, with a
+  reason, and the rest still apply. `WriteResult` is falsy when anything was rejected or
+  conflicted, so `if not conn.write_ads(...)` reads as "something did not land".
+- **Atomicity is per batch** outside a transaction, so a failure partway leaves earlier
+  batches applied — that is what lets an arbitrarily large load run. Inside a transaction
+  every batch stages into it and they land together.
+- **Conflicts** are per key: a write that lost an optimistic race comes back in
+  `conflicts`, unapplied, for you to re-read and retry. For a read-modify-write to be
+  race-free the read has to share the write's transaction — set `autocommit = False`, and
+  `conn.ads()` will read through it.
+- Two values old-ClassAd text cannot hold are rejected rather than mangled: a string
+  containing a newline, or one ending in a backslash.
+
+## Inserting expressions through SQL
+
+A string parameter binds as a string, so `"Start && WithinResourceLimits"` stores those
+characters rather than the expression. To bind code, say so:
+
+```python
+from htcondordb import Expr
+
+conn.execute("INSERT INTO machines (Key, Requirements) VALUES (?, ?)",
+             ("slot1", Expr("Start && WithinResourceLimits")))
+```
+
+`classad2.ExprTree` and `classad2.ClassAd` bind directly and need no wrapper;
+`classad2.Value.Undefined` and `.Error` bind as `UNDEFINED` and `error`.
+
+`Expr` text is emitted **verbatim** — not escaped, not quoted, not validated. It is the one
+place in this driver where a parameter is not automatically safe, so never build one from
+untrusted input. Everything else stays quoted.
+
 ## ClassAd value shapes
 
 A ClassAd column is not scalars-only, and is not homogeneous: two rows of the same column

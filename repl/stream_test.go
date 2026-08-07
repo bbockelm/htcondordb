@@ -233,3 +233,50 @@ func TestAggregateAdTypes(t *testing.T) {
 		t.Errorf("Missing is %v, want undefined", v)
 	}
 }
+
+// A stream inside a transaction sees the transaction's own uncommitted writes, like every
+// other read. It did not: StreamSelect went straight to the connection-level op, so
+// conn.ads() and execute() disagreed about what was visible inside one transaction -- and
+// a read-modify-write built on it took its snapshot outside the transaction, leaving a
+// concurrent writer to be silently overwritten rather than conflicting at commit.
+func TestStreamSelectReadsThroughTransaction(t *testing.T) {
+	e, cleanup := newTestExec(t)
+	defer cleanup()
+	seedMachines(t, e)
+
+	mustExec(t, e, "BEGIN")
+	mustExec(t, e, "INSERT INTO ads (Key, Name, Cpus) VALUES ('slot4', 'slot4', 32)")
+
+	names := map[string]bool{}
+	for _, ad := range collectStream(t, e, "SELECT * FROM ads") {
+		names[attrOf(t, ad, "Name")] = true
+	}
+	if !names["slot4"] {
+		t.Error("the transaction's own insert is invisible to its stream")
+	}
+	if len(names) != 4 {
+		t.Errorf("streamed %d ads, want 4", len(names))
+	}
+
+	mustExec(t, e, "ROLLBACK")
+	if got := len(collectStream(t, e, "SELECT * FROM ads")); got != 3 {
+		t.Errorf("after ROLLBACK streamed %d ads, want 3", got)
+	}
+}
+
+// A stream against a table the transaction did not bind to reads committed state, matching
+// the row-returning path: a transaction covers one table.
+func TestStreamSelectOtherTableIsCommitted(t *testing.T) {
+	e, cleanup := newCatalogExec(t)
+	defer cleanup()
+
+	mustExec(t, e, "CREATE TABLE other")
+	mustExec(t, e, "INSERT INTO other (Key, Name) VALUES ('seed', 'seed')")
+	mustExec(t, e, "BEGIN")
+	mustExec(t, e, "INSERT INTO ads (Key, Name) VALUES ('a', 'a')")
+
+	if got := len(collectStream(t, e, "SELECT * FROM other")); got != 1 {
+		t.Errorf("unbound table streamed %d ads, want 1", got)
+	}
+	mustExec(t, e, "ROLLBACK")
+}
