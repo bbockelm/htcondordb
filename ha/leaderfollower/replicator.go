@@ -23,9 +23,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/bbockelm/htcondordb/watchfeed"
 )
 
 // Dialer establishes a fresh DAEMON-level dbrpc client to the leader. The replicator
@@ -222,11 +222,12 @@ func (r *Replicator) watchTable(ctx context.Context, client *dbrpc.Client, table
 	if err != nil {
 		return err
 	}
-	events, stop, err := client.WatchTable(ctx, table, r.cursorFor(table))
+	events, stop, wireForm, err := watchfeed.Watch(ctx, client, table, r.cursorFor(table))
 	if err != nil {
 		return err
 	}
 	defer stop()
+	r.log.Debug("replication feed open", "table", table, "wire", wireForm)
 	for {
 		select {
 		case <-ctx.Done():
@@ -242,8 +243,12 @@ func (r *Replicator) watchTable(ctx context.Context, client *dbrpc.Client, table
 	}
 }
 
-// applyEvent applies one watch event to a local table and records its cursor.
-func (r *Replicator) applyEvent(local *db.DB, table string, ev dbrpc.WatchEvent) error {
+// applyEvent applies one watch event to a local table and records its cursor. The ad
+// arrives decoded (see watchfeed), whichever transport carried it.
+func (r *Replicator) applyEvent(local *db.DB, table string, ev watchfeed.Event) error {
+	if ev.Err != nil {
+		return ev.Err
+	}
 	switch ev.Kind {
 	case wkReset:
 		if err := clearTable(local); err != nil {
@@ -252,12 +257,8 @@ func (r *Replicator) applyEvent(local *db.DB, table string, ev dbrpc.WatchEvent)
 		r.resets.Add(1)
 		r.log.Info("full resync: cleared local table, replaying leader state", "table", table)
 	case wkUpsert:
-		ad, err := classad.Parse(ev.AdText) // server streams the new-ClassAd format
-		if err != nil {
-			return err
-		}
 		tx := local.Begin()
-		tx.NewClassAd(ev.Key, ad)
+		tx.NewClassAd(ev.Key, ev.Ad)
 		if err := tx.CommitNondurable(); err != nil {
 			return err
 		}

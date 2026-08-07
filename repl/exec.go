@@ -15,6 +15,7 @@ import (
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/bbockelm/htcondordb/watchfeed"
 )
 
 // DefaultKeyAttr is the attribute a row's primary key is stored under when none
@@ -711,8 +712,11 @@ func (e *Executor) ConvertTableToMemory(name string) error {
 // WatchStream opens a live change stream on a table from cursor (nil ⇒ replay the current
 // contents first), returning the event channel and a stop function (which cancels the
 // server-side watch; also called on connection close).
-func (e *Executor) WatchStream(table string, cursor []byte) (<-chan dbrpc.WatchEvent, func(), error) {
-	return e.c.WatchTable(context.Background(), table, cursor)
+// Events arrive with their ad already decoded, over the wire-form feed where the server
+// has it (see watchfeed).
+func (e *Executor) WatchStream(table string, cursor []byte) (<-chan watchfeed.Event, func(), error) {
+	ch, stop, _, err := watchfeed.Watch(context.Background(), e.c, table, cursor)
+	return ch, stop, err
 }
 
 // WatchHead returns an opaque cursor at the table's current change-log head, so a watch
