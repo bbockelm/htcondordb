@@ -17,11 +17,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/db/replicate"
 	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/bbockelm/htcondordb/watchfeed"
 )
 
 // Dial opens a fresh dbrpc client to a source (leader) htcondordb; cleanup releases it. A fresh
@@ -121,11 +121,12 @@ func (r *Runner) session(ctx context.Context) error {
 	}
 	defer cleanup()
 
-	events, stop, err := c.WatchTable(ctx, r.cfg.Source, r.sink.Cursor())
+	events, stop, wireForm, err := watchfeed.Watch(ctx, c, r.cfg.Source, r.sink.Cursor())
 	if err != nil {
 		return err
 	}
 	defer stop()
+	r.log.Debug("cedarsync: change feed open", "src", r.cfg.Src, "wire", wireForm)
 
 	var ver uint64
 	for {
@@ -150,18 +151,15 @@ func (r *Runner) session(ctx context.Context) error {
 	}
 }
 
-// toChange converts a dbrpc watch event to a replicate.Change, parsing the ad text for an upsert.
+// toChange converts a watch event to a replicate.Change. The ad arrives decoded (see
+// watchfeed), so this only has to notice one that could not be decoded.
 // ver is advanced only for a sink-visible change. ok is false for an undecodable ad or a resync.
-func (r *Runner) toChange(ev dbrpc.WatchEvent, ver *uint64) (replicate.Change, bool) {
-	we := db.WatchEvent{Kind: db.WatchKind(ev.Kind), Key: ev.Key, Cursor: ev.Cursor}
-	if db.WatchKind(ev.Kind) == db.WatchUpsert && ev.AdText != "" {
-		ad, err := classad.Parse(ev.AdText)
-		if err != nil {
-			r.log.Warn("cedarsync: skipping undecodable ad", "src", r.cfg.Src, "key", ev.Key, "err", err)
-			return replicate.Change{}, false
-		}
-		we.Ad = ad
+func (r *Runner) toChange(ev watchfeed.Event, ver *uint64) (replicate.Change, bool) {
+	if ev.Err != nil {
+		r.log.Warn("cedarsync: skipping undecodable ad", "src", r.cfg.Src, "key", ev.Key, "err", ev.Err)
+		return replicate.Change{}, false
 	}
+	we := db.WatchEvent{Kind: db.WatchKind(ev.Kind), Key: ev.Key, Cursor: ev.Cursor, Ad: ev.Ad}
 	ch, ok := replicate.ChangeFromWatch(we, r.cfg.Src, *ver)
 	if ok {
 		*ver++

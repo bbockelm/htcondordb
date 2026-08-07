@@ -9,9 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
-	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/bbockelm/htcondordb/watchfeed"
 )
 
 // Watch event kinds on the wire (dbrpc.WatchEvent.Kind).
@@ -130,7 +129,7 @@ func (s *session) watchHeader(console io.Writer, st *Statement) {
 // watchEmit renders one event; it returns false when the event is filtered out. Upserts
 // are parsed, matched against the WHERE constraint, and projected; deletes are always
 // shown (a deleted ad has no attributes to test or project).
-func (s *session) watchEmit(console io.Writer, st *Statement, filter *db.Constraint, ev dbrpc.WatchEvent) bool {
+func (s *session) watchEmit(console io.Writer, st *Statement, filter *db.Constraint, ev watchfeed.Event) bool {
 	kind := "UPSERT"
 	if ev.Kind == watchDelete {
 		kind = "DELETE"
@@ -148,9 +147,13 @@ func (s *session) watchEmit(console io.Writer, st *Statement, filter *db.Constra
 		return true
 	}
 
-	ad, err := classad.Parse(ev.AdText)
-	if err != nil {
-		fmt.Fprintf(console, "%-6s %s  (unparseable ad: %v)\n", kind, ev.Key, err)
+	if ev.Err != nil {
+		fmt.Fprintf(console, "%-6s %s  (undecodable ad: %v)\n", kind, ev.Key, ev.Err)
+		return true
+	}
+	ad := ev.Ad
+	if ad == nil {
+		fmt.Fprintf(console, "%-6s %s  (no ad)\n", kind, ev.Key)
 		return true
 	}
 	if filter != nil && !filter.Matches(ad) {

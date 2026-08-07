@@ -9,6 +9,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/bbockelm/htcondordb/watchfeed"
 )
 
 func mustAd(t *testing.T, text string) *classad.ClassAd {
@@ -45,7 +46,7 @@ func TestApplyEventLogic(t *testing.T) {
 	}
 
 	upsert := func(key, text string) {
-		if err := r.applyEvent(ads, "ads", dbrpc.WatchEvent{Kind: wkUpsert, Key: key, AdText: mustAd(t, text).String(), Cursor: []byte(key)}); err != nil {
+		if err := r.applyEvent(ads, "ads", watchfeed.Event{Kind: wkUpsert, Key: key, Ad: mustAd(t, text), Cursor: []byte(key)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -55,14 +56,14 @@ func TestApplyEventLogic(t *testing.T) {
 		t.Fatalf("after 2 upserts Len = %d, want 2", ads.Len())
 	}
 
-	if err := r.applyEvent(ads, "ads", dbrpc.WatchEvent{Kind: wkDelete, Key: "1.0", Cursor: []byte("d")}); err != nil {
+	if err := r.applyEvent(ads, "ads", watchfeed.Event{Kind: wkDelete, Key: "1.0", Cursor: []byte("d")}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := ads.LookupClassAd("1.0"); ok {
 		t.Fatal("key 1.0 should be gone after delete")
 	}
 
-	if err := r.applyEvent(ads, "ads", dbrpc.WatchEvent{Kind: wkReset, Cursor: []byte("r")}); err != nil {
+	if err := r.applyEvent(ads, "ads", watchfeed.Event{Kind: wkReset, Cursor: []byte("r")}); err != nil {
 		t.Fatal(err)
 	}
 	if ads.Len() != 0 {

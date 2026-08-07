@@ -3,7 +3,8 @@ package plugin
 import (
 	"testing"
 
-	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/PelicanPlatform/classad/classad"
+	"github.com/bbockelm/htcondordb/watchfeed"
 )
 
 func TestStreamPathRoundTrip(t *testing.T) {
@@ -36,8 +37,11 @@ func TestWatchKindString(t *testing.T) {
 
 func TestEventRow(t *testing.T) {
 	spec := streamSpec{Table: "machines", Columns: []string{"Cpus", "Name"}}
-	ev := dbrpc.WatchEvent{Kind: 0, Key: "slot1@h", AdText: "Name = \"slot1@h\"\nCpus = 8\n"}
-	row := eventRow(spec, ev)
+	ad, err := classad.Parse(`[ Name = "slot1@h"; Cpus = 8 ]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := eventRow(spec, watchfeed.Event{Kind: 0, Key: "slot1@h", Ad: ad})
 	if row.kind != "upsert" || row.key != "slot1@h" {
 		t.Errorf("row kind/key = %q/%q, want upsert/slot1@h", row.kind, row.key)
 	}
@@ -52,7 +56,7 @@ func TestEventRow(t *testing.T) {
 func TestEventRowDelete(t *testing.T) {
 	// A delete has no ad text; columns are present but empty.
 	spec := streamSpec{Table: "jobs", Columns: []string{"Owner"}}
-	row := eventRow(spec, dbrpc.WatchEvent{Kind: 1, Key: "1.0"})
+	row := eventRow(spec, watchfeed.Event{Kind: 1, Key: "1.0"})
 	if row.kind != "delete" || row.key != "1.0" {
 		t.Errorf("row = %+v, want delete/1.0", row)
 	}

@@ -11,8 +11,7 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 
-	"github.com/PelicanPlatform/classad/classad"
-	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/bbockelm/htcondordb/watchfeed"
 
 	"github.com/bbockelm/htcondordb/repl"
 )
@@ -200,15 +199,16 @@ func (d *Datasource) RunStream(ctx context.Context, req *backend.RunStreamReques
 
 // eventRow projects a watch event into a streamed row: the event time, the ad key,
 // the change kind, and each requested attribute rendered as a string.
-func eventRow(spec streamSpec, ev dbrpc.WatchEvent) *streamRow {
+// The ad arrives decoded (see watchfeed). It used to arrive as text and be parsed here
+// with ParseOld -- but the watch feed renders the NEW-ClassAd (bracketed) form, which
+// ParseOld rejects, and the error was discarded: every requested column came out blank.
+func eventRow(spec streamSpec, ev watchfeed.Event) *streamRow {
 	row := &streamRow{t: time.Now().UTC(), key: ev.Key, kind: watchKindString(ev.Kind)}
 	if len(spec.Columns) > 0 {
 		row.cols = make([]string, len(spec.Columns))
-		if ev.AdText != "" {
-			if ad, err := classad.ParseOld(ev.AdText); err == nil {
-				for i, c := range spec.Columns {
-					row.cols[i] = ad.EvaluateAttr(c).String()
-				}
+		if ev.Ad != nil {
+			for i, c := range spec.Columns {
+				row.cols[i] = ev.Ad.EvaluateAttr(c).String()
 			}
 		}
 	}
