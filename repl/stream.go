@@ -57,6 +57,16 @@ func (e *Executor) StreamSelect(st *Statement, yield func(*classad.ClassAd) bool
 	}
 
 	ctx := context.Background()
+	// Inside a transaction, stream through it so the caller sees its own uncommitted
+	// writes -- the same rule the row-returning path follows. The transactional read op
+	// has no projected variant, so a transaction gets whole ads; the projection is an
+	// optimization and correctness comes first. This is also what makes a read-modify-write
+	// safe: the read joins the transaction's snapshot, so a concurrent writer conflicts at
+	// commit instead of being silently overwritten.
+	if e.txReads(st.Table) {
+		return e.tx.QueryStream(ctx, constraint(st.Where), limit,
+			func(row string) bool { return deliver(row, classad.Parse) })
+	}
 	// Projected when every selected column is a plain attribute -- the same decision the
 	// materializing path makes, so a streamed row carries exactly what a collected one
 	// would, references chased and all.

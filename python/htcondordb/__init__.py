@@ -50,6 +50,7 @@ from ._errors import (
     Warning,
 )
 from ._library import LIBRARY_ENV, library_path
+from ._params import Expr
 from ._types import (
     BINARY,
     DATETIME,
@@ -65,6 +66,7 @@ from ._types import (
     TimestampFromTicks,
 )
 from .adstream import AdStream
+from .adwrite import AdReject, WriteResult
 from .connection import Connection
 from .cursor import Cursor
 
@@ -155,6 +157,9 @@ __all__ = [
     # driver objects and helpers
     "Connection",
     "Cursor",
+    "Expr",
+    "AdReject",
+    "WriteResult",
     "AdStream",
     "LIBRARY_ENV",
     "library_path",

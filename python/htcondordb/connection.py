@@ -292,6 +292,54 @@ class Connection:
 
         return _ads(self, operation, parameters)
 
+    def write_ads(self, table, ads, key="Name", chunk=None):
+        """Upsert an iterable of ClassAds into a table, in batches.
+
+        The write counterpart to :meth:`ads`. Expressions stay expressions in both
+        directions, so a read-modify-write round trip does not flatten ``Requirements`` to
+        the value it happened to evaluate to::
+
+            updated = []
+            for ad in conn.ads("SELECT * FROM machines WHERE Cpus > 4"):
+                ad["Checked"] = True
+                updated.append(ad)
+            conn.write_ads("machines", updated, key="Name")
+
+        It is also the way to bulk load: one write per batch, against a statement parse and
+        a round trip per row through :meth:`execute`.
+
+        Args:
+            table: the table to write into.
+            ads: an **iterable** of ``classad2.ClassAd`` (or dicts, or ClassAd text). It is
+                consumed lazily and batched as it goes, so loading a million ads never
+                materializes them.
+            key: the attribute holding each ad's storage key, or a callable ``ad -> str``.
+                Defaults to ``Name``, matching ``htcondordb-cli -key``. Note that ads which
+                came from a SQL ``INSERT`` carry their key in ``Key``, so a read-modify-write
+                against such a table wants ``key="Key"``.
+            chunk: ads per write; the default is tuned to the transport's frame size.
+
+        Returns:
+            A :class:`~htcondordb.adwrite.WriteResult` with the count written, per-ad
+            rejects (by position in *ads*), and any conflicted keys. It is falsy when
+            anything was rejected or conflicted, so ``if not conn.write_ads(...)`` reads
+            as "something did not land".
+
+        **This is an upsert, and it REPLACES.** An existing ad at a key is overwritten
+        whole, so an attribute the new ad omits is deleted. Writing back ads that came from
+        a projected ``SELECT`` will therefore drop every attribute you did not select --
+        read with ``SELECT *`` if you intend to write back. Use ``UPDATE`` to change a
+        subset of attributes in place.
+
+        Atomicity follows the connection. Outside a transaction each batch commits on its
+        own, so a failure partway leaves earlier batches applied -- which is what lets an
+        arbitrarily large load run. Inside one, every batch stages into it and lands
+        together.
+        """
+        from .adwrite import DEFAULT_CHUNK, write_ads as _write_ads
+
+        return _write_ads(self, table, ads, key=key, chunk=chunk or DEFAULT_CHUNK)
+
     # --- context manager ---
 
     def __enter__(self) -> "Connection":

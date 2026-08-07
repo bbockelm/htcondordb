@@ -42,6 +42,7 @@ int hcdb_sql(uintptr_t h, char *sql, int opts, char **out);
 uintptr_t hcdb_sql_ads(uintptr_t h, char *sql, char **err);
 int hcdb_sql_ads_next(uintptr_t ch, char **out);
 void hcdb_sql_ads_free(uintptr_t ch);
+int hcdb_write_ads(uintptr_t h, char *req, char **out);
 void hcdb_close(uintptr_t h);
 void hcdb_free(char *p);
 """
