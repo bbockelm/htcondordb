@@ -133,13 +133,22 @@ func (r *Runner) session(ctx context.Context, st *State) error {
 		pending = nil
 		return upl.Submit(ctx, b)
 	}
-	// persist writes cursor as the durable resume point if it advanced past the stored one.
-	// The caller must guarantee every change up to cursor has been acknowledged.
-	persist := func(cursor []byte) error {
-		if len(cursor) == 0 || bytes.Equal(cursor, st.WireCursor) {
-			return nil
+	// writeState refreshes the live status (beat + uploader progress), advances the durable
+	// resume cursor if it moved past the stored one (the caller must guarantee everything up to
+	// cursor has been acknowledged), and persists. It ALWAYS writes -- even when the cursor did
+	// not advance -- so the daemon sees a fresh beat on an idle-but-healthy exporter and does not
+	// mistake it for a stalled one.
+	writeState := func(cursor []byte) error {
+		indexed, skipped := upl.Stats()
+		st.Status = Status{
+			Beat:        time.Now().Unix(),
+			DocsIndexed: indexed,
+			DocsSkipped: skipped,
+			InFlight:    upl.InFlight(),
 		}
-		st.WireCursor = cursor
+		if len(cursor) > 0 && !bytes.Equal(cursor, st.WireCursor) {
+			st.WireCursor = cursor
+		}
 		blob, err := st.encode()
 		if err != nil {
 			return err
@@ -163,7 +172,7 @@ func (r *Runner) session(ctx context.Context, st *State) error {
 			if err := submit(lastCursor); err != nil {
 				return err
 			}
-			if err := persist(upl.Committed()); err != nil {
+			if err := writeState(upl.Committed()); err != nil {
 				return err
 			}
 		case ev, ok := <-events:
@@ -173,7 +182,7 @@ func (r *Runner) session(ctx context.Context, st *State) error {
 					return err
 				}
 				_ = upl.Drain(ctx)
-				_ = persist(upl.Committed())
+				_ = writeState(upl.Committed())
 				return errResync
 			}
 			if len(ev.Cursor) > 0 {
@@ -207,7 +216,7 @@ func (r *Runner) session(ctx context.Context, st *State) error {
 				if err := upl.Drain(ctx); err != nil {
 					return err
 				}
-				if err := persist(ev.Cursor); err != nil {
+				if err := writeState(ev.Cursor); err != nil {
 					return err
 				}
 			case db.WatchResync:
