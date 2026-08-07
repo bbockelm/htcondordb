@@ -278,6 +278,7 @@ func (c *viewCollector) Collect(ch chan<- prometheus.Metric) {
 type syncCollector struct {
 	sources   func() []dbad.StatusSource
 	exporters func() []dbad.ExporterStatus
+	importers func() []dbad.ImporterStatus
 
 	syncLag      *prometheus.Desc
 	syncCaughtUp *prometheus.Desc
@@ -291,14 +292,23 @@ type syncCollector struct {
 	expSkipped   *prometheus.Desc
 	expInFlight  *prometheus.Desc
 	expLastBeat  *prometheus.Desc
+	impUp        *prometheus.Desc
+	impRestarts  *prometheus.Desc
+	impImported  *prometheus.Desc
+	impSchedds   *prometheus.Desc
+	impFailures  *prometheus.Desc
+	impLastBeat  *prometheus.Desc
+	impLastCycle *prometheus.Desc
 }
 
-func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus) *syncCollector {
+func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus, importers func() []dbad.ImporterStatus) *syncCollector {
 	sync := []string{"kind", "source"}
 	exp := []string{"exporter", "kind"}
+	imp := []string{"import_job"}
 	return &syncCollector{
 		sources:   sources,
 		exporters: exporters,
+		importers: importers,
 		syncLag: prometheus.NewDesc(namespace+"_sync_lag_bytes",
 			"Bytes the schedd-sync tailer is behind the source file (live: source size minus committed offset), by kind and source. A climbing value means the sync is falling behind.", sync, nil),
 		syncCaughtUp: prometheus.NewDesc(namespace+"_sync_caught_up",
@@ -323,6 +333,20 @@ func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dba
 			"Documents/records the exporter has sent but not yet had acknowledged downstream, by exporter and kind.", exp, nil),
 		expLastBeat: prometheus.NewDesc(namespace+"_exporter_last_beat_timestamp_seconds",
 			"Unix time of the exporter's last liveness/progress beat, by exporter and kind. Staleness (now minus this) is what the daemon's liveness monitor restarts on.", exp, nil),
+		impUp: prometheus.NewDesc(namespace+"_import_job_up",
+			"1 if the daemon-managed history-import runner process is running, else 0, by import_job.", imp, nil),
+		impRestarts: prometheus.NewDesc(namespace+"_import_job_restarts_total",
+			"Number of times the daemon has restarted this history-import runner (crash or wedged-liveness), by import_job.", imp, nil),
+		impImported: prometheus.NewDesc(namespace+"_import_job_imported_total",
+			"Cumulative history records this runner has imported since it started, by import_job.", imp, nil),
+		impSchedds: prometheus.NewDesc(namespace+"_import_job_last_cycle_schedds",
+			"Schedds imported in the runner's last cycle, by import_job.", imp, nil),
+		impFailures: prometheus.NewDesc(namespace+"_import_job_last_cycle_failures",
+			"Schedds that errored in the runner's last cycle, by import_job. A persistently non-zero value flags an unreachable schedd.", imp, nil),
+		impLastBeat: prometheus.NewDesc(namespace+"_import_job_last_beat_timestamp_seconds",
+			"Unix time of the runner's last liveness beat, by import_job. Staleness (now minus this) is what the daemon's liveness monitor restarts on.", imp, nil),
+		impLastCycle: prometheus.NewDesc(namespace+"_import_job_last_cycle_timestamp_seconds",
+			"Unix time of the runner's last completed import cycle, by import_job.", imp, nil),
 	}
 }
 
@@ -359,6 +383,24 @@ func (c *syncCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 	}
+	if c.importers != nil {
+		for _, im := range c.importers() {
+			g := func(d *prometheus.Desc, v float64) {
+				ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, im.Name)
+			}
+			g(c.impUp, b2f(im.Running))
+			ch <- prometheus.MustNewConstMetric(c.impRestarts, prometheus.CounterValue, float64(im.Restarts), im.Name)
+			ch <- prometheus.MustNewConstMetric(c.impImported, prometheus.CounterValue, float64(im.ImportedTotal), im.Name)
+			g(c.impSchedds, float64(im.Schedds))
+			g(c.impFailures, float64(im.Failures))
+			if !im.LastBeat.IsZero() {
+				g(c.impLastBeat, float64(im.LastBeat.Unix()))
+			}
+			if !im.LastCycle.IsZero() {
+				g(c.impLastCycle, float64(im.LastCycle.Unix()))
+			}
+		}
+	}
 }
 
 func b2f(b bool) float64 {
@@ -371,15 +413,15 @@ func b2f(b bool) float64 {
 // Handler returns an http.Handler serving Prometheus metrics for the catalog: the
 // per-table storage gauges and operational timing counters above, the materialized-view
 // gauges, the schedd-sync + exporter health gauges, plus the standard Go runtime and process
-// (RSS, open FDs, ...) collectors. sources and exporters may be nil (their metric families are
-// then simply absent). It uses a private registry so it can be mounted without global-registry
-// collisions.
-func Handler(cat *db.Catalog, sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus) http.Handler {
+// (RSS, open FDs, ...) collectors. sources, exporters, and importers may be nil (their metric
+// families are then simply absent). It uses a private registry so it can be mounted without
+// global-registry collisions.
+func Handler(cat *db.Catalog, sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus, importers func() []dbad.ImporterStatus) http.Handler {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		newCatalogCollector(cat),
 		&viewCollector{cat: cat},
-		newSyncCollector(sources, exporters),
+		newSyncCollector(sources, exporters, importers),
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
