@@ -794,6 +794,15 @@ func (e *Executor) projectionAttrs(st *Statement) []string {
 	if st.AsOf != "" || st.Distinct {
 		return nil
 	}
+	// Inside a transaction, no projection: the projected query op is connection-level and
+	// reads the COMMITTED store, so a SELECT after an INSERT in the same transaction would
+	// not see its own write -- and would report it as missing rather than fail. The
+	// transactional read op has no projected variant, so the transaction gets whole ads.
+	// The projection is an optimization; correctness comes first. (The streaming path and
+	// the aggregate path already make this same call.)
+	if e.txReads(st.Table) {
+		return nil
+	}
 	if len(st.Items) == 0 || (len(st.Items) == 1 && st.Items[0].Star) {
 		return nil
 	}
