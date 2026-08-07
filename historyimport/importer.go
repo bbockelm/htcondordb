@@ -92,6 +92,32 @@ func (im *Importer) log() *slog.Logger {
 	return slog.Default()
 }
 
+// RunLoop runs job j once immediately and then every j.Interval until ctx is
+// cancelled. A cycle error is logged and the loop continues (the next cycle
+// retries from the persisted cursors); it returns ctx.Err() on cancellation.
+func (im *Importer) RunLoop(ctx context.Context, j Job) error {
+	interval := j.Interval
+	if interval <= 0 {
+		interval = DefaultInterval
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		st, err := im.RunJob(ctx, j)
+		if err != nil {
+			im.log().Warn("historyimport: cycle failed", "job", j.Name, "err", err)
+		} else {
+			im.log().Info("historyimport: cycle complete",
+				"job", j.Name, "schedds", st.Schedds, "failures", st.Failures, "imported", st.Imported)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
 // RunJob executes one cycle of job j: discover its pool's matching schedds, then
 // import each schedd's new history. A single schedd's failure is logged and
 // skipped so one unreachable schedd never blocks the rest of the pool.
