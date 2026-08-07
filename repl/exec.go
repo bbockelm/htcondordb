@@ -77,6 +77,12 @@ type Executor struct {
 	applyBatch func([]WriteOp) error
 	resync     func(target string) error
 
+	// wireRowsOff forces reads onto the old-ClassAd text path even where the wire-form
+	// relay would serve them. It exists so a test can run the same query over both
+	// transports and compare, and as an escape hatch if a wire row ever decodes wrong in
+	// the field. Not settable from config.
+	wireRowsOff bool
+
 	// archives caches the set of append-only (history) table names, so a SELECT can be routed
 	// to the archive query path -- archives are not mutable tables and the regular query op
 	// does not resolve them. Loaded lazily; archivesOK gates a successful load so a transient
@@ -752,6 +758,17 @@ func (e *Executor) queryAdsAsOf(table, where string, limit int, asOf string) ([]
 			texts, err = e.tx.Query(context.Background(), constraint(where), limit)
 			break
 		}
+		// Whole ads over the wire relay when the table can serve them: no projection, so
+		// the row is self-contained by construction and the ref question does not arise.
+		if e.wireEligible(table) {
+			ads, werr := e.queryAdsWire(table, where, nil, limit)
+			if werr == nil {
+				return ads, nil
+			}
+			if !wireFallback(werr) {
+				return nil, werr
+			}
+		}
 		texts, err = e.c.QueryTable(context.Background(), table, constraint(where), limit)
 	default:
 		var at time.Time
@@ -931,6 +948,20 @@ func (e *Executor) queryAdsForClientScan(st *Statement) ([]*classad.ClassAd, err
 // server-side projection op (QueryRawProject), which streams the old-ClassAd render of the
 // projected subset. limit > 0 caps the scan server-side.
 func (e *Executor) queryAdsProjected(table, where string, attrs []string, limit int) ([]*classad.ClassAd, error) {
+	// Wire-form rows first: the row leaves storage as wire bytes and is rebuilt into an AST
+	// here, so rendering it to old-ClassAd text in between costs a render plus a parse for
+	// nothing. queryAdsWire hands back a fallback error -- an older server, a table that
+	// cannot serve wire rows, or a projected row whose expressions need a sibling the
+	// projection dropped -- and the text path below answers those.
+	if e.wireEligible(table) {
+		ads, werr := e.queryAdsWire(table, where, attrs, limit)
+		if werr == nil {
+			return ads, nil
+		}
+		if !wireFallback(werr) {
+			return nil, werr
+		}
+	}
 	// The refs-chasing projection, not the plain one: a projected attribute may hold an
 	// expression over its siblings (Requirements, Rank, ...), and projecting to exactly
 	// the named attributes drops those siblings, so the expression evaluates to undefined

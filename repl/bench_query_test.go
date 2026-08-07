@@ -24,7 +24,10 @@ import (
 // server-side scan or aggregate, and rendering the result.
 func benchExec(b *testing.B, n int) (*Executor, func()) {
 	b.Helper()
-	cat, err := db.OpenCatalog("")
+	// A PERSISTENT catalog. An in-memory table cannot serve wire-form rows, so an
+	// in-memory fixture measures only the old-ClassAd text fallback -- i.e. not the path
+	// a deployment actually runs.
+	cat, err := db.OpenCatalog(b.TempDir())
 	if err != nil {
 		b.Fatal(err)
 	}
