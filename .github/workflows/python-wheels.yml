@@ -1,0 +1,221 @@
+name: python wheels
+
+# Builds the Python driver's wheels. Each bundles libhtcondordb_client, so a user needs
+# nothing but pip -- no Go toolchain, no `make lib`, no HTCONDORDB_LIBRARY.
+#
+# One wheel per OS and architecture, not per Python version: cffi runs in ABI mode and
+# opens the library with dlopen, so no CPython ABI is linked and the tag is py3-none-<plat>.
+#
+# Linux wheels build inside manylinux rather than on the runner, because cgo links the
+# build host's glibc and a wheel built on current Ubuntu will not install on the EL8/EL9
+# machines this is for.
+#
+# ONE-TIME SETUP for publishing (see the publish job):
+#
+#   1. On PyPI, add a Trusted Publisher for the project (a "pending publisher" works before
+#      the project exists) with owner `bbockelm`, repository `htcondordb`, workflow
+#      `python-wheels.yml`, environment `pypi`. The workflow FILENAME is part of the trust
+#      relationship -- renaming this file breaks publishing until PyPI is updated.
+#   2. On GitHub, create an environment named `pypi` with required reviewers, and restrict
+#      its deployment branches to tags matching `v*`. That is the human gate: PyPI trusts
+#      this workflow, and the environment decides who may run it.
+#
+# No API token is created or stored at any point.
+on:
+  push:
+    branches: [main]
+    paths: ['python/**', 'capi/**', 'repl/**', '.github/workflows/python-wheels.yml']
+  pull_request:
+    paths: ['python/**', 'capi/**', 'repl/**', '.github/workflows/python-wheels.yml']
+  workflow_dispatch:
+  release:
+    types: [published]
+
+# No workflow-wide permissions: each job is granted only what it needs, so nothing here
+# can mint the publish job's OIDC token by accident.
+permissions: {}
+
+jobs:
+  linux:
+    name: manylinux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            image_arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            image_arch: aarch64
+            runner: ubuntu-24.04-arm
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.image_arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25'
+
+      - name: Build the shared library
+        env:
+          GOWORK: "off"
+          GOFLAGS: -mod=mod
+        run: |
+          mkdir -p python/htcondordb/_lib
+          # -buildvcs=false: the checkout inside the container is owned by another uid, so
+          # git refuses it as "dubious ownership" and Go's VCS stamping fails the build.
+          # Nothing here needs the stamp.
+          go build -buildvcs=false -buildmode=c-shared \
+            -o python/htcondordb/_lib/libhtcondordb_client.so ./capi
+
+      - name: Build and repair the wheel
+        run: |
+          /opt/python/cp312-cp312/bin/python -m pip install -q --upgrade build setuptools wheel auditwheel
+          cd python && /opt/python/cp312-cp312/bin/python -m build --wheel --no-isolation
+          # auditwheel checks the wheel's external library dependencies and retags it to
+          # the real glibc floor, which for the Go runtime is far below the build image's.
+          /opt/python/cp312-cp312/bin/python -m auditwheel repair \
+            --plat manylinux_2_28_${{ matrix.image_arch }} -w dist/repaired dist/*.whl
+          ls -la dist/repaired
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wheel-manylinux-${{ matrix.arch }}
+          path: python/dist/repaired/*.whl
+
+  macos:
+    name: macos universal2
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Build the shared library for both architectures
+        env:
+          GOWORK: "off"
+          GOFLAGS: -mod=mod
+        run: |
+          set -euo pipefail
+          mkdir -p python/htcondordb/_lib
+          # One universal2 wheel rather than a job per architecture: the Intel macOS
+          # runners are gone, so an x86_64 job has nothing to run on. cgo cross-compiles
+          # to x86_64 from an arm64 host because the macOS SDK is universal -- clang just
+          # needs the target arch -- and lipo joins the two slices.
+          #
+          # It is also what the interpreter expects: setup-python is universal2, so a
+          # universal2 library is the honest match rather than something delocate has to
+          # be told to overlook.
+          go build -buildvcs=false -buildmode=c-shared -o /tmp/arm64.dylib ./capi
+          CGO_ENABLED=1 GOARCH=amd64 CC="clang -arch x86_64" \
+            go build -buildvcs=false -buildmode=c-shared -o /tmp/amd64.dylib ./capi
+          lipo -create /tmp/arm64.dylib /tmp/amd64.dylib \
+            -output python/htcondordb/_lib/libhtcondordb_client.dylib
+          file python/htcondordb/_lib/libhtcondordb_client.dylib
+
+      - name: Build the wheel
+        env:
+          # setup-python is universal2, and so now is the library, so this only pins the
+          # tag rather than papering over a mismatch. The macOS VERSION in the tag is not
+          # taken from here: wheel reads it out of the built binary, so the tag reports the
+          # SDK floor the dylib actually has and claims nothing untested.
+          _PYTHON_HOST_PLATFORM: macosx-11.0-universal2
+        run: |
+          python -m pip install -q --upgrade build setuptools wheel delocate
+          cd python && python -m build --wheel --no-isolation
+          # delocate bundles any non-system dylib the library needs, and verifies every
+          # architecture the tag claims is actually present.
+          delocate-wheel -w dist/repaired -v dist/*.whl
+          ls -la dist/repaired
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wheel-macos-universal2
+          path: python/dist/repaired/*.whl
+
+  smoke:
+    name: install on a clean distro
+    needs: linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wheel-manylinux-amd64
+          path: dist
+      # A different distro from the manylinux image the wheel was built in: the point is
+      # that the bundled library loads somewhere other than where it was compiled.
+      - name: Install and import
+        run: |
+          docker run --rm -v "$PWD/dist":/dist python:3.12-slim bash -euc '
+            python -m venv /tmp/v && . /tmp/v/bin/activate
+            pip install -q /dist/*.whl
+            python -c "
+          import htcondordb
+          print(\"version\", htcondordb.__version__)
+          print(\"bundled library\", htcondordb.library_path())
+          "'
+
+  publish:
+    name: publish to PyPI
+    # Only for a published release. Never on a push or a pull request -- a fork's PR must
+    # not be able to reach this job, since the artifacts would be built from that fork.
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: [linux, macos, smoke]
+    runs-on: ubuntu-latest
+
+    # The environment is the human gate. Configure it with required reviewers and a
+    # deployment-branch rule limited to v* tags, so publishing cannot happen without an
+    # approval recorded against a tag.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/htcondordb
+
+    permissions:
+      # Trusted Publishing: PyPI mints a short-lived, project-scoped token from this OIDC
+      # claim. No API token is stored in the repository at all, so there is no long-lived
+      # credential to leak, rotate or mis-scope.
+      id-token: write
+      # PEP 740 attestations, signed with the same identity, so an installer can verify a
+      # file came from this workflow in this repository.
+      attestations: write
+
+    steps:
+      # Deliberately no checkout: this job builds nothing, so it needs none of the
+      # repository's code. It uploads exactly what the build jobs produced and the smoke
+      # job installed.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Check the release tag matches the package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          # Wheels are named htcondordb-<version>-...; all must agree with the tag, or a
+          # release cuts the previous version's artifacts under a new name.
+          for whl in dist/*.whl; do
+            version="$(basename "$whl" | cut -d- -f2)"
+            if [ "$version" != "$tag" ]; then
+              echo "release tag $GITHUB_REF_NAME does not match wheel version $version" >&2
+              echo "bump version in python/pyproject.toml before tagging" >&2
+              exit 1
+            fi
+          done
+          ls -la dist
+
+      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          attestations: true
+          print-hash: true

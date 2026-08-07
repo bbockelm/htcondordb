@@ -38,20 +38,37 @@ exist, so a string attribute whose text happens to be `0042` comes back as `"004
 
 ## Installing
 
-Build the shared library first — it is not on PyPI and there are no wheels yet:
-
 ```sh
-make lib                    # writes bin/libhtcondordb_client.{so,dylib}
-pip install ./python
-export HTCONDORDB_LIBRARY=$PWD/bin/libhtcondordb_client.so
+pip install htcondordb-*.whl
 ```
 
-The driver searches, in order: `$HTCONDORDB_LIBRARY`, a copy bundled inside the installed
-package (`htcondordb/_lib/`), the repo's `bin/` for an editable checkout, then the dynamic
-loader's own search path.
+The wheel bundles `libhtcondordb_client`, so that is the whole installation — no Go
+toolchain, no `make lib`, no `HTCONDORDB_LIBRARY`. `cffi` is the only dependency.
 
-`cffi` is the only hard dependency. HTCondor's `classad2` bindings are optional and needed
-only by `Cursor.fetchads()`.
+One wheel serves every Python 3 on a given platform: the driver uses cffi in ABI mode and
+opens the library with `dlopen`, so no CPython ABI is linked. Three artifacts cover
+everything — `manylinux` x86_64 and aarch64, and one macOS `universal2`.
+
+Linux wheels are built in `manylinux_2_28` (EL8 and newer) and are checked to install and
+run on a different distribution from the one they were built in. The macOS wheel carries
+both architectures in one binary, and is tagged for the SDK it was built against rather
+than an older floor, so it does not claim support for releases nothing has run on.
+
+Building one yourself:
+
+```sh
+make wheel           # for this host
+make wheel-linux     # manylinux_2_28, in a container (the shipping artifact)
+make wheel-validate  # install it in a clean container and run real SQL through it
+```
+
+For development, skip the wheel entirely: `make lib` and point `HTCONDORDB_LIBRARY` at
+`bin/libhtcondordb_client.{so,dylib}`. The driver searches that first, then a bundled copy,
+then the repo's `bin/`, then the loader's own path.
+
+`conn.ads()` additionally needs HTCondor's `classad2` bindings (`pip install htcondor`).
+Those have Linux wheels but no macOS distribution, so on a Mac that path needs a local
+HTCondor build; everything else works either way.
 
 ## Authentication
 
@@ -215,6 +232,29 @@ corrupt them (one in the SQL layer's quoting, one in the store's raw-text render
 are fixed as of classad v0.24.1, and `SELECT` of an expression-valued attribute now carries
 the siblings that expression reads, so a narrow `SELECT Requirements` agrees with
 `SELECT *`.
+
+## Releasing
+
+Wheels publish to PyPI from GitHub Actions using **Trusted Publishing** — PyPI mints a
+short-lived, project-scoped token from the workflow's OIDC identity, so there is no API
+token stored in the repository to leak or rotate.
+
+Cutting a release:
+
+1. Bump `version` in `python/pyproject.toml` and merge it.
+2. Publish a GitHub release on the matching `vX.Y.Z` tag.
+3. Approve the `pypi` environment when the run pauses for it.
+
+The publish job builds nothing and checks out nothing: it uploads exactly the artifacts the
+build jobs produced and the smoke job installed. It refuses to run on anything but a
+published release, and it verifies the tag matches the version in every wheel before
+uploading — so a release cannot quietly ship the previous version's artifacts under a new
+name.
+
+Uploads carry PEP 740 attestations, signed with the same workflow identity, so an installer
+can verify a file came from this workflow in this repository.
+
+One-time setup is described in `.github/workflows/python-wheels.yml`.
 
 ## Testing
 
