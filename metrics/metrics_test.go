@@ -25,7 +25,7 @@ func TestHandlerExposesStorageAndOpMetrics(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	Handler(cat, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	Handler(cat, nil, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -52,7 +52,7 @@ func (f fakeSource) Status() scheddsync.SyncStatus { return f.st }
 
 // TestHandlerExposesSyncAndExporterMetrics: the handler emits schedd-sync tailer health and
 // per-exporter health, the "is anything falling behind" signals an operator alerts on.
-func TestHandlerExposesSyncAndExporterMetrics(t *testing.T) {
+func TestHandlerExposesSyncExporterAndImporterMetrics(t *testing.T) {
 	cat, err := db.OpenCatalog(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -71,9 +71,16 @@ func TestHandlerExposesSyncAndExporterMetrics(t *testing.T) {
 			{Name: "jobs-kafka", Kind: "kafka", Running: false, Restarts: 4},
 		}
 	}
+	importers := func() []dbad.ImporterStatus {
+		return []dbad.ImporterStatus{
+			{Name: "ospool", Running: true, Restarts: 2, ImportedTotal: 9123, Schedds: 8, Failures: 1,
+				LastBeat: time.Unix(1_700_000_470, 0), LastCycle: time.Unix(1_700_000_400, 0)},
+			{Name: "cm-east", Running: false, Restarts: 5},
+		}
+	}
 
 	rec := httptest.NewRecorder()
-	Handler(cat, sources, exporters).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	Handler(cat, sources, exporters, importers).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -89,6 +96,15 @@ func TestHandlerExposesSyncAndExporterMetrics(t *testing.T) {
 		`htcondordb_exporter_in_flight{exporter="jobs-os",kind="opensearch"} 7`,
 		`htcondordb_exporter_up{exporter="jobs-kafka",kind="kafka"} 0`,
 		`htcondordb_exporter_restarts_total{exporter="jobs-kafka",kind="kafka"} 4`,
+		`htcondordb_import_job_up{import_job="ospool"} 1`,
+		`htcondordb_import_job_restarts_total{import_job="ospool"} 2`,
+		`htcondordb_import_job_imported_total{import_job="ospool"} 9123`,
+		`htcondordb_import_job_last_cycle_schedds{import_job="ospool"} 8`,
+		`htcondordb_import_job_last_cycle_failures{import_job="ospool"} 1`,
+		`htcondordb_import_job_last_beat_timestamp_seconds{import_job="ospool"} `,
+		`htcondordb_import_job_last_cycle_timestamp_seconds{import_job="ospool"} `,
+		`htcondordb_import_job_up{import_job="cm-east"} 0`,
+		`htcondordb_import_job_restarts_total{import_job="cm-east"} 5`,
 	}
 	for _, w := range want {
 		if !strings.Contains(body, w) {
@@ -98,6 +114,10 @@ func TestHandlerExposesSyncAndExporterMetrics(t *testing.T) {
 	// A running exporter with no beat yet still emits up/restarts but no last_beat sample.
 	if strings.Contains(body, `htcondordb_exporter_last_beat_timestamp_seconds{exporter="jobs-kafka"`) {
 		t.Error("exporter with zero LastBeat should emit no last_beat sample")
+	}
+	// Likewise an import job with no beat/cycle yet emits no timestamp samples.
+	if strings.Contains(body, `htcondordb_import_job_last_beat_timestamp_seconds{import_job="cm-east"`) {
+		t.Error("import job with zero LastBeat should emit no last_beat sample")
 	}
 }
 
@@ -125,7 +145,7 @@ func TestHandlerExposesArchiveMetrics(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	Handler(cat, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	Handler(cat, nil, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}

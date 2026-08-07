@@ -343,7 +343,7 @@ func run() error {
 	// but bind it to a trusted interface.
 	if addr := getStr(cfg, "HTCONDORDB_METRICS_ADDRESS"); addr != "" {
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", metrics.Handler(svc.Catalog(), syncMgr.Sources, expMgr.Statuses))
+		mux.Handle("/metrics", metrics.Handler(svc.Catalog(), syncMgr.Sources, expMgr.Statuses, impMgr.Statuses))
 		// pprof (opt-in via HTCONDORDB_ENABLE_PPROF): profiling endpoints on the same
 		// trusted listener, so a memory/CPU anomaly in a live daemon is one
 		// `go tool pprof http://.../debug/pprof/heap` away instead of a blind restart.
