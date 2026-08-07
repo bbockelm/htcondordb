@@ -22,20 +22,24 @@ name: python wheels
 #
 # No API token is created or stored at any point.
 on:
+  # Pushes carry NO path filter, for two different reasons.
+  #
+  # Tags: a release must build the wheels whatever the last commit happened to touch. This
+  # is also the trigger that actually reaches the publish job -- release.yml creates the
+  # GitHub Release with GITHUB_TOKEN, and GitHub raises no workflow events for anything
+  # that token does, so `release: published` never fires from it. Relying on that alone
+  # left the publish path unreachable: tagging built the Go artifacts and silently produced
+  # no wheels.
+  #
+  # main: a pull request is tested against its own merge base, so a change that lands while
+  # it was open is never tested together with it. Running on the merge result closes that,
+  # and covers a direct push besides. A path filter cannot be applied to only one of the
+  # two (a single `push:` block shares it, and path filtering on tags is unreliable), so
+  # both run unfiltered -- the cost is some redundant builds, against a release artifact
+  # that is continuously known to build.
   push:
     branches: [main]
-    # Wider than just python/: the integration tests start a real daemon, so a change to
-    # the daemon, the server or the dependency set can break them without touching a line
-    # of Python.
-    paths:
-      - 'python/**'
-      - 'capi/**'
-      - 'repl/**'
-      - 'cmd/**'
-      - 'server/**'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/python-wheels.yml'
+    tags: ['v*']
   pull_request:
     # Wider than just python/: the integration tests start a real daemon, so a change to
     # the daemon, the server or the dependency set can break them without touching a line
@@ -241,9 +245,11 @@ jobs:
 
   publish:
     name: publish to PyPI
-    # Only for a published release. Never on a push or a pull request -- a fork's PR must
-    # not be able to reach this job, since the artifacts would be built from that fork.
-    if: github.event_name == 'release' && github.event.action == 'published'
+    # Only for a v* tag -- reached either by pushing the tag or by publishing a release on
+    # one. Never on a pull request: a fork's PR must not reach this job, since the
+    # artifacts would be built from that fork. The pypi environment is still the human
+    # gate; this only decides what is eligible to ask for it.
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [tests, linux, macos, smoke]
     runs-on: ubuntu-latest
 
