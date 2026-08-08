@@ -84,7 +84,13 @@ jobs:
             case "${tag}" in
               *-*) prerelease="--prerelease" ;;
             esac
+            # Draft, not published. Publishing is a separate, human act -- which is
+            # also what makes the Python wheels publishable: GitHub raises no workflow
+            # events for anything GITHUB_TOKEN does, so a release created here as
+            # published would fire nothing, and python-wheels.yml keys its PyPI upload
+            # off `release: published`. Publish the draft when the release is ready.
             gh release create "${tag}" "${assets[@]}" \
+              --draft \
               --title "${tag}" \
               --generate-notes \
               ${prerelease}
