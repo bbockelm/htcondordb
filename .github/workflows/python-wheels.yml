@@ -24,12 +24,14 @@ name: python wheels
 on:
   # Pushes carry NO path filter, for two different reasons.
   #
-  # Tags: a release must build the wheels whatever the last commit happened to touch. This
-  # is also the trigger that actually reaches the publish job -- release.yml creates the
-  # GitHub Release with GITHUB_TOKEN, and GitHub raises no workflow events for anything
-  # that token does, so `release: published` never fires from it. Relying on that alone
-  # left the publish path unreachable: tagging built the Go artifacts and silently produced
-  # no wheels.
+  # Tags BUILD; releases PUBLISH. Tagging proves the wheels build before anything is
+  # committed to, and publishing the release is the deliberate act that ships them. The
+  # publish job keys off the event, so exactly one of these two can ever upload -- v0.13.0
+  # went out twice because both could, and the second run died on PyPI's 400.
+  #
+  # This only works because release.yml creates the release as a DRAFT: GitHub raises no
+  # workflow events for anything GITHUB_TOKEN does, so a release it published itself would
+  # fire nothing. A person publishing the draft is a real event.
   #
   # main: a pull request is tested against its own merge base, so a change that lands while
   # it was open is never tested together with it. Running on the merge result closes that,
@@ -59,6 +61,12 @@ on:
 
 # No workflow-wide permissions: each job is granted only what it needs, so nothing here
 # can mint the publish job's OIDC token by accident.
+# One run per ref at a time. Not cancel-in-progress: cancelling a publish midway through
+# uploading a set of wheels would leave the release half-uploaded.
+concurrency:
+  group: python-wheels-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions: {}
 
 jobs:
@@ -245,11 +253,11 @@ jobs:
 
   publish:
     name: publish to PyPI
-    # Only for a v* tag -- reached either by pushing the tag or by publishing a release on
-    # one. Never on a pull request: a fork's PR must not reach this job, since the
-    # artifacts would be built from that fork. The pypi environment is still the human
-    # gate; this only decides what is eligible to ask for it.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Publishing a release, and nothing else. A tag push builds the wheels but does not
+    # ship them, so exactly one event per release can upload. Never on a pull request: a
+    # fork's PR must not reach this job, since the artifacts would be built from that fork.
+    # The pypi environment remains the human gate on top of this.
+    if: github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
     needs: [tests, linux, macos, smoke]
     runs-on: ubuntu-latest
 
@@ -303,3 +311,7 @@ jobs:
         with:
           attestations: true
           print-hash: true
+          # A re-run after a partial upload should finish the job, not die on the first
+          # file that already landed. PyPI files are immutable, so this can only turn an
+          # error into a no-op -- it cannot overwrite anything.
+          skip-existing: true
