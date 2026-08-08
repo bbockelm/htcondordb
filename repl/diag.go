@@ -36,6 +36,8 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		} else {
 			s.withDiag(console, t, s.showIndexes)
 		}
+	case ".schema":
+		s.schemaCmd(console, arg)
 	case ".hot":
 		if t := s.tableArg(arg); s.exec.isArchive(t) {
 			fmt.Fprintf(console, "%s is an append-only history archive: it has no hot set.\n", t)
