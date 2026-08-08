@@ -291,6 +291,8 @@ Diagnostics (current table, or an explicit one where noted):
   .stats [table]        storage stats (ads, segments, bytes)
   .indexes [table]      configured indexes (+ demand-based suggestions)
   .hot [table]          hot attributes (front-loaded in each ad)
+  .schema [table]       the columnar accelerator's derived schema, field by field
+  .schema fit [table]   whether that schema still fits the data (per-field escape rates)
   .suggest [table]      index add/drop suggestions from observed demand
   .suggest -i [table]   review suggestions interactively and apply the accepted ones
   .explain <expr>       how the current table's planner would run a constraint
@@ -306,6 +308,8 @@ CompletionDate); with none, the current table:
   .refreshhot [-all] [<sampleMax> <topN>]      recompute the hot set
   .analyze [table|-all] [<topN>]               self-tune now: hot set + indexes + histograms
   .rewrite [table|-all]                        re-encode all ads with the hot set
+  .schema rebuild [table] [<max> <topN>]       re-derive the columnar schema and rebuild
+                                               every sealed segment's block (heavy)
   .compact [table|-all]                        reclaim dead space
   .retrain [table|-all] [<sampleMax>]          train/refresh ZSTD compression
   .rotate [table|-all]                         drop history segments outside retention now
