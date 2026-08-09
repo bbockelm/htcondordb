@@ -58,3 +58,21 @@ func TestColumnarOnByDefault(t *testing.T) {
 		t.Fatalf("columnar count %d != row query count %d", got, want)
 	}
 }
+
+// TestArchiveColumnarOnByDefault guards the archive half of the same decision. classad's
+// maintenance leaves ArchiveSchemaScanHotTopN at 0, so if this regressed to 0 here the accelerator
+// would silently never build on a history table -- and a history table is where a numeric
+// aggregate most needs it. That the option actually causes a build is tested in classad
+// (dbrpc.TestArchiveSchemaScanOnWhenConfigured); this pins that we ask for it.
+func TestArchiveColumnarOnByDefault(t *testing.T) {
+	opts := defaultMaintainOptions()
+	if opts.ArchiveSchemaScanHotTopN <= 0 {
+		t.Fatalf("defaultMaintainOptions().ArchiveSchemaScanHotTopN = %d, want > 0 so history "+
+			"tables build the columnar accelerator", opts.ArchiveSchemaScanHotTopN)
+	}
+	if opts.ArchiveSchemaScanHotTopN != opts.SchemaScanHotTopN {
+		t.Errorf("archive hot-column count %d != mutable %d; the two should stay in step so a "+
+			"query behaves the same whichever table type it hits",
+			opts.ArchiveSchemaScanHotTopN, opts.SchemaScanHotTopN)
+	}
+}
