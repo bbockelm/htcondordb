@@ -38,6 +38,7 @@ import (
 
 	"github.com/bbockelm/htcondordb/command"
 	"github.com/bbockelm/htcondordb/dbad"
+	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/metrics"
 	"github.com/bbockelm/htcondordb/server"
 )
@@ -496,14 +497,14 @@ func advertisedAddr(d *daemon.Daemon, ln net.Listener) string {
 
 // writeAddressFile publishes the command address to HTCONDORDB_ADDRESS_FILE
 // (default $(LOG)/.htcondordb_address). Returns the path written, or "".
+//
+// The path comes from the same resolver clients read, so redirecting the address file --
+// including from the environment -- moves both halves together rather than leaving a client
+// reading a path nothing writes.
 func writeAddressFile(d *daemon.Daemon, cfg *config.Config, ln net.Listener) string {
-	path, ok := cfg.Get("HTCONDORDB_ADDRESS_FILE")
-	if !ok || strings.TrimSpace(path) == "" {
-		logDir, ok := cfg.Get("LOG")
-		if !ok || logDir == "" {
-			return ""
-		}
-		path = filepath.Join(logDir, ".htcondordb_address")
+	path := locate.AddressFilePath(cfg)
+	if path == "" {
+		return ""
 	}
 	if err := os.WriteFile(path, []byte("<"+advertisedAddr(d, ln)+">\n"), 0o644); err != nil {
 		d.Logger().Warn(logging.DestinationGeneral, "could not write address file", "path", path, "err", err.Error())

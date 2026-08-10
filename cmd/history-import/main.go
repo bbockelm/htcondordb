@@ -33,6 +33,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/config"
 
 	"github.com/bbockelm/htcondordb/historyimport"
+	"github.com/bbockelm/htcondordb/locate"
 )
 
 // dbSessionCommand is the CEDAR command for htcondordb's multiplexed dbrpc
@@ -212,31 +213,17 @@ func dial(ctx context.Context, cfg *config.Config, addrFlag string) (*dbrpc.Clie
 	return dbc, func() { _ = dbc.Close(); _ = cl.Close() }, nil
 }
 
-// resolveAddr finds the daemon address: the flag, then HTCONDORDB_ADDRESS_FILE,
-// then $(LOG)/.htcondordb_address, then HTCONDORDB_HOST.
+// resolveAddr finds the daemon address: the flag, else package locate, which owns the knob
+// precedence and the environment overrides for every client in the tree.
 func resolveAddr(cfg *config.Config, addrFlag string) (string, error) {
 	if addrFlag != "" {
 		return addrFlag, nil
 	}
-	addrFile, _ := cfg.Get("HTCONDORDB_ADDRESS_FILE")
-	if addrFile == "" {
-		if logDir, _ := cfg.Get("LOG"); logDir != "" {
-			addrFile = filepath.Join(logDir, ".htcondordb_address")
-		}
+	addr, err := locate.Daemon(cfg)
+	if err != nil {
+		return "", fmt.Errorf("%w -- or pass -addr", err)
 	}
-	if addrFile != "" {
-		if data, err := os.ReadFile(addrFile); err == nil {
-			for _, line := range strings.Split(string(data), "\n") {
-				if line = strings.TrimSpace(line); line != "" {
-					return line, nil
-				}
-			}
-		}
-	}
-	if host, _ := cfg.Get("HTCONDORDB_HOST"); host != "" {
-		return host, nil
-	}
-	return "", fmt.Errorf("cannot locate htcondordb: pass -addr, or set HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST")
+	return addr, nil
 }
 
 // defaultCursorFile places the cursor file under $(LOG) (writable by the importer's

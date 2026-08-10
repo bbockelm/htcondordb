@@ -7,12 +7,16 @@ import (
 	"testing"
 
 	"github.com/bbockelm/golang-htcondor/config"
+	"github.com/bbockelm/htcondordb/locate"
 )
 
-// testConfig writes body to a throwaway condor_config and returns a Config read from it,
-// with the same subsystem openConn uses.
+// testConfig writes body to a throwaway condor_config and returns a Config read from it, with
+// the same subsystem openConn uses and both address knobs cleared from the environment so a
+// developer's own exports cannot change what a test resolves.
 func testConfig(t *testing.T, body string) *config.Config {
 	t.Helper()
+	t.Setenv(locate.AddressFileKnob, "")
+	t.Setenv(locate.HostKnob, "")
 	path := filepath.Join(t.TempDir(), "condor_config")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -25,10 +29,11 @@ func testConfig(t *testing.T, body string) *config.Config {
 	return cfg
 }
 
-// A caller-supplied address wins outright: nothing about the ambient configuration should
-// be able to redirect a client that named its daemon.
+// A caller-supplied address wins outright: nothing about the ambient configuration or the
+// environment should be able to redirect a client that named its daemon.
 func TestResolveAddrExplicitWins(t *testing.T) {
-	cfg := testConfig(t, "HTCONDORDB_HOST = elsewhere.example.edu:9618\n")
+	cfg := testConfig(t, locate.HostKnob+" = elsewhere.example.edu:9618\n")
+	t.Setenv(locate.HostKnob, "also-elsewhere.example.edu:9618")
 	for _, addr := range []string{"host.example.edu:9618", "<1.2.3.4:9618?sock=collector>"} {
 		got, err := resolveAddr(cfg, addr)
 		if err != nil {
@@ -40,69 +45,30 @@ func TestResolveAddrExplicitWins(t *testing.T) {
 	}
 }
 
-// The default path -- no address at all -- reads the daemon's address file.
-func TestResolveAddrFromAddressFile(t *testing.T) {
+// No address delegates to package locate, which owns the precedence (covered there). These
+// two cases confirm the delegation happens at all -- from the configuration and from the
+// environment -- and that whitespace counts as "no address".
+func TestResolveAddrLocatesTheDaemon(t *testing.T) {
 	dir := t.TempDir()
 	addrFile := filepath.Join(dir, "address")
-	// Address files carry a sinful string and often trailing lines; take the first
-	// non-empty one, as every other HTCondor client does.
-	if err := os.WriteFile(addrFile, []byte("<127.0.0.1:12345?sock=htcondordb>\n\n"), 0o600); err != nil {
+	if err := os.WriteFile(addrFile, []byte("<127.0.0.1:12345?sock=htcondordb>\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := testConfig(t, "HTCONDORDB_ADDRESS_FILE = "+addrFile+"\n")
+	cfg := testConfig(t, locate.AddressFileKnob+" = "+addrFile+"\n")
 
-	got, err := resolveAddr(cfg, "")
-	if err != nil {
-		t.Fatalf("resolveAddr(\"\"): %v", err)
-	}
-	if want := "<127.0.0.1:12345?sock=htcondordb>"; got != want {
-		t.Errorf("resolveAddr(\"\") = %q, want %q", got, want)
+	for _, addr := range []string{"", "   "} {
+		got, err := resolveAddr(cfg, addr)
+		if err != nil {
+			t.Fatalf("resolveAddr(%q): %v", addr, err)
+		}
+		if want := "<127.0.0.1:12345?sock=htcondordb>"; got != want {
+			t.Errorf("resolveAddr(%q) = %q, want %q", addr, got, want)
+		}
 	}
 
-	// Whitespace is not an address: a caller passing "" and a caller passing " " both mean
-	// "locate it for me".
-	if got, err = resolveAddr(cfg, "   "); err != nil || got != "<127.0.0.1:12345?sock=htcondordb>" {
-		t.Errorf("resolveAddr(\"   \") = %q, %v; want the located address", got, err)
-	}
-}
-
-// $(LOG)/.htcondordb_address is the convention when the knob is not set explicitly, which
-// is the case that matters most: an operator who configured nothing but LOG still gets a
-// working client.
-func TestResolveAddrFromLogDirDefault(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".htcondordb_address"), []byte("127.0.0.1:9999\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := testConfig(t, "LOG = "+dir+"\n")
-
-	got, err := resolveAddr(cfg, "")
-	if err != nil {
-		t.Fatalf("resolveAddr(\"\"): %v", err)
-	}
-	if got != "127.0.0.1:9999" {
-		t.Errorf("resolveAddr(\"\") = %q, want 127.0.0.1:9999", got)
-	}
-}
-
-// A daemon on another host publishes no local address file, so HTCONDORDB_HOST has to work
-// both on its own and as the fallback when a configured address file is absent.
-func TestResolveAddrHostFallback(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "nonexistent")
-	for name, body := range map[string]string{
-		"host only":           "HTCONDORDB_HOST = db.example.edu:9618\n",
-		"file missing":        "HTCONDORDB_ADDRESS_FILE = " + missing + "\nHTCONDORDB_HOST = db.example.edu:9618\n",
-		"host needs trimming": "HTCONDORDB_HOST =   db.example.edu:9618  \n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			got, err := resolveAddr(testConfig(t, body), "")
-			if err != nil {
-				t.Fatalf("resolveAddr(\"\"): %v", err)
-			}
-			if got != "db.example.edu:9618" {
-				t.Errorf("resolveAddr(\"\") = %q, want db.example.edu:9618", got)
-			}
-		})
+	t.Setenv(locate.HostKnob, "db.example.edu:9618")
+	if got, err := resolveAddr(cfg, ""); err != nil || got != "db.example.edu:9618" {
+		t.Errorf("resolveAddr(\"\") = %q, %v; want the environment override", got, err)
 	}
 }
 
@@ -113,22 +79,9 @@ func TestResolveAddrUnlocatable(t *testing.T) {
 	if err == nil {
 		t.Fatal("resolveAddr(\"\") succeeded with nothing configured")
 	}
-	for _, want := range []string{"HTCONDORDB_ADDRESS_FILE", "HTCONDORDB_HOST"} {
+	for _, want := range []string{locate.AddressFileKnob, locate.HostKnob} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %s", err, want)
 		}
-	}
-}
-
-// A configured address file that cannot be read, with no host to fall back to, must say so
-// -- and say which file -- rather than reporting a generic failure.
-func TestResolveAddrUnreadableFile(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "nonexistent")
-	_, err := resolveAddr(testConfig(t, "HTCONDORDB_ADDRESS_FILE = "+missing+"\n"), "")
-	if err == nil {
-		t.Fatal("resolveAddr(\"\") succeeded with an unreadable address file")
-	}
-	if !strings.Contains(err.Error(), missing) {
-		t.Errorf("error %q does not name the address file %s", err, missing)
 	}
 }

@@ -13,11 +13,27 @@ with htcondordb.connect() as conn:
         print(owner, n)
 ```
 
-`connect()` with no argument finds the local daemon the way `htcondordb-cli` does with no
-`-addr`: the address file named by `HTCONDORDB_ADDRESS_FILE` (by default
-`$(LOG)/.htcondordb_address`), else the `HTCONDORDB_HOST` knob. Pass an address —
-`htcondordb.connect("db.example.edu:9618")` — to reach a daemon the configuration does not
-point at. Either way `conn.address` reports what was reached.
+`connect()` with no argument finds the daemon the way `htcondordb-cli` does with no
+`-addr`, and `conn.address` reports what it reached. Two knobs name the daemon, each
+settable in the environment or in the HTCondor configuration:
+
+| | |
+|---|---|
+| `HTCONDORDB_ADDRESS_FILE` | The file the daemon publishes its address to, by default `$(LOG)/.htcondordb_address`. Preferred, and re-read on every `connect()`, so a restarted daemon is followed. |
+| `HTCONDORDB_HOST` | A static `host:port`, for a daemon on another machine. Used when no address file is configured, or when the configured one cannot be read. |
+
+The environment wins over the configuration, and wins as a pair — so pointing a report at
+another pool's daemon takes no config file and no code change:
+
+```sh
+HTCONDORDB_HOST=db.example.edu:9618 python report.py
+```
+
+```python
+os.environ["HTCONDORDB_HOST"] = "db.example.edu:9618"   # before connect()
+```
+
+Passing an address — `htcondordb.connect("db.example.edu:9618")` — overrides both.
 
 Because it is DB-API, pandas works with no adapter:
 

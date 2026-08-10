@@ -112,11 +112,14 @@ def connect(
     Args:
         address: The daemon's address -- ``host:port``, or an HTCondor sinful string
             (``<1.2.3.4:9618?sock=...>``), including a shared-port or CCB one. Omit it to
-            locate the local daemon from the HTCondor configuration, the way
-            ``htcondordb-cli`` does with no ``-addr``: the address file named by
-            ``HTCONDORDB_ADDRESS_FILE`` (by default ``$(LOG)/.htcondordb_address``), else
-            the ``HTCONDORDB_HOST`` knob. :attr:`Connection.address
-            <htcondordb.connection.Connection.address>` reports what that resolved to.
+            locate the daemon, the way ``htcondordb-cli`` does with no ``-addr``: the
+            address file named by ``HTCONDORDB_ADDRESS_FILE`` (by default
+            ``$(LOG)/.htcondordb_address``), else ``HTCONDORDB_HOST``. Either knob may be
+            set in the environment or in the HTCondor configuration, and the environment
+            wins -- ``HTCONDORDB_HOST=db.example.edu:9618`` points a report at another
+            pool's daemon without editing a config file or the code.
+            :attr:`Connection.address <htcondordb.connection.Connection.address>` reports
+            what that resolved to.
         autocommit: When true (the default), each statement commits as it runs. Pass
             ``False`` to open a transaction immediately and batch writes until
             :meth:`~htcondordb.connection.Connection.commit`. See

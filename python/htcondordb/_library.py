@@ -93,9 +93,12 @@ def _candidate_paths() -> list[str]:
     return candidates
 
 
-# The variables HTCondor's configuration reads: the config file itself, plus the
-# `_CONDOR_<KNOB>` convention for overriding any knob from the environment.
-_CONDOR_ENV_NAMES = frozenset({"CONDOR_CONFIG"})
+# What the library reads from the environment: the configuration file, the two knobs that
+# name the daemon, and the `_CONDOR_<KNOB>` convention for overriding any knob at all.
+# Nothing else in the environment is copied into another runtime.
+_CONDOR_ENV_NAMES = frozenset(
+    {"CONDOR_CONFIG", "HTCONDORDB_ADDRESS_FILE", "HTCONDORDB_HOST"}
+)
 _CONDOR_ENV_PREFIX = "_CONDOR_"
 
 

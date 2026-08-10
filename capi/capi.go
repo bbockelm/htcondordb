@@ -43,6 +43,7 @@ import (
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/repl"
 
 	"github.com/PelicanPlatform/classad/dbrpc"
@@ -79,28 +80,19 @@ type conn struct {
 
 // openConn dials and authenticates a session, returning the error so callers that can
 // surface a reason (hcdb_connect_err) do, and callers that cannot (hcdb_connect) drop it.
-// resolveAddr passes a caller-supplied address through untouched, and locates the local
-// daemon when the caller gave none -- the same way htcondordb-cli does with no -addr: the
-// address file named by HTCONDORDB_ADDRESS_FILE (by default $(LOG)/.htcondordb_address),
-// else the HTCONDORDB_HOST knob. The mechanics live in golang-htcondor so every client
-// resolves htcondordb identically; a caller should not have to know a port to reach the
-// daemon on its own machine.
+// resolveAddr passes a caller-supplied address through untouched, and locates the daemon
+// when the caller gave none, the same way htcondordb-cli does with no -addr. A caller should
+// not have to know a port to reach the daemon on its own machine, and an operator should be
+// able to redirect it from the environment; package locate owns both rules for every client
+// in the tree.
 //
-// Resolution happens once per connection, as in the CLI. A client that wants to follow a
-// restarted daemon reconnects, which comes back through here and re-reads the file.
+// Resolution happens once per connection. A client that wants to follow a restarted daemon
+// reconnects, which comes back through here and re-reads the address file.
 func resolveAddr(cfg *config.Config, addr string) (string, error) {
 	if strings.TrimSpace(addr) != "" {
 		return addr, nil
 	}
-	resolve, source, err := htcondor.LocalDaemonAddress(cfg, "HTCONDORDB")
-	if err != nil {
-		return "", err
-	}
-	located, err := resolve()
-	if err != nil {
-		return "", fmt.Errorf("cannot locate the htcondordb daemon via %s: %w (pass an address, or set HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST)", source, err)
-	}
-	return located, nil
+	return locate.Daemon(cfg)
 }
 
 func openConn(addr string) (*conn, error) {

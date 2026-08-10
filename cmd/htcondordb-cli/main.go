@@ -39,6 +39,7 @@ import (
 	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/htcondordb/command"
 	"github.com/bbockelm/htcondordb/ha/consistent"
+	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/repl"
 )
 
@@ -50,7 +51,8 @@ Usage:
   htcondordb-cli [flags] load [-key A]   load a ClassAd stream from stdin
 
 Flags:
-  -addr <host:port>   daemon address (default: HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST)
+  -addr <host:port>   daemon address (default: HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST,
+                      from the environment or the configuration)
   -e <sql>            execute one statement, print the result, and exit
   -format <mode>      output format for -e: table (default) | json | classad | classad-new
   -key-attr <name>    attribute holding each row's primary key (default: Key)
@@ -295,17 +297,16 @@ func oneShotStatements(f *flags) string {
 	return ""
 }
 
-// locateDaemon resolves the daemon's command address using the standard convention --
-// HTCONDORDB_ADDRESS_FILE (default $(LOG)/.htcondordb_address) preferred, else the
-// HTCONDORDB_HOST knob. The mechanics live in golang-htcondor so the collector and this
-// CLI resolve htcondordb the same way; here we resolve once (the CLI is a short-lived
-// tool that does not reconnect).
+// locateDaemon resolves the daemon's command address through package locate, so this CLI,
+// the Python driver and history-import all agree on where the daemon is and on which
+// environment variables redirect them. Resolved once: the CLI is short-lived and does not
+// reconnect.
 func locateDaemon(cfg *config.Config) (string, error) {
-	resolve, _, err := htcondor.LocalDaemonAddress(cfg, "HTCONDORDB")
+	addr, err := locate.Daemon(cfg)
 	if err != nil {
-		return "", fmt.Errorf("cannot locate the htcondordb daemon: pass -addr, or set HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST")
+		return "", fmt.Errorf("%w -- or pass -addr", err)
 	}
-	return resolve()
+	return addr, nil
 }
 
 func getConfig(cfg *config.Config, key string) string {

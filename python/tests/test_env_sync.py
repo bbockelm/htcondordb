@@ -56,6 +56,18 @@ def test_pushes_condor_config(library, monkeypatch):
     assert pushed(library) == {"CONDOR_CONFIG": "/etc/condor/condor_config"}
 
 
+def test_pushes_the_address_knobs(library, monkeypatch):
+    # These two are how a caller redirects connect() without touching a config file, and the
+    # library resolves them itself -- so they have to cross over with CONDOR_CONFIG.
+    monkeypatch.setenv("HTCONDORDB_HOST", "db.example.edu:9618")
+    monkeypatch.setenv("HTCONDORDB_ADDRESS_FILE", "/var/log/condor/.htcondordb_address")
+    library.sync_environment()
+    assert pushed(library) == {
+        "HTCONDORDB_HOST": "db.example.edu:9618",
+        "HTCONDORDB_ADDRESS_FILE": "/var/log/condor/.htcondordb_address",
+    }
+
+
 def test_pushes_knob_overrides(library, monkeypatch):
     # _CONDOR_<KNOB> is how HTCondor overrides any knob from the environment, so the
     # library has to see those too -- not just the config file path.
