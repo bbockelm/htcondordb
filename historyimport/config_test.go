@@ -47,6 +47,51 @@ func TestJobsFromConfig(t *testing.T) {
 	}
 }
 
+func TestJobsFromConfigSource(t *testing.T) {
+	kv := map[string]string{
+		"HTCONDORDB_HISTORY_IMPORT":                "hist epochs epochs2",
+		"HTCONDORDB_HISTORY_IMPORT_HIST_POOL":      "p:9618",
+		"HTCONDORDB_HISTORY_IMPORT_EPOCHS_POOL":    "p:9618",
+		"HTCONDORDB_HISTORY_IMPORT_EPOCHS_SOURCE":  "epoch",
+		"HTCONDORDB_HISTORY_IMPORT_EPOCHS2_POOL":   "p:9618",
+		"HTCONDORDB_HISTORY_IMPORT_EPOCHS2_SOURCE": "epoch",
+		"HTCONDORDB_HISTORY_IMPORT_EPOCHS2_TABLE":  "my_epochs",
+	}
+	get := func(k string) (string, bool) { v, ok := kv[k]; return v, ok }
+	jobs, err := JobsFromConfig(get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Job{}
+	for _, j := range jobs {
+		byName[j.Name] = j
+	}
+	// Default source is history, default table "history".
+	if byName["hist"].Source != SourceHistory || byName["hist"].Table != DefaultTable {
+		t.Errorf("hist = %+v, want history/%s", byName["hist"], DefaultTable)
+	}
+	// Epoch source defaults the table to the epoch table (no collision with history).
+	if byName["epochs"].Source != SourceEpoch || byName["epochs"].Table != DefaultEpochTable {
+		t.Errorf("epochs = %+v, want epoch/%s", byName["epochs"], DefaultEpochTable)
+	}
+	// An explicit TABLE still wins for an epoch job.
+	if byName["epochs2"].Source != SourceEpoch || byName["epochs2"].Table != "my_epochs" {
+		t.Errorf("epochs2 = %+v, want epoch/my_epochs", byName["epochs2"])
+	}
+}
+
+func TestJobsFromConfigInvalidSource(t *testing.T) {
+	kv := map[string]string{
+		"HTCONDORDB_HISTORY_IMPORT":          "j",
+		"HTCONDORDB_HISTORY_IMPORT_J_POOL":   "p:9618",
+		"HTCONDORDB_HISTORY_IMPORT_J_SOURCE": "transfer",
+	}
+	get := func(k string) (string, bool) { v, ok := kv[k]; return v, ok }
+	if _, err := JobsFromConfig(get); err == nil {
+		t.Error("an unsupported SOURCE should error")
+	}
+}
+
 func TestJobsFromConfigUnconfigured(t *testing.T) {
 	get := func(string) (string, bool) { return "", false }
 	jobs, err := JobsFromConfig(get)
