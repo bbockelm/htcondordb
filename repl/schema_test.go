@@ -149,3 +149,91 @@ func TestSchemaTableArgument(t *testing.T) {
 		t.Errorf("no args = %q/%v, want the current table and nothing", tbl, rest)
 	}
 }
+
+// catalogSchemaSession is the fixture the earlier tests should have used: a CATALOG server with
+// both a mutable table and an archive, which is the shape a deployment runs. The single-table
+// mutable fixture above cannot reach an archive at all, so `.schema rebuild` on a history table --
+// which failed with `unknown archive admin action` -- passed every test.
+func catalogSchemaSession(t *testing.T, n int) (*session, *db.Catalog, *bytes.Buffer, func()) {
+	t.Helper()
+	cat, err := db.OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := cat.CreateTable("jobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hist, err := cat.CreateArchiveTable("history", db.ArchiveConfig{SegmentSize: 1 << 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		ad, perr := classad.ParseOld(fmt.Sprintf(
+			"ClusterId = %d\nProcId = %d\nOwner = \"u%d\"\nRequestMemory = %d\nWallClock = %d.5",
+			i/10, i%10, i%8, ((i%16)+1)*512, i))
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		if err := jobs.Put(fmt.Sprintf("k%d", i), ad); err != nil {
+			t.Fatal(err)
+		}
+		if err := hist.Append(ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := dbrpc.NewServerCatalog(cat)
+	cp, sp := net.Pipe()
+	go func() { _ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{Privileged: true}) }()
+	c := dbrpc.NewClient(dbrpc.NewStreamConn(cp))
+	e := NewExecutor(c, ExecConfig{})
+	var out bytes.Buffer
+	return &session{exec: e, table: "jobs"}, cat, &out, func() { c.Close(); s.Close(); cat.Close() }
+}
+
+// TestSchemaCommandsOnBothTableTypes runs every .schema subcommand against a mutable table AND an
+// archive. This is the regression for `.schema rebuild` on a history table erroring as an unknown
+// admin action.
+func TestSchemaCommandsOnBothTableTypes(t *testing.T) {
+	sess, cat, out, cleanup := catalogSchemaSession(t, 3000)
+	defer cleanup()
+
+	for _, table := range []string{"jobs", "history"} {
+		// Rebuild from cold: on a table with no accelerator yet, this is what builds one.
+		out.Reset()
+		sess.schemaCmd(out, "rebuild "+table)
+		if got := out.String(); !strings.Contains(got, "schema rebuilt") {
+			t.Errorf("%s: .schema rebuild did not report success:\n%s", table, got)
+			continue
+		}
+
+		// The schema is now visible.
+		out.Reset()
+		sess.schemaCmd(out, table)
+		got := out.String()
+		if !strings.Contains(got, "on —") {
+			t.Errorf("%s: .schema should report the accelerator on:\n%s", table, got)
+		}
+		if !strings.Contains(got, "RequestMemory") {
+			t.Errorf("%s: .schema is missing a seeded attribute:\n%s", table, got)
+		}
+
+		// And the fit report renders.
+		out.Reset()
+		sess.schemaCmd(out, "fit "+table)
+		got = out.String()
+		if !strings.Contains(got, "sampled record") {
+			t.Errorf("%s: .schema fit produced no report:\n%s", table, got)
+		}
+		if strings.Contains(got, "{\"sampled\"") {
+			t.Errorf("%s: raw JSON leaked into the console:\n%s", table, got)
+		}
+	}
+
+	// The archive really did get an accelerator, not just a cheerful message.
+	if a, ok := cat.ArchiveTable("history"); !ok {
+		t.Fatal("archive missing")
+	} else if info := a.SchemaScanInfo(); !info.Enabled || info.SchemaFields == 0 {
+		t.Errorf("archive accelerator after .schema rebuild: %+v, want enabled with fields", info)
+	}
+}
