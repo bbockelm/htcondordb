@@ -382,7 +382,9 @@ func run() error {
 		}()
 	}
 
+	selfVer, classadVer := buildIdentity()
 	log.Info(logging.DestinationGeneral, "htcondordb starting",
+		"version", selfVer, "classad", classadVer,
 		"listen", ln.Addr().String(), "address", advertisedAddr(d, ln),
 		"db_dir", databaseDir(d, cfg), "under_master", d.UnderMaster(),
 		"ha_mode", ha.mode, "role", ha.role, "read_only", ha.forceReadOnly)

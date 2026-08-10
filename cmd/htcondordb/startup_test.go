@@ -66,3 +66,22 @@ func TestStartupTimerSortsSlowestFirst(t *testing.T) {
 		t.Errorf("done() reordered the phase list in place: %q", got.String())
 	}
 }
+
+// TestBuildIdentityReportsClassadVersion is the point of buildIdentity: the startup log has to
+// name the classad version the binary was compiled against. Without it, a stale daemon and an
+// unfixed daemon produce identical output -- the same "unknown admin action" error -- and there is
+// no way to tell "not fixed" from "not deployed" without shell access to the host.
+func TestBuildIdentityReportsClassadVersion(t *testing.T) {
+	self, classad := buildIdentity()
+	if self == "" {
+		t.Error("self version empty; the log line would omit which build is running")
+	}
+	// Under `go test` the binary carries real dependency build info, so this must resolve to a
+	// version rather than the unknown fallback.
+	if classad == "" || classad == "unknown" {
+		t.Errorf("classad version = %q, want the dbrpc module version from the build info", classad)
+	}
+	if !strings.HasPrefix(classad, "v") {
+		t.Errorf("classad version = %q, want something like v0.25.3", classad)
+	}
+}

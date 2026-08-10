@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -80,4 +81,45 @@ func (t *startupTimer) done() {
 	}
 	t.log.Info(logging.DestinationGeneral, "startup timing",
 		"total", total.Round(time.Millisecond).String(), "phases", b.String())
+}
+
+// buildIdentity reports this binary's own version and the classad version it was compiled
+// against, read from the embedded Go build info.
+//
+// It exists because "is the running daemon the build with the fix in it?" was not answerable from
+// the log. A merged, tagged, released fix and a stale binary produce byte-identical output -- the
+// old error message -- so the same report can mean "not fixed" or "not deployed", and there was no
+// way to tell them apart without shell access to the host.
+func buildIdentity() (self string, classad string) {
+	self = version
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return self, "unknown"
+	}
+	// A binary built with `go build` from a checkout has a main version of "(devel)"; prefer the
+	// linker-set version in that case, and fall back to the VCS revision so a dev build is still
+	// identifiable.
+	if self == "dev" || self == "" {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			self = info.Main.Version
+		} else {
+			for _, s := range info.Settings {
+				if s.Key == "vcs.revision" && len(s.Value) >= 12 {
+					self = "devel+" + s.Value[:12]
+					break
+				}
+			}
+		}
+	}
+	for _, dep := range info.Deps {
+		if dep == nil {
+			continue
+		}
+		// The dbrpc submodule is the one that carries the admin actions and opcodes, so it is the
+		// version worth reporting when a command is rejected as unknown.
+		if dep.Path == "github.com/PelicanPlatform/classad/dbrpc" {
+			return self, dep.Version
+		}
+	}
+	return self, "unknown"
 }
