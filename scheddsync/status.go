@@ -65,7 +65,7 @@ func (s *JobSync) publishStatus(progressed bool) {
 
 func (s *HistorySync) publishStatus(progressed bool) {
 	size, lag := lagAndFile(s.filename, s.offset)
-	st := SyncStatus{Kind: "history", Source: s.filename, Offset: s.offset, FileSize: size, LagBytes: lag, CaughtUp: lag == 0}
+	st := SyncStatus{Kind: s.kind, Source: s.filename, Offset: s.offset, FileSize: size, LagBytes: lag, CaughtUp: lag == 0}
 	st.Resyncs, st.LastResync = s.resyncs, s.lastResync
 	if prev := s.status.Load(); prev != nil {
 		st.LastSync = prev.LastSync

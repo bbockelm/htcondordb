@@ -47,7 +47,7 @@ func (m *scheddSyncManager) Resync(target string) error {
 	r, ok := m.resyncers[target]
 	m.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("no such schedd-sync target %q (want jobs or history, and it must be enabled)", target)
+		return fmt.Errorf("no such schedd-sync target %q (want jobs, history, or epoch, and it must be enabled)", target)
 	}
 	r.Resync()
 	return nil
@@ -76,10 +76,11 @@ const defaultArchiveCategoricalAttrs = "Owner"
 // must stay comparable -- apply() reconciles by struct equality -- so attribute lists are
 // carried as their canonical config strings and split at the point of use.
 type scheddSyncSettings struct {
-	enabled  bool
-	jobLog   string
-	histFile string
-	posDir   string
+	enabled   bool
+	jobLog    string
+	histFile  string
+	epochFile string
+	posDir    string
 
 	// History-archive tuning. archiveSegSize applies only when the archive is first
 	// created (archiveconfig.json is authoritative on reopen); the index attributes are
@@ -112,9 +113,10 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		catAttrs = defaultArchiveCategoricalAttrs
 	}
 	return scheddSyncSettings{
-		enabled:  true,
-		jobLog:   firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG")),
-		histFile: firstNonEmpty(getStr(cfg, "HTCONDORDB_HISTORY"), getStr(cfg, "HISTORY")),
+		enabled:   true,
+		jobLog:    firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG")),
+		histFile:  firstNonEmpty(getStr(cfg, "HTCONDORDB_HISTORY"), getStr(cfg, "HISTORY")),
+		epochFile: firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_EPOCH_HISTORY"), getStr(cfg, "JOB_EPOCH_HISTORY")),
 		// The position store lives under the database dir, resolved the same way the DB is
 		// (HTCONDORDB_DIR or $(SPOOL)/htcondordb) -- not HTCONDORDB_DIR alone, which left
 		// SPOOL-configured deployments with no persisted resume position.
@@ -217,8 +219,8 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 		if err := scheddSyncGuardEUID(os.Geteuid()); err != nil {
 			return err
 		}
-		if next.jobLog == "" && next.histFile == "" {
-			return fmt.Errorf("HTCONDORDB_SYNC_SCHEDD is set but neither JOB_QUEUE_LOG nor HISTORY is configured")
+		if next.jobLog == "" && next.histFile == "" && next.epochFile == "" {
+			return fmt.Errorf("HTCONDORDB_SYNC_SCHEDD is set but none of JOB_QUEUE_LOG, HISTORY, or JOB_EPOCH_HISTORY is configured")
 		}
 	}
 
@@ -331,6 +333,35 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		sources = append(sources, hs)
 		resyncers["history"] = hs
 		m.logger.Info("schedd-sync: tailing history file", "file", s.histFile, "archive", "history")
+	}
+	if s.epochFile != "" {
+		ep, err := m.svc.Catalog().CreateArchiveTable("epoch_history", db.ArchiveConfig{
+			SegmentSize:      s.archiveSegSize,
+			CategoricalAttrs: splitAttrList(s.archiveCatAttrs),
+			ValueAttrs:       splitAttrList(s.archiveValAttrs),
+			// Zone-map the epoch write time and htcondordb's ingest time so range
+			// queries on either prune whole segments. Epoch records carry no
+			// CompletionDate (a run instance is not a completed job).
+			ZoneAttrs: []string{scheddsync.EpochWriteDateAttr, scheddsync.EnteredHistoryAttr},
+		})
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("schedd-sync: creating epoch archive: %w", err)
+		}
+		m.reconcileArchiveIndexes(ctx, ep, s)
+		es := scheddsync.NewJobEpochSync(ep, scheddsync.HistorySyncConfig{
+			Filename: s.epochFile,
+			Logger:   m.logger,
+			Store:    syncStore("epoch.pos"),
+			OnResync: func(ev scheddsync.ResyncEvent) {
+				m.logger.Error("schedd-sync: epoch durability gap; run-instance records lost to rotation",
+					"reason", ev.Reason)
+			},
+		})
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = es.Run(ctx) }()
+		sources = append(sources, es)
+		resyncers["epoch"] = es
+		m.logger.Info("schedd-sync: tailing epoch history file", "file", s.epochFile, "archive", "epoch_history")
 	}
 
 	done := make(chan struct{})

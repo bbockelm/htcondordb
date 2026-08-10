@@ -51,6 +51,14 @@ type HistorySync struct {
 	store    PositionStore
 	now      func() time.Time // ingest-time clock; overridable in tests
 
+	// The tailer is source-parameterized so the same append-only-file machinery
+	// (offset resume, rotation chain, recovery dedup) serves both the completed-job
+	// history file and the epoch (per-run-instance) file. Defaults are the history
+	// behavior; NewJobEpochSync overrides them.
+	kind          string                                // SyncStatus Kind: "history" | "job_epoch"
+	keyConstraint func(*classad.ClassAd) (string, bool) // archive-query constraint uniquely identifying a record
+	eventTime     func(*classad.ClassAd) (int64, bool)  // the record's event time (for EnteredHistoryTime); ok=false -> ingest clock
+
 	file         *os.File    // current open handle (survives a rename of filename)
 	fi           os.FileInfo // its FileInfo, for SameFile rotation detection
 	offset       int64       // bytes consumed from file
@@ -133,7 +141,36 @@ func NewHistorySync(archive *db.ArchiveTable, cfg HistorySyncConfig) *HistorySyn
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &HistorySync{filename: cfg.Filename, archive: archive, interval: interval, log: logger, store: cfg.Store, onResync: cfg.OnResync, now: time.Now}
+	return &HistorySync{
+		filename: cfg.Filename, archive: archive, interval: interval, log: logger,
+		store: cfg.Store, onResync: cfg.OnResync, now: time.Now,
+		kind:          "history",
+		keyConstraint: historyKeyConstraint,
+		eventTime:     historyEventTime,
+	}
+}
+
+// historyKeyConstraint identifies a completed-job record: one per (ClusterId, ProcId)
+// in a schedd's history.
+func historyKeyConstraint(ad *classad.ClassAd) (string, bool) {
+	cid, ok1 := ad.EvaluateAttrInt("ClusterId")
+	pid, ok2 := ad.EvaluateAttrInt("ProcId")
+	if !ok1 || !ok2 {
+		return "", false
+	}
+	return fmt.Sprintf("ClusterId == %d && ProcId == %d", cid, pid), true
+}
+
+// historyEventTime is the completed job's entry into history: its terminal-status
+// transition, falling back to its completion time.
+func historyEventTime(ad *classad.ClassAd) (int64, bool) {
+	if v, ok := ad.EvaluateAttrInt("EnteredCurrentStatus"); ok && v > 0 {
+		return v, true
+	}
+	if v, ok := ad.EvaluateAttrInt("CompletionDate"); ok && v > 0 {
+		return v, true
+	}
+	return 0, false
 }
 
 // Run polls until ctx is cancelled, starting immediately.
@@ -599,24 +636,21 @@ func (s *HistorySync) appendRecord(rec []byte) {
 // records recover their real history-entry time), and keeps EnteredHistoryTime monotonic with
 // append order so its zone map still prunes.
 func (s *HistorySync) enteredHistoryTime(ad *classad.ClassAd) int64 {
-	if v, ok := ad.EvaluateAttrInt("EnteredCurrentStatus"); ok && v > 0 {
-		return v
-	}
-	if v, ok := ad.EvaluateAttrInt("CompletionDate"); ok && v > 0 {
+	if v, ok := s.eventTime(ad); ok {
 		return v
 	}
 	return s.now().Unix()
 }
 
-// alreadyArchived reports whether a completed job (keyed by ClusterId+ProcId, unique per
-// schedd history) is already in the archive.
+// alreadyArchived reports whether a record (keyed per the sync's source: (ClusterId,
+// ProcId) for history, plus RunInstanceID/EpochAdType for epoch) is already in the
+// archive.
 func (s *HistorySync) alreadyArchived(ad *classad.ClassAd) bool {
-	cid, ok1 := ad.EvaluateAttrInt("ClusterId")
-	pid, ok2 := ad.EvaluateAttrInt("ProcId")
-	if !ok1 || !ok2 {
+	constraint, ok := s.keyConstraint(ad)
+	if !ok {
 		return false // no key to dedup on: treat as new
 	}
-	seq, err := s.archive.QueryLimit(fmt.Sprintf("ClusterId == %d && ProcId == %d", cid, pid), 1)
+	seq, err := s.archive.QueryLimit(constraint, 1)
 	if err != nil {
 		return false
 	}
