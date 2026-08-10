@@ -197,17 +197,24 @@ func New(cfg Config) (*Service, error) {
 
 // defaultMaintainOptions is the background self-tuning a server runs when the caller supplies no
 // cfg.Maintenance. SchemaScanHotTopN mirrors HotTopN so the per-segment columnar accelerator --
-// CountConstraint's fast path for COUNT(*) WHERE <numeric> -- is ON BY DEFAULT over the same
-// demand-hot set. It was previously left at 0, so the accelerator (shipped in classad v0.23.0)
-// never engaged.
+// the fast path for numeric COUNT/MIN/MAX/SUM/AVG -- is ON BY DEFAULT over the same demand-hot
+// set. It was previously left at 0, so the accelerator (shipped in classad v0.23.0) never engaged.
+//
+// ArchiveSchemaScanHotTopN turns it on for history tables too, which is where it matters most: an
+// archive is the big append-only scan target, and a numeric aggregate over one drops from tens of
+// milliseconds of row scan to about one. classad leaves the option at 0 because the FIRST build
+// reads every sealed record of the whole history once -- real, but a one-time cost that buys
+// 25-65x on the queries a history table is actually asked, and paying it silently once beats
+// leaving the accelerator dark forever.
 func defaultMaintainOptions() db.MaintainOptions {
 	const hotTopN = 32
 	return db.MaintainOptions{
-		HotTopN:             hotTopN,
-		SchemaScanHotTopN:   hotTopN,
-		Retrain:             true,
-		MinIndexDemand:      10,
-		IndexBudgetHighFrac: 0.10,
+		HotTopN:                  hotTopN,
+		SchemaScanHotTopN:        hotTopN,
+		ArchiveSchemaScanHotTopN: hotTopN,
+		Retrain:                  true,
+		MinIndexDemand:           10,
+		IndexBudgetHighFrac:      0.10,
 	}
 }
 
