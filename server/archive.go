@@ -11,12 +11,6 @@ import (
 // written under it then reference, so retraining often buys little and accumulates dictionaries.
 const DefaultArchiveRetrainInterval = 24 * time.Hour
 
-// archiveRetrainSampleMax is the record count sampled to train an archive's dictionary, matching the
-// admin action's default. An explicit count rather than 0: 0 means "no count bound" only in a
-// classad new enough to have the byte-budgeted sampler, and in older ones CollectSamples(0) returns
-// no samples at all, so a retrain would silently decline with "no samples" instead of training.
-const archiveRetrainSampleMax = 2000
-
 // RunPeriodicArchiveMaintenance maintains every archive table every interval until ctx is
 // cancelled (a no-op if interval <= 0, or while no archive tables exist). Each pass rotates
 // (drops whole sealed segments outside retention, so a history table does not grow without
@@ -109,7 +103,13 @@ func (s *Service) maybeRetrainArchive(name string) {
 		return
 	}
 	start := time.Now()
-	n, err := a.RetrainDict(archiveRetrainSampleMax)
+	// 0 = no record-count bound, so the sampler's own byte budget decides how much to draw. That is
+	// what the dictionary trainer actually consumes, and it is what makes the cost independent of how
+	// fat this table's ads happen to be: a count of 2000 is a few hundred KB of small job ads or ~15
+	// MB of slot ads, while the byte budget is the same work either way. Requires classad >= v0.26.0,
+	// where 0 means "unbounded count"; in older versions CollectSamples(0) returned NO samples, so a
+	// retrain would have silently declined with "no samples" instead of training.
+	n, err := a.RetrainDict(0)
 	if err != nil {
 		// Training legitimately declines on small or homogeneous data (BuildDict rejects some
 		// sample distributions). Keep the existing dictionary and try again next interval.
