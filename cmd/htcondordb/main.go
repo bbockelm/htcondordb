@@ -83,12 +83,17 @@ func run() error {
 	log := d.Logger()
 	slog.SetDefault(d.Slog()) // route cedar's server/security slog into our log
 
+	// Time each startup phase: everything from here to the listener used to be silent, so a slow
+	// start showed only as a gap between two timestamps.
+	boot := newStartupTimer(log)
+
 	// Server-side security policy for our command socket (SEC_* knobs). The
 	// negotiated command is DBSession; DAEMON is the strongest level we serve.
 	sec, err := htcondor.GetServerSecurityConfig(d.Config(), command.DBSession, "DAEMON")
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
 	}
+	boot.mark("security-config")
 	// This daemon gates every operation on the peer's authenticated identity
 	// (READ vs WRITE vs DAEMON), so authorization is meaningless without an
 	// identity. HTCondor's default SEC_*_AUTHENTICATION is OPTIONAL, and
@@ -113,6 +118,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("building authorization policy: %w", err)
 	}
+	boot.mark("authz-policy")
 	policyPtr.Store(policy)
 	authorize := func(perm, peerAddr, user string) bool {
 		// A CEDAR family/parent session is a pre-shared key this daemon minted and handed only
@@ -155,6 +161,7 @@ func run() error {
 	})
 
 	// Resolve the HA configuration (standalone / leader-follower / consistent).
+	boot.mark("server-setup")
 	ha, err := detectHA(cfg)
 	if err != nil {
 		return err
@@ -173,6 +180,7 @@ func run() error {
 
 	// The database service. A follower (or a non-leader raft node) serves
 	// read-only: writes go to the leader.
+	boot.mark("ha-detect")
 	logQueries := configBool(cfg, "HTCONDORDB_LOG_QUERIES")
 	memoryTables := splitAttrs(getStr(cfg, "HTCONDORDB_MEMORY_TABLES"))
 	svc, err := server.New(server.Config{
@@ -212,6 +220,7 @@ func run() error {
 
 	// DC_NOP / DC_RECONFIG / DC_OFF so condor_ping, condor_reconfig -daemon and
 	// condor_off -daemon work against this daemon's command port.
+	boot.mark("open-database")
 	d.RegisterDefaultCommands(srv)
 
 	// Command-socket listener: the inherited shared-port endpoint under
@@ -223,6 +232,8 @@ func run() error {
 		log.Error(logging.DestinationGeneral, "listener setup failed", "err", err.Error())
 		return err
 	}
+	boot.mark("listener")
+	boot.done()
 	defer func() { _ = ln.Close() }()
 
 	// Publish the command address so clients (the REPL, followers) can find us.
@@ -371,7 +382,9 @@ func run() error {
 		}()
 	}
 
+	selfVer, classadVer := buildIdentity()
 	log.Info(logging.DestinationGeneral, "htcondordb starting",
+		"version", selfVer, "classad", classadVer,
 		"listen", ln.Addr().String(), "address", advertisedAddr(d, ln),
 		"db_dir", databaseDir(d, cfg), "under_master", d.UnderMaster(),
 		"ha_mode", ha.mode, "role", ha.role, "read_only", ha.forceReadOnly)
