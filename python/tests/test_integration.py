@@ -8,10 +8,23 @@ automatically when the daemon binary is not built (see conftest).
 from __future__ import annotations
 
 import datetime
+import os
+from pathlib import Path
 
 import pytest
 
 import htcondordb
+
+
+def round_trip(conn) -> None:
+    """Prove a connection is usable, not merely open, on a table of its own."""
+    name = "pytest_locate_" + os.urandom(4).hex()
+    conn.execute(f"CREATE TABLE {name}").close()
+    try:
+        conn.execute(f"INSERT INTO {name} (Key, Owner) VALUES ('j1', 'alice')").close()
+        assert conn.execute(f"SELECT Owner FROM {name}").fetchone() == ("alice",)
+    finally:
+        conn.execute(f"DROP TABLE {name}").close()
 
 
 class TestConnection:
@@ -44,6 +57,51 @@ class TestConnection:
         with pytest.raises(htcondordb.OperationalError) as excinfo:
             htcondordb.connect("127.0.0.1:1")
         assert "127.0.0.1:1" in str(excinfo.value)
+
+    def test_connect_defaults_to_the_address_file(self, daemon_address):
+        # The point of the default: a report never has to be told a port. The test config
+        # sets HTCONDORDB_ADDRESS_FILE, so an argument-free connect() has to land on the
+        # same daemon and be usable, not merely open.
+        with htcondordb.connect() as conn:
+            assert conn.address == daemon_address
+            round_trip(conn)
+
+    def test_connect_falls_back_to_the_host_knob(
+        self, daemon_address, tmp_path, monkeypatch
+    ):
+        # A daemon on another host publishes no local address file. Reuse the live daemon's
+        # configuration (so security still matches) with the address file and LOG removed,
+        # leaving HTCONDORDB_HOST as the only way to find it.
+        original = Path(os.environ["CONDOR_CONFIG"]).read_text().splitlines()
+        kept = [
+            line
+            for line in original
+            if not line.startswith(("HTCONDORDB_ADDRESS_FILE", "LOG "))
+        ]
+        config = tmp_path / "host_only_config"
+        config.write_text("\n".join(kept + [f"HTCONDORDB_HOST = {daemon_address}", ""]))
+        monkeypatch.setenv("CONDOR_CONFIG", str(config))
+
+        with htcondordb.connect() as conn:
+            assert conn.address == daemon_address
+            round_trip(conn)
+
+    def test_unlocatable_daemon_names_the_knobs(
+        self, library_available, tmp_path, monkeypatch
+    ):
+        if not library_available:
+            pytest.skip("shared library not built; run 'make lib'")
+        # With nothing configured the error has to point at the knobs; a bare connection
+        # failure would send the reader hunting for a network problem instead.
+        config = tmp_path / "empty_config"
+        config.write_text("LOG =\n")
+        monkeypatch.setenv("CONDOR_CONFIG", str(config))
+
+        with pytest.raises(htcondordb.OperationalError) as excinfo:
+            htcondordb.connect()
+        message = str(excinfo.value)
+        assert "HTCONDORDB_ADDRESS_FILE" in message
+        assert "HTCONDORDB_HOST" in message
 
     def test_commit_is_a_noop(self, connection):
         connection.commit()  # must not raise: callers commit defensively after writes

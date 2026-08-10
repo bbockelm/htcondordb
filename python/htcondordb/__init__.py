@@ -104,12 +104,19 @@ threadsafety = 2
 paramstyle = "qmark"
 
 
-def connect(address: str, autocommit: bool = True, **kwargs) -> Connection:
+def connect(
+    address: str | None = None, autocommit: bool = True, **kwargs
+) -> Connection:
     """Open an authenticated session with an htcondordb daemon.
 
     Args:
         address: The daemon's address -- ``host:port``, or an HTCondor sinful string
-            (``<1.2.3.4:9618?sock=...>``), including a shared-port or CCB one.
+            (``<1.2.3.4:9618?sock=...>``), including a shared-port or CCB one. Omit it to
+            locate the local daemon from the HTCondor configuration, the way
+            ``htcondordb-cli`` does with no ``-addr``: the address file named by
+            ``HTCONDORDB_ADDRESS_FILE`` (by default ``$(LOG)/.htcondordb_address``), else
+            the ``HTCONDORDB_HOST`` knob. :attr:`Connection.address
+            <htcondordb.connection.Connection.address>` reports what that resolved to.
         autocommit: When true (the default), each statement commits as it runs. Pass
             ``False`` to open a transaction immediately and batch writes until
             :meth:`~htcondordb.connection.Connection.commit`. See
@@ -120,8 +127,8 @@ def connect(address: str, autocommit: bool = True, **kwargs) -> Connection:
         A :class:`~htcondordb.connection.Connection`.
 
     Raises:
-        OperationalError: the daemon was unreachable or authentication failed; the
-            message carries the reason.
+        OperationalError: the daemon was unreachable, could not be located, or
+            authentication failed; the message carries the reason.
         InterfaceError: the shared library could not be loaded.
 
     There are deliberately no credential arguments: HTCondor's security configuration is

@@ -6,12 +6,18 @@ Python code can run SQL against the store the same way it would against SQLite o
 ```python
 import htcondordb
 
-with htcondordb.connect("collector.example.edu:9618") as conn:
+with htcondordb.connect() as conn:
     for owner, n in conn.execute(
         "SELECT Owner, COUNT(*) AS n FROM jobs WHERE JobStatus = ? GROUP BY Owner", (2,)
     ):
         print(owner, n)
 ```
+
+`connect()` with no argument finds the local daemon the way `htcondordb-cli` does with no
+`-addr`: the address file named by `HTCONDORDB_ADDRESS_FILE` (by default
+`$(LOG)/.htcondordb_address`), else the `HTCONDORDB_HOST` knob. Pass an address —
+`htcondordb.connect("db.example.edu:9618")` — to reach a daemon the configuration does not
+point at. Either way `conn.address` reports what was reached.
 
 Because it is DB-API, pandas works with no adapter:
 
@@ -75,7 +81,12 @@ HTCondor build; everything else works either way.
 There are no credential arguments to `connect()`. HTCondor's security configuration is
 ambient: the library reads `CONDOR_CONFIG` and authenticates exactly as `htcondordb-cli`
 does — pool token, SSL, FS, whatever the configuration allows. Point `CONDOR_CONFIG` at a
-different file to authenticate differently.
+different file to authenticate differently. Setting it from Python works too:
+`os.environ["CONDOR_CONFIG"] = ...` before `connect()` is honored, as are `_CONDOR_<KNOB>`
+overrides.
+
+The same configuration decides where the daemon is, so pointing `CONDOR_CONFIG` at another
+pool moves both the credentials and the address `connect()` resolves.
 
 A client that cannot authenticate still connects, but the daemon authorizes it **READ-only**
 and strips private attributes. Writes then fail with `ProgrammingError`, carrying the

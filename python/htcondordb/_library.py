@@ -35,6 +35,8 @@ LIBRARY_ENV = "HTCONDORDB_LIBRARY"
 _CDEF = """
 uintptr_t hcdb_connect(char *addr);
 uintptr_t hcdb_connect_err(char *addr, char **err);
+int hcdb_address(uintptr_t h, char **out);
+int hcdb_setenv(char *name, char *value);
 uintptr_t hcdb_query(uintptr_t h, char *table, char *constraint);
 int hcdb_query_next(uintptr_t qh, char **out);
 void hcdb_query_free(uintptr_t qh);
@@ -91,6 +93,12 @@ def _candidate_paths() -> list[str]:
     return candidates
 
 
+# The variables HTCondor's configuration reads: the config file itself, plus the
+# `_CONDOR_<KNOB>` convention for overriding any knob from the environment.
+_CONDOR_ENV_NAMES = frozenset({"CONDOR_CONFIG"})
+_CONDOR_ENV_PREFIX = "_CONDOR_"
+
+
 class _Library:
     """A loaded ``libhtcondordb_client``, with its cffi handle."""
 
@@ -98,6 +106,32 @@ class _Library:
         self.ffi = ffi
         self.lib = lib
         self.path = path
+        # Names handed to hcdb_setenv so far, so one that goes away can be unset.
+        self._pushed_env: set[str] = set()
+
+    def sync_environment(self) -> None:
+        """Push HTCondor environment variables into the library.
+
+        Go answers ``os.Getenv`` from a copy of the environment taken when the library is
+        loaded, so a variable this process sets afterwards -- the usual
+        ``os.environ["CONDOR_CONFIG"] = ...`` before connecting -- would otherwise be
+        invisible and the library would quietly read a different configuration. Pushing the
+        current values across at connect time is what makes the documented
+        "configuration is ambient" behaviour actually true.
+
+        Variables pushed on an earlier call and since removed are unset, so deleting one
+        takes effect too.
+        """
+        current = {
+            name: value
+            for name, value in os.environ.items()
+            if name in _CONDOR_ENV_NAMES or name.startswith(_CONDOR_ENV_PREFIX)
+        }
+        for name in self._pushed_env - current.keys():
+            self.lib.hcdb_setenv(name.encode("utf-8"), self.ffi.NULL)
+        for name, value in current.items():
+            self.lib.hcdb_setenv(name.encode("utf-8"), value.encode("utf-8"))
+        self._pushed_env = set(current)
 
     def string(self, ptr) -> str:
         """Copy a C string the library allocated into a ``str``, then free it.
@@ -150,6 +184,8 @@ def load() -> _Library:
                 name
                 for name in (
                     "hcdb_connect_err",
+                    "hcdb_address",
+                    "hcdb_setenv",
                     "hcdb_sql",
                     "hcdb_sql_ads",
                     "hcdb_close",

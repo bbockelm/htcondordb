@@ -58,8 +58,7 @@ class Connection:
     ProgrammingError = _errors.ProgrammingError
     NotSupportedError = _errors.NotSupportedError
 
-    def __init__(self, address: str, autocommit: bool = True) -> None:
-        self._address = address
+    def __init__(self, address: str | None = None, autocommit: bool = True) -> None:
         self._lib = _library.load()
         self._lock = threading.Lock()
         self._cursors: set[Cursor] = set()
@@ -68,12 +67,30 @@ class Connection:
         self._in_transaction = False
 
         ffi, lib = self._lib.ffi, self._lib.lib
+        # Before connecting, not after: the library's view of CONDOR_CONFIG decides its
+        # security policy and where it looks for the daemon.
+        self._lib.sync_environment()
         err = ffi.new("char **")
-        handle = lib.hcdb_connect_err(address.encode("utf-8"), err)
+        # An empty address tells the library to locate the local daemon from the HTCondor
+        # configuration; see connect() for the convention.
+        handle = lib.hcdb_connect_err((address or "").encode("utf-8"), err)
         if handle == 0:
             reason = self._lib.string(err[0]) or "unknown error"
-            raise OperationalError(f"connecting to {address}: {reason}")
+            if address:
+                raise OperationalError(f"connecting to {address}: {reason}")
+            # No prefix here: with no address to name, the library's own message is the
+            # informative one -- it says which daemon it located, or why it could not.
+            raise OperationalError(reason)
         self._handle = handle
+
+        # Report the address actually reached rather than the caller's argument, which may
+        # have been None: a connection that says where it went is worth more in a log or
+        # a traceback than one that says "wherever the configuration pointed".
+        out = ffi.new("char **")
+        if lib.hcdb_address(handle, out) == 0:
+            self._address = self._lib.string(out[0]) or ""
+        else:  # pragma: no cover - the handle was just created
+            self._address = address or ""
 
         # Set through the property so a False opens the first transaction, exactly as a
         # later assignment would.
@@ -236,7 +253,11 @@ class Connection:
 
     @property
     def address(self) -> str:
-        """The daemon address this connection was opened against."""
+        """The daemon address this connection reached.
+
+        This is the resolved address even when the caller passed none, so it names the
+        daemon that the address file or ``HTCONDORDB_HOST`` pointed at.
+        """
         return self._address
 
     @property
