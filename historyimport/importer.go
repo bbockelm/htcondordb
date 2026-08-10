@@ -138,7 +138,12 @@ func (im *Importer) RunJob(ctx context.Context, j Job) (Stats, error) {
 		if err := ctx.Err(); err != nil {
 			return st, err
 		}
-		n, err := im.importSchedd(ctx, j, sd)
+		var n int
+		if j.Source == SourceEpoch {
+			n, err = im.importEpochSchedd(ctx, j, sd)
+		} else {
+			n, err = im.importSchedd(ctx, j, sd)
+		}
 		st.Imported += n
 		if err != nil {
 			st.Failures++

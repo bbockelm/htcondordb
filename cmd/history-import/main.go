@@ -169,9 +169,13 @@ func runJob(ctx context.Context, cfg *config.Config, addrFlag string, job histor
 	}
 	defer cleanup()
 
+	src := historyimport.ScheddHistorySource{}
+	if job.Source == historyimport.SourceEpoch {
+		src.HistorySource = htcondor.HistorySourceJobEpoch
+	}
 	im := &historyimport.Importer{
 		Disc: historyimport.CollectorDiscovery{},
-		Src:  historyimport.ScheddHistorySource{},
+		Src:  src,
 		W:    &historyimport.DBWriter{Client: client},
 		Cur:  cursors,
 		Log:  log,
@@ -179,7 +183,7 @@ func runJob(ctx context.Context, cfg *config.Config, addrFlag string, job histor
 	if beater != nil {
 		im.OnCycle = beater.RecordCycle
 	}
-	log.Info("history-import: starting", "job", job.Name, "pool", job.Pool, "table", job.Table, "interval", job.Interval)
+	log.Info("history-import: starting", "job", job.Name, "source", job.Source, "pool", job.Pool, "table", job.Table, "interval", job.Interval)
 	return im.RunLoop(ctx, job)
 }
 

@@ -46,6 +46,9 @@ func (CollectorDiscovery) Schedds(ctx context.Context, pool, constraint string) 
 // sending as soon as the importer has what it needs (e.g. reached archived
 // records).
 type ScheddHistorySource struct {
+	// HistorySource selects the schedd stream (job history vs. epoch). The zero
+	// value means completed-job history.
+	HistorySource htcondor.HistoryRecordSource
 	// BufferSize / WriteTimeout tune the underlying stream; zero uses defaults.
 	BufferSize   int
 	WriteTimeout time.Duration
@@ -57,12 +60,20 @@ func (s ScheddHistorySource) History(ctx context.Context, sd ScheddRef, constrai
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	source := s.HistorySource
+	if source == "" {
+		source = htcondor.HistorySourceJobHistory
+	}
 	sc := htcondor.NewSchedd(sd.Name, sd.Address)
 	opts := &htcondor.HistoryQueryOptions{
-		Source:    htcondor.HistorySourceJobHistory,
-		Backwards: true, // newest first, so `since` and recovery dedup can stop early
-		Since:     since,
-		Limit:     limit, // 0 = unlimited
+		Source: source,
+		// The archive must hold the FULL record, not condor_history's narrow default
+		// projection -- "*" returns every attribute (including the epoch-only
+		// EpochWriteDate / RunInstanceID the importer keys on).
+		Projection: []string{"*"},
+		Backwards:  true, // newest first, so `since` and recovery dedup can stop early
+		Since:      since,
+		Limit:      limit, // 0 = unlimited
 	}
 	streamOpts := &htcondor.StreamOptions{BufferSize: s.BufferSize, WriteTimeout: s.WriteTimeout}
 
