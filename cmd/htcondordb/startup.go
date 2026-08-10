@@ -27,11 +27,17 @@ import (
 const slowPhase = time.Second
 
 // startupTimer accumulates startup phase durations.
+//
+// Two levels. phases are the top-level spans, measured as deltas between mark calls. detail holds
+// sub-phases reported with an explicit duration by code further down (server.New), which cannot use
+// the delta scheme because it does not own the clock. Detail is logged on its own line and is NOT
+// folded into the phase totals, so the two cannot double-count.
 type startupTimer struct {
 	log    *logging.Logger
 	start  time.Time
 	last   time.Time
 	phases []phaseTime
+	detail []phaseTime
 }
 
 type phaseTime struct {
@@ -62,6 +68,25 @@ func (t *startupTimer) mark(name string) {
 	}
 }
 
+// record adds a sub-phase with an explicit duration, for a component that measures its own internal
+// steps. Safe on a nil timer so a caller need not check.
+//
+// It exists because the top-level "open-database" phase turned out to cover server.New in its
+// entirety -- opening the catalog, ensuring the default table, creating memory tables, building the
+// RPC server, starting maintenance and the transaction reaper -- so a slow start named a phase that
+// was really six. A number that attributes 4.6s to "open-database" when the catalog open is 80ms of
+// it is worse than no number, because it sends the reader to the wrong code.
+func (t *startupTimer) record(name string, d time.Duration) {
+	if t == nil {
+		return
+	}
+	t.detail = append(t.detail, phaseTime{name, d})
+	if d >= slowPhase && t.log != nil {
+		t.log.Info(logging.DestinationGeneral, "startup step slow",
+			"step", name, "took", d.Round(time.Millisecond).String())
+	}
+}
+
 // done logs the whole breakdown, slowest first, with the total. Called once the command socket is
 // listening -- the point the old log line marked with no explanation of what preceded it.
 func (t *startupTimer) done() {
@@ -81,6 +106,20 @@ func (t *startupTimer) done() {
 	}
 	t.log.Info(logging.DestinationGeneral, "startup timing",
 		"total", total.Round(time.Millisecond).String(), "phases", b.String())
+	if len(t.detail) == 0 {
+		return
+	}
+	byTime = make([]phaseTime, len(t.detail))
+	copy(byTime, t.detail)
+	sort.SliceStable(byTime, func(i, j int) bool { return byTime[i].d > byTime[j].d })
+	var d strings.Builder
+	for i, p := range byTime {
+		if i > 0 {
+			d.WriteString(", ")
+		}
+		fmt.Fprintf(&d, "%s=%s", p.name, p.d.Round(time.Millisecond))
+	}
+	t.log.Info(logging.DestinationGeneral, "startup detail", "steps", d.String())
 }
 
 // buildIdentity reports this binary's own version and the classad version it was compiled

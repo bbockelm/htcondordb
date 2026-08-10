@@ -105,6 +105,15 @@ type Config struct {
 	// (the commit stream ships decrypted, privilege-stripped ads), so a follower's keys
 	// need not match the leader's.
 	PoolKeys []db.KEK
+	// OnPhase, when set, is called with the duration of each internal step of New: opening the
+	// catalog, ensuring the default table, creating memory tables, building the RPC server,
+	// starting maintenance and starting the transaction reaper.
+	//
+	// New is a single call from the daemon's point of view, so a startup-timing phase around it
+	// attributes everything it does to one name. When that name was "open-database" and the number
+	// was seconds, it pointed at the catalog open -- which can be a small fraction of it. This lets
+	// the caller report where the time actually went.
+	OnPhase func(name string, d time.Duration)
 	// EncryptedAttrs is the default set of attributes encrypted at rest, in addition to
 	// HTCondor private attributes (which are always encrypted when PoolKeys is set).
 	// Adjustable at runtime by a DAEMON via the encrypt.set meta-command.
@@ -158,6 +167,16 @@ func New(cfg Config) (*Service, error) {
 		defaultTable = dbrpc.DefaultTable
 	}
 
+	// step times each internal step and reports it, when the caller asked for detail.
+	stepStart := time.Now()
+	step := func(name string) {
+		if cfg.OnPhase != nil {
+			now := time.Now()
+			cfg.OnPhase(name, now.Sub(stepStart))
+			stepStart = now
+		}
+	}
+
 	cat, err := db.OpenCatalogConfig(db.CatalogConfig{
 		Dir:            cfg.Dir,
 		PoolKeys:       cfg.PoolKeys,
@@ -166,6 +185,7 @@ func New(cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("server: opening catalog: %w", err)
 	}
+	step("catalog-open")
 	if _, err := cat.EnsureTable(defaultTable); err != nil {
 		_ = cat.Close()
 		return nil, fmt.Errorf("server: ensuring default table: %w", err)
@@ -177,6 +197,8 @@ func New(cfg Config) (*Service, error) {
 		}
 	}
 
+	step("ensure-tables")
+
 	svc := &Service{
 		cat:          cat,
 		rpc:          dbrpc.NewServerCatalog(cat),
@@ -186,6 +208,7 @@ func New(cfg Config) (*Service, error) {
 		logQueries:   cfg.LogQueries,
 		log:          log,
 	}
+	step("rpc-server")
 	// Background self-tuning (index auto-tune + hot-set refresh + dictionary retrain),
 	// unless disabled. Stopped by Close (via rpc.Close).
 	if !cfg.DisableMaintenance {
@@ -199,7 +222,9 @@ func New(cfg Config) (*Service, error) {
 	// cancelled mid-transaction never sends the abort; disconnect cleanup only covers
 	// closed connections). Each orphan holds its buffered ad writes on the heap, so an
 	// unreaped server leaks live heap for the life of the connection. Always on.
+	step("maintenance-start")
 	svc.stopReaper = svc.rpc.StartTxnReaper(time.Minute, 5*time.Minute)
+	step("txn-reaper")
 	return svc, nil
 }
 
