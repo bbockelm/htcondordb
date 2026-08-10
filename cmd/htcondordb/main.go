@@ -264,8 +264,16 @@ func run() error {
 	if _, set := cfg.Get("HTCONDORDB_ARCHIVE_ROTATE_INTERVAL"); !set {
 		rotSecs = 3600
 	}
+	// An archive's compression dictionary is retrained on the same maintenance boundary (default
+	// daily; 0 disables). It is adopted lazily -- new writes use it, existing segments keep reading
+	// on the dictionary they were written under -- so this costs a sample pass, not a reseal.
+	retrainSecs := int(server.DefaultArchiveRetrainInterval / time.Second)
+	if _, set := cfg.Get("HTCONDORDB_ARCHIVE_RETRAIN_INTERVAL"); set {
+		retrainSecs = configInt(cfg, "HTCONDORDB_ARCHIVE_RETRAIN_INTERVAL")
+	}
 	if rotSecs > 0 {
-		go svc.RunPeriodicArchiveMaintenance(ctx, time.Duration(rotSecs)*time.Second)
+		go svc.RunPeriodicArchiveMaintenanceEvery(ctx,
+			time.Duration(rotSecs)*time.Second, time.Duration(retrainSecs)*time.Second)
 	}
 
 	// Schedd-sync mode: mirror a schedd's job_queue.log into a "jobs" table and its

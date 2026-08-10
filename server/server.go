@@ -23,6 +23,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -133,6 +134,13 @@ type Service struct {
 	logQueries   bool
 	log          *slog.Logger
 	stopReaper   func() // stops the idle-transaction reaper; set in New
+
+	// Archive dictionary retrain scheduling (see maybeRetrainArchive). retrainMu guards
+	// lastArchiveRetrain; the interval and seed are written once before the maintenance loop starts.
+	retrainMu           sync.Mutex
+	lastArchiveRetrain  map[string]time.Time
+	archiveRetrainEvery time.Duration
+	archiveRetrainSeed  time.Time
 }
 
 // New opens the table catalog and builds the service. The caller owns the
