@@ -145,7 +145,7 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 			}
 			ad.InsertAttr(p+"SecondsSinceSync", secs)
 		}
-		if s.Kind == "history" {
+		if s.Kind == "history" || s.Kind == "job_epoch" {
 			ad.InsertAttr(p+"Resyncs", s.Resyncs)
 			ad.InsertAttrBool(p+"GapDetected", s.Resyncs > 0)
 			if !s.LastResync.IsZero() {
@@ -211,6 +211,8 @@ func syncPrefix(kind string) string {
 		return "JobQueue"
 	case "history":
 		return "History"
+	case "job_epoch":
+		return "Epoch"
 	default:
 		return ""
 	}
