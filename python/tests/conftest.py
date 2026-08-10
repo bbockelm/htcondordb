@@ -110,6 +110,12 @@ def daemon_address(tmp_path_factory) -> str:
     )
 
     env = dict(os.environ, CONDOR_CONFIG=str(config_file), _CONDOR_TOOL_DEBUG="D_ALWAYS")
+    # The address knobs are read from the environment as well as the configuration, so a
+    # developer with either exported would otherwise redirect this daemon (and the clients
+    # in these tests) away from the session's own config.
+    for knob in ("HTCONDORDB_ADDRESS_FILE", "HTCONDORDB_HOST"):
+        env.pop(knob, None)
+        os.environ.pop(knob, None)
     process = subprocess.Popen(
         [str(daemon_bin), "-listen", f"127.0.0.1:{port}"],
         env=env,

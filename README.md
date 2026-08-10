@@ -188,11 +188,20 @@ inherits the condor config and drops to the condor user.
 
 ## Configuration knobs
 
+`HTCONDORDB_ADDRESS_FILE` and `HTCONDORDB_HOST` are also read from the environment, where
+they take precedence over the configuration (and over each other in the same order). That is
+how a client with no command line -- the Python driver's `connect()` -- is pointed at a
+different daemon. They apply as a pair: setting either in the environment makes the
+environment the only source of both, so overriding just the host cannot lose to a configured
+address file. Every client in the tree resolves through `locate.Daemon`, and the daemon
+publishes to `locate.AddressFilePath`, so a redirect moves both halves together.
+
+
 | Knob | Default | Meaning |
 |------|---------|---------|
 | `HTCONDORDB_DIR` | `$(SPOOL)/htcondordb` | On-disk database directory. |
-| `HTCONDORDB_ADDRESS_FILE` | `$(LOG)/.htcondordb_address` | Where the command address is published. |
-| `HTCONDORDB_HOST` | — | Client fallback when no address file is found. |
+| `HTCONDORDB_ADDRESS_FILE` | `$(LOG)/.htcondordb_address` | Where the command address is published, and where clients look for it. Also read from the environment. |
+| `HTCONDORDB_HOST` | — | Client fallback when no address file is readable. Also read from the environment. |
 | `HTCONDORDB_HA_MODE` | `standalone` | `standalone` / `leader-follower` / `consistent`. |
 | `HTCONDORDB_ROLE` | `leader` | Leader-follower role. |
 | `HTCONDORDB_LEADER` | — | Leader address (follower). |

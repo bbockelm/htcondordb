@@ -30,7 +30,10 @@ import "C"
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"runtime/cgo"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -40,6 +43,7 @@ import (
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/repl"
 
 	"github.com/PelicanPlatform/classad/dbrpc"
@@ -62,6 +66,10 @@ const (
 // executor is not safe for concurrent use, and a caller with several cursors on one
 // connection (the Python driver's normal shape) would otherwise race on that cache.
 type conn struct {
+	// addr is the address actually connected to, which is not necessarily the one the
+	// caller passed: an empty address is resolved from the ambient configuration, and a
+	// caller reporting "connected to ..." needs the answer rather than the blank.
+	addr   string
 	cl     *cedarclient.HTCondorClient
 	dbc    *dbrpc.Client
 	ex     *repl.Executor
@@ -72,13 +80,30 @@ type conn struct {
 
 // openConn dials and authenticates a session, returning the error so callers that can
 // surface a reason (hcdb_connect_err) do, and callers that cannot (hcdb_connect) drop it.
+// resolveAddr passes a caller-supplied address through untouched, and locates the daemon
+// when the caller gave none, the same way htcondordb-cli does with no -addr. A caller should
+// not have to know a port to reach the daemon on its own machine, and an operator should be
+// able to redirect it from the environment; package locate owns both rules for every client
+// in the tree.
+//
+// Resolution happens once per connection. A client that wants to follow a restarted daemon
+// reconnects, which comes back through here and re-reads the address file.
+func resolveAddr(cfg *config.Config, addr string) (string, error) {
+	if strings.TrimSpace(addr) != "" {
+		return addr, nil
+	}
+	return locate.Daemon(cfg)
+}
+
 func openConn(addr string) (*conn, error) {
 	// Run as subsystem TOOL (like C++ command-line clients) so operator config scoped with
 	// a TOOL. prefix (e.g. TOOL.SEC_CLIENT_AUTHENTICATION_METHODS) is honored; a bare
 	// config.New() leaves the subsystem empty and disables <SUBSYS>.PARAM resolution.
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "TOOL"})
 	if err != nil {
-		return nil, err
+		// Name what failed: an unadorned "open /path: no such file" from a connect() call
+		// reads like the driver's own problem rather than a misdirected CONDOR_CONFIG.
+		return nil, fmt.Errorf("reading the HTCondor configuration: %w", err)
 	}
 	sec, err := htcondor.GetSecurityConfig(cfg, command.DBSession, "CLIENT")
 	if err != nil {
@@ -92,16 +117,28 @@ func openConn(addr string) (*conn, error) {
 		sec.Authentication = security.SecurityPreferred
 	}
 
+	// Whether we picked the address rather than the caller: it changes what a failure has
+	// to say, since the caller cannot name an address it never supplied.
+	located := strings.TrimSpace(addr) == ""
+	addr, err = resolveAddr(cfg, addr)
+	if err != nil {
+		return nil, err
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer connCancel()
 	cl, err := cedarclient.ConnectAndAuthenticate(connCtx, addr, sec)
 	if err != nil {
 		cancel()
+		if located {
+			return nil, fmt.Errorf("connecting to %s (located from the configuration): %w", addr, err)
+		}
 		return nil, err
 	}
 	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()))
 	return &conn{
+		addr:   addr,
 		cl:     cl,
 		dbc:    dbc,
 		ex:     repl.NewExecutor(dbc, repl.ExecConfig{}),
@@ -111,7 +148,7 @@ func openConn(addr string) (*conn, error) {
 }
 
 // Opens an authenticated dbrpc session to the htcondordb daemon at addr (a sinful or
-// host:port). The client security policy (pool token / FS / SSL, per configuration) is read
+// host:port), or to the local daemon located from the configuration when addr is empty. The client security policy (pool token / FS / SSL, per configuration) is read
 // from the ambient HTCondor configuration via CONDOR_CONFIG, so the caller supplies only the
 // address -- just like htcondordb-cli. Returns an opaque connection handle, or 0 on error.
 // Release it with hcdb_close.
@@ -219,6 +256,51 @@ func hcdb_close(h C.uintptr_t) {
 	_ = c.cl.Close()
 	c.cancel()
 	cgo.Handle(h).Delete()
+}
+
+// Sets an environment variable inside the library, or removes it when value is NULL.
+// Returns hcdbOK, or hcdbErr for a NULL name.
+//
+// This exists because Go's os package answers Getenv from a copy of the environment made
+// when the library is loaded: a variable the host process sets afterwards -- Python's
+// os.environ["CONDOR_CONFIG"] = ... -- is invisible to the HTCondor configuration parser,
+// which then silently reads the wrong configuration. A host that lets its user change the
+// environment must push those changes in through here before connecting.
+//
+//export hcdb_setenv
+func hcdb_setenv(name *C.char, value *C.char) C.int {
+	if name == nil {
+		return hcdbErr
+	}
+	key := C.GoString(name)
+	if key == "" {
+		return hcdbErr
+	}
+	if value == nil {
+		if err := os.Unsetenv(key); err != nil {
+			return hcdbErr
+		}
+		return hcdbOK
+	}
+	if err := os.Setenv(key, C.GoString(value)); err != nil {
+		return hcdbErr
+	}
+	return hcdbOK
+}
+
+// Writes the address this connection is talking to -- resolved, if the caller passed an
+// empty one -- to *out, a C string the caller frees with hcdb_free. Returns hcdbOK, or
+// hcdbErr with the handle unusable.
+//
+//export hcdb_address
+func hcdb_address(h C.uintptr_t, out **C.char) C.int {
+	c := handleConn(h)
+	if c == nil {
+		*out = nil
+		return hcdbErr
+	}
+	*out = C.CString(c.addr)
+	return hcdbOK
 }
 
 // Frees a string returned by the library (e.g. hcdb_query_next).

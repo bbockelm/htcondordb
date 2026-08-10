@@ -8,10 +8,51 @@ automatically when the daemon binary is not built (see conftest).
 from __future__ import annotations
 
 import datetime
+import os
+from pathlib import Path
 
 import pytest
 
 import htcondordb
+
+
+def variant_config(tmp_path, name, *, address_file=None, host=None):
+    """The live daemon's configuration with the address knobs replaced.
+
+    Reusing the daemon's own config keeps security matching (the tests authenticate over FS);
+    only where the daemon is said to be changes. ``LOG`` is dropped too, so
+    ``$(LOG)/.htcondordb_address`` cannot quietly supply an address the test did not ask for.
+    """
+    lines = [
+        line
+        for line in Path(os.environ["CONDOR_CONFIG"]).read_text().splitlines()
+        if not line.startswith(("HTCONDORDB_ADDRESS_FILE", "HTCONDORDB_HOST", "LOG "))
+    ]
+    if address_file is not None:
+        lines.append(f"HTCONDORDB_ADDRESS_FILE = {address_file}")
+    if host is not None:
+        lines.append(f"HTCONDORDB_HOST = {host}")
+    path = tmp_path / name
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def unreachable_address_file(tmp_path, name="bogus_address"):
+    """An address file naming a port nothing listens on."""
+    path = tmp_path / name
+    path.write_text("127.0.0.1:1\n")
+    return path
+
+
+def round_trip(conn) -> None:
+    """Prove a connection is usable, not merely open, on a table of its own."""
+    name = "pytest_locate_" + os.urandom(4).hex()
+    conn.execute(f"CREATE TABLE {name}").close()
+    try:
+        conn.execute(f"INSERT INTO {name} (Key, Owner) VALUES ('j1', 'alice')").close()
+        assert conn.execute(f"SELECT Owner FROM {name}").fetchone() == ("alice",)
+    finally:
+        conn.execute(f"DROP TABLE {name}").close()
 
 
 class TestConnection:
@@ -44,6 +85,94 @@ class TestConnection:
         with pytest.raises(htcondordb.OperationalError) as excinfo:
             htcondordb.connect("127.0.0.1:1")
         assert "127.0.0.1:1" in str(excinfo.value)
+
+    def test_connect_defaults_to_the_address_file(self, daemon_address):
+        # The point of the default: a report never has to be told a port. The test config
+        # sets HTCONDORDB_ADDRESS_FILE, so an argument-free connect() has to land on the
+        # same daemon and be usable, not merely open.
+        with htcondordb.connect() as conn:
+            assert conn.address == daemon_address
+            round_trip(conn)
+
+    def test_connect_falls_back_to_the_host_knob(
+        self, daemon_address, tmp_path, monkeypatch
+    ):
+        # A daemon on another host publishes no local address file, leaving HTCONDORDB_HOST
+        # as the only way to find it.
+        config = variant_config(tmp_path, "host_only_config", host=daemon_address)
+        monkeypatch.setenv("CONDOR_CONFIG", str(config))
+
+        with htcondordb.connect() as conn:
+            assert conn.address == daemon_address
+            round_trip(conn)
+
+    def test_environment_host_overrides_the_configuration(
+        self, daemon_address, tmp_path, monkeypatch
+    ):
+        # The override that matters: point a report at another pool's daemon with an
+        # environment variable, over a configuration that names a different one. The
+        # configured address file is deliberately readable and wrong -- if the environment
+        # did not win as a pair, this would connect to a dead port instead.
+        config = variant_config(
+            tmp_path,
+            "config_with_other_daemon",
+            address_file=unreachable_address_file(tmp_path),
+        )
+        monkeypatch.setenv("CONDOR_CONFIG", str(config))
+        monkeypatch.setenv("HTCONDORDB_HOST", daemon_address)
+
+        with htcondordb.connect() as conn:
+            assert conn.address == daemon_address
+            round_trip(conn)
+
+    def test_environment_address_file_overrides_the_configuration(
+        self, daemon_address, tmp_path, monkeypatch
+    ):
+        # The same override through the other knob: the environment names the file to read,
+        # and the configuration's own address file is ignored rather than preferred.
+        real_address_file = tmp_path / "real_address"
+        real_address_file.write_text(f"{daemon_address}\n")
+        config = variant_config(
+            tmp_path,
+            "config_with_other_file",
+            address_file=unreachable_address_file(tmp_path),
+        )
+        monkeypatch.setenv("CONDOR_CONFIG", str(config))
+        monkeypatch.setenv("HTCONDORDB_ADDRESS_FILE", str(real_address_file))
+
+        with htcondordb.connect() as conn:
+            assert conn.address == daemon_address
+            round_trip(conn)
+
+    def test_an_environment_override_stops_applying_when_removed(
+        self, daemon_address, tmp_path, monkeypatch
+    ):
+        # An override the process has since dropped must stop being used -- the library
+        # keeps its own copy of the environment, so a stale one would silently outlive it.
+        monkeypatch.setenv("HTCONDORDB_HOST", "127.0.0.1:1")
+        with pytest.raises(htcondordb.OperationalError):
+            htcondordb.connect()
+
+        monkeypatch.delenv("HTCONDORDB_HOST")
+        with htcondordb.connect() as conn:
+            assert conn.address == daemon_address
+
+    def test_unlocatable_daemon_names_the_knobs(
+        self, library_available, tmp_path, monkeypatch
+    ):
+        if not library_available:
+            pytest.skip("shared library not built; run 'make lib'")
+        # With nothing configured the error has to point at the knobs; a bare connection
+        # failure would send the reader hunting for a network problem instead.
+        config = tmp_path / "empty_config"
+        config.write_text("LOG =\n")
+        monkeypatch.setenv("CONDOR_CONFIG", str(config))
+
+        with pytest.raises(htcondordb.OperationalError) as excinfo:
+            htcondordb.connect()
+        message = str(excinfo.value)
+        assert "HTCONDORDB_ADDRESS_FILE" in message
+        assert "HTCONDORDB_HOST" in message
 
     def test_commit_is_a_noop(self, connection):
         connection.commit()  # must not raise: callers commit defensively after writes
