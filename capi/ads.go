@@ -48,6 +48,10 @@ type adCursor struct {
 //
 //export hcdb_sql_ads
 func hcdb_sql_ads(h C.uintptr_t, sql *C.char, err **C.char) C.uintptr_t {
+	return guardHandle("hcdb_sql_ads", err, func() C.uintptr_t { return hcdb_sql_adsImpl(h, sql, err) })
+}
+
+func hcdb_sql_adsImpl(h C.uintptr_t, sql *C.char, err **C.char) C.uintptr_t {
 	c := handleConn(h)
 	if c == nil {
 		*err = C.CString("invalid connection handle")
@@ -104,6 +108,10 @@ func hcdb_sql_ads(h C.uintptr_t, sql *C.char, err **C.char) C.uintptr_t {
 //
 //export hcdb_sql_ads_next
 func hcdb_sql_ads_next(ch C.uintptr_t, out **C.char) C.int {
+	return guardStatus("hcdb_sql_ads_next", out, func() C.int { return hcdb_sql_ads_nextImpl(ch, out) })
+}
+
+func hcdb_sql_ads_nextImpl(ch C.uintptr_t, out **C.char) C.int {
 	cur := handleAdCursor(ch)
 	if cur == nil {
 		*out = C.CString("invalid cursor handle")
@@ -133,6 +141,10 @@ func hcdb_sql_ads_next(ch C.uintptr_t, out **C.char) C.int {
 //
 //export hcdb_sql_ads_free
 func hcdb_sql_ads_free(ch C.uintptr_t) {
+	guardVoid("hcdb_sql_ads_free", func() { hcdb_sql_ads_freeImpl(ch) })
+}
+
+func hcdb_sql_ads_freeImpl(ch C.uintptr_t) {
 	cur := handleAdCursor(ch)
 	if cur == nil {
 		return

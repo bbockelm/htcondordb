@@ -18,7 +18,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 from . import _library
-from ._errors import DatabaseError, InterfaceError, OperationalError, ProgrammingError
+from ._errors import (
+    DatabaseError,
+    InterfaceError,
+    InternalError,
+    OperationalError,
+    ProgrammingError,
+)
 from ._params import bind
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -91,7 +97,10 @@ class AdStream:
         self.close()
         if code == _library.RESULT_MISSING:
             raise StopIteration
-        raise OperationalError(payload or "the ad stream failed with no message")
+        message = payload or "the ad stream failed with no message"
+        if code == _library.RESULT_PANIC:
+            raise InternalError(message)
+        raise OperationalError(message)
 
     # --- lifetime ---
 
@@ -136,8 +145,11 @@ def _classify(reason: str) -> DatabaseError:
     """Map an open failure to an exception.
 
     Opening parses the statement, so the common failures are the caller's: bad SQL, or a
-    statement that is not a SELECT and so has no ads behind it.
+    statement that is not a SELECT and so has no ads behind it. A recovered panic is the
+    exception -- that one is the library's own fault.
     """
+    if _library.is_internal(reason):
+        return InternalError(reason)
     lowered = reason.lower()
     if "only select" in lowered or "unsupported statement" in lowered or "expected" in lowered:
         return ProgrammingError(reason)

@@ -119,6 +119,12 @@ Standard DB-API, with a few things worth knowing:
 | `autocommit` | Defaults to `True` — see [Transactions](#transactions) |
 | `description` | 7-tuples; only `name` and `type_code` are meaningful (ClassAd is dynamically typed) |
 
+**A bug in the library raises; it does not crash.** Every entry point in the C client runs
+inside a `recover()`, so a panic in the Go stack arrives as `InternalError` — carrying the Go
+stack trace, for a bug report — instead of aborting the interpreter with no traceback. Go's
+*unrecoverable* runtime failures (out of memory, `concurrent map writes`) are the exception:
+those still abort, by design in Go.
+
 **Always use placeholders.** The daemon has no server-side bind parameters, so the driver
 renders literals itself — carefully, and with tests — in
 [`_params.py`](htcondordb/_params.py). Formatting values into a statement yourself gives up

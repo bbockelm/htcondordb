@@ -155,6 +155,10 @@ func openConn(addr string) (*conn, error) {
 //
 //export hcdb_connect
 func hcdb_connect(addr *C.char) C.uintptr_t {
+	return guardHandle("hcdb_connect", nil, func() C.uintptr_t { return hcdb_connectImpl(addr) })
+}
+
+func hcdb_connectImpl(addr *C.char) C.uintptr_t {
 	c, err := openConn(C.GoString(addr))
 	if err != nil {
 		return 0
@@ -169,6 +173,10 @@ func hcdb_connect(addr *C.char) C.uintptr_t {
 //
 //export hcdb_connect_err
 func hcdb_connect_err(addr *C.char, err **C.char) C.uintptr_t {
+	return guardHandle("hcdb_connect_err", err, func() C.uintptr_t { return hcdb_connect_errImpl(addr, err) })
+}
+
+func hcdb_connect_errImpl(addr *C.char, err **C.char) C.uintptr_t {
 	c, e := openConn(C.GoString(addr))
 	if e != nil {
 		*err = C.CString(e.Error())
@@ -192,6 +200,18 @@ func handleConn(h C.uintptr_t) (c *conn) {
 	return c
 }
 
+// handleRows resolves a query cursor handle, returning nil rather than panicking on a zero,
+// stale, or wrong-typed one -- including a connection handle passed where a cursor belongs.
+func handleRows(qh C.uintptr_t) (r *rows) {
+	defer func() {
+		if recover() != nil {
+			r = nil
+		}
+	}()
+	r, _ = cgo.Handle(qh).Value().(*rows)
+	return r
+}
+
 // rows is a materialized query result the C side drains with hcdb_query_next.
 type rows struct {
 	ads []string
@@ -205,6 +225,10 @@ type rows struct {
 //
 //export hcdb_query
 func hcdb_query(h C.uintptr_t, table, constraint *C.char) C.uintptr_t {
+	return guardHandle("hcdb_query", nil, func() C.uintptr_t { return hcdb_queryImpl(h, table, constraint) })
+}
+
+func hcdb_queryImpl(h C.uintptr_t, table, constraint *C.char) C.uintptr_t {
 	c := handleConn(h)
 	if c == nil {
 		return 0
@@ -229,7 +253,15 @@ func hcdb_query(h C.uintptr_t, table, constraint *C.char) C.uintptr_t {
 //
 //export hcdb_query_next
 func hcdb_query_next(qh C.uintptr_t, out **C.char) C.int {
-	r := cgo.Handle(qh).Value().(*rows)
+	return guardStatus("hcdb_query_next", out, func() C.int { return hcdb_query_nextImpl(qh, out) })
+}
+
+func hcdb_query_nextImpl(qh C.uintptr_t, out **C.char) C.int {
+	r := handleRows(qh)
+	if r == nil {
+		*out = C.CString("invalid cursor handle")
+		return hcdbErr
+	}
 	if r.i >= len(r.ads) {
 		*out = nil
 		return hcdbMissing
@@ -242,12 +274,27 @@ func hcdb_query_next(qh C.uintptr_t, out **C.char) C.int {
 // Frees a query cursor handle.
 //
 //export hcdb_query_free
-func hcdb_query_free(qh C.uintptr_t) { cgo.Handle(qh).Delete() }
+func hcdb_query_free(qh C.uintptr_t) {
+	guardVoid("hcdb_query_free", func() { hcdb_query_freeImpl(qh) })
+}
+
+func hcdb_query_freeImpl(qh C.uintptr_t) {
+	// Resolve before deleting: Delete panics on a handle that was never valid or has already
+	// been freed, and freeing twice is the most ordinary mistake a caller can make.
+	if handleRows(qh) == nil {
+		return
+	}
+	cgo.Handle(qh).Delete()
+}
 
 // Closes the dbrpc session and the underlying CEDAR connection, and frees the handle.
 //
 //export hcdb_close
 func hcdb_close(h C.uintptr_t) {
+	guardVoid("hcdb_close", func() { hcdb_closeImpl(h) })
+}
+
+func hcdb_closeImpl(h C.uintptr_t) {
 	c := handleConn(h)
 	if c == nil {
 		return // already closed, or never valid: closing twice is not an error
@@ -269,6 +316,10 @@ func hcdb_close(h C.uintptr_t) {
 //
 //export hcdb_setenv
 func hcdb_setenv(name *C.char, value *C.char) C.int {
+	return guardStatus("hcdb_setenv", nil, func() C.int { return hcdb_setenvImpl(name, value) })
+}
+
+func hcdb_setenvImpl(name *C.char, value *C.char) C.int {
 	if name == nil {
 		return hcdbErr
 	}
@@ -294,6 +345,10 @@ func hcdb_setenv(name *C.char, value *C.char) C.int {
 //
 //export hcdb_address
 func hcdb_address(h C.uintptr_t, out **C.char) C.int {
+	return guardStatus("hcdb_address", out, func() C.int { return hcdb_addressImpl(h, out) })
+}
+
+func hcdb_addressImpl(h C.uintptr_t, out **C.char) C.int {
 	c := handleConn(h)
 	if c == nil {
 		*out = nil
@@ -304,6 +359,10 @@ func hcdb_address(h C.uintptr_t, out **C.char) C.int {
 }
 
 // Frees a string returned by the library (e.g. hcdb_query_next).
+//
+// The one entry point with no panic guard, because there is nothing for one to catch: passing
+// a pointer this library did not allocate is undefined behaviour in C's allocator, not a Go
+// panic, and no amount of recover() makes it safe.
 //
 //export hcdb_free
 func hcdb_free(p *C.char) { C.free(unsafe.Pointer(p)) }

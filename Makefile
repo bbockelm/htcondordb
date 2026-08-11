@@ -27,7 +27,7 @@ GO    ?= go
 LIB_EXT ?= $(if $(filter Darwin,$(shell uname -s)),dylib,so)
 LIB     := $(BIN_DIR)/libhtcondordb_client.$(LIB_EXT)
 
-.PHONY: all build daemon cli lib archive python-test wheel wheel-macos wheel-linux wheel-validate wheel-clean test vet tidy clean version
+.PHONY: all build daemon cli lib lib-check-linux archive python-test wheel wheel-macos wheel-linux wheel-validate wheel-clean test vet tidy clean version
 
 all: build
 
@@ -41,6 +41,14 @@ cli: ## Build the htcondordb-cli shell/loader
 
 lib: ## Build the C client as a shared library (for the Python driver / dlopen callers)
 	$(GOENV) $(GO) build -buildmode=c-shared -ldflags '$(LDFLAGS)' -o $(LIB) ./capi
+
+lib-check-linux: ## Compile the C client for Linux in a container (catches macOS-only cgo)
+	# cgo headers differ: glibc does not pull stdint.h in via stdlib.h the way macOS does, so a
+	# missing include in a capi preamble builds clean on a Mac and fails only in CI. This is the
+	# same check without the round trip. Needs docker; the module cache is shared read-only.
+	docker run --rm -v "$(CURDIR)":/src:ro -v "$$(go env GOMODCACHE)":/gomod:ro -w /src \
+		-e GOWORK=off -e GOFLAGS=-mod=mod -e GOPROXY=off -e GOMODCACHE=/gomod \
+		golang:1.25 go build -buildmode=c-shared -o /tmp/libhtcondordb_client.so ./capi
 
 archive: ## Build the C client as a static archive (for C/C++ callers to link)
 	$(GOENV) $(GO) build -buildmode=c-archive -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/libhtcondordb_client.a ./capi
