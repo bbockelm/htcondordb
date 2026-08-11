@@ -355,6 +355,18 @@ func fmtDur(d time.Duration) string {
 // showOpStats prints the cumulative operational timing counters -- where the store
 // spent time blocked in, or holding, each stall point -- so an operator can see what
 // is "blocking the world" (long shard-write holds, slow syncs, expensive maintenance).
+//
+// "commit (durability)" is the only row whose Count is a number of COMMITS. Every other
+// row counts an internal event: shard write wait/hold count write-lock acquisitions, and
+// sync counts per-shard msyncs, so a commit spanning several shards contributes several
+// syncs and a group-coalesced batch of commits contributes ONE. Without the commit row
+// there is no way to tell 97k commits with no batching apart from 12k commits fanning out
+// over 8 shards -- the counts look identical either way, which is exactly the question an
+// operator asks of these numbers.
+//
+// It is only recorded for the transactional path (Begin/Commit). A bare Put goes through
+// the shard's group-commit queue and never reports it, so a Put-only workload shows n=0
+// here while still producing syncs.
 func showOpStats(w io.Writer, o db.OpStats) {
 	rows := []struct {
 		label string
@@ -363,6 +375,7 @@ func showOpStats(w io.Writer, o db.OpStats) {
 		{"shard write wait", o.ShardWriteWait},
 		{"shard write hold", o.ShardWriteHold},
 		{"segment alloc", o.SegmentAlloc},
+		{"commit (durability)", o.CommitSync},
 		{"sync (msync)", o.Sync},
 		{"compact", o.Compact},
 		{"retrain", o.Retrain},
@@ -371,6 +384,9 @@ func showOpStats(w io.Writer, o db.OpStats) {
 	}
 	fmt.Fprintln(w, "operational timings (cumulative):")
 	for _, r := range rows {
+		if r.label == "commit (durability)" && r.s.Count == 0 {
+			continue // not a transactional workload; the row would only mislead
+		}
 		mean := time.Duration(0)
 		if r.s.Count > 0 {
 			mean = time.Duration(r.s.Nanos / r.s.Count)
@@ -385,6 +401,14 @@ func showOpStats(w io.Writer, o db.OpStats) {
 				fmt.Fprintf(w, "  %17s %s\n", "", line)
 			}
 		}
+	}
+	// The ratio the two rows exist to be read together: how many shard msyncs each commit
+	// costs. It is the commit's shard fan-out, and it is what says whether the durability
+	// work is amortized across a commit's writes or paid per shard on every one.
+	if o.CommitSync.Count > 0 && o.Sync.Count > 0 {
+		fmt.Fprintf(w, "  %-17s %.1f msync(s) per commit (%d syncs / %d commits)\n",
+			"durability ratio", float64(o.Sync.Count)/float64(o.CommitSync.Count),
+			o.Sync.Count, o.CommitSync.Count)
 	}
 }
 
