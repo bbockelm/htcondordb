@@ -76,6 +76,8 @@ class Connection:
         handle = lib.hcdb_connect_err((address or "").encode("utf-8"), err)
         if handle == 0:
             reason = self._lib.string(err[0]) or "unknown error"
+            if _library.is_internal(reason):
+                raise _errors.InternalError(reason)
             if address:
                 raise OperationalError(f"connecting to {address}: {reason}")
             # No prefix here: with no address to name, the library's own message is the

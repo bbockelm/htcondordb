@@ -88,6 +88,10 @@ type sqlResult struct {
 //
 //export hcdb_sql
 func hcdb_sql(h C.uintptr_t, sql *C.char, opts C.int, out **C.char) C.int {
+	return guardStatus("hcdb_sql", out, func() C.int { return hcdb_sqlImpl(h, sql, opts, out) })
+}
+
+func hcdb_sqlImpl(h C.uintptr_t, sql *C.char, opts C.int, out **C.char) C.int {
 	c := handleConn(h)
 	if c == nil {
 		*out = C.CString("invalid connection handle")

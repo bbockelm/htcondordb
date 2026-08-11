@@ -49,6 +49,10 @@ type adWriteResponse struct {
 //
 //export hcdb_write_ads
 func hcdb_write_ads(h C.uintptr_t, req *C.char, out **C.char) C.int {
+	return guardStatus("hcdb_write_ads", out, func() C.int { return hcdb_write_adsImpl(h, req, out) })
+}
+
+func hcdb_write_adsImpl(h C.uintptr_t, req *C.char, out **C.char) C.int {
 	c := handleConn(h)
 	if c == nil {
 		*out = C.CString("invalid connection handle")
