@@ -1,7 +1,6 @@
 package repl
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -51,7 +50,7 @@ func (e *Executor) queryAdsWire(table, where string, attrs []string, limit int) 
 	var rowErr error
 	// redact=false leaves the private-attribute decision to the connection's privilege,
 	// exactly as the text row streams do.
-	err := e.c.QueryRawWireStream(context.Background(), table, constraint(where), attrs, limit, false,
+	err := e.c.QueryRawWireStream(e.opCtx(), table, constraint(where), attrs, limit, false,
 		func(row []byte) bool {
 			// The row aliases the transport's frame buffer and is only valid until this
 			// returns; the decode copies everything it keeps.

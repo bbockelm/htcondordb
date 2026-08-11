@@ -64,6 +64,9 @@ class AdStream:
         self._lib = connection._lib
         self._handle = 0
         self._exhausted = False
+        # Ads already pulled from the library but not yet handed out. Empty in normal use;
+        # filled when the connection needs its executor lock back (see _settle).
+        self._pending: list = []
 
         connection._check_open()
         ffi, lib = self._lib.ffi, self._lib.lib
@@ -73,6 +76,8 @@ class AdStream:
             reason = self._lib.string(err[0]) or "unknown error"
             raise _classify(reason)
         self._handle = handle
+        # A live stream holds the connection's executor lock until it is drained or closed.
+        connection._note_stream(self)
 
     # --- iteration ---
 
@@ -80,6 +85,18 @@ class AdStream:
         return self
 
     def __next__(self):
+        # Anything already pulled comes first, so a stream that had to be settled keeps handing
+        # out the same ads in the same order.
+        if self._pending:
+            return self._pending.pop(0)
+        return self._next_from_library()
+
+    def _next_from_library(self):
+        """Pull the next ad from the library, bypassing the buffer.
+
+        Raises ``StopIteration`` when the stream is exhausted, which is what makes this usable
+        both from :meth:`__next__` and from :meth:`_settle`.
+        """
         if self._exhausted:
             raise StopIteration
         if self._handle == 0:
@@ -105,11 +122,34 @@ class AdStream:
     # --- lifetime ---
 
     def close(self) -> None:
-        """Stop the stream and release it. Closing twice is not an error."""
+        """Stop the stream and release it. Closing twice is not an error.
+
+        Ads already pulled but not yet handed out stay available: closing gives up the server
+        side, it does not discard rows the caller has not seen.
+        """
         self._exhausted = True
+        self._connection._forget_stream(self)
         if self._handle != 0:
             handle, self._handle = self._handle, 0
             self._lib.lib.hcdb_sql_ads_free(handle)
+
+    def _settle(self) -> None:
+        """Give up the connection's executor lock by pulling the rest of the stream into memory.
+
+        Called when another statement needs the connection. Iteration continues from the buffer
+        afterwards, so the caller sees the same ads in the same order -- it costs the memory the
+        stream was there to avoid, which is why it only happens when something else needs the
+        connection.
+        """
+        if self._handle == 0:
+            return
+        while True:
+            try:
+                self._pending.append(self._next_from_library())
+            except StopIteration:
+                break
+
+
 
     def __enter__(self) -> "AdStream":
         return self

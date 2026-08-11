@@ -65,6 +65,7 @@ from ._types import (
     Timestamp,
     TimestampFromTicks,
 )
+from ._mappings import MappingStream
 from .adstream import AdStream
 from .adwrite import AdReject, WriteResult
 from .connection import Connection
@@ -104,8 +105,38 @@ threadsafety = 2
 paramstyle = "qmark"
 
 
+def set_log_level(level: str | None) -> None:
+    """Set where the library logs and how much: ``off``, ``error``, ``warn``, ``info``, ``debug``.
+
+    Off by default. The transport and security code underneath logs through Go's ``slog``, and a
+    library embedded in someone else's process should not write to their stderr unasked -- every
+    connect would otherwise print several lines of session negotiation into a report's output.
+    Nothing is lost by that default: failures reach the caller as exceptions, which is what the
+    log would only be duplicating.
+
+    ``HTCONDORDB_LOG_LEVEL`` does the same thing without a code change, and is read at the first
+    connection.
+
+    Output goes to stderr -- the one destination a C caller and a Python caller agree on.
+    Capture it if you want it elsewhere.
+
+    Raises:
+        ValueError: for a name that is not one of the five (the library goes quiet either way).
+        InterfaceError: if the shared library could not be loaded.
+    """
+    lib = _library.load()
+    name = (level or "off").encode("utf-8")
+    if lib.lib.hcdb_set_log_level(name) != _library.RESULT_OK:
+        raise ValueError(
+            f"unknown log level {level!r}; expected off, error, warn, info or debug"
+        )
+
+
 def connect(
-    address: str | None = None, autocommit: bool = True, **kwargs
+    address: str | None = None,
+    autocommit: bool = True,
+    timeout: float | None = None,
+    **kwargs,
 ) -> Connection:
     """Open an authenticated session with an htcondordb daemon.
 
@@ -125,6 +156,12 @@ def connect(
             :meth:`~htcondordb.connection.Connection.commit`. See
             :class:`~htcondordb.connection.Connection` for the two constraints a
             transaction carries -- reads do not join it, and it cannot span tables.
+
+        timeout: Seconds a query may run before it fails, or ``None`` (the default) for no
+            limit. Also settable later as
+            :attr:`Connection.timeout <htcondordb.connection.Connection.timeout>`. Queries only
+            -- a write is deliberately not bounded, because cancelling one mid-flight can leave a
+            transaction open on the server.
 
     Returns:
         A :class:`~htcondordb.connection.Connection`.
@@ -146,7 +183,7 @@ def connect(
             "Credentials come from the HTCondor configuration (CONDOR_CONFIG), not from "
             "connect() arguments."
         )
-    return Connection(address, autocommit=autocommit)
+    return Connection(address, autocommit=autocommit, timeout=timeout)
 
 
 __all__ = [
@@ -186,7 +223,9 @@ __all__ = [
     "AdReject",
     "WriteResult",
     "AdStream",
+    "MappingStream",
     "LIBRARY_ENV",
     "library_path",
+    "set_log_level",
     "__version__",
 ]

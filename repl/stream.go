@@ -1,7 +1,6 @@
 package repl
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -56,7 +55,7 @@ func (e *Executor) StreamSelect(st *Statement, yield func(*classad.ClassAd) bool
 		return limit <= 0 || n < limit
 	}
 
-	ctx := context.Background()
+	ctx := e.opCtx()
 	// Inside a transaction, stream through it so the caller sees its own uncommitted
 	// writes -- the same rule the row-returning path follows. The transactional read op
 	// has no projected variant, so a transaction gets whole ads; the projection is an

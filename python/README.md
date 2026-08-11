@@ -53,10 +53,61 @@ reimplements none of it and inherits new SQL features as the daemon gains them.
 Python  ->  cffi (ABI mode, dlopen)  ->  libhtcondordb_client  ->  CEDAR  ->  htcondordb
 ```
 
-`hcdb_sql` runs one statement and returns a JSON result document; the driver decodes it into
-rows. Cell types are recovered on the Go side from the underlying ClassAd values where they
-exist, so a string attribute whose text happens to be `0042` comes back as `"0042"`, not
-`42`.
+`hcdb_sql_stream` runs one statement and returns a header (columns, and for DML the affected
+count) plus rows in batches the driver asks for. Cell types are recovered on the Go side from
+the underlying ClassAd values, so a string attribute whose text happens to be `0042` comes back
+as `"0042"`, not `42`.
+
+## Large results
+
+Rows arrive in batches as they are fetched, so iterating a cursor costs memory proportional to a
+batch rather than to the result:
+
+```python
+for owner, mem in conn.execute("SELECT Owner, RequestMemory FROM jobs"):
+    ...                      # one batch in flight, whatever the table's size
+```
+
+`cursor.itersize` (default 1000) sets how many rows a batch asks for. It is separate from
+PEP 249's `arraysize`, which defaults to 1 — a batch of one row would spend a call across the
+language boundary per row and undo the point.
+
+Three things follow, all of them worth knowing before a large query:
+
+| | |
+|---|---|
+| `fetchall()` materializes | It hands back everything, by definition. Iterate instead to keep a large result out of memory. |
+| `rowcount` counts what you fetched | For a SELECT it is `-1` before the first fetch and grows as rows arrive, because the total is not known until the result is exhausted. PEP 249 allows this and `sqlite3` does the same. For DML it is the affected count, unchanged. |
+| Some shapes cannot stream *as tuples* | `SELECT *` needs its column list before row 1, and that list is the union of every matched ad's attributes — see `conn.mappings()` below, which streams it. Aggregates, `GROUP BY` and window functions cannot stream in any row shape: their rows are synthesized from groups rather than read from ads. Those run whole and are served from memory; the rows are identical, only the memory differs. |
+
+**Name your columns.** `SELECT Owner, RequestMemory FROM jobs` streams *and* pushes a
+projection to the server, so only those attributes cross the wire. `SELECT *` does neither.
+
+### Streaming `SELECT *`: `conn.mappings()`
+
+A tuple result has to know its columns before the first row. `SELECT *` does not — its column
+list is the union of every matched ad's attributes, and ClassAds are schemaless, so row 2 may
+carry an attribute row 1 lacks. Keyed rows need no column list at all, so this streams:
+
+```python
+for row in conn.mappings("SELECT * FROM jobs WHERE Owner = ?", ("alice",)):
+    print(row["Owner"], row.get("RequestMemory"))
+```
+
+Each row is a `dict` of exactly that ad's attributes — nothing is padded to a union, and a wide
+or ragged result costs one batch rather than the whole table. It takes `itersize`, is a context
+manager, and reports `stream.streamed`.
+
+Values are **evaluated**, so an attribute holding an expression arrives as what it evaluates to.
+`conn.ads()` is the path that preserves expressions (`ad.lookup("Requirements")`), at the cost of
+needing HTCondor's `classad2` bindings; `mappings()` needs nothing beyond the driver.
+
+Aggregates and `GROUP BY` are still computed whole here — that limit is about synthesizing rows,
+not about their shape — but they do come back as dicts.
+
+An unfinished statement holds the daemon's per-connection executor lock, so starting another one
+on the same connection first drains the open one into memory. Two cursors on one connection stay
+correct; interleaving them just gives up the memory win.
 
 ## Installing
 
@@ -92,6 +143,37 @@ then the repo's `bin/`, then the loader's own path.
 Those have Linux wheels but no macOS distribution, so on a Mac that path needs a local
 HTCondor build; everything else works either way.
 
+## Timeouts, logging, threads
+
+**A query can be bounded in time.** Nothing was stopping a report from hanging forever:
+
+```python
+conn = htcondordb.connect(timeout=60)     # or conn.timeout = 60 at any point
+```
+
+A query that exceeds it raises `OperationalError` naming the timeout. Each statement takes the
+value current when it starts, so the attribute doubles as a per-statement limit.
+
+Two deliberate gaps. **Writes are not bounded** — cancelling one mid-flight can leave a
+transaction open on the server, which trades a hang for a worse problem. And a timeout does not
+make Ctrl-C work during a blocking fetch: cffi releases the GIL, so Python defers the signal
+until the call returns. The timeout is what keeps that bounded.
+
+**The library is quiet by default.** The transport and security code underneath logs through Go's
+`slog`, and used to print several lines of session negotiation into your stderr on every connect.
+It now logs nothing unless asked:
+
+```python
+htcondordb.set_log_level("info")          # off, error, warn, info, debug
+```
+
+`HTCONDORDB_LOG_LEVEL` does the same without a code change. Nothing is lost by the default:
+failures arrive as exceptions, which is all the log was duplicating.
+
+**Threads may share a connection** (`threadsafety = 2`) and will queue behind each other — the
+driver holds the connection's lock across every operation that reaches the library. A single
+*cursor* is not shareable: two threads fetching from one row buffer would interleave.
+
 ## Authentication
 
 There are no credential arguments to `connect()`. HTCondor's security configuration is
@@ -117,7 +199,9 @@ Standard DB-API, with a few things worth knowing:
 | `paramstyle` | `qmark` — `?` placeholders, positional |
 | `threadsafety` | `2` — connections are shareable across threads, cursors are not |
 | `autocommit` | Defaults to `True` — see [Transactions](#transactions) |
-| `description` | 7-tuples; only `name` and `type_code` are meaningful (ClassAd is dynamically typed) |
+| `description` | 7-tuples; only `name` and `type_code` are meaningful (ClassAd is dynamically typed). Reading it fetches the first batch, since a type can only come from data |
+| `rowcount` | For a SELECT, the rows fetched so far (`-1` before the first fetch); for DML, the affected count |
+| `itersize` | Rows per batch, default 1000 (extension; `arraysize` stays PEP 249's default of 1) |
 
 **A bug in the library raises; it does not crash.** Every entry point in the C client runs
 inside a `recover()`, so a panic in the Go stack arrives as `InternalError` — carrying the Go

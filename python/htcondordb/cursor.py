@@ -14,6 +14,7 @@ from ._errors import (
     ProgrammingError,
 )
 from ._params import bind
+from ._stream import RowStream
 from ._types import BINARY, DATETIME, NUMBER, STRING, ROWID  # noqa: F401 - re-exported
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -23,9 +24,23 @@ if TYPE_CHECKING:  # pragma: no cover
 class Cursor:
     """Runs statements and holds their results.
 
-    A statement's whole result is materialized when :meth:`execute` returns -- the daemon's
-    SQL executor builds it in full before replying, so there is nothing to gain from
-    fetching lazily. Bound the size with ``LIMIT`` when a query could match a lot of rows.
+    Rows arrive in batches as they are fetched, so walking a large table costs memory
+    proportional to a batch rather than to the result. :attr:`itersize` sets how many rows a
+    batch asks for.
+
+    Two consequences worth knowing:
+
+    * ``rowcount`` counts the rows fetched *so far* for a SELECT, and is ``-1`` before the
+      first fetch, because the total is not known until the result is exhausted. PEP 249
+      allows this and ``sqlite3`` behaves the same way. For DML it is the affected count, as
+      before.
+    * A SELECT whose rows cannot be produced one at a time -- ``SELECT *``, an aggregate, a
+      ``GROUP BY``, a window function -- is still run whole by the daemon and then served
+      from memory. Only the memory differs; the rows do not.
+
+    While a streaming statement is unfinished it holds the connection's executor lock, so
+    starting another statement on the same connection first drains this one into memory. Two
+    cursors on one connection stay correct; interleaving them just gives up the memory win.
     """
 
     def __init__(self, connection: "Connection") -> None:
@@ -33,12 +48,18 @@ class Cursor:
         self._rows: list[tuple] = []
         self._ads: list[str] = []
         self._position = 0
-        self._description: tuple | None = None
+        self._columns: list[str] | None = None
         self._rowcount = -1
         self._closed = False
         self._include_ads = False
+        self._stream: RowStream | None = None
+        self._streamed = False
         #: PEP 249: the number of rows :meth:`fetchmany` returns by default.
         self.arraysize = 1
+        #: How many rows a batch asks the library for. Independent of :attr:`arraysize`,
+        #: which PEP 249 defaults to 1 -- a batch size of one row would spend a call across
+        #: the language boundary per row and undo the point of fetching in batches.
+        self.itersize = 1000
 
     # --- PEP 249 attributes ---
 
@@ -51,8 +72,20 @@ class Cursor:
         meaningful: ClassAd attributes are dynamically typed and columns have no declared
         width or nullability. ``type_code`` is inferred from the first non-null value in
         the column, and is ``None`` for a column that is null all the way down.
+
+        Reading this fetches the first batch of a result nothing has been fetched from yet:
+        the column *names* come from the statement, but a type can only come from data, and
+        rows now arrive lazily. The rows are buffered, not consumed -- fetching still returns
+        them all.
         """
-        return self._description
+        if self._columns is None:
+            return None
+        if not self._rows and self._stream is not None:
+            self._buffer(1)
+        return tuple(
+            (name, _column_type(self._rows, index), None, None, None, None, None)
+            for index, name in enumerate(self._columns)
+        )
 
     @property
     def rowcount(self) -> int:
@@ -71,10 +104,11 @@ class Cursor:
 
     def close(self) -> None:
         """Release the cursor. Closing twice is not an error."""
-        if self._closed:
-            return
-        self._closed = True
-        self._reset()
+        with self._connection._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._reset()
         self._connection._forget(self)
 
     def execute(self, operation: str, parameters: Sequence[Any] | None = None) -> "Cursor":
@@ -99,9 +133,28 @@ class Cursor:
         self._check_open()
         self._reset()
 
-        statement = bind(operation, parameters)
-        document = self._call_sql(statement)
-        self._load(document)
+        return self._run(bind(operation, parameters), objects=False)
+
+    def _run(self, statement: str, objects: bool) -> "Cursor":
+        """Open a stream for an already-bound statement.
+
+        The keyed-row path (``objects``) is how Connection.mappings streams a ``SELECT *``; it
+        reuses everything here -- batching, settling, cleanup -- and differs only in the shape
+        each row arrives in.
+        """
+        # Under the connection's lock for the whole operation: settling another cursor mutates
+        # that cursor's row buffer, so a concurrent fetch on it would interleave.
+        with self._connection._lock:
+            # Another unfinished statement on this connection holds the executor lock, so settle
+            # it first. Without this, two live cursors on one connection deadlock.
+            self._connection._settle_streams()
+            stream = RowStream(
+                self._connection,
+                statement,
+                objects=objects,
+                timeout=self._connection.timeout,
+            )
+            self._load_header(stream)
         return self
 
     def executemany(
@@ -137,28 +190,41 @@ class Cursor:
         """Return the next row, or ``None`` when the result is exhausted."""
         self._check_open()
         self._check_results()
-        if self._position >= len(self._rows):
+        if not self._buffer(1):
             return None
         row = self._rows[self._position]
         self._position += 1
         return row
 
     def fetchmany(self, size: int | None = None) -> list[tuple]:
-        """Return up to *size* rows (default :attr:`arraysize`)."""
+        """Return up to *size* rows (default :attr:`arraysize`).
+
+        Fewer than *size* rows means the result is exhausted: the batching underneath is not
+        visible here.
+        """
         self._check_open()
         self._check_results()
         if size is None:
             size = self.arraysize
         if size <= 0:
             return []
+        with self._connection._lock:
+            while self._buffered_rows() < size:
+                if not self._fill(size):
+                    break
         rows = self._rows[self._position : self._position + size]
         self._position += len(rows)
         return rows
 
     def fetchall(self) -> list[tuple]:
-        """Return every remaining row."""
+        """Return every remaining row.
+
+        This materializes what is left, which is what the caller asked for -- iterate the
+        cursor instead to keep a large result out of memory.
+        """
         self._check_open()
         self._check_results()
+        self._drain()
         rows = self._rows[self._position :]
         self._position = len(self._rows)
         return rows
@@ -238,7 +304,12 @@ class Cursor:
         self.close()
 
     def __repr__(self) -> str:
-        state = "closed" if self._closed else f"{len(self._rows)} row(s)"
+        if self._closed:
+            state = "closed"
+        elif self._stream is not None and not self._stream.exhausted:
+            state = f"{len(self._rows)} row(s) fetched, more pending"
+        else:
+            state = f"{len(self._rows)} row(s)"
         return f"<htcondordb.Cursor [{state}]>"
 
     # --- internals ---
@@ -250,15 +321,107 @@ class Cursor:
 
     def _check_results(self) -> None:
         """PEP 249 requires a fetch before any execute to raise."""
-        if self._description is None and self._rowcount == -1:
+        if self._columns is None and self._rowcount == -1 and self._stream is None:
             raise ProgrammingError("no statement has been executed on this cursor")
 
     def _reset(self) -> None:
+        # Release any unfinished stream first: it holds the connection's executor lock, and
+        # dropping the reference without freeing the handle would strand both.
+        if self._stream is not None:
+            stream, self._stream = self._stream, None
+            self._connection._forget_stream(self)
+            stream.close()
         self._rows = []
         self._ads = []
         self._position = 0
-        self._description = None
+        self._columns = None
         self._rowcount = -1
+        self._streamed = False
+
+    def _load_header(self, stream: RowStream) -> None:
+        """Take the result header, leaving the rows to be fetched."""
+        header = stream.header
+        self._connection._note_transaction_state(bool(header.get("in_transaction", False)))
+        self._streamed = bool(header.get("streamed", False))
+
+        if not header.get("select", False):
+            # DML/DDL: nothing to fetch, and rowcount is what was written.
+            self._rowcount = int(header.get("affected", 0))
+            stream.close()
+            return
+
+        self._columns = list(header.get("columns", []))
+        self._stream = stream
+        if stream.streaming:
+            # Registered only while it holds the lock, so the connection knows what to settle.
+            self._connection._note_stream(self)
+
+    def _buffered_rows(self) -> int:
+        return len(self._rows) - self._position
+
+    def _fill(self, minimum: int = 1) -> bool:
+        """Pull one more batch into the buffer; return whether it added any rows.
+
+        Asks for whole batches rather than exactly what was requested: a batch is one call
+        across the language boundary and one JSON decode, so a caller taking rows one at a time
+        still pays for them a thousand at a time.
+        """
+        if self._stream is None:
+            return False
+        with self._connection._lock:
+            if self._stream is None:  # settled by another thread while we waited
+                return False
+            rows = self._stream.next_batch(max(minimum, self.itersize))
+            if not rows:
+                self._finish_stream()
+                return False
+            self._rows.extend(rows)
+            self._rowcount = max(self._rowcount, 0) + len(rows)
+            if self._stream.exhausted:
+                self._finish_stream()
+            return True
+
+    def _buffer(self, minimum: int) -> bool:
+        """Ensure at least one unread row is buffered; return whether one is available.
+
+        Distinct from :meth:`_fill` on purpose: asking "is a row available" and asking "fetch
+        more" are different questions, and answering the first with the second is how a fetch
+        loop spins forever.
+
+        Check-and-fill runs under the connection's lock because it has to be atomic. Another
+        thread starting a statement settles this cursor -- filling its buffer and clearing its
+        stream -- so a fill that added nothing can mean "someone else already did it", and
+        treating that as "no rows" ends iteration with rows still in hand.
+        """
+        with self._connection._lock:
+            while self._buffered_rows() == 0:
+                if not self._fill(minimum):
+                    return False
+            return True
+
+    def _drain(self) -> None:
+        """Fetch everything that is left into the buffer."""
+        while self._fill(self.itersize):
+            pass
+
+    def _finish_stream(self) -> None:
+        """The stream is over: stop tracking it, and settle rowcount at the true total."""
+        if self._stream is None:
+            return
+        self._stream.close()
+        self._stream = None
+        self._connection._forget_stream(self)
+        if self._rowcount < 0:
+            self._rowcount = 0
+
+    def _settle(self) -> None:
+        """Give up the executor lock by pulling the rest of the result into memory.
+
+        Called when another statement needs the connection. The rows are all still here, so the
+        caller sees no difference beyond the memory this costs.
+        """
+        if self._stream is not None:
+            self._drain()
 
     def _call_sql(self, statement: str) -> dict:
         """Run *statement* through the C library and decode its JSON result document."""
@@ -312,10 +475,7 @@ class Cursor:
         self._rows = [tuple(row) for row in rows]
         self._ads = list(document.get("ads") or [])
         self._rowcount = len(self._rows)
-        self._description = tuple(
-            (name, _column_type(self._rows, index), None, None, None, None, None)
-            for index, name in enumerate(columns)
-        )
+        self._columns = list(columns)
 
 
 def _column_type(rows: Sequence[Sequence[Any]], index: int) -> Any:

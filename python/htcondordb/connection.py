@@ -16,16 +16,19 @@ from ._errors import (
 from .cursor import Cursor
 
 if TYPE_CHECKING:  # pragma: no cover
+    from ._mappings import MappingStream
     from .adstream import AdStream
 
 
 class Connection:
     """An authenticated session with an htcondordb daemon.
 
-    Build one with :func:`htcondordb.connect`. The connection owns a single CEDAR stream,
-    so statements on it are serialized (in the C library, which holds a lock for the
-    duration of each one); cursors on the same connection are safe to use from several
-    threads, but they will not run concurrently.
+    Build one with :func:`htcondordb.connect`. The connection owns a single CEDAR stream, so
+    statements on it are serialized: the driver holds this connection's lock for the duration of
+    every operation that reaches the library, and the library holds its own for each statement.
+    Threads may share a connection (PEP 249 ``threadsafety = 2``) and will queue behind each
+    other; a single *cursor* is not safe to share, because two threads fetching from one row
+    buffer would interleave.
 
     **Transactions.** The connection starts in autocommit mode, where each statement
     commits as it runs, :meth:`commit` is a no-op, and :meth:`rollback` raises. Setting
@@ -58,10 +61,22 @@ class Connection:
     ProgrammingError = _errors.ProgrammingError
     NotSupportedError = _errors.NotSupportedError
 
-    def __init__(self, address: str | None = None, autocommit: bool = True) -> None:
+    def __init__(
+        self,
+        address: str | None = None,
+        autocommit: bool = True,
+        timeout: float | None = None,
+    ) -> None:
         self._lib = _library.load()
-        self._lock = threading.Lock()
+        # Reentrant, and held across every operation that touches the library or this
+        # connection's state -- see the class docstring on what threadsafety = 2 means here.
+        # Reentrant because the paths nest: execute -> settle another cursor -> its fetch.
+        self._lock = threading.RLock()
+        self._timeout = timeout
         self._cursors: set[Cursor] = set()
+        # Holders of an unfinished server-side stream. Each keeps the connection's executor
+        # lock until drained, so anything else on this connection has to settle them first.
+        self._live_streams: set[Any] = set()
         self._autocommit = True
         #: Whether a transaction is open, tracked from each statement's reported state.
         self._in_transaction = False
@@ -247,11 +262,32 @@ class Connection:
     def cursor(self) -> Cursor:
         """Return a new :class:`~htcondordb.cursor.Cursor` on this connection."""
         self._check_open()
-        cursor = Cursor(self)
-        self._cursors.add(cursor)
-        return cursor
+        with self._lock:
+            cursor = Cursor(self)
+            self._cursors.add(cursor)
+            return cursor
 
     # --- extensions ---
+
+    @property
+    def timeout(self) -> float | None:
+        """Seconds a query may run before it fails, or ``None`` for no limit.
+
+        Settable at any time; each statement takes the value current when it starts, so this
+        doubles as a per-statement limit. A query that exceeds it raises ``OperationalError``
+        naming the timeout.
+
+        **Queries only.** A write is deliberately not bounded: cancelling one mid-flight can
+        leave a transaction open on the server, which trades a hang for a worse problem. The
+        connect attempt has its own fixed 30-second limit.
+        """
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value: float | None) -> None:
+        if value is not None and value <= 0:
+            raise ValueError("timeout must be a positive number of seconds, or None")
+        self._timeout = value
 
     @property
     def address(self) -> str:
@@ -311,9 +347,49 @@ class Connection:
         ``SUM(RequestMemory)`` becomes ``SumRequestMemory``, and an ``AS`` alias is used
         as-is when it is a legal attribute name.
         """
-        from .adstream import ads as _ads
+        # An unfinished stream on this connection holds the executor lock, so settle it before
+        # opening another one.
+        with self._lock:
+            self._settle_streams()
+            from .adstream import ads as _ads
 
-        return _ads(self, operation, parameters)
+            return _ads(self, operation, parameters)
+
+    def mappings(self, operation: str, parameters: Any = None) -> "MappingStream":
+        """Run a statement and iterate its rows as ``dict`` objects, streaming.
+
+        The shape to reach for when walking a wide or ragged result -- above all ``SELECT *``::
+
+            for row in conn.mappings("SELECT * FROM jobs WHERE Owner = ?", ("alice",)):
+                print(row["Owner"], row.get("RequestMemory"))
+
+        :meth:`execute` cannot stream a ``SELECT *``: a tabular result needs its column list
+        before the first row, and for ``SELECT *`` that list is the union of every matched ad's
+        attributes, which is not known until the last one has been seen. Keyed rows need no such
+        list -- each ad carries its own attribute names -- so this streams whatever the shape of
+        the data, and a large table costs one batch rather than the whole result.
+
+        Values are **evaluated**: an attribute holding an expression arrives as what it evaluates
+        to. Use :meth:`ads` to keep expressions, which needs HTCondor's ``classad2`` bindings;
+        this path needs nothing beyond the driver.
+
+        Rows a statement synthesizes rather than reads -- an aggregate, a ``GROUP BY``, a window
+        function -- still cannot be produced one at a time, in any row shape, so those are
+        computed whole and then iterated. ``stream.streamed`` says which happened.
+
+        Args:
+            operation: A single statement, with ``?`` placeholders.
+            parameters: One value per placeholder, bound exactly as in :meth:`execute`.
+
+        Returns:
+            A :class:`~htcondordb._mappings.MappingStream`: an iterator of dicts, also a context
+            manager, with ``itersize`` for the batch size.
+        """
+        with self._lock:
+            self._settle_streams()
+            from ._mappings import mappings as _mappings
+
+            return _mappings(self, operation, parameters)
 
     def write_ads(self, table, ads, key="Name", chunk=None):
         """Upsert an iterable of ClassAds into a table, in batches.
@@ -359,9 +435,11 @@ class Connection:
         arbitrarily large load run. Inside one, every batch stages into it and lands
         together.
         """
-        from .adwrite import DEFAULT_CHUNK, write_ads as _write_ads
+        with self._lock:
+            self._settle_streams()
+            from .adwrite import DEFAULT_CHUNK, write_ads as _write_ads
 
-        return _write_ads(self, table, ads, key=key, chunk=chunk or DEFAULT_CHUNK)
+            return _write_ads(self, table, ads, key=key, chunk=chunk or DEFAULT_CHUNK)
 
     # --- context manager ---
 
@@ -383,9 +461,35 @@ class Connection:
         if self._handle == 0:
             raise InterfaceError("the connection is closed")
 
+    def _note_stream(self, holder: Any) -> None:
+        """Record a holder that is keeping the executor lock; see :meth:`_settle_streams`."""
+        with self._lock:
+            self._live_streams.add(holder)
+
+    def _forget_stream(self, holder: Any) -> None:
+        with self._lock:
+            self._live_streams.discard(holder)
+
+    def _settle_streams(self, keep: Any = None) -> None:
+        """Let every unfinished stream on this connection give up the executor lock.
+
+        A live stream holds that lock until it is drained or closed, because the executor is
+        per-connection state and the CEDAR session carries one result at a time. Without this a
+        second statement on the same connection would wait for a stream that is itself waiting
+        for a reader -- a deadlock, not a slow query.
+
+        Settling costs the memory the stream was avoiding, which is why it happens only when
+        something else actually needs the connection rather than on a timer.
+        """
+        for holder in list(self._live_streams):
+            if holder is keep:
+                continue
+            holder._settle()
+
     def _forget(self, cursor: Cursor) -> None:
         """Drop a closed cursor's registration so it is not closed twice."""
-        self._cursors.discard(cursor)
+        with self._lock:
+            self._cursors.discard(cursor)
 
     def _control(self, statement: str) -> None:
         """Run a transaction-control statement on a throwaway cursor."""
@@ -422,4 +526,5 @@ class Connection:
 
     def _note_transaction_state(self, in_transaction: bool) -> None:
         """Record the transaction state a statement reported (see Cursor._load)."""
-        self._in_transaction = in_transaction
+        with self._lock:
+            self._in_transaction = in_transaction
