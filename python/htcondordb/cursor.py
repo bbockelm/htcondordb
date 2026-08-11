@@ -88,6 +88,17 @@ class Cursor:
         )
 
     @property
+    def streamed(self) -> bool:
+        """Whether this statement's rows arrive as the daemon produces them.
+
+        ``False`` for the shapes that have to be computed whole first -- ``SELECT *``, an
+        aggregate, a ``GROUP BY``, a window function (see
+        :meth:`~htcondordb.connection.Connection.mappings` for streaming a ``SELECT *``).
+        Advisory: it says whether memory is bounded, not anything about the rows.
+        """
+        return self._streamed
+
+    @property
     def rowcount(self) -> int:
         """Rows produced by the last SELECT, or written by the last INSERT/UPDATE/DELETE.
 
@@ -297,6 +308,15 @@ class Cursor:
             raise StopIteration
         return row
 
+    def __del__(self) -> None:  # pragma: no cover - GC timing
+        # A dropped cursor with an unfinished stream is holding a server-side cursor and this
+        # connection's executor lock. Releasing it here is what makes forgetting to close one a
+        # non-event rather than a stall until the next statement.
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def __enter__(self) -> "Cursor":
         return self
 
@@ -399,10 +419,28 @@ class Cursor:
                     return False
             return True
 
-    def _drain(self) -> None:
-        """Fetch everything that is left into the buffer."""
+    def _drain(self, limit: int | None = None) -> None:
+        """Fetch everything that is left into the buffer.
+
+        *limit* caps how many rows may be added, raising rather than growing past it; see
+        :attr:`Connection.settle_limit <htcondordb.connection.Connection.settle_limit>` for why
+        that is worth having.
+        """
+        added = 0
         while self._fill(self.itersize):
-            pass
+            if limit is None:
+                continue
+            added = len(self._rows) - self._position
+            if added > limit:
+                # Stop the stream: it cannot be left half-drained holding the executor lock, and
+                # the caller is going to have to change something either way.
+                self._finish_stream()
+                raise OperationalError(
+                    f"draining an unfinished statement to free the connection exceeded "
+                    f"settle_limit ({limit} rows). Another statement needed this connection "
+                    "while this one was still streaming; finish or close it first, or run the "
+                    "long query on its own connection."
+                )
 
     def _finish_stream(self) -> None:
         """The stream is over: stop tracking it, and settle rowcount at the true total."""
@@ -421,7 +459,7 @@ class Cursor:
         caller sees no difference beyond the memory this costs.
         """
         if self._stream is not None:
-            self._drain()
+            self._drain(self._connection.settle_limit)
 
     def _call_sql(self, statement: str) -> dict:
         """Run *statement* through the C library and decode its JSON result document."""

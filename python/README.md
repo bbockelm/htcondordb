@@ -122,6 +122,13 @@ One wheel serves every Python 3 on a given platform: the driver uses cffi in ABI
 opens the library with `dlopen`, so no CPython ABI is linked. Three artifacts cover
 everything — `manylinux` x86_64 and aarch64, and one macOS `universal2`.
 
+**Alpine/musl is not supported, and not for want of a CI job.** A musl wheel builds fine and
+`auditwheel` retags it correctly — but the shared library segfaults on `dlopen`, from a plain C
+program as readily as from Python. Go's `c-shared` runtime wants far more thread stack than musl
+allocates by default, and a Python interpreter's main thread cannot be relinked to give it more.
+Shipping musl wheels would therefore replace a clean "no matching distribution" from pip with a
+segfault on import. Use a glibc base image (`python:3.12-slim`, EL8+) instead.
+
 Linux wheels are built in `manylinux_2_28` (EL8 and newer) and are checked to install and
 run on a different distribution from the one they were built in. The macOS wheel carries
 both architectures in one binary, and is tagged for the SDK it was built against rather
@@ -173,6 +180,26 @@ failures arrive as exceptions, which is all the log was duplicating.
 **Threads may share a connection** (`threadsafety = 2`) and will queue behind each other — the
 driver holds the connection's lock across every operation that reaches the library. A single
 *cursor* is not shareable: two threads fetching from one row buffer would interleave.
+
+**Processes may not.** Go's runtime does not survive `fork()`, so a forked child cannot use the
+library at all — not even by opening a fresh connection, because the broken runtime is already
+loaded. Using it in a child raises `InterfaceError` saying so, rather than hanging. With
+`multiprocessing`, use the `spawn` or `forkserver` start method (`forkserver` is the Linux default
+from CPython 3.14; before that it is `fork`):
+
+```python
+multiprocessing.set_start_method("spawn")
+```
+
+## Sharp edges
+
+| | |
+|---|---|
+| Interleaving a big scan | Starting a statement while another is unfinished drains the open one into memory, since it holds the daemon's per-connection executor lock. Correct, but it spends the memory the stream was avoiding. Set `conn.settle_limit = N` to fail fast instead, and give a long scan its own connection. |
+| `NaN` and `Infinity` | JSON cannot represent them, so a non-finite `real` arrives as `None` — indistinguishable from `undefined`. The alternative was the whole batch failing to encode. |
+| `undefined` vs `error` | Both arrive as `None`, so a `GROUP BY` over a column holding both yields two indistinguishable `None` groups. |
+| Ctrl-C during a fetch | Deferred until the call returns, because cffi releases the GIL. Set a `timeout` to bound it. |
+| Platforms | manylinux_2_28 x86_64/aarch64 and macOS universal2. No musl (Alpine) or Windows wheels, and no sdist — `pip install` on those platforms fails to find a distribution. See below for why musl is not simply a missing build. |
 
 ## Authentication
 

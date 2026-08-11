@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import weakref
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Iterator
 
@@ -73,14 +74,23 @@ class Connection:
         # Reentrant because the paths nest: execute -> settle another cursor -> its fetch.
         self._lock = threading.RLock()
         self._timeout = timeout
-        self._cursors: set[Cursor] = set()
-        # Holders of an unfinished server-side stream. Each keeps the connection's executor
-        # lock until drained, so anything else on this connection has to settle them first.
-        self._live_streams: set[Any] = set()
+        self._settle_limit: int | None = None
+        # Weak, so a cursor the caller drops can be collected -- and its __del__ releases any
+        # unfinished stream, which would otherwise hold a server-side cursor (and this
+        # connection's executor lock) until the next statement settled it.
+        self._cursors: "weakref.WeakSet[Cursor]" = weakref.WeakSet()
+        # Holders of an unfinished server-side stream. Each keeps the connection's executor lock
+        # until drained, so anything else on this connection has to settle them first.
+        #
+        # Weak, for the same reason _cursors is: a holder the caller drops must be collectable, so
+        # its __del__ can release the stream. A strong reference here would keep an abandoned
+        # cursor alive forever and its stream open with it.
+        self._live_streams: "weakref.WeakSet[Any]" = weakref.WeakSet()
         self._autocommit = True
         #: Whether a transaction is open, tracked from each statement's reported state.
         self._in_transaction = False
 
+        _library.check_usable()
         ffi, lib = self._lib.ffi, self._lib.lib
         # Before connecting, not after: the library's view of CONDOR_CONFIG decides its
         # security policy and where it looks for the daemon.
@@ -290,6 +300,29 @@ class Connection:
         self._timeout = value
 
     @property
+    def settle_limit(self) -> int | None:
+        """Most rows a stream may be drained into memory when another statement needs the
+        connection, or ``None`` (the default) for no limit.
+
+        Starting a statement while another is unfinished drains the open one into memory, because
+        it holds the daemon's per-connection executor lock (see :meth:`mappings` and
+        ``Cursor``). That is what keeps interleaving correct -- but it spends the memory the
+        stream was avoiding, so interleaving a small query with a 50-million-row scan will try to
+        materialize the scan.
+
+        The default is no limit, which is how the driver behaved before rows were streamed at
+        all: nothing that used to work starts failing. Set this in production to fail fast
+        instead, and use a second connection for the long-running scan.
+        """
+        return self._settle_limit
+
+    @settle_limit.setter
+    def settle_limit(self, value: int | None) -> None:
+        if value is not None and value <= 0:
+            raise ValueError("settle_limit must be a positive number of rows, or None")
+        self._settle_limit = value
+
+    @property
     def address(self) -> str:
         """The daemon address this connection reached.
 
@@ -458,6 +491,9 @@ class Connection:
     # --- internals ---
 
     def _check_open(self) -> None:
+        # Every operation comes through here, which makes it the one place a process-level
+        # problem (a forked child) has to be caught.
+        _library.check_usable()
         if self._handle == 0:
             raise InterfaceError("the connection is closed")
 

@@ -21,6 +21,7 @@ import "C"
 
 import (
 	"encoding/json"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -224,6 +225,13 @@ func valueJSON(v classad.Value) any {
 		return n
 	case v.IsReal():
 		f, _ := v.RealValue()
+		// JSON has no NaN or Infinity, and encoding/json refuses to marshal them -- so one
+		// non-finite cell would fail the whole batch rather than just itself. Null is a lossy
+		// answer (it arrives as None, indistinguishable from undefined) but a bounded one, and
+		// it is documented; failing a report's entire query over one such value is not.
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil
+		}
 		return f
 	default:
 		return v.String()
