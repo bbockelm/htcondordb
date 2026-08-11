@@ -174,6 +174,26 @@ failures arrive as exceptions, which is all the log was duplicating.
 driver holds the connection's lock across every operation that reaches the library. A single
 *cursor* is not shareable: two threads fetching from one row buffer would interleave.
 
+**Processes may not.** Go's runtime does not survive `fork()`, so a forked child cannot use the
+library at all — not even by opening a fresh connection, because the broken runtime is already
+loaded. Using it in a child raises `InterfaceError` saying so, rather than hanging. With
+`multiprocessing`, use the `spawn` or `forkserver` start method (`forkserver` is the Linux default
+from CPython 3.14; before that it is `fork`):
+
+```python
+multiprocessing.set_start_method("spawn")
+```
+
+## Sharp edges
+
+| | |
+|---|---|
+| Interleaving a big scan | Starting a statement while another is unfinished drains the open one into memory, since it holds the daemon's per-connection executor lock. Correct, but it spends the memory the stream was avoiding. Set `conn.settle_limit = N` to fail fast instead, and give a long scan its own connection. |
+| `NaN` and `Infinity` | JSON cannot represent them, so a non-finite `real` arrives as `None` — indistinguishable from `undefined`. The alternative was the whole batch failing to encode. |
+| `undefined` vs `error` | Both arrive as `None`, so a `GROUP BY` over a column holding both yields two indistinguishable `None` groups. |
+| Ctrl-C during a fetch | Deferred until the call returns, because cffi releases the GIL. Set a `timeout` to bound it. |
+| Platforms | manylinux_2_28 x86_64/aarch64 and macOS universal2. No musl (Alpine) or Windows wheels, and no sdist — `pip install` on those platforms fails to find a distribution. |
+
 ## Authentication
 
 There are no credential arguments to `connect()`. HTCondor's security configuration is

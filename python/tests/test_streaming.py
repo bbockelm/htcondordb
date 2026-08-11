@@ -137,7 +137,7 @@ class TestParity:
         # Advisory, but worth pinning: it is how a caller knows whether its memory is bounded,
         # and the parity tests above are only meaningful if both paths are actually exercised.
         cursor = connection.execute(sql.format(t=rows))
-        assert cursor._streamed is streamed
+        assert cursor.streamed is streamed
         cursor.fetchall()
 
     def test_star_still_returns_every_column(self, connection, rows):
@@ -198,7 +198,7 @@ class TestMemoryIsBounded:
         cursor.itersize = 10
         # Streaming is the half this test cannot see; without it the rows are all in the daemon
         # regardless of how few the driver holds, so assert it rather than implying it.
-        assert cursor._streamed, "the statement stopped streaming; rows are materialized"
+        assert cursor.streamed, "the statement stopped streaming; rows are materialized"
 
         high_water = 0
         seen = 0

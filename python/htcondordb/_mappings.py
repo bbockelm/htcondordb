@@ -48,7 +48,7 @@ class MappingStream:
             raise
         # Snapshot rather than delegate: closing the cursor resets its flag, so a caller reading
         # this after iterating would otherwise always be told "not streamed".
-        self._streamed = self._cursor._streamed
+        self._streamed = self._cursor.streamed
 
     @property
     def itersize(self) -> int:

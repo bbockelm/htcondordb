@@ -59,7 +59,7 @@ class TestRaggedResults:
         # The contrast, and why mappings() is a separate entry point rather than a flag: the
         # tabular path cannot stream this statement, and still must not.
         cursor = connection.execute(f"SELECT * FROM {ragged}")
-        assert cursor._streamed is False
+        assert cursor.streamed is False
         assert len(cursor.fetchall()) == 62
 
     def test_agrees_with_the_tabular_path(self, connection, ragged):

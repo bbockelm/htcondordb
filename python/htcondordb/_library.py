@@ -34,6 +34,39 @@ RESULT_PANIC = -5
 PANIC_PREFIX = "internal error in "
 
 
+#: Set in a child process after os.fork(). Go's runtime does not survive a fork -- its threads
+#: are not recreated in the child -- so the library is unusable there, and a call would hang or
+#: crash rather than fail. This turns that into an exception naming the cause.
+_forked_child = False
+
+
+def _mark_forked_child() -> None:  # pragma: no cover - runs only in a forked child
+    global _forked_child
+    _forked_child = True
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_mark_forked_child)
+
+
+def check_usable() -> None:
+    """Raise if this process cannot use the library at all.
+
+    Only one case so far: a child of os.fork(). The Go runtime the library is built on does not
+    survive forking, and that is not something the child can recover from -- opening a fresh
+    connection does not help, because the broken runtime is already loaded. multiprocessing's
+    "spawn" and "forkserver" start methods are fine (they exec a new interpreter); "fork", the
+    default on Linux before CPython 3.14, is not.
+    """
+    if _forked_child:
+        raise InterfaceError(
+            "htcondordb cannot be used in a process forked from one that loaded it: Go's "
+            "runtime does not survive fork(). Use multiprocessing with the 'spawn' or "
+            "'forkserver' start method (multiprocessing.set_start_method('spawn')), or connect "
+            "in each worker after it starts by exec rather than inheriting a connection."
+        )
+
+
 def exception_for(code: int, message: str) -> Exception:
     """Map a library result code to the exception the driver raises.
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
@@ -192,5 +193,35 @@ func TestBuildResultAdsOption(t *testing.T) {
 	}
 	if doc.Ads[0] == "" {
 		t.Error("ad text is empty")
+	}
+}
+
+// JSON cannot represent NaN or Infinity, and encoding/json refuses to marshal them -- so without
+// a guard one non-finite cell fails the whole batch instead of just itself. Null is lossy but
+// bounded; losing a report's entire query to one value is not.
+func TestValueJSONNonFinite(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		f    float64
+	}{
+		{"NaN", math.NaN()},
+		{"+Inf", math.Inf(1)},
+		{"-Inf", math.Inf(-1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := valueJSON(classad.NewRealValue(tc.f))
+			if got != nil {
+				t.Fatalf("valueJSON(%v) = %#v, want nil", tc.f, got)
+			}
+			// The point of the guard: the row it lives in still marshals.
+			if _, err := json.Marshal([]any{got, "alice"}); err != nil {
+				t.Errorf("a row holding %v failed to marshal: %v", tc.f, err)
+			}
+		})
+	}
+
+	// A finite real is untouched.
+	if got := valueJSON(classad.NewRealValue(1.5)); got != 1.5 {
+		t.Errorf("valueJSON(1.5) = %#v, want 1.5", got)
 	}
 }

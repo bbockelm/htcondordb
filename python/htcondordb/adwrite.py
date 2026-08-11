@@ -129,12 +129,26 @@ def _attribute_key(name: str) -> Callable[[Any], str]:
     """Build a key function reading one attribute off each ad."""
 
     def key_of(ad: Any) -> str:
+        if isinstance(ad, str):
+            # Pulling an attribute out of ClassAd text would mean parsing it, which needs
+            # classad2. Indexing the string instead raises "string indices must be integers",
+            # which says nothing about what to do.
+            raise ProgrammingError(
+                f"cannot read the key attribute {name!r} out of a ClassAd given as text: that "
+                "would mean parsing it. Pass key= a callable (key=lambda ad: ...), or pass the "
+                "ads as classad2.ClassAd objects or dicts."
+            )
         try:
             value = ad[name]
         except KeyError:
             raise ProgrammingError(
                 f"ad has no {name!r} attribute to use as its key; pass key= with another "
                 "attribute name or a callable"
+            ) from None
+        except TypeError as exc:
+            raise ProgrammingError(
+                f"cannot read the key attribute {name!r} from a {type(ad).__name__}: {exc}. "
+                "Pass key= a callable, or ads as classad2.ClassAd objects or dicts."
             ) from None
         return str(value)
 
