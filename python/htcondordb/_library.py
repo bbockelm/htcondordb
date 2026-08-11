@@ -25,6 +25,22 @@ RESULT_ERR = -1
 RESULT_MISSING = -2
 RESULT_BAD_SQL = -3
 RESULT_DENIED = -4
+RESULT_PANIC = -5
+
+#: Prefix of a message produced by a recovered panic in the library. Two entry points return a
+#: handle and so report failure only as a string, with no code to carry RESULT_PANIC; this is
+#: the contract they use instead. It must match panicPrefix in capi/guard.go.
+PANIC_PREFIX = "internal error in "
+
+
+def is_internal(message: str) -> bool:
+    """Whether a failure message came from a bug inside the library rather than from the call.
+
+    A panic in the Go stack is recovered at the boundary and reported like any other failure,
+    so without this the driver would raise OperationalError -- telling the caller to check
+    their network or their credentials for what is really a defect to report.
+    """
+    return message.startswith(PANIC_PREFIX)
 
 #: ``hcdb_sql`` option bits.
 SQL_ADS = 1 << 0
@@ -37,6 +53,7 @@ uintptr_t hcdb_connect(char *addr);
 uintptr_t hcdb_connect_err(char *addr, char **err);
 int hcdb_address(uintptr_t h, char **out);
 int hcdb_setenv(char *name, char *value);
+int hcdb_selftest_panic(char **out);
 uintptr_t hcdb_query(uintptr_t h, char *table, char *constraint);
 int hcdb_query_next(uintptr_t qh, char **out);
 void hcdb_query_free(uintptr_t qh);

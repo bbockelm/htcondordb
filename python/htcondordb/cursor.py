@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 from . import _library
 from ._errors import (
+    InternalError,
     DatabaseError,
     InterfaceError,
     OperationalError,
@@ -286,6 +287,11 @@ class Cursor:
             raise ProgrammingError(message)
         if code == _library.RESULT_DENIED:
             raise ProgrammingError(message)
+        if code == _library.RESULT_PANIC:
+            # A bug in the library, recovered at the boundary rather than taking the
+            # interpreter down with it. InternalError is PEP 249's category for exactly this:
+            # a failure that is not the caller's fault and that retrying will not fix.
+            raise InternalError(message)
         if code == _library.RESULT_ERR:
             raise OperationalError(message)
         raise DatabaseError(f"unexpected result code {code}: {message}")
