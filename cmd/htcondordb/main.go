@@ -184,6 +184,7 @@ func run() error {
 	logQueries := configBool(cfg, "HTCONDORDB_LOG_QUERIES")
 	memoryTables := splitAttrs(getStr(cfg, "HTCONDORDB_MEMORY_TABLES"))
 	svc, err := server.New(server.Config{
+		OnPhase:        boot.record,
 		Dir:            databaseDir(d, cfg),
 		Authorize:      authorize,
 		ForceReadOnly:  ha.forceReadOnly,
@@ -208,6 +209,8 @@ func run() error {
 	// Restore-on-startup (disaster recovery): if HTCONDORDB_RESTORE_FILE names an existing
 	// snapshot, load it before serving, then the file is moved aside so a restart serves
 	// live data. An encrypted snapshot is opened with this daemon's pool keys.
+	boot.mark("open-database")
+
 	if restoreFile := getStr(cfg, "HTCONDORDB_RESTORE_FILE"); restoreFile != "" {
 		if restored, rerr := svc.RestoreOnStartup(restoreFile); rerr != nil {
 			return fmt.Errorf("restore-on-startup from %s: %w", restoreFile, rerr)
@@ -216,11 +219,13 @@ func run() error {
 		}
 	}
 
+	boot.mark("restore-snapshot")
+
 	svc.RegisterOn(srv)
 
 	// DC_NOP / DC_RECONFIG / DC_OFF so condor_ping, condor_reconfig -daemon and
 	// condor_off -daemon work against this daemon's command port.
-	boot.mark("open-database")
+	boot.mark("register-commands")
 	d.RegisterDefaultCommands(srv)
 
 	// Command-socket listener: the inherited shared-port endpoint under
