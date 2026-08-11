@@ -14,7 +14,13 @@ import json
 from typing import TYPE_CHECKING, Any, Callable, Iterable, NamedTuple
 
 from . import _library
-from ._errors import DatabaseError, InterfaceError, OperationalError, ProgrammingError
+from ._errors import (
+    DatabaseError,
+    InterfaceError,
+    InternalError,
+    OperationalError,
+    ProgrammingError,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .connection import Connection
@@ -85,6 +91,8 @@ def write_ads(
         if code != _library.RESULT_OK:
             if code in (_library.RESULT_BAD_SQL, _library.RESULT_DENIED):
                 raise ProgrammingError(payload)
+            if code == _library.RESULT_PANIC:
+                raise InternalError(payload)
             raise OperationalError(payload or "the write failed with no message")
         try:
             doc = json.loads(payload)

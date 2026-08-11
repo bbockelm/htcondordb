@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 import htcondordb
+from htcondordb import _library
 
 
 def variant_config(tmp_path, name, *, address_file=None, host=None):
@@ -187,6 +188,24 @@ class TestConnection:
         conn.close()
         with pytest.raises(htcondordb.InterfaceError):
             cursor.execute("SELECT 1")
+
+
+class TestCrashSafetyWithALiveConnection:
+    """Recovering from a panic has to leave the session usable, not merely the process."""
+
+    def test_a_panic_does_not_disturb_the_connection(self, connection, table):
+        connection.execute(
+            f"INSERT INTO {table} (Key, Owner) VALUES ('j1', 'alice')"
+        ).close()
+
+        lib = connection._lib
+        out = lib.ffi.new("char **")
+        assert lib.lib.hcdb_selftest_panic(out) == _library.RESULT_PANIC
+        assert lib.string(out[0]).startswith(_library.PANIC_PREFIX)
+
+        # Same connection, same CEDAR stream, after a recovered panic in the same runtime.
+        assert connection.execute(f"SELECT Owner FROM {table}").fetchone() == ("alice",)
+        assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (1,)
 
 
 class TestDDLAndWrites:
