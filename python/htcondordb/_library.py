@@ -17,6 +17,7 @@ import threading
 from ctypes.util import find_library
 from pathlib import Path
 
+from . import _errors
 from ._errors import InterfaceError
 
 #: Return codes from the C library. These mirror the ``hcdb*`` constants in capi/.
@@ -31,6 +32,24 @@ RESULT_PANIC = -5
 #: handle and so report failure only as a string, with no code to carry RESULT_PANIC; this is
 #: the contract they use instead. It must match panicPrefix in capi/guard.go.
 PANIC_PREFIX = "internal error in "
+
+
+def exception_for(code: int, message: str) -> Exception:
+    """Map a library result code to the exception the driver raises.
+
+    One table, used by every call site: the C library classifies its own failures, so a new code
+    cannot be handled in one place and forgotten in another. See the hcdb* constants in capi/.
+    """
+    if code in (RESULT_BAD_SQL, RESULT_DENIED):
+        return _errors.ProgrammingError(message)
+    if code == RESULT_PANIC:
+        # A bug in the library, recovered at the boundary rather than taking the interpreter
+        # down. InternalError is PEP 249's category for a failure that is not the caller's
+        # fault and that retrying will not fix.
+        return _errors.InternalError(message)
+    if code == RESULT_ERR:
+        return _errors.OperationalError(message)
+    return _errors.DatabaseError(f"unexpected result code {code}: {message}")
 
 
 def is_internal(message: str) -> bool:
@@ -54,6 +73,9 @@ uintptr_t hcdb_connect_err(char *addr, char **err);
 int hcdb_address(uintptr_t h, char **out);
 int hcdb_setenv(char *name, char *value);
 int hcdb_selftest_panic(char **out);
+int hcdb_sql_stream(uintptr_t h, char *sql, uintptr_t *cursor, char **header, char **out);
+int hcdb_sql_stream_next(uintptr_t ch, int max_rows, char **out);
+void hcdb_sql_stream_free(uintptr_t ch);
 uintptr_t hcdb_query(uintptr_t h, char *table, char *constraint);
 int hcdb_query_next(uintptr_t qh, char **out);
 void hcdb_query_free(uintptr_t qh);
@@ -207,6 +229,7 @@ def load() -> _Library:
                     "hcdb_address",
                     "hcdb_setenv",
                     "hcdb_sql",
+                    "hcdb_sql_stream",
                     "hcdb_sql_ads",
                     "hcdb_close",
                     "hcdb_free",

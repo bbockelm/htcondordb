@@ -53,10 +53,39 @@ reimplements none of it and inherits new SQL features as the daemon gains them.
 Python  ->  cffi (ABI mode, dlopen)  ->  libhtcondordb_client  ->  CEDAR  ->  htcondordb
 ```
 
-`hcdb_sql` runs one statement and returns a JSON result document; the driver decodes it into
-rows. Cell types are recovered on the Go side from the underlying ClassAd values where they
-exist, so a string attribute whose text happens to be `0042` comes back as `"0042"`, not
-`42`.
+`hcdb_sql_stream` runs one statement and returns a header (columns, and for DML the affected
+count) plus rows in batches the driver asks for. Cell types are recovered on the Go side from
+the underlying ClassAd values, so a string attribute whose text happens to be `0042` comes back
+as `"0042"`, not `42`.
+
+## Large results
+
+Rows arrive in batches as they are fetched, so iterating a cursor costs memory proportional to a
+batch rather than to the result:
+
+```python
+for owner, mem in conn.execute("SELECT Owner, RequestMemory FROM jobs"):
+    ...                      # one batch in flight, whatever the table's size
+```
+
+`cursor.itersize` (default 1000) sets how many rows a batch asks for. It is separate from
+PEP 249's `arraysize`, which defaults to 1 — a batch of one row would spend a call across the
+language boundary per row and undo the point.
+
+Three things follow, all of them worth knowing before a large query:
+
+| | |
+|---|---|
+| `fetchall()` materializes | It hands back everything, by definition. Iterate instead to keep a large result out of memory. |
+| `rowcount` counts what you fetched | For a SELECT it is `-1` before the first fetch and grows as rows arrive, because the total is not known until the result is exhausted. PEP 249 allows this and `sqlite3` does the same. For DML it is the affected count, unchanged. |
+| Some shapes cannot stream | `SELECT *` (its header is the union of every ad's attributes), aggregates and `GROUP BY` (rows are synthesized from groups), and window functions (a row's value ranks it against the others). Those run whole on the daemon and are then served from memory. The rows are identical; only the memory differs. `cursor._streamed` says which happened. |
+
+**Name your columns.** `SELECT Owner, RequestMemory FROM jobs` streams *and* pushes a
+projection to the server, so only those attributes cross the wire. `SELECT *` does neither.
+
+An unfinished statement holds the daemon's per-connection executor lock, so starting another one
+on the same connection first drains the open one into memory. Two cursors on one connection stay
+correct; interleaving them just gives up the memory win.
 
 ## Installing
 
@@ -117,7 +146,9 @@ Standard DB-API, with a few things worth knowing:
 | `paramstyle` | `qmark` — `?` placeholders, positional |
 | `threadsafety` | `2` — connections are shareable across threads, cursors are not |
 | `autocommit` | Defaults to `True` — see [Transactions](#transactions) |
-| `description` | 7-tuples; only `name` and `type_code` are meaningful (ClassAd is dynamically typed) |
+| `description` | 7-tuples; only `name` and `type_code` are meaningful (ClassAd is dynamically typed). Reading it fetches the first batch, since a type can only come from data |
+| `rowcount` | For a SELECT, the rows fetched so far (`-1` before the first fetch); for DML, the affected count |
+| `itersize` | Rows per batch, default 1000 (extension; `arraysize` stays PEP 249's default of 1) |
 
 **A bug in the library raises; it does not crash.** Every entry point in the C client runs
 inside a `recover()`, so a panic in the Go stack arrives as `InternalError` — carrying the Go

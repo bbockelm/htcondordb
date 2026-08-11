@@ -62,6 +62,9 @@ class Connection:
         self._lib = _library.load()
         self._lock = threading.Lock()
         self._cursors: set[Cursor] = set()
+        # Holders of an unfinished server-side stream. Each keeps the connection's executor
+        # lock until drained, so anything else on this connection has to settle them first.
+        self._live_streams: set[Any] = set()
         self._autocommit = True
         #: Whether a transaction is open, tracked from each statement's reported state.
         self._in_transaction = False
@@ -311,6 +314,9 @@ class Connection:
         ``SUM(RequestMemory)`` becomes ``SumRequestMemory``, and an ``AS`` alias is used
         as-is when it is a legal attribute name.
         """
+        # An unfinished stream on this connection holds the executor lock, so settle it before
+        # opening another one.
+        self._settle_streams()
         from .adstream import ads as _ads
 
         return _ads(self, operation, parameters)
@@ -359,6 +365,7 @@ class Connection:
         arbitrarily large load run. Inside one, every batch stages into it and lands
         together.
         """
+        self._settle_streams()
         from .adwrite import DEFAULT_CHUNK, write_ads as _write_ads
 
         return _write_ads(self, table, ads, key=key, chunk=chunk or DEFAULT_CHUNK)
@@ -382,6 +389,29 @@ class Connection:
     def _check_open(self) -> None:
         if self._handle == 0:
             raise InterfaceError("the connection is closed")
+
+    def _note_stream(self, holder: Any) -> None:
+        """Record a holder that is keeping the executor lock; see :meth:`_settle_streams`."""
+        self._live_streams.add(holder)
+
+    def _forget_stream(self, holder: Any) -> None:
+        self._live_streams.discard(holder)
+
+    def _settle_streams(self, keep: Any = None) -> None:
+        """Let every unfinished stream on this connection give up the executor lock.
+
+        A live stream holds that lock until it is drained or closed, because the executor is
+        per-connection state and the CEDAR session carries one result at a time. Without this a
+        second statement on the same connection would wait for a stream that is itself waiting
+        for a reader -- a deadlock, not a slow query.
+
+        Settling costs the memory the stream was avoiding, which is why it happens only when
+        something else actually needs the connection rather than on a timer.
+        """
+        for holder in list(self._live_streams):
+            if holder is keep:
+                continue
+            holder._settle()
 
     def _forget(self, cursor: Cursor) -> None:
         """Drop a closed cursor's registration so it is not closed twice."""
