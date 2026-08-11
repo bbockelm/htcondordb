@@ -39,15 +39,28 @@ import (
 // and the caller's next call picks up where it left off.
 const rowChunkBytes = 4 << 20
 
+// hcdbRowsAsObjects asks for each row as a JSON object keyed by column name, instead of an
+// array of cells.
+//
+// It is what lets SELECT * stream. A tabular result needs its column list before the first row,
+// and for SELECT * that list is the union of every matched ad's attributes -- not knowable until
+// the last ad has been seen (see starColumns). Keyed rows need no such list: each ad carries its
+// own attribute names, so nothing has to be reconciled across rows.
+const hcdbRowsAsObjects = 1 << 0
+
 // sqlCursor serves one statement's rows in batches, from a live stream or from a materialized
 // result. Exactly one of the two is in play, chosen at open.
 type sqlCursor struct {
 	columns []string
 
-	// Streaming: the producer goroutine runs StreamSelect and hands each row's cells to
-	// rows, which is unbuffered -- so the producer blocks until this side takes the previous
-	// row, and an abandoned cursor cannot run the query to completion in the background.
-	rows   chan []any
+	// objects reports that rows are emitted as JSON objects rather than arrays.
+	objects bool
+
+	// Streaming: the producer goroutine runs StreamSelect and hands each row to rows, which is
+	// unbuffered -- so the producer blocks until this side takes the previous row, and an
+	// abandoned cursor cannot run the query to completion in the background. Each element is an
+	// []any or a map[string]any, depending on objects.
+	rows   chan any
 	cancel context.CancelFunc
 	done   chan struct{}
 	mu     sync.Mutex
@@ -56,6 +69,11 @@ type sqlCursor struct {
 	// Materialized: rows already in hand, served from position i.
 	buffered *repl.Result
 	i        int
+}
+
+// isStar reports a SELECT * -- the shape with no column list of its own.
+func isStar(st *repl.Statement) bool {
+	return len(st.Items) == 1 && st.Items[0].Star
 }
 
 // sqlHeader is what a caller learns at open: everything in hcdb_sql's envelope except the rows.
@@ -100,13 +118,15 @@ type sqlHeader struct {
 // one is drained or freed.
 //
 //export hcdb_sql_stream
-func hcdb_sql_stream(h C.uintptr_t, sql *C.char, cursor *C.uintptr_t, header **C.char, out **C.char) C.int {
+func hcdb_sql_stream(h C.uintptr_t, sql *C.char, opts C.int, cursor *C.uintptr_t, header **C.char,
+	out **C.char) C.int {
 	return guardStatus("hcdb_sql_stream", out, func() C.int {
-		return hcdb_sql_streamImpl(h, sql, cursor, header, out)
+		return hcdb_sql_streamImpl(h, sql, opts, cursor, header, out)
 	})
 }
 
-func hcdb_sql_streamImpl(h C.uintptr_t, sql *C.char, cursor *C.uintptr_t, header **C.char, out **C.char) C.int {
+func hcdb_sql_streamImpl(h C.uintptr_t, sql *C.char, opts C.int, cursor *C.uintptr_t,
+	header **C.char, out **C.char) C.int {
 	*cursor = 0
 	c := handleConn(h)
 	if c == nil {
@@ -118,6 +138,8 @@ func hcdb_sql_streamImpl(h C.uintptr_t, sql *C.char, cursor *C.uintptr_t, header
 		*out = C.CString(perr.Error())
 		return hcdbBadSQL
 	}
+
+	objects := int(opts)&hcdbRowsAsObjects != 0
 
 	// A SELECT whose rows come from ads alone streams; everything else -- DML, and the
 	// result-set shapes RowStreamer declines -- runs to completion here.
@@ -134,14 +156,52 @@ func hcdb_sql_streamImpl(h C.uintptr_t, sql *C.char, cursor *C.uintptr_t, header
 			return hcdbBadSQL
 		}
 	}
-	if rowOf == nil {
-		return openBufferedCursor(c, st, cursor, header, out)
+	// SELECT * declines to stream as a table because its header is unknowable in advance --
+	// but keyed rows have no header, so in that shape it streams from each ad's own attributes.
+	if objects && rowOf == nil && st.Kind == repl.StmtSelect && isStar(st) {
+		return openStreamCursor(c, st, nil, adAttributesRow, cursor, header, out)
 	}
-	return openStreamCursor(c, st, columns, rowOf, cursor, header, out)
+	if rowOf == nil {
+		return openBufferedCursor(c, st, objects, cursor, header, out)
+	}
+	return openStreamCursor(c, st, columns, rowFromValues(columns, rowOf, objects), cursor, header, out)
+}
+
+// rowFromValues turns a per-row value evaluator into the shape the caller asked for.
+func rowFromValues(columns []string, rowOf func(*classad.ClassAd) []classad.Value,
+	objects bool) func(*classad.ClassAd) any {
+	if !objects {
+		return func(ad *classad.ClassAd) any {
+			cells := make([]any, len(columns))
+			for j, v := range rowOf(ad) {
+				cells[j] = valueJSON(v)
+			}
+			return cells
+		}
+	}
+	return func(ad *classad.ClassAd) any {
+		row := make(map[string]any, len(columns))
+		for j, v := range rowOf(ad) {
+			row[columns[j]] = valueJSON(v)
+		}
+		return row
+	}
+}
+
+// adAttributesRow is the SELECT * row in keyed form: the ad's own attributes, evaluated. There is
+// no column list to align to, which is the whole reason this shape can stream.
+func adAttributesRow(ad *classad.ClassAd) any {
+	names := ad.GetAttributes()
+	row := make(map[string]any, len(names))
+	for _, name := range names {
+		row[name] = valueJSON(ad.EvaluateAttr(name))
+	}
+	return row
 }
 
 // openBufferedCursor executes the statement now and serves its rows from memory.
-func openBufferedCursor(c *conn, st *repl.Statement, cursor *C.uintptr_t, header **C.char, out **C.char) C.int {
+func openBufferedCursor(c *conn, st *repl.Statement, objects bool, cursor *C.uintptr_t,
+	header **C.char, out **C.char) C.int {
 	c.mu.Lock()
 	start := time.Now()
 	res, execErr := c.ex.Exec(st)
@@ -166,7 +226,7 @@ func openBufferedCursor(c *conn, st *repl.Statement, cursor *C.uintptr_t, header
 		return hcdbErr
 	}
 
-	cur := &sqlCursor{columns: res.Columns, buffered: res}
+	cur := &sqlCursor{columns: res.Columns, buffered: res, objects: objects}
 	h := sqlHeader{
 		Select:        res.IsSelect,
 		Columns:       res.Columns,
@@ -181,7 +241,7 @@ func openBufferedCursor(c *conn, st *repl.Statement, cursor *C.uintptr_t, header
 
 // openStreamCursor starts the producer and returns before the first row is fetched.
 func openStreamCursor(c *conn, st *repl.Statement, columns []string,
-	rowOf func(*classad.ClassAd) []classad.Value, cursor *C.uintptr_t, header **C.char,
+	rowOf func(*classad.ClassAd) any, cursor *C.uintptr_t, header **C.char,
 	out **C.char) C.int {
 
 	// A SELECT cannot change the transaction state, so reading it at open is as accurate as
@@ -193,7 +253,7 @@ func openStreamCursor(c *conn, st *repl.Statement, columns []string,
 	ctx, cancel := context.WithCancel(c.ctx)
 	cur := &sqlCursor{
 		columns: columns,
-		rows:    make(chan []any),
+		rows:    make(chan any),
 		cancel:  cancel,
 		done:    make(chan struct{}),
 	}
@@ -206,12 +266,8 @@ func openStreamCursor(c *conn, st *repl.Statement, columns []string,
 		defer c.mu.Unlock()
 
 		serr := c.ex.StreamSelect(st, func(ad *classad.ClassAd) bool {
-			cells := make([]any, len(columns))
-			for j, v := range rowOf(ad) {
-				cells[j] = valueJSON(v)
-			}
 			select {
-			case cur.rows <- cells:
+			case cur.rows <- rowOf(ad):
 				return true
 			case <-ctx.Done():
 				return false
@@ -304,15 +360,17 @@ func hcdb_sql_stream_nextImpl(ch C.uintptr_t, maxRows C.int, out **C.char) C.int
 
 // nextBatch collects up to limit rows, stopping early at the byte budget. An empty batch with
 // no error means exhausted.
-func (cur *sqlCursor) nextBatch(limit int) ([][]any, error) {
+// Each row is an []any (cells aligned to the header) or a map[string]any (keyed), per the
+// cursor's objects flag; both marshal as JSON without further help, so the batch is []any.
+func (cur *sqlCursor) nextBatch(limit int) ([]any, error) {
 	if cur.buffered != nil {
 		return cur.bufferedBatch(limit), nil
 	}
 
-	batch := make([][]any, 0, min(limit, 64))
+	batch := make([]any, 0, min(limit, 64))
 	bytes := 0
 	for len(batch) < limit && bytes < rowChunkBytes {
-		cells, ok := <-cur.rows
+		row, ok := <-cur.rows
 		if !ok {
 			// Channel closed: the producer finished. Its error (if any) is settled by then --
 			// done is closed after err is stored.
@@ -325,20 +383,32 @@ func (cur *sqlCursor) nextBatch(limit int) ([][]any, error) {
 			}
 			break
 		}
-		batch = append(batch, cells)
-		bytes += estimateSize(cells)
+		batch = append(batch, row)
+		bytes += estimateSize(row)
 	}
 	return batch, nil
 }
 
-func (cur *sqlCursor) bufferedBatch(limit int) [][]any {
-	batch := make([][]any, 0, min(limit, 64))
+func (cur *sqlCursor) bufferedBatch(limit int) []any {
+	batch := make([]any, 0, min(limit, 64))
 	bytes := 0
 	for cur.i < len(cur.buffered.Rows) && len(batch) < limit && bytes < rowChunkBytes {
 		cells := cellValues(cur.buffered, cur.i)
 		cur.i++
-		batch = append(batch, cells)
-		bytes += estimateSize(cells)
+		var row any = cells
+		if cur.objects {
+			// Keyed from the header rather than from an ad: an aggregate's rows were never ads,
+			// and this is the one place both shapes have to agree on the same cells.
+			keyed := make(map[string]any, len(cur.columns))
+			for j, name := range cur.columns {
+				if j < len(cells) {
+					keyed[name] = cells[j]
+				}
+			}
+			row = keyed
+		}
+		batch = append(batch, row)
+		bytes += estimateSize(row)
 	}
 	return batch
 }
@@ -346,16 +416,30 @@ func (cur *sqlCursor) bufferedBatch(limit int) [][]any {
 // estimateSize approximates a row's JSON size. Rough on purpose: it exists to stop a batch of
 // large strings from growing without bound, and paying for exact accounting per cell would cost
 // more than the imprecision does.
-func estimateSize(cells []any) int {
-	n := 2 + len(cells) // brackets and separators
-	for _, c := range cells {
-		if s, ok := c.(string); ok {
-			n += len(s) + 3 // quotes and comma
-			continue
+func estimateSize(row any) int {
+	switch r := row.(type) {
+	case []any:
+		n := 2 + len(r) // brackets and separators
+		for _, c := range r {
+			n += cellSize(c)
 		}
-		n += 8
+		return n
+	case map[string]any:
+		n := 2 + len(r)
+		for name, c := range r {
+			n += len(name) + 4 // quoted key and colon
+			n += cellSize(c)
+		}
+		return n
 	}
-	return n
+	return 8
+}
+
+func cellSize(c any) int {
+	if s, ok := c.(string); ok {
+		return len(s) + 3 // quotes and comma
+	}
+	return 8
 }
 
 // Releases a cursor, stopping the stream behind it first. Required even after the cursor is

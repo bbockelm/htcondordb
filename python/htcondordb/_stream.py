@@ -32,21 +32,25 @@ class RowStream:
     else on the same connection.
     """
 
-    def __init__(self, connection: "Connection", statement: str) -> None:
+    def __init__(
+        self, connection: "Connection", statement: str, objects: bool = False
+    ) -> None:
         lib = connection._lib
         ffi, c = lib.ffi, lib.lib
 
         cursor = ffi.new("uintptr_t *")
         header = ffi.new("char **")
         out = ffi.new("char **")
+        options = _library.STREAM_ROWS_AS_OBJECTS if objects else 0
         code = c.hcdb_sql_stream(
-            connection._handle, statement.encode("utf-8"), cursor, header, out
+            connection._handle, statement.encode("utf-8"), options, cursor, header, out
         )
         if code != _library.RESULT_OK:
             message = lib.string(out[0]) or "the statement failed with no message"
             raise _library.exception_for(code, message)
 
         self._lib = lib
+        self._objects = objects
         self._handle = int(cursor[0])
         #: The result header: select, columns, affected, note, star, in_transaction, streamed.
         self.header: dict[str, Any] = json.loads(lib.string(header[0]))
@@ -63,8 +67,10 @@ class RowStream:
     def exhausted(self) -> bool:
         return self._exhausted
 
-    def next_batch(self, size: int) -> list[tuple]:
+    def next_batch(self, size: int) -> list:
         """Return up to *size* more rows, or an empty list when the result is exhausted.
+
+        Rows are tuples, or dicts when the stream was opened with ``objects``.
 
         A short batch does not mean the end -- the library also caps a batch by byte size, so
         only an empty one is terminal.
@@ -79,7 +85,8 @@ class RowStream:
 
         if code == _library.RESULT_OK:
             try:
-                return [tuple(row) for row in json.loads(payload)]
+                rows = json.loads(payload)
+                return rows if self._objects else [tuple(row) for row in rows]
             except ValueError as exc:  # a malformed batch is a driver/library mismatch
                 self.close()
                 raise _library.exception_for(

@@ -78,10 +78,32 @@ Three things follow, all of them worth knowing before a large query:
 |---|---|
 | `fetchall()` materializes | It hands back everything, by definition. Iterate instead to keep a large result out of memory. |
 | `rowcount` counts what you fetched | For a SELECT it is `-1` before the first fetch and grows as rows arrive, because the total is not known until the result is exhausted. PEP 249 allows this and `sqlite3` does the same. For DML it is the affected count, unchanged. |
-| Some shapes cannot stream | `SELECT *` (its header is the union of every ad's attributes), aggregates and `GROUP BY` (rows are synthesized from groups), and window functions (a row's value ranks it against the others). Those run whole on the daemon and are then served from memory. The rows are identical; only the memory differs. `cursor._streamed` says which happened. |
+| Some shapes cannot stream *as tuples* | `SELECT *` needs its column list before row 1, and that list is the union of every matched ad's attributes — see `conn.mappings()` below, which streams it. Aggregates, `GROUP BY` and window functions cannot stream in any row shape: their rows are synthesized from groups rather than read from ads. Those run whole and are served from memory; the rows are identical, only the memory differs. |
 
 **Name your columns.** `SELECT Owner, RequestMemory FROM jobs` streams *and* pushes a
 projection to the server, so only those attributes cross the wire. `SELECT *` does neither.
+
+### Streaming `SELECT *`: `conn.mappings()`
+
+A tuple result has to know its columns before the first row. `SELECT *` does not — its column
+list is the union of every matched ad's attributes, and ClassAds are schemaless, so row 2 may
+carry an attribute row 1 lacks. Keyed rows need no column list at all, so this streams:
+
+```python
+for row in conn.mappings("SELECT * FROM jobs WHERE Owner = ?", ("alice",)):
+    print(row["Owner"], row.get("RequestMemory"))
+```
+
+Each row is a `dict` of exactly that ad's attributes — nothing is padded to a union, and a wide
+or ragged result costs one batch rather than the whole table. It takes `itersize`, is a context
+manager, and reports `stream.streamed`.
+
+Values are **evaluated**, so an attribute holding an expression arrives as what it evaluates to.
+`conn.ads()` is the path that preserves expressions (`ad.lookup("Requirements")`), at the cost of
+needing HTCondor's `classad2` bindings; `mappings()` needs nothing beyond the driver.
+
+Aggregates and `GROUP BY` are still computed whole here — that limit is about synthesizing rows,
+not about their shape — but they do come back as dicts.
 
 An unfinished statement holds the daemon's per-connection executor lock, so starting another one
 on the same connection first drains the open one into memory. Two cursors on one connection stay

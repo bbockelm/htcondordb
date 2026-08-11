@@ -65,6 +65,7 @@ from ._types import (
     Timestamp,
     TimestampFromTicks,
 )
+from ._mappings import MappingStream
 from .adstream import AdStream
 from .adwrite import AdReject, WriteResult
 from .connection import Connection
@@ -186,6 +187,7 @@ __all__ = [
     "AdReject",
     "WriteResult",
     "AdStream",
+    "MappingStream",
     "LIBRARY_ENV",
     "library_path",
     "__version__",

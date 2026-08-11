@@ -132,11 +132,19 @@ class Cursor:
         self._check_open()
         self._reset()
 
-        statement = bind(operation, parameters)
+        return self._run(bind(operation, parameters), objects=False)
+
+    def _run(self, statement: str, objects: bool) -> "Cursor":
+        """Open a stream for an already-bound statement.
+
+        The keyed-row path (``objects``) is how Connection.mappings streams a ``SELECT *``; it
+        reuses everything here -- batching, settling, cleanup -- and differs only in the shape
+        each row arrives in.
+        """
         # Another unfinished statement on this connection holds the executor lock, so settle it
         # before starting this one. Without this, two live cursors on one connection deadlock.
         self._connection._settle_streams()
-        stream = RowStream(self._connection, statement)
+        stream = RowStream(self._connection, statement, objects=objects)
         self._load_header(stream)
         return self
 

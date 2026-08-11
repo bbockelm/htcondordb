@@ -64,6 +64,10 @@ def is_internal(message: str) -> bool:
 #: ``hcdb_sql`` option bits.
 SQL_ADS = 1 << 0
 
+#: ``hcdb_sql_stream`` option bits. Keyed rows need no column list, which is what lets
+#: ``SELECT *`` stream -- see hcdbRowsAsObjects in capi/rows.go.
+STREAM_ROWS_AS_OBJECTS = 1 << 0
+
 #: Environment variable naming the shared library explicitly.
 LIBRARY_ENV = "HTCONDORDB_LIBRARY"
 
@@ -73,7 +77,7 @@ uintptr_t hcdb_connect_err(char *addr, char **err);
 int hcdb_address(uintptr_t h, char **out);
 int hcdb_setenv(char *name, char *value);
 int hcdb_selftest_panic(char **out);
-int hcdb_sql_stream(uintptr_t h, char *sql, uintptr_t *cursor, char **header, char **out);
+int hcdb_sql_stream(uintptr_t h, char *sql, int opts, uintptr_t *cursor, char **header, char **out);
 int hcdb_sql_stream_next(uintptr_t ch, int max_rows, char **out);
 void hcdb_sql_stream_free(uintptr_t ch);
 uintptr_t hcdb_query(uintptr_t h, char *table, char *constraint);

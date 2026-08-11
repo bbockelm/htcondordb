@@ -16,6 +16,7 @@ from ._errors import (
 from .cursor import Cursor
 
 if TYPE_CHECKING:  # pragma: no cover
+    from ._mappings import MappingStream
     from .adstream import AdStream
 
 
@@ -320,6 +321,41 @@ class Connection:
         from .adstream import ads as _ads
 
         return _ads(self, operation, parameters)
+
+    def mappings(self, operation: str, parameters: Any = None) -> "MappingStream":
+        """Run a statement and iterate its rows as ``dict`` objects, streaming.
+
+        The shape to reach for when walking a wide or ragged result -- above all ``SELECT *``::
+
+            for row in conn.mappings("SELECT * FROM jobs WHERE Owner = ?", ("alice",)):
+                print(row["Owner"], row.get("RequestMemory"))
+
+        :meth:`execute` cannot stream a ``SELECT *``: a tabular result needs its column list
+        before the first row, and for ``SELECT *`` that list is the union of every matched ad's
+        attributes, which is not known until the last one has been seen. Keyed rows need no such
+        list -- each ad carries its own attribute names -- so this streams whatever the shape of
+        the data, and a large table costs one batch rather than the whole result.
+
+        Values are **evaluated**: an attribute holding an expression arrives as what it evaluates
+        to. Use :meth:`ads` to keep expressions, which needs HTCondor's ``classad2`` bindings;
+        this path needs nothing beyond the driver.
+
+        Rows a statement synthesizes rather than reads -- an aggregate, a ``GROUP BY``, a window
+        function -- still cannot be produced one at a time, in any row shape, so those are
+        computed whole and then iterated. ``stream.streamed`` says which happened.
+
+        Args:
+            operation: A single statement, with ``?`` placeholders.
+            parameters: One value per placeholder, bound exactly as in :meth:`execute`.
+
+        Returns:
+            A :class:`~htcondordb._mappings.MappingStream`: an iterator of dicts, also a context
+            manager, with ``itersize`` for the batch size.
+        """
+        self._settle_streams()
+        from ._mappings import mappings as _mappings
+
+        return _mappings(self, operation, parameters)
 
     def write_ads(self, table, ads, key="Name", chunk=None):
         """Upsert an iterable of ClassAds into a table, in batches.
