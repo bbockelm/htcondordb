@@ -143,6 +143,37 @@ then the repo's `bin/`, then the loader's own path.
 Those have Linux wheels but no macOS distribution, so on a Mac that path needs a local
 HTCondor build; everything else works either way.
 
+## Timeouts, logging, threads
+
+**A query can be bounded in time.** Nothing was stopping a report from hanging forever:
+
+```python
+conn = htcondordb.connect(timeout=60)     # or conn.timeout = 60 at any point
+```
+
+A query that exceeds it raises `OperationalError` naming the timeout. Each statement takes the
+value current when it starts, so the attribute doubles as a per-statement limit.
+
+Two deliberate gaps. **Writes are not bounded** — cancelling one mid-flight can leave a
+transaction open on the server, which trades a hang for a worse problem. And a timeout does not
+make Ctrl-C work during a blocking fetch: cffi releases the GIL, so Python defers the signal
+until the call returns. The timeout is what keeps that bounded.
+
+**The library is quiet by default.** The transport and security code underneath logs through Go's
+`slog`, and used to print several lines of session negotiation into your stderr on every connect.
+It now logs nothing unless asked:
+
+```python
+htcondordb.set_log_level("info")          # off, error, warn, info, debug
+```
+
+`HTCONDORDB_LOG_LEVEL` does the same without a code change. Nothing is lost by the default:
+failures arrive as exceptions, which is all the log was duplicating.
+
+**Threads may share a connection** (`threadsafety = 2`) and will queue behind each other — the
+driver holds the connection's lock across every operation that reaches the library. A single
+*cursor* is not shareable: two threads fetching from one row buffer would interleave.
+
 ## Authentication
 
 There are no credential arguments to `connect()`. HTCondor's security configuration is

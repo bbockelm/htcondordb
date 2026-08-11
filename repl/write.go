@@ -80,7 +80,7 @@ func (e *Executor) WriteAds(table string, items []AdItem) (AdWriteResult, error)
 		return res, nil
 	}
 
-	ctx := context.Background()
+	ctx := e.opCtx()
 	if e.txActive {
 		// Stage into the caller's transaction. It has to be the same table -- a dbrpc
 		// transaction covers one -- and staging binds it just as a statement would.

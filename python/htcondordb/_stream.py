@@ -33,7 +33,11 @@ class RowStream:
     """
 
     def __init__(
-        self, connection: "Connection", statement: str, objects: bool = False
+        self,
+        connection: "Connection",
+        statement: str,
+        objects: bool = False,
+        timeout: float | None = None,
     ) -> None:
         lib = connection._lib
         ffi, c = lib.ffi, lib.lib
@@ -42,8 +46,17 @@ class RowStream:
         header = ffi.new("char **")
         out = ffi.new("char **")
         options = _library.STREAM_ROWS_AS_OBJECTS if objects else 0
+        # Microseconds, and 0 means no limit. Rounded up so a very small timeout asks for the
+        # smallest limit the library can express rather than silently asking for none.
+        timeout_us = 0 if not timeout else max(1, int(timeout * 1_000_000))
         code = c.hcdb_sql_stream(
-            connection._handle, statement.encode("utf-8"), options, cursor, header, out
+            connection._handle,
+            statement.encode("utf-8"),
+            options,
+            timeout_us,
+            cursor,
+            header,
+            out,
         )
         if code != _library.RESULT_OK:
             message = lib.string(out[0]) or "the statement failed with no message"

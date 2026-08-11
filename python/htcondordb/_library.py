@@ -77,7 +77,8 @@ uintptr_t hcdb_connect_err(char *addr, char **err);
 int hcdb_address(uintptr_t h, char **out);
 int hcdb_setenv(char *name, char *value);
 int hcdb_selftest_panic(char **out);
-int hcdb_sql_stream(uintptr_t h, char *sql, int opts, uintptr_t *cursor, char **header, char **out);
+int hcdb_sql_stream(uintptr_t h, char *sql, int opts, long long timeout_us, uintptr_t *cursor, char **header, char **out);
+int hcdb_set_log_level(char *level);
 int hcdb_sql_stream_next(uintptr_t ch, int max_rows, char **out);
 void hcdb_sql_stream_free(uintptr_t ch);
 uintptr_t hcdb_query(uintptr_t h, char *table, char *constraint);
@@ -140,7 +141,13 @@ def _candidate_paths() -> list[str]:
 # name the daemon, and the `_CONDOR_<KNOB>` convention for overriding any knob at all.
 # Nothing else in the environment is copied into another runtime.
 _CONDOR_ENV_NAMES = frozenset(
-    {"CONDOR_CONFIG", "HTCONDORDB_ADDRESS_FILE", "HTCONDORDB_HOST"}
+    {
+        "CONDOR_CONFIG",
+        "HTCONDORDB_ADDRESS_FILE",
+        "HTCONDORDB_HOST",
+        # Read by the library when it configures its log destination; see set_log_level.
+        "HTCONDORDB_LOG_LEVEL",
+    }
 )
 _CONDOR_ENV_PREFIX = "_CONDOR_"
 
@@ -234,6 +241,7 @@ def load() -> _Library:
                     "hcdb_setenv",
                     "hcdb_sql",
                     "hcdb_sql_stream",
+                    "hcdb_set_log_level",
                     "hcdb_sql_ads",
                     "hcdb_close",
                     "hcdb_free",

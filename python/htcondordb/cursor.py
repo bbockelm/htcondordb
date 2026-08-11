@@ -104,10 +104,11 @@ class Cursor:
 
     def close(self) -> None:
         """Release the cursor. Closing twice is not an error."""
-        if self._closed:
-            return
-        self._closed = True
-        self._reset()
+        with self._connection._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._reset()
         self._connection._forget(self)
 
     def execute(self, operation: str, parameters: Sequence[Any] | None = None) -> "Cursor":
@@ -141,11 +142,19 @@ class Cursor:
         reuses everything here -- batching, settling, cleanup -- and differs only in the shape
         each row arrives in.
         """
-        # Another unfinished statement on this connection holds the executor lock, so settle it
-        # before starting this one. Without this, two live cursors on one connection deadlock.
-        self._connection._settle_streams()
-        stream = RowStream(self._connection, statement, objects=objects)
-        self._load_header(stream)
+        # Under the connection's lock for the whole operation: settling another cursor mutates
+        # that cursor's row buffer, so a concurrent fetch on it would interleave.
+        with self._connection._lock:
+            # Another unfinished statement on this connection holds the executor lock, so settle
+            # it first. Without this, two live cursors on one connection deadlock.
+            self._connection._settle_streams()
+            stream = RowStream(
+                self._connection,
+                statement,
+                objects=objects,
+                timeout=self._connection.timeout,
+            )
+            self._load_header(stream)
         return self
 
     def executemany(
@@ -199,9 +208,10 @@ class Cursor:
             size = self.arraysize
         if size <= 0:
             return []
-        while self._buffered_rows() < size:
-            if not self._fill(size):
-                break
+        with self._connection._lock:
+            while self._buffered_rows() < size:
+                if not self._fill(size):
+                    break
         rows = self._rows[self._position : self._position + size]
         self._position += len(rows)
         return rows
@@ -358,15 +368,18 @@ class Cursor:
         """
         if self._stream is None:
             return False
-        rows = self._stream.next_batch(max(minimum, self.itersize))
-        if not rows:
-            self._finish_stream()
-            return False
-        self._rows.extend(rows)
-        self._rowcount = max(self._rowcount, 0) + len(rows)
-        if self._stream.exhausted:
-            self._finish_stream()
-        return True
+        with self._connection._lock:
+            if self._stream is None:  # settled by another thread while we waited
+                return False
+            rows = self._stream.next_batch(max(minimum, self.itersize))
+            if not rows:
+                self._finish_stream()
+                return False
+            self._rows.extend(rows)
+            self._rowcount = max(self._rowcount, 0) + len(rows)
+            if self._stream.exhausted:
+                self._finish_stream()
+            return True
 
     def _buffer(self, minimum: int) -> bool:
         """Ensure at least one unread row is buffered; return whether one is available.
@@ -374,11 +387,17 @@ class Cursor:
         Distinct from :meth:`_fill` on purpose: asking "is a row available" and asking "fetch
         more" are different questions, and answering the first with the second is how a fetch
         loop spins forever.
+
+        Check-and-fill runs under the connection's lock because it has to be atomic. Another
+        thread starting a statement settles this cursor -- filling its buffer and clearing its
+        stream -- so a fill that added nothing can mean "someone else already did it", and
+        treating that as "no rows" ends iteration with rows still in hand.
         """
-        while self._buffered_rows() == 0:
-            if not self._fill(minimum):
-                return False
-        return True
+        with self._connection._lock:
+            while self._buffered_rows() == 0:
+                if not self._fill(minimum):
+                    return False
+            return True
 
     def _drain(self) -> None:
         """Fetch everything that is left into the buffer."""

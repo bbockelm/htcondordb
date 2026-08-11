@@ -6,6 +6,8 @@ the PEP, and tooling written against DB-API relies on them being exactly this sh
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 import htcondordb
@@ -123,7 +125,22 @@ class TestCursorWithoutExecute:
         from htcondordb.cursor import Cursor
 
         class _StubConnection:
+            # The lock is part of the contract Cursor relies on: every operation that touches
+            # the library or shared state runs under it, so a stand-in has to provide one.
+            _lock = threading.RLock()
+            timeout = None
+            _live_streams: set = set()
+
             def _check_open(self):
+                pass
+
+            def _settle_streams(self, keep=None):
+                pass
+
+            def _note_stream(self, holder):
+                pass
+
+            def _forget_stream(self, holder):
                 pass
 
             def _forget(self, cursor):

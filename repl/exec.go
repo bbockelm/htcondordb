@@ -100,13 +100,46 @@ type Executor struct {
 	tx       *dbrpc.Tx
 	txTable  string
 	txBuf    []WriteOp
+
+	// opContext bounds the server operations a statement issues, so a caller can put a
+	// deadline on a query. nil means context.Background(), which is what every caller got
+	// before this existed and what the CLI and daemon still get.
+	//
+	// Statement-scoped by design: it is set around one statement and restored after, which is
+	// safe because an Executor serves one statement at a time (its caller holds a lock for the
+	// duration -- including for a whole stream, whose producer holds it until drained).
+	opContext context.Context
+}
+
+// opCtx is the context this Executor's server operations run under.
+func (e *Executor) opCtx() context.Context {
+	if e.opContext == nil {
+		return context.Background()
+	}
+	return e.opContext
+}
+
+// SetOpContext bounds this Executor's server operations by ctx until the returned function is
+// called, which restores the previous one. Pass a context with a deadline to time-limit a
+// statement:
+//
+//	restore := ex.SetOpContext(ctx)
+//	defer restore()
+//
+// Deliberately not applied to writes by their callers: cancelling a write mid-flight can leave
+// a transaction open on the server, so a deadline that covers a COMMIT trades a hang for a
+// worse problem. See capi, which sets this for SELECT only.
+func (e *Executor) SetOpContext(ctx context.Context) func() {
+	previous := e.opContext
+	e.opContext = ctx
+	return func() { e.opContext = previous }
 }
 
 // isArchive reports whether table is an append-only history table, loading (and caching) the
 // archive-table set from the server on first use.
 func (e *Executor) isArchive(table string) bool {
 	if !e.archivesOK {
-		names, err := e.c.ArchiveTables(context.Background())
+		names, err := e.c.ArchiveTables(e.opCtx())
 		if err != nil {
 			return false // couldn't list; treat as a normal table (retry next call)
 		}
@@ -152,15 +185,15 @@ func (e *Executor) commit(table string, ops []WriteOp) error {
 	if e.applyBatch != nil {
 		return e.applyBatch(ops)
 	}
-	tx, err := e.c.BeginTable(context.Background(), table)
+	tx, err := e.c.BeginTable(e.opCtx(), table)
 	if err != nil {
 		return err
 	}
 	if err := applyOps(tx, ops); err != nil {
-		_ = tx.Abort(context.Background())
+		_ = tx.Abort(e.opCtx())
 		return err
 	}
-	return tx.Commit(context.Background())
+	return tx.Commit(e.opCtx())
 }
 
 // applyOps issues a batch of write ops against an open transaction, without committing.
@@ -207,7 +240,7 @@ func (e *Executor) stage(table string, ops []WriteOp) error {
 	}
 
 	if e.tx == nil {
-		tx, err := e.c.BeginTable(context.Background(), table)
+		tx, err := e.c.BeginTable(e.opCtx(), table)
 		if err != nil {
 			return err
 		}
@@ -239,7 +272,7 @@ func (e *Executor) execCommit() (*Result, error) {
 
 	switch {
 	case tx != nil:
-		if err := tx.Commit(context.Background()); err != nil {
+		if err := tx.Commit(e.opCtx()); err != nil {
 			return nil, err
 		}
 	case len(buf) > 0:
@@ -262,7 +295,7 @@ func (e *Executor) execRollback() (*Result, error) {
 		// The transaction is discarded either way: a failed Abort leaves it for the
 		// server's idle reaper (or the connection close), and reporting the error would
 		// only make a caller believe its writes might still land.
-		_ = tx.Abort(context.Background())
+		_ = tx.Abort(e.opCtx())
 	}
 	return &Result{Note: "ROLLBACK"}, nil
 }
@@ -347,19 +380,19 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 
 func (e *Executor) execCreateTable(st *Statement) (*Result, error) {
 	if st.InMemory {
-		if err := e.c.CreateTableInMemory(context.Background(), st.Table); err != nil {
+		if err := e.c.CreateTableInMemory(e.opCtx(), st.Table); err != nil {
 			return nil, err
 		}
 		return &Result{Note: "CREATE TABLE " + st.Table + " MEMORY"}, nil
 	}
-	if err := e.c.CreateTable(context.Background(), st.Table); err != nil {
+	if err := e.c.CreateTable(e.opCtx(), st.Table); err != nil {
 		return nil, err
 	}
 	return &Result{Note: "CREATE TABLE " + st.Table}, nil
 }
 
 func (e *Executor) execDropTable(st *Statement) (*Result, error) {
-	if err := e.c.DropTable(context.Background(), st.Table); err != nil {
+	if err := e.c.DropTable(e.opCtx(), st.Table); err != nil {
 		return nil, err
 	}
 	return &Result{Note: "DROP TABLE " + st.Table}, nil
@@ -374,14 +407,14 @@ func (e *Executor) execCreateView(st *Statement) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := e.c.CreateView(context.Background(), st.ViewName, spec); err != nil {
+	if err := e.c.CreateView(e.opCtx(), st.ViewName, spec); err != nil {
 		return nil, err
 	}
 	return &Result{Note: "CREATE MATERIALIZED VIEW " + st.ViewName}, nil
 }
 
 func (e *Executor) execDropView(st *Statement) (*Result, error) {
-	if err := e.c.DropView(context.Background(), st.ViewName); err != nil {
+	if err := e.c.DropView(e.opCtx(), st.ViewName); err != nil {
 		return nil, err
 	}
 	return &Result{Note: "DROP MATERIALIZED VIEW " + st.ViewName}, nil
@@ -521,7 +554,7 @@ func (e *Executor) execCreateIndex(st *Statement) (*Result, error) {
 	if st.IndexKind == "categorical" {
 		action = "index.add.categorical"
 	}
-	msg, err := e.c.AdminTable(context.Background(), st.Table, action, st.Columns...)
+	msg, err := e.c.AdminTable(e.opCtx(), st.Table, action, st.Columns...)
 	if err != nil {
 		return nil, err
 	}
@@ -529,7 +562,7 @@ func (e *Executor) execCreateIndex(st *Statement) (*Result, error) {
 }
 
 func (e *Executor) execDropIndex(st *Statement) (*Result, error) {
-	msg, err := e.c.AdminTable(context.Background(), st.Table, "index.drop", st.Columns...)
+	msg, err := e.c.AdminTable(e.opCtx(), st.Table, "index.drop", st.Columns...)
 	if err != nil {
 		return nil, err
 	}
@@ -563,7 +596,7 @@ func (e *Executor) execMatch(st *Statement) (*Result, error) {
 			targetWhere = "(" + targetWhere + ") && (" + free + ")"
 		}
 	}
-	rows, err := e.c.MatchTables(context.Background(), st.Table, st.MatchResource, e.keyAttr, reqWhere, targetWhere, st.Limit, st.MatchUsing)
+	rows, err := e.c.MatchTables(e.opCtx(), st.Table, st.MatchResource, e.keyAttr, reqWhere, targetWhere, st.Limit, st.MatchUsing)
 	if err != nil {
 		return nil, err
 	}
@@ -592,12 +625,12 @@ func (e *Executor) ExecString(s string) (*Result, error) {
 // Diagnostics returns a table's storage stats, hot set, indexes, and tuning
 // suggestions (the .stats/.indexes/.hot commands).
 func (e *Executor) Diagnostics(table string) (*dbrpc.Diagnostics, error) {
-	return e.c.DiagnosticsTable(context.Background(), table)
+	return e.c.DiagnosticsTable(e.opCtx(), table)
 }
 
 // Explain reports how a table would execute a constraint query (.explain).
 func (e *Executor) Explain(table, constraint string) (*db.QueryExplain, error) {
-	return e.c.ExplainTable(context.Background(), table, constraint)
+	return e.c.ExplainTable(e.opCtx(), table, constraint)
 }
 
 // MatchExplain reports the matchmaking plan for the request st identifies (its KEY,
@@ -624,24 +657,24 @@ func (e *Executor) MatchExplain(st *Statement) (*db.MatchExplain, error) {
 			targetWhere = "(" + targetWhere + ") && (" + free + ")"
 		}
 	}
-	return e.c.MatchExplain(context.Background(), st.Table, selector, st.MatchResource, targetWhere)
+	return e.c.MatchExplain(e.opCtx(), st.Table, selector, st.MatchResource, targetWhere)
 }
 
 // Admin runs an index/hot-set management action on a table, returning the
 // server's message.
 func (e *Executor) Admin(table, action string, args ...string) (string, error) {
-	return e.c.AdminTable(context.Background(), table, action, args...)
+	return e.c.AdminTable(e.opCtx(), table, action, args...)
 }
 
 // Tables lists the catalog's table names.
 func (e *Executor) Tables() ([]string, error) {
-	tables, err := e.c.Tables(context.Background())
+	tables, err := e.c.Tables(e.opCtx())
 	if err != nil {
 		return nil, err
 	}
 	// Include append-only history tables so `.tables` and completion surface them -- they are a
 	// distinct namespace the regular table list omits, and are otherwise invisible.
-	archives, aerr := e.c.ArchiveTables(context.Background())
+	archives, aerr := e.c.ArchiveTables(e.opCtx())
 	if aerr == nil {
 		tables = append(tables, archives...)
 	}
@@ -655,7 +688,7 @@ func (e *Executor) tableExists(name string) bool {
 	if e.isArchive(name) { // cached
 		return true
 	}
-	names, err := e.c.Tables(context.Background())
+	names, err := e.c.Tables(e.opCtx())
 	if err != nil {
 		return false
 	}
@@ -668,7 +701,7 @@ func (e *Executor) tableExists(name string) bool {
 }
 
 // ListViews returns the materialized view names.
-func (e *Executor) ListViews() ([]string, error) { return e.c.ListViews(context.Background()) }
+func (e *Executor) ListViews() ([]string, error) { return e.c.ListViews(e.opCtx()) }
 
 // ViewRows returns the current rows of a materialized view (one ad per group). Views are
 // read like tables, so this reuses the ordinary query path against the view's backing.
@@ -679,34 +712,34 @@ func (e *Executor) ViewRows(name string) ([]*classad.ClassAd, error) {
 // ListExporters returns the registered external-sink exporters (name + kind). This is safe
 // for an unprivileged connection; the config (which may hold credentials) is not returned.
 func (e *Executor) ListExporters() ([]dbrpc.ExporterInfo, error) {
-	return e.c.ListExporters(context.Background())
+	return e.c.ListExporters(e.opCtx())
 }
 
 // Exporter returns a single exporter's full definition (including its opaque config). The
 // server gates this to DAEMON connections, so an unprivileged client gets an error.
 func (e *Executor) Exporter(name string) (db.ExporterDef, bool, error) {
-	return e.c.GetExporter(context.Background(), name)
+	return e.c.GetExporter(e.opCtx(), name)
 }
 
 // ExporterStateSize reports whether an exporter has checkpointed resume state and, if so,
 // its size in bytes. The blob itself is opaque to the CLI (owned by the exporter process).
 func (e *Executor) ExporterStateSize(name string) (int, bool, error) {
-	blob, ok, err := e.c.GetExporterState(context.Background(), name)
+	blob, ok, err := e.c.GetExporterState(e.opCtx(), name)
 	return len(blob), ok, err
 }
 
 // CreateTable creates a table (used by load auto-routing).
-func (e *Executor) CreateTable(name string) error { return e.c.CreateTable(context.Background(), name) }
+func (e *Executor) CreateTable(name string) error { return e.c.CreateTable(e.opCtx(), name) }
 
 // CreateTableInMemory creates a RAM-only table (data not persisted across a server restart).
 func (e *Executor) CreateTableInMemory(name string) error {
-	return e.c.CreateTableInMemory(context.Background(), name)
+	return e.c.CreateTableInMemory(e.opCtx(), name)
 }
 
 // ConvertTableToMemory drops an existing table's on-disk backing (DAEMON-only), keeping its
 // current contents in RAM only.
 func (e *Executor) ConvertTableToMemory(name string) error {
-	return e.c.ConvertTableToMemory(context.Background(), name)
+	return e.c.ConvertTableToMemory(e.opCtx(), name)
 }
 
 // WatchStream opens a live change stream on a table from cursor (nil ⇒ replay the current
@@ -715,14 +748,14 @@ func (e *Executor) ConvertTableToMemory(name string) error {
 // Events arrive with their ad already decoded, over the wire-form feed where the server
 // has it (see watchfeed).
 func (e *Executor) WatchStream(table string, cursor []byte) (<-chan watchfeed.Event, func(), error) {
-	ch, stop, _, err := watchfeed.Watch(context.Background(), e.c, table, cursor)
+	ch, stop, _, err := watchfeed.Watch(e.opCtx(), e.c, table, cursor)
 	return ch, stop, err
 }
 
 // WatchHead returns an opaque cursor at the table's current change-log head, so a watch
 // from it streams only subsequent changes (SINCE NOW) with no replay of current contents.
 func (e *Executor) WatchHead(table string) ([]byte, error) {
-	return e.c.WatchHead(context.Background(), table)
+	return e.c.WatchHead(e.opCtx(), table)
 }
 
 // constraint returns the WHERE constraint, defaulting to match-all.
@@ -753,13 +786,13 @@ func (e *Executor) queryAdsAsOf(table, where string, limit int, asOf string) ([]
 		if asOf != "" {
 			return nil, fmt.Errorf("AS OF is not supported on the append-only %q table", table)
 		}
-		texts, err = e.c.ArchiveQuery(context.Background(), table, constraint(where), limit)
+		texts, err = e.c.ArchiveQuery(e.opCtx(), table, constraint(where), limit)
 	case asOf == "":
 		// Inside a transaction, read through it so the statement sees the transaction's
 		// own uncommitted writes -- the connection-level op reads the committed store and
 		// would report an INSERT made moments earlier as missing.
 		if e.txReads(table) {
-			texts, err = e.tx.Query(context.Background(), constraint(where), limit)
+			texts, err = e.tx.Query(e.opCtx(), constraint(where), limit)
 			break
 		}
 		// Whole ads over the wire relay when the table can serve them: no projection, so
@@ -773,13 +806,13 @@ func (e *Executor) queryAdsAsOf(table, where string, limit int, asOf string) ([]
 				return nil, werr
 			}
 		}
-		texts, err = e.c.QueryTable(context.Background(), table, constraint(where), limit)
+		texts, err = e.c.QueryTable(e.opCtx(), table, constraint(where), limit)
 	default:
 		var at time.Time
 		if at, err = parseAsOf(asOf); err != nil {
 			return nil, err
 		}
-		texts, err = e.c.QueryAsOfTable(context.Background(), table, constraint(where), limit, at)
+		texts, err = e.c.QueryAsOfTable(e.opCtx(), table, constraint(where), limit, at)
 	}
 	if err != nil {
 		return nil, err
@@ -971,9 +1004,9 @@ func (e *Executor) queryAdsProjected(table, where string, attrs []string, limit 
 	// the named attributes drops those siblings, so the expression evaluates to undefined
 	// here. Against a server without the opcode, fall back to the plain projection --
 	// same results for literal attributes, the old undefined for expression ones.
-	texts, err := e.c.QueryRawProjectRefs(context.Background(), table, constraint(where), attrs, limit)
+	texts, err := e.c.QueryRawProjectRefs(e.opCtx(), table, constraint(where), attrs, limit)
 	if errors.Is(err, dbrpc.ErrProjectRefsUnsupported) {
-		texts, err = e.c.QueryRawProject(context.Background(), table, constraint(where), attrs, limit)
+		texts, err = e.c.QueryRawProject(e.opCtx(), table, constraint(where), attrs, limit)
 	}
 	if err != nil {
 		return nil, err
@@ -1155,7 +1188,7 @@ func (e *Executor) execAggregate(st *Statement, groupBy []string) (*Result, erro
 		return e.execAggregateAsOf(st, groupBy)
 	}
 	aggs, groupIdx := aggSpecs(st, groupBy)
-	rows, err := e.c.AggregateTable(context.Background(), st.Table, constraint(st.Where), groupBy, aggs)
+	rows, err := e.c.AggregateTable(e.opCtx(), st.Table, constraint(st.Where), groupBy, aggs)
 	if err != nil {
 		return nil, err
 	}
@@ -1168,7 +1201,7 @@ func (e *Executor) execAggregate(st *Statement, groupBy []string) (*Result, erro
 // ErrArchiveAggregateUnsupported, so we fall back to client-side aggregation over the rows.
 func (e *Executor) execArchiveAggregate(st *Statement, groupBy []string) (*Result, error) {
 	aggs, groupIdx := aggSpecs(st, groupBy)
-	rows, err := e.c.ArchiveAggregate(context.Background(), st.Table, constraint(st.Where), groupBy, aggs)
+	rows, err := e.c.ArchiveAggregate(e.opCtx(), st.Table, constraint(st.Where), groupBy, aggs)
 	if errors.Is(err, dbrpc.ErrArchiveAggregateUnsupported) {
 		return e.execAggregateAsOf(st, groupBy) // client-side fetch-and-reduce fallback
 	}
@@ -1181,7 +1214,7 @@ func (e *Executor) execArchiveAggregate(st *Statement, groupBy []string) (*Resul
 // archiveRowCount returns the number of rows in an append-only history table via the
 // server-side count aggregate (falling back to a client-side count against an older server).
 func (e *Executor) archiveRowCount(table string) (int, error) {
-	rows, err := e.c.ArchiveAggregate(context.Background(), table, "true", nil,
+	rows, err := e.c.ArchiveAggregate(e.opCtx(), table, "true", nil,
 		[]dbrpc.AggSpec{{Func: dbrpc.AggCount, Arg: "*"}})
 	if errors.Is(err, dbrpc.ErrArchiveAggregateUnsupported) {
 		ads, aerr := e.queryAds(table, "", 0) // client-side fallback (queryAds routes archives)
@@ -1376,9 +1409,9 @@ func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
 	// widths, so the only difference here is which one to call.
 	var rows []dbrpc.AggRow
 	if e.isArchive(st.Table) {
-		rows, err = e.c.ArchiveAggregateBucketed(context.Background(), st.Table, constraint(st.Where), groups, aggs)
+		rows, err = e.c.ArchiveAggregateBucketed(e.opCtx(), st.Table, constraint(st.Where), groups, aggs)
 	} else {
-		rows, err = e.c.AggregateBucketedTable(context.Background(), st.Table, constraint(st.Where), groups, aggs)
+		rows, err = e.c.AggregateBucketedTable(e.opCtx(), st.Table, constraint(st.Where), groups, aggs)
 	}
 	if err != nil {
 		return nil, err
@@ -1879,7 +1912,7 @@ func (e *Executor) execDelete(st *Statement) (*Result, error) {
 	// later ROLLBACK silently fail to undo it. Staging keys is slower but is the only
 	// path the transaction can discard.
 	if e.applyBatch == nil && !e.txActive {
-		n, err := e.c.DeleteWhereTable(context.Background(), st.Table, constraint(st.Where))
+		n, err := e.c.DeleteWhereTable(e.opCtx(), st.Table, constraint(st.Where))
 		if err != nil {
 			return nil, fmt.Errorf("deleting: %w", err)
 		}
@@ -1912,9 +1945,9 @@ func (e *Executor) matchedKeys(table, where string) ([]string, error) {
 	// Inside a transaction, match through it: an UPDATE or DELETE must be able to address
 	// a row the same transaction created, which the committed-state op cannot see.
 	if e.txReads(table) {
-		return e.tx.KeysWhere(context.Background(), constraint(where))
+		return e.tx.KeysWhere(e.opCtx(), constraint(where))
 	}
-	return e.c.QueryKeysTable(context.Background(), table, constraint(where)) // UPDATE/DELETE act on every matching row
+	return e.c.QueryKeysTable(e.opCtx(), table, constraint(where)) // UPDATE/DELETE act on every matching row
 }
 
 // --- value helpers ---

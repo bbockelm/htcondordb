@@ -12,7 +12,10 @@ import "C"
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"runtime/cgo"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,6 +72,9 @@ type sqlCursor struct {
 	// Materialized: rows already in hand, served from position i.
 	buffered *repl.Result
 	i        int
+
+	// timeout is what was asked for, kept only so an expiry can say so.
+	timeout time.Duration
 }
 
 // isStar reports a SELECT * -- the shape with no column list of its own.
@@ -118,15 +124,15 @@ type sqlHeader struct {
 // one is drained or freed.
 //
 //export hcdb_sql_stream
-func hcdb_sql_stream(h C.uintptr_t, sql *C.char, opts C.int, cursor *C.uintptr_t, header **C.char,
-	out **C.char) C.int {
+func hcdb_sql_stream(h C.uintptr_t, sql *C.char, opts C.int, timeoutUS C.longlong,
+	cursor *C.uintptr_t, header **C.char, out **C.char) C.int {
 	return guardStatus("hcdb_sql_stream", out, func() C.int {
-		return hcdb_sql_streamImpl(h, sql, opts, cursor, header, out)
+		return hcdb_sql_streamImpl(h, sql, opts, timeoutUS, cursor, header, out)
 	})
 }
 
-func hcdb_sql_streamImpl(h C.uintptr_t, sql *C.char, opts C.int, cursor *C.uintptr_t,
-	header **C.char, out **C.char) C.int {
+func hcdb_sql_streamImpl(h C.uintptr_t, sql *C.char, opts C.int, timeoutUS C.longlong,
+	cursor *C.uintptr_t, header **C.char, out **C.char) C.int {
 	*cursor = 0
 	c := handleConn(h)
 	if c == nil {
@@ -140,6 +146,16 @@ func hcdb_sql_streamImpl(h C.uintptr_t, sql *C.char, opts C.int, cursor *C.uintp
 	}
 
 	objects := int(opts)&hcdbRowsAsObjects != 0
+
+	// A deadline bounds a SELECT and nothing else. Cancelling a write mid-flight can leave a
+	// transaction open on the server, so a timeout that covered COMMIT would trade a hang for a
+	// worse problem; a query that runs long is the case that actually strands a caller.
+	// Microseconds, so a caller can express a limit below a millisecond -- a local query over a
+	// small table finishes inside one, which a test needs to be able to bound.
+	timeout := time.Duration(timeoutUS) * time.Microsecond
+	if st.Kind != repl.StmtSelect {
+		timeout = 0
+	}
 
 	// A SELECT whose rows come from ads alone streams; everything else -- DML, and the
 	// result-set shapes RowStreamer declines -- runs to completion here.
@@ -159,12 +175,13 @@ func hcdb_sql_streamImpl(h C.uintptr_t, sql *C.char, opts C.int, cursor *C.uintp
 	// SELECT * declines to stream as a table because its header is unknowable in advance --
 	// but keyed rows have no header, so in that shape it streams from each ad's own attributes.
 	if objects && rowOf == nil && st.Kind == repl.StmtSelect && isStar(st) {
-		return openStreamCursor(c, st, nil, adAttributesRow, cursor, header, out)
+		return openStreamCursor(c, st, nil, adAttributesRow, timeout, cursor, header, out)
 	}
 	if rowOf == nil {
-		return openBufferedCursor(c, st, objects, cursor, header, out)
+		return openBufferedCursor(c, st, objects, timeout, cursor, header, out)
 	}
-	return openStreamCursor(c, st, columns, rowFromValues(columns, rowOf, objects), cursor, header, out)
+	return openStreamCursor(c, st, columns, rowFromValues(columns, rowOf, objects), timeout,
+		cursor, header, out)
 }
 
 // rowFromValues turns a per-row value evaluator into the shape the caller asked for.
@@ -200,9 +217,15 @@ func adAttributesRow(ad *classad.ClassAd) any {
 }
 
 // openBufferedCursor executes the statement now and serves its rows from memory.
-func openBufferedCursor(c *conn, st *repl.Statement, objects bool, cursor *C.uintptr_t,
-	header **C.char, out **C.char) C.int {
+func openBufferedCursor(c *conn, st *repl.Statement, objects bool, timeout time.Duration,
+	cursor *C.uintptr_t, header **C.char, out **C.char) C.int {
 	c.mu.Lock()
+	if timeout > 0 {
+		ctx, cancel := context.WithTimeout(c.ctx, timeout)
+		defer cancel()
+		restore := c.ex.SetOpContext(ctx)
+		defer restore()
+	}
 	start := time.Now()
 	res, execErr := c.ex.Exec(st)
 	elapsed := time.Since(start)
@@ -212,13 +235,10 @@ func openBufferedCursor(c *conn, st *repl.Statement, objects bool, cursor *C.uin
 	c.mu.Unlock()
 
 	if execErr != nil {
-		// HintFor is the single source of truth for recognizing a read-only refusal, and its
-		// hint says what to check -- worth carrying to the caller verbatim.
+		*out = C.CString(statementError(execErr, timeout))
 		if hint := repl.HintFor(execErr); hint != "" {
-			*out = C.CString(execErr.Error() + ": " + hint)
 			return hcdbDenied
 		}
-		*out = C.CString(execErr.Error())
 		return hcdbErr
 	}
 	if res == nil {
@@ -241,8 +261,8 @@ func openBufferedCursor(c *conn, st *repl.Statement, objects bool, cursor *C.uin
 
 // openStreamCursor starts the producer and returns before the first row is fetched.
 func openStreamCursor(c *conn, st *repl.Statement, columns []string,
-	rowOf func(*classad.ClassAd) any, cursor *C.uintptr_t, header **C.char,
-	out **C.char) C.int {
+	rowOf func(*classad.ClassAd) any, timeout time.Duration, cursor *C.uintptr_t,
+	header **C.char, out **C.char) C.int {
 
 	// A SELECT cannot change the transaction state, so reading it at open is as accurate as
 	// reading it at the end -- and the end may be a long way off.
@@ -251,7 +271,13 @@ func openStreamCursor(c *conn, st *repl.Statement, columns []string,
 	c.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(c.ctx)
+	if timeout > 0 {
+		// The deadline covers the whole stream, not just its opening: a query that produces its
+		// first row promptly and then stalls is the shape a caller most needs bounded.
+		ctx, cancel = context.WithTimeout(c.ctx, timeout)
+	}
 	cur := &sqlCursor{
+		timeout: timeout,
 		columns: columns,
 		rows:    make(chan any),
 		cancel:  cancel,
@@ -264,6 +290,8 @@ func openStreamCursor(c *conn, st *repl.Statement, columns []string,
 		// open transaction), so a stream takes the same lock a statement does.
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		restore := c.ex.SetOpContext(ctx)
+		defer restore()
 
 		serr := c.ex.StreamSelect(st, func(ad *classad.ClassAd) bool {
 			select {
@@ -342,7 +370,7 @@ func hcdb_sql_stream_nextImpl(ch C.uintptr_t, maxRows C.int, out **C.char) C.int
 
 	batch, streamErr := cur.nextBatch(limit)
 	if streamErr != nil {
-		*out = C.CString(streamErr.Error())
+		*out = C.CString(statementError(streamErr, cur.timeout))
 		return hcdbErr
 	}
 	if len(batch) == 0 {
@@ -473,4 +501,15 @@ func (cur *sqlCursor) release() {
 		}
 	}()
 	<-cur.done
+}
+
+// statementError renders a failed statement's error, naming a timeout as one. A bare
+// "context deadline exceeded" reads like an internal fault; the caller set this limit and needs
+// to see that it was theirs.
+func statementError(err error, timeout time.Duration) string {
+	if timeout > 0 && (errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(err.Error(), context.DeadlineExceeded.Error())) {
+		return fmt.Sprintf("the query exceeded its %s timeout: %v", timeout, err)
+	}
+	return err.Error()
 }
