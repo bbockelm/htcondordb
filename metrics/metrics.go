@@ -7,6 +7,7 @@ package metrics
 
 import (
 	"fmt"
+	"github.com/PelicanPlatform/classad/collections"
 	"net/http"
 	"strings"
 
@@ -419,6 +420,20 @@ func b2f(b bool) float64 {
 func Handler(cat *db.Catalog, sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus, importers func() []dbad.ImporterStatus) http.Handler {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
+		// Store integrity, deliberately process-wide rather than per table: it counts bucket-chain links that
+		// named a segment the shard does not have, which is a segment-LIFETIME bug -- a reader walking a
+		// mapping it did not hold alive -- and not a property of any one table's data.
+		//
+		// Zero on a healthy store. Nonzero means a chain walk terminated early instead of panicking, so a
+		// lookup may have missed a key that exists: a wrong answer rather than a crash. Alert on any increase,
+		// not on a threshold.
+		//
+		// A counter by nature, exported as a gauge because the value is read from the library on scrape rather
+		// than accumulated here; _total keeps the name honest about its monotonicity.
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "htcondordb_store_corrupt_chain_links_total",
+			Help: "Bucket-chain links naming a segment the shard does not have. Nonzero indicates a segment-lifetime bug; a lookup may have missed an existing key.",
+		}, func() float64 { return float64(collections.CorruptChainLinks()) }),
 		newCatalogCollector(cat),
 		&viewCollector{cat: cat},
 		newSyncCollector(sources, exporters, importers),
