@@ -48,12 +48,70 @@ jobs:
             mkdir -p "${stage}"
             GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w -X main.version=${version}" \
               -o "${stage}/" ./cmd/htcondordb ./cmd/htcondordb-cli
+            # The exporter launchers ship in the SAME directory as the daemon, because that is
+            # where the daemon looks for them: exporter_manager.go resolves each Kind's binary by
+            # basename on PATH, else next to os.Executable(). Shipping the daemon alone meant a
+            # release install silently skipped every configured exporter ("not found: skip"),
+            # working only for people who built from source into a shared bin dir. Each is its own
+            # module, so each is built from its own directory; all three are pure Go, so the same
+            # CGO_ENABLED=0 cross build applies. No -X main.version: these have no version var,
+            # and a silently-ignored linker flag is worse than none.
+            for exp in kafkasync opensearchsync archivedropbox; do
+              (cd "${exp}" && GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w" \
+                -o "${GITHUB_WORKSPACE}/${stage}/" "./cmd/${exp}")
+            done
             cp README.md "${stage}/" 2>/dev/null || true
             tar -czf "dist/${name}.tar.gz" -C dist "${name}"
             rm -rf "${stage}"
           done
           (cd dist && sha256sum *.tar.gz > SHA256SUMS.txt)
           echo "Built archives:"; ls -l dist
+
+      # The Grafana datasource plugin, zipped for manual install. Its CI workflow only produced
+      # a workflow artifact, which expires and has no stable URL -- so there was no way to install
+      # a released version without building the frontend yourself. The zip's top-level directory
+      # must be the plugin id: that is what Grafana expects to unpack into its plugins dir.
+      - name: Set up Node (Grafana plugin frontend)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: grafana/package-lock.json
+
+      - name: Build Grafana plugin bundle
+        env:
+          CGO_ENABLED: '0'
+          GOWORK: 'off'
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+        working-directory: grafana
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            GOOS="$os" GOARCH="$arch" go build -trimpath -o "dist/gpx_htcondordb_${os}_${arch}" ./pkg
+          done
+          # Same completeness check the plugin's own workflow makes, so a half-built bundle cannot
+          # become a release asset.
+          test -f dist/module.js
+          test -f dist/plugin.json
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            test -f "dist/gpx_htcondordb_${target%/*}_${target#*/}"
+          done
+
+      - name: Package Grafana plugin zip
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          id="bbockelm-htcondordb-datasource"
+          rm -rf plugin-stage && mkdir -p "plugin-stage/${id}"
+          cp -R grafana/dist/. "plugin-stage/${id}/"
+          (cd plugin-stage && zip -qr "../dist/${id}_${version}.zip" "${id}")
+          rm -rf plugin-stage
+          (cd dist && sha256sum "${id}_${version}.zip" >> SHA256SUMS.txt)
+          ls -l dist
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -72,7 +130,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          assets=(dist/*.tar.gz dist/SHA256SUMS.txt)
+          assets=(dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt)
           # Idempotent: attach to an existing release (e.g. one created by hand or a
           # re-run) instead of failing; otherwise create it. --clobber replaces assets
           # so re-runs are safe.
