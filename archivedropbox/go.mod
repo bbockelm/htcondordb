@@ -3,15 +3,15 @@ module github.com/bbockelm/htcondordb/archivedropbox
 go 1.25.9
 
 require (
-	github.com/PelicanPlatform/classad v0.26.0
-	github.com/PelicanPlatform/classad/db v0.26.0
-	github.com/PelicanPlatform/classad/dbrpc v0.26.0
+	github.com/PelicanPlatform/classad v0.28.0
+	github.com/PelicanPlatform/classad/db v0.28.0
+	github.com/PelicanPlatform/classad/dbrpc v0.28.0
 	github.com/bbockelm/cedar v0.6.8
 	github.com/bbockelm/golang-htcondor v0.12.0
 )
 
 require (
-	github.com/PelicanPlatform/classad/collections v0.26.0 // indirect
+	github.com/PelicanPlatform/classad/collections v0.28.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
