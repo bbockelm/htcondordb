@@ -298,6 +298,20 @@ func run() error {
 		}
 	})
 
+	// Mirror-out (follower end): regenerate a job_queue.log from the mirrored tables on a cadence,
+	// so a follower that replicates a leader's schedd-sync tables re-emits a live, restorable backup
+	// log. Reapplied on reconfigure. Off unless HTCONDORDB_MIRROR_JOB_QUEUE_LOG names a destination.
+	mirrorMgr := &mirrorOutManager{parent: ctx, svc: svc, logger: d.Slog()}
+	if merr := mirrorMgr.apply(cfg); merr != nil {
+		return merr
+	}
+	d.OnReconfig(func(newCfg *config.Config) {
+		if merr := mirrorMgr.apply(newCfg); merr != nil {
+			log.Error(logging.DestinationGeneral, "reconfigure: mirror-out not reapplied", "err", merr.Error())
+			return
+		}
+	})
+
 	// Exporter manager: launch + supervise the standalone change-data exporters (kafkasync /
 	// opensearchsync) as children, so registering an exporter (CreateExporter) is enough for the
 	// daemon to run it -- each with a fresh, standalone inherited CEDAR session, as an
@@ -354,7 +368,12 @@ func run() error {
 	// MCP) discover this database and its command address here, and the ad doubles as a metrics
 	// sink carrying per-table storage gauges and per-source sync health -- scrapable via the
 	// collector even when the daemon's own /metrics endpoint is off.
-	startCollectorAdvertise(ctx, d, cfg, svc, advertisedAddr(d, ln), syncMgr.Sources, expMgr.Statuses, impMgr.Statuses)
+	// The collector ad and /metrics report every sync source: the schedd-sync tailers (in)
+	// and the mirror-out (out).
+	syncSources := func() []dbad.StatusSource {
+		return append(syncMgr.Sources(), mirrorMgr.Sources()...)
+	}
+	startCollectorAdvertise(ctx, d, cfg, svc, advertisedAddr(d, ln), syncSources, expMgr.Statuses, impMgr.Statuses)
 
 	// Start any background HA machinery (a follower's replicator, or the raft
 	// coordinator and its command handlers in consistent mode).
@@ -370,7 +389,7 @@ func run() error {
 	// but bind it to a trusted interface.
 	if addr := getStr(cfg, "HTCONDORDB_METRICS_ADDRESS"); addr != "" {
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", metrics.Handler(svc.Catalog(), syncMgr.Sources, expMgr.Statuses, impMgr.Statuses))
+		mux.Handle("/metrics", metrics.Handler(svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses))
 		// pprof (opt-in via HTCONDORDB_ENABLE_PPROF): profiling endpoints on the same
 		// trusted listener, so a memory/CPU anomaly in a live daemon is one
 		// `go tool pprof http://.../debug/pprof/heap` away instead of a blind restart.
