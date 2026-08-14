@@ -10,10 +10,12 @@
 package scheddsync
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -44,12 +46,18 @@ type JobSync struct {
 	// their own durable table so a proc materializing into a pre-existing cluster after a
 	// resume-from-offset restart can still chain its cluster's attributes; the header gets one so a
 	// job_queue.log reconstruction can restore the schedd's queue counters (id-reuse safety).
-	target   *db.DB
-	users    *db.DB
-	jobsets  *db.DB
-	clusters *db.DB
-	header   *db.DB
-	parser   *classadlog.Parser
+	target         *db.DB
+	users          *db.DB
+	jobsets        *db.DB
+	clusters       *db.DB
+	header         *db.DB
+	clusterprivate *db.DB // cluster-private ads ("C.-2"): per-cluster private attributes
+	// logmeta holds a single record: the log's LogHistoricalSequenceNumber (op 107, the
+	// sequence number + creation timestamp that head every job_queue.log). It is NOT routed
+	// from an ad key -- 107 carries no key -- so it is captured out of band from the log's
+	// first line (captureLogMeta) and is never touched by the reconcile sweep.
+	logmeta *db.DB
+	parser  *classadlog.Parser
 	prober   *classadlog.Prober
 	interval time.Duration
 	log      *slog.Logger
@@ -108,14 +116,18 @@ type JobSyncConfig struct {
 	Filename     string        // path to job_queue.log (required)
 	PollInterval time.Duration // default 200ms
 	Logger       *slog.Logger  // default slog.Default()
-	// Users, Jobsets, Clusters, and Header are the sibling tables the non-proc job_queue.log
-	// namespaces flatten into (the jobs table is the NewJobSync target). When any is nil a private
-	// in-memory table stands in, so routing and cluster-ad chaining still work for callers that only
-	// inspect the jobs table (e.g. tests). Header holds the single schedd header ad ("0.0").
-	Users    *db.DB
-	Jobsets  *db.DB
-	Clusters *db.DB
-	Header   *db.DB
+	// Users, Jobsets, Clusters, Header, and ClusterPrivate are the sibling tables the non-proc
+	// job_queue.log namespaces flatten into (the jobs table is the NewJobSync target). When any is
+	// nil a private in-memory table stands in, so routing and cluster-ad chaining still work for
+	// callers that only inspect the jobs table (e.g. tests). Header holds the single schedd header
+	// ad ("0.0"); ClusterPrivate holds the per-cluster private ads ("C.-2"). LogMeta holds a single
+	// record for the log's sequence header (op 107); it is captured from the log's first line.
+	Users          *db.DB
+	Jobsets        *db.DB
+	Clusters       *db.DB
+	Header         *db.DB
+	ClusterPrivate *db.DB
+	LogMeta        *db.DB
 	// Store, if set, durably records the resume position so a restart resumes instead of
 	// replaying the whole log, and recovers correctly if the log was compacted while down.
 	Store PositionStore
@@ -134,6 +146,7 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 		logger = slog.Default()
 	}
 	users, jobsets, clusters, header := cfg.Users, cfg.Jobsets, cfg.Clusters, cfg.Header
+	clusterprivate, logmeta := cfg.ClusterPrivate, cfg.LogMeta
 	if users == nil {
 		users = mustMemTable()
 	}
@@ -146,19 +159,27 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 	if header == nil {
 		header = mustMemTable()
 	}
+	if clusterprivate == nil {
+		clusterprivate = mustMemTable()
+	}
+	if logmeta == nil {
+		logmeta = mustMemTable()
+	}
 	return &JobSync{
-		target:   target,
-		users:    users,
-		jobsets:  jobsets,
-		clusters: clusters,
-		header:   header,
-		parser:   classadlog.NewParser(cfg.Filename),
-		prober:   classadlog.NewProber(),
-		interval: interval,
-		log:      logger,
-		children: map[string]map[string]struct{}{},
-		txs:      map[*db.DB]*db.Txn{},
-		store:    cfg.Store,
+		target:         target,
+		users:          users,
+		jobsets:        jobsets,
+		clusters:       clusters,
+		header:         header,
+		clusterprivate: clusterprivate,
+		logmeta:        logmeta,
+		parser:         classadlog.NewParser(cfg.Filename),
+		prober:         classadlog.NewProber(),
+		interval:       interval,
+		log:            logger,
+		children:       map[string]map[string]struct{}{},
+		txs:            map[*db.DB]*db.Txn{},
+		store:          cfg.Store,
 	}
 }
 
@@ -258,6 +279,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	beforeJobsets := s.jobsets.Keys()
 	beforeClusters := s.clusters.Keys()
 	beforeHeader := s.header.Keys()
+	beforeClusterPrivate := s.clusterprivate.Keys()
 	seen := map[*db.DB]map[string]struct{}{}
 
 	if oerr := s.parser.Open(); oerr != nil {
@@ -284,6 +306,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 
 	rec := &reconciler{
 		jobs: s.target, users: s.users, jobsets: s.jobsets, clusters: s.clusters, header: s.header,
+		clusterprivate: s.clusterprivate,
 		seen: seen, log: s.log, batches: map[*db.DB]*db.Txn{},
 	}
 	for {
@@ -323,12 +346,14 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 		{s.target, beforeJobs}, {s.users, beforeUsers},
 		{s.jobsets, beforeJobsets}, {s.clusters, beforeClusters},
 		{s.header, beforeHeader},
+		{s.clusterprivate, beforeClusterPrivate},
 	} {
 		if err = s.sweepKeys(sw.table, sw.before, seen[sw.table]); err != nil {
 			return err
 		}
 	}
-	s.checkpoint() // position recorded only after the reconciled table matches the log
+	s.captureLogMeta()             // the leading 107 sequence header (offset was reset to 0)
+	s.checkpoint()                 // position recorded only after the reconciled table matches the log
 	s.publishStatus(true)
 	return nil
 }
@@ -420,7 +445,7 @@ func (s *JobSync) sweepKeys(table *db.DB, before []string, seen map[string]struc
 // the key's last run and every submission attribute would vanish. The op handling mirrors
 // JobSync.applyEntry; keep the two in sync.
 type reconciler struct {
-	jobs, users, jobsets, clusters, header *db.DB
+	jobs, users, jobsets, clusters, header, clusterprivate *db.DB
 	// seen is PER TABLE: the keys given a live ad in each table this reconcile. It must not be a
 	// single global set -- a key legitimately routed to one table (e.g. an owner "0O.-1" in users)
 	// would then protect a stale, misrouted row under the SAME key in another table (a pre-routing
@@ -449,7 +474,7 @@ func (r *reconciler) apply(e *classadlog.LogEntry) error {
 			return err
 		}
 		r.curKey, r.curAd, r.curDels, r.destroy = e.Key, classad.New(), nil, false
-		r.curTable = routeTable(e.Key, r.jobs, r.users, r.jobsets, r.clusters, r.header)
+		r.curTable = routeTable(e.Key, r.jobs, r.users, r.jobsets, r.clusters, r.header, r.clusterprivate)
 	}
 	switch e.OpType {
 	case classadlog.OpNewClassAd:
@@ -702,6 +727,10 @@ func (s *JobSync) checkpoint() {
 // full replay (offset already rewound). It updates the prober so the next probe is relative
 // to what was consumed.
 func (s *JobSync) readAndApply(ctx context.Context, reload bool) (err error) {
+	if s.parser.GetNextOffset() == 0 {
+		// Reading from the start: the log's leading 107 sequence header is in this pass.
+		s.captureLogMeta()
+	}
 	if oerr := s.parser.Open(); oerr != nil {
 		return oerr
 	}
@@ -842,15 +871,15 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 }
 
 // tableFor returns the mirror table a job_queue.log key belongs to, or nil for keys we do not
-// mirror (the schedd header "0.0", cluster-private ads "C.-2", OCU ads "C.-99"). The namespace
-// is encoded in the "cluster.proc" key; see the is*Key classifiers.
+// mirror (OCU ads "C.-99"). The namespace is encoded in the "cluster.proc" key; see the is*Key
+// classifiers.
 func (s *JobSync) tableFor(key string) *db.DB {
-	return routeTable(key, s.target, s.users, s.jobsets, s.clusters, s.header)
+	return routeTable(key, s.target, s.users, s.jobsets, s.clusters, s.header, s.clusterprivate)
 }
 
 // routeTable classifies a job_queue.log key and returns the table it flattens into, or nil for a
 // dropped namespace. Shared by the incremental (applyEntry) and reconcile (reconciler) paths.
-func routeTable(key string, jobs, users, jobsets, clusters, header *db.DB) *db.DB {
+func routeTable(key string, jobs, users, jobsets, clusters, header, clusterprivate *db.DB) *db.DB {
 	switch {
 	case isJobKey(key):
 		return jobs
@@ -862,6 +891,8 @@ func routeTable(key string, jobs, users, jobsets, clusters, header *db.DB) *db.D
 		return users
 	case isHeaderKey(key):
 		return header
+	case isClusterPrivateKey(key):
+		return clusterprivate
 	default:
 		return nil
 	}
@@ -914,6 +945,81 @@ func isClusterKey(key string) bool {
 func isJobsetKey(key string) bool {
 	c, p, ok := parseJobKey(key)
 	return ok && c > 0 && p == -100
+}
+
+// isClusterPrivateKey reports whether key names a cluster-private ad (cluster>0, proc==-2, the
+// schedd's CLUSTERPRIVATE_qkey2): the per-cluster private attributes, created alongside every
+// cluster ad. Not a job row and not chained into procs; mirrored so a backup is complete.
+func isClusterPrivateKey(key string) bool {
+	c, p, ok := parseJobKey(key)
+	return ok && c > 0 && p == -2
+}
+
+// LogMetaKey is the single logmeta record's storage key. It is deliberately not a valid
+// "cluster.proc" ClassAd key so it can never collide with a mirrored ad.
+const LogMetaKey = "sequence"
+
+// LogSeqAttr and LogCreationTimeAttr hold the job_queue.log's LogHistoricalSequenceNumber
+// (op 107) fields in the logmeta record, so a reconstruction re-emits the same sequence header.
+const (
+	LogSeqAttr          = "SequenceNumber"
+	LogCreationTimeAttr = "CreationTimestamp"
+)
+
+// captureLogMeta reads the log's first record and, if it is a LogHistoricalSequenceNumber
+// (op 107, "107 <seq> CreationTimestamp <birthdate>"), records the sequence number and creation
+// timestamp in the logmeta table so a reconstruction reproduces the same header. The 107 carries
+// no ClassAd key, so it is not part of the routed ad stream (nor the reconcile sweep); it is
+// rewritten only when the schedd truncates the log -- which triggers a full reload here -- so
+// capturing it on every read-from-start keeps it current. A log without a 107 leaves logmeta
+// untouched (the writer then emits a fresh sequence).
+func (s *JobSync) captureLogMeta() {
+	seq, ts, ok := readLogSequence(s.parser.GetFilename())
+	if !ok {
+		return
+	}
+	ad := classad.New()
+	ad.InsertAttrString(KeyAttr, LogMetaKey)
+	ad.InsertAttr(LogSeqAttr, seq)
+	ad.InsertAttr(LogCreationTimeAttr, ts)
+	if cur, ok := s.logmeta.LookupClassAd(LogMetaKey); ok && cur.Equal(ad) {
+		return // unchanged; avoid a needless write/watch event
+	}
+	tx := s.logmeta.Begin()
+	tx.NewClassAd(LogMetaKey, ad)
+	if err := tx.Commit(); err != nil {
+		s.log.Warn("scheddsync: recording log sequence number failed", "err", err.Error())
+	}
+}
+
+// readLogSequence opens filename and returns the sequence number and creation timestamp from its
+// leading LogHistoricalSequenceNumber record ("107 <seq> CreationTimestamp <birthdate>"). ok is
+// false if the file cannot be read or its first real record is not a valid 107.
+func readLogSequence(filename string) (seq, ts int64, ok bool) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue // skip blanks and comments, as the parser does
+		}
+		fields := strings.Fields(line)
+		// "107 <seq> CreationTimestamp <birthdate>": fields[2] is the label, which we ignore.
+		if len(fields) >= 4 && fields[0] == "107" {
+			s, err1 := strconv.ParseInt(fields[1], 10, 64)
+			t, err2 := strconv.ParseInt(fields[3], 10, 64)
+			if err1 == nil && err2 == nil {
+				return s, t, true
+			}
+		}
+		return 0, 0, false // first real record is not a usable 107
+	}
+	return 0, 0, false
 }
 
 // isUserKey reports whether key names a user/owner/project record (cluster==0, proc>0).

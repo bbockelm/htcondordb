@@ -11,8 +11,9 @@ import (
 
 // routingLog exercises every job_queue.log namespace in one small log: the schedd header (0.0),
 // a user/owner record (0.1), a cluster ad (01.-1 carrying Owner "alice"), a jobset ad (1.-100),
-// a cluster-private ad (1.-2), and a real proc ad (1.0). The cluster ad's Owner is set BEFORE the
-// proc is created so the proc chains it out of the clusters table (the reverse-order path).
+// a cluster-private ad (1.-2), an OCU ad (1.-99, still dropped), and a real proc ad (1.0). The
+// cluster ad's Owner is set BEFORE the proc is created so the proc chains it out of the clusters
+// table (the reverse-order path).
 const routingLog = `101 0.0 Job Machine
 103 0.0 NextClusterNum 2
 101 0.1 Owner (unknown)
@@ -22,6 +23,8 @@ const routingLog = `101 0.0 Job Machine
 101 1.-100 JobSet (unknown)
 103 1.-100 JobSetName "myset"
 101 1.-2 ClusterPvt (unknown)
+103 1.-2 Secret "s3cr3t"
+101 1.-99 OCU (unknown)
 101 1.0 Job Machine
 103 1.0 ProcId 0
 103 1.0 ClusterId 1
@@ -32,8 +35,8 @@ func TestRoutingReconcile(t *testing.T) { assertRouting(t, true) }
 
 // assertRouting replays routingLog through either the incremental (Poll -> applyEntry) path or the
 // reconcile-reload path and verifies each namespace landed in exactly the right table, that the
-// header ad routes to the header table, that the cluster-private ad is dropped everywhere, and that
-// the proc chained its cluster's Owner.
+// header and cluster-private ads route to their own tables, that the OCU ad is dropped everywhere,
+// and that the proc chained its cluster's Owner.
 func assertRouting(t *testing.T, reconcile bool) {
 	t.Helper()
 	dir := t.TempDir()
@@ -45,9 +48,11 @@ func assertRouting(t *testing.T, reconcile bool) {
 	jobsets := openMem(t)
 	clusters := openMem(t)
 	header := openMem(t)
+	clusterprivate := openMem(t)
 
 	s := NewJobSync(jobs, JobSyncConfig{
 		Filename: logPath, Users: users, Jobsets: jobsets, Clusters: clusters, Header: header,
+		ClusterPrivate: clusterprivate,
 	})
 	var err error
 	if reconcile {
@@ -64,21 +69,16 @@ func assertRouting(t *testing.T, reconcile bool) {
 	wantKeys(t, "jobsets", jobsets, "1.-100")
 	wantKeys(t, "clusters", clusters, "01.-1")
 	wantKeys(t, "header", header, "0.0")
+	wantKeys(t, "clusterprivate", clusterprivate, "1.-2")
 
-	// The cluster-private ad (1.-2) is dropped from every table; the header (0.0) belongs only in
-	// the header table, not in any of the others.
+	// The OCU ad (1.-99) is dropped from every table; no ad belongs in a table other than its own.
 	for _, tbl := range []struct {
 		name string
 		db   *db.DB
-	}{{"jobs", jobs}, {"users", users}, {"jobsets", jobsets}, {"clusters", clusters}} {
-		for _, dropped := range []string{"0.0", "1.-2"} {
-			if _, ok := tbl.db.LookupClassAd(dropped); ok {
-				t.Errorf("misrouted key %q present in %s table", dropped, tbl.name)
-			}
+	}{{"jobs", jobs}, {"users", users}, {"jobsets", jobsets}, {"clusters", clusters}, {"header", header}, {"clusterprivate", clusterprivate}} {
+		if _, ok := tbl.db.LookupClassAd("1.-99"); ok {
+			t.Errorf("OCU ad 1.-99 should be dropped but is present in %s table", tbl.name)
 		}
-	}
-	if _, ok := header.LookupClassAd("1.-2"); ok {
-		t.Error("cluster-private ad 1.-2 leaked into the header table")
 	}
 
 	// The proc row inherits the cluster ad's Owner ("alice") even though it was written only on
