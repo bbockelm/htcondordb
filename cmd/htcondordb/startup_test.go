@@ -146,3 +146,34 @@ func TestRecordTableOpenNilTimer(t *testing.T) {
 	var tm *startupTimer
 	tm.recordTableOpen("table", "jobs", time.Second)
 }
+
+// TestRecordSealMigrationAggregates covers the counters behind the summary line, including the concurrent
+// path (migrations are reported from the goroutines opening the tables) and the zero case: a table that
+// migrated nothing must not be counted, or a normal start would claim an upgrade happened.
+func TestRecordSealMigrationAggregates(t *testing.T) {
+	tm := newStartupTimer(nil)
+	tm.recordSealMigration("empty", 0) // nothing migrated: must not count as a migrated table
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			tm.recordSealMigration(fmt.Sprintf("t%d", i), 10)
+		}(i)
+	}
+	wg.Wait()
+	if tm.migTables != 8 {
+		t.Errorf("migTables = %d, want 8 (a zero-segment table must not count; a lost update loses a real one)",
+			tm.migTables)
+	}
+	if tm.migSegments != 80 {
+		t.Errorf("migSegments = %d, want 80", tm.migSegments)
+	}
+	tm.done() // must not panic with a nil logger
+}
+
+// TestRecordSealMigrationNilTimer covers the nil receiver: the hook is passed to the catalog unconditionally.
+func TestRecordSealMigrationNilTimer(t *testing.T) {
+	var tm *startupTimer
+	tm.recordSealMigration("jobs", 5)
+}

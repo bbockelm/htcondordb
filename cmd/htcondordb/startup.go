@@ -57,6 +57,10 @@ type startupTimer struct {
 	tblCount int
 	tblSum   time.Duration
 	tblSlow  []phaseTime // the slowestKept slowest, descending
+
+	// One-time seal migrations reported during those same opens; guarded by tblMu for the same reason.
+	migTables   int
+	migSegments int
 }
 
 type phaseTime struct {
@@ -140,6 +144,29 @@ func (t *startupTimer) recordTableOpen(kind, name string, d time.Duration) {
 	}
 }
 
+// recordSealMigration notes that one table's open rewrote segments to encrypt private attributes that
+// predate always-on encryption. Safe for concurrent use and on a nil timer, like recordTableOpen.
+//
+// Every migration is logged as it happens, with no threshold: unlike a slow open, this is a one-time
+// event on the first start after the upgrade, and the number of segments is the explanation for a start
+// that will not repeat. A threshold would hide the small cases and leave only the alarming ones, which is
+// backwards -- the point is that the cost is expected.
+func (t *startupTimer) recordSealMigration(table string, segments int) {
+	if t == nil || segments <= 0 {
+		return
+	}
+	t.tblMu.Lock()
+	t.migTables++
+	t.migSegments += segments
+	log := t.log
+	t.tblMu.Unlock()
+
+	if log != nil {
+		log.Info(logging.DestinationGeneral, "encrypting private attributes written before encryption "+
+			"was always on (one-time, this start only)", "table", table, "segments", segments)
+	}
+}
+
 // done logs the whole breakdown, slowest first, with the total. Called once the command socket is
 // listening -- the point the old log line marked with no explanation of what preceded it.
 func (t *startupTimer) done() {
@@ -182,9 +209,16 @@ func (t *startupTimer) done() {
 func (t *startupTimer) logTableOpens() {
 	t.tblMu.Lock()
 	count, sum := t.tblCount, t.tblSum
+	migTables, migSegments := t.migTables, t.migSegments
 	slow := make([]phaseTime, len(t.tblSlow))
 	copy(slow, t.tblSlow)
 	t.tblMu.Unlock()
+	if migTables > 0 {
+		// Repeated in the summary as well as per table: this is the line that explains the whole start,
+		// and it must be findable next to the timing it accounts for rather than scrolled back to.
+		t.log.Info(logging.DestinationGeneral, "one-time encryption of pre-existing private attributes "+
+			"completed; later starts skip it", "tables", migTables, "segments", migSegments)
+	}
 	if count == 0 {
 		return
 	}
