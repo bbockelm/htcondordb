@@ -185,6 +185,7 @@ func run() error {
 	memoryTables := splitAttrs(getStr(cfg, "HTCONDORDB_MEMORY_TABLES"))
 	svc, err := server.New(server.Config{
 		OnPhase:        boot.record,
+		OnTableOpen:    boot.recordTableOpen,
 		Dir:            databaseDir(d, cfg),
 		Authorize:      authorize,
 		ForceReadOnly:  ha.forceReadOnly,
