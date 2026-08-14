@@ -3,9 +3,9 @@ module github.com/bbockelm/htcondordb/kafkasync
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.28.0
-	github.com/PelicanPlatform/classad/db v0.28.0
-	github.com/PelicanPlatform/classad/dbrpc v0.28.0
+	github.com/PelicanPlatform/classad v0.28.1
+	github.com/PelicanPlatform/classad/db v0.28.1
+	github.com/PelicanPlatform/classad/dbrpc v0.28.1
 	github.com/bbockelm/cedar v0.6.8
 	github.com/bbockelm/golang-htcondor v0.11.1
 	github.com/twmb/franz-go v1.21.5
@@ -13,7 +13,7 @@ require (
 )
 
 require (
-	github.com/PelicanPlatform/classad/collections v0.28.0 // indirect
+	github.com/PelicanPlatform/classad/collections v0.28.1 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
