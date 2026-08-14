@@ -3,9 +3,12 @@ package scheddsync
 // logwriter.go reconstructs a schedd job_queue.log (ClassAdLog format) from the
 // mirrored DB tables -- the inverse of JobSync. It is the "out" half of a
 // job_queue.log -> htcondordb -> job_queue.log round-trip: given the tables JobSync
-// populates, it emits a COMPACTED log (one NewClassAd + one SetAttribute per
-// attribute for each current ad, with no operation history) that reproduces the
-// current queue state when replayed by a schedd or by JobSync.
+// populates, it emits a COMPACTED log (a leading LogHistoricalSequenceNumber record,
+// then one NewClassAd + one SetAttribute per attribute for each current ad, with no
+// operation history) that reproduces the current queue state when replayed by a real
+// schedd or by JobSync. The byte layout matches the schedd's own log-truncation
+// (WriteClassAdLogState in classad_log.cpp), which a real schedd loads on restart --
+// see the Level-2 restart-restore integration test.
 //
 // Fidelity notes (see the round-trip test):
 //   - The header ad ("0.0", queue counters like NextClusterNum) is reconstructed when a
@@ -57,28 +60,35 @@ func (w *QueueLogWriter) WriteFile(path string) error {
 }
 
 // WriteTo reconstructs the log and writes it to out, returning the number of bytes written
-// (satisfying io.WriterTo). The whole queue is emitted inside a single transaction
-// (105...106) so a replay applies it atomically -- and so a JobSync replaying it never
-// observes a partially-restored queue.
+// (satisfying io.WriterTo). The layout matches the schedd's own log-truncation
+// (WriteClassAdLogState in classad_log.cpp): a mandatory LogHistoricalSequenceNumber record
+// first, then the ads as flat top-level NewClassAd + SetAttribute records (no transaction
+// wrapper -- the schedd's truncated base state is not wrapped either).
+//
+// Record framing follows HTCondor exactly: an opcode is written as "%d " (trailing space),
+// each record ends with a newline, and the opcodes are 101 (NewClassAd), 103 (SetAttribute),
+// and 107 (LogHistoricalSequenceNumber).
 func (w *QueueLogWriter) WriteTo(out io.Writer) (int64, error) {
 	if w.Jobs == nil {
 		return 0, fmt.Errorf("scheddsync: QueueLogWriter requires a Jobs table")
 	}
 	cw := &countingWriter{w: out}
 	bw := bufio.NewWriter(cw)
-	if _, err := bw.WriteString("105\n"); err != nil { // BeginTransaction
+	// A job_queue.log must begin with a LogHistoricalSequenceNumber (op 107):
+	// "107 <seq> CreationTimestamp <birthdate>\n". The mirror treats 107 as a no-op and does
+	// not capture the schedd's original sequence/birthdate, so a fresh sequence is emitted --
+	// historical-log-rotation bookkeeping resets on restore, which is harmless (the queue
+	// counters that matter live in the header ad, reconstructed below).
+	if _, err := bw.WriteString("107 1 CreationTimestamp 0\n"); err != nil {
 		return cw.n, err
 	}
-	// Order matters: the header first (as in a real log), then all non-proc namespaces (in
-	// particular every cluster ad) before any proc ad, so a cluster SetAttribute never fans out
-	// onto an already-materialized proc.
+	// Order: header, users, jobsets, clusters, then procs. Emitting every cluster ad before any
+	// proc ad keeps a JobSync re-ingest correct (a cluster SetAttribute must not fan out onto an
+	// already-materialized proc); a real schedd is order-insensitive here.
 	for _, table := range []*db.DB{w.Header, w.Users, w.Jobsets, w.Clusters, w.Jobs} {
 		if err := writeTable(bw, table); err != nil {
 			return cw.n, err
 		}
-	}
-	if _, err := bw.WriteString("106\n"); err != nil { // EndTransaction
-		return cw.n, err
 	}
 	if err := bw.Flush(); err != nil {
 		return cw.n, err
