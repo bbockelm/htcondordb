@@ -17,3 +17,5 @@ python/htcondordb/_lib/
 
 # Editor / OS
 .DS_Store
+# Local git worktrees for parallel branches; never repository content.
+.worktrees/
