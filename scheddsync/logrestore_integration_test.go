@@ -23,7 +23,7 @@ import (
 // schedd. It then asserts condor_q reports the same surviving jobs -- and that a newly
 // submitted job continues the cluster counter past the gap rather than reusing an id, which
 // is only possible because the header ad was preserved and restored.
-func TestQueueLogRestartRestore(t *testing.T) {
+func TestQueueLogRestartRestoreIntegration(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("must run unprivileged (the schedd's spool must not be read/written as root)")
 	}
