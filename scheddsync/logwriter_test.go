@@ -9,8 +9,11 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 )
 
-// tables opens the four in-memory namespace tables JobSync routes into.
-func tables(t *testing.T) (jobs, users, jobsets, clusters *db.DB) {
+// ns holds the five in-memory namespace tables JobSync routes a job_queue.log into.
+type ns struct{ jobs, users, jobsets, clusters, header *db.DB }
+
+// tables opens a fresh set of in-memory namespace tables.
+func tables(t *testing.T) ns {
 	t.Helper()
 	open := func() *db.DB {
 		d, err := db.Open("")
@@ -20,18 +23,23 @@ func tables(t *testing.T) (jobs, users, jobsets, clusters *db.DB) {
 		t.Cleanup(func() { d.Close() })
 		return d
 	}
-	return open(), open(), open(), open()
+	return ns{open(), open(), open(), open(), open()}
 }
 
 // syncLog replays logPath into the given tables with a one-shot JobSync poll.
-func syncLog(t *testing.T, logPath string, jobs, users, jobsets, clusters *db.DB) {
+func syncLog(t *testing.T, logPath string, n ns) {
 	t.Helper()
-	s := NewJobSync(jobs, JobSyncConfig{
-		Filename: logPath, Users: users, Jobsets: jobsets, Clusters: clusters,
+	s := NewJobSync(n.jobs, JobSyncConfig{
+		Filename: logPath, Users: n.users, Jobsets: n.jobsets, Clusters: n.clusters, Header: n.header,
 	})
 	if err := s.Poll(context.Background()); err != nil {
 		t.Fatalf("poll %s: %v", logPath, err)
 	}
+}
+
+// writer builds a QueueLogWriter over a namespace set.
+func (n ns) writer() *QueueLogWriter {
+	return &QueueLogWriter{Jobs: n.jobs, Users: n.users, Jobsets: n.jobsets, Clusters: n.clusters, Header: n.header}
 }
 
 // assertTablesEqual checks two tables hold the same keys with Equal ads.
@@ -90,41 +98,46 @@ func TestQueueLogRoundTrip(t *testing.T) {
 `)
 
 	// Forward: original log -> tables (DB1).
-	jobs1, users1, jobsets1, clusters1 := tables(t)
-	syncLog(t, orig, jobs1, users1, jobsets1, clusters1)
+	n1 := tables(t)
+	syncLog(t, orig, n1)
 
-	// Sanity on the ingest itself: the proc override survived chaining, and the dropped
-	// header did not land in any table.
-	if jobs1.Len() != 2 {
-		t.Fatalf("jobs Len = %d, want 2", jobs1.Len())
+	// Sanity on the ingest itself: the proc override survived chaining, the header ad landed
+	// in the header table (not jobs), and its queue counter was captured.
+	if n1.jobs.Len() != 2 {
+		t.Fatalf("jobs Len = %d, want 2", n1.jobs.Len())
 	}
-	if ad, ok := jobs1.LookupClassAd("1.0"); !ok {
+	if ad, ok := n1.jobs.LookupClassAd("1.0"); !ok {
 		t.Fatal("job 1.0 missing after ingest")
 	} else if v, _ := ad.EvaluateAttrInt("SharedAttr"); v != 99 {
 		t.Fatalf("1.0 SharedAttr = %d, want 99 (proc override of cluster's 42)", v)
 	} else if v, _ := ad.EvaluateAttrString("Owner"); v != "alice" {
 		t.Fatalf("1.0 Owner = %q, want alice (chained from cluster)", v)
 	}
-	if _, ok := jobs1.LookupClassAd("0.0"); ok {
+	if _, ok := n1.jobs.LookupClassAd("0.0"); ok {
 		t.Error("header ad 0.0 leaked into the jobs table")
+	}
+	if ad, ok := n1.header.LookupClassAd("0.0"); !ok {
+		t.Fatal("header ad 0.0 missing from the header table")
+	} else if v, _ := ad.EvaluateAttrInt("NextClusterNum"); v != 3 {
+		t.Fatalf("header NextClusterNum = %d, want 3", v)
 	}
 
 	// Reverse: tables -> reconstructed log.
 	recon := filepath.Join(dir, "job_queue.reconstructed.log")
-	w := &QueueLogWriter{Jobs: jobs1, Users: users1, Jobsets: jobsets1, Clusters: clusters1}
-	if err := w.WriteFile(recon); err != nil {
+	if err := n1.writer().WriteFile(recon); err != nil {
 		t.Fatalf("reconstruct log: %v", err)
 	}
 
 	// Forward again: reconstructed log -> tables (DB2).
-	jobs2, users2, jobsets2, clusters2 := tables(t)
-	syncLog(t, recon, jobs2, users2, jobsets2, clusters2)
+	n2 := tables(t)
+	syncLog(t, recon, n2)
 
-	// The round-trip must preserve every namespace exactly.
-	assertTablesEqual(t, "jobs", jobs1, jobs2)
-	assertTablesEqual(t, "users", users1, users2)
-	assertTablesEqual(t, "jobsets", jobsets1, jobsets2)
-	assertTablesEqual(t, "clusters", clusters1, clusters2)
+	// The round-trip must preserve every namespace exactly -- including the header.
+	assertTablesEqual(t, "jobs", n1.jobs, n2.jobs)
+	assertTablesEqual(t, "users", n1.users, n2.users)
+	assertTablesEqual(t, "jobsets", n1.jobsets, n2.jobsets)
+	assertTablesEqual(t, "clusters", n1.clusters, n2.clusters)
+	assertTablesEqual(t, "header", n1.header, n2.header)
 }
 
 // TestQueueLogRoundTripStable proves the reconstruction is a fixed point: reserializing the
@@ -145,23 +158,21 @@ func TestQueueLogRoundTripStable(t *testing.T) {
 103 2.0 ClusterId 2
 106
 `)
-	jobs1, users1, jobsets1, clusters1 := tables(t)
-	syncLog(t, orig, jobs1, users1, jobsets1, clusters1)
+	n1 := tables(t)
+	syncLog(t, orig, n1)
 
 	var buf1 bytes.Buffer
-	w1 := &QueueLogWriter{Jobs: jobs1, Users: users1, Jobsets: jobsets1, Clusters: clusters1}
-	if _, err := w1.WriteTo(&buf1); err != nil {
+	if _, err := n1.writer().WriteTo(&buf1); err != nil {
 		t.Fatalf("first reconstruction: %v", err)
 	}
 
 	recon := filepath.Join(dir, "recon.log")
 	writeFile(t, recon, buf1.String())
-	jobs2, users2, jobsets2, clusters2 := tables(t)
-	syncLog(t, recon, jobs2, users2, jobsets2, clusters2)
+	n2 := tables(t)
+	syncLog(t, recon, n2)
 
 	var buf2 bytes.Buffer
-	w2 := &QueueLogWriter{Jobs: jobs2, Users: users2, Jobsets: jobsets2, Clusters: clusters2}
-	if _, err := w2.WriteTo(&buf2); err != nil {
+	if _, err := n2.writer().WriteTo(&buf2); err != nil {
 		t.Fatalf("second reconstruction: %v", err)
 	}
 

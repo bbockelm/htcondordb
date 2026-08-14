@@ -32,8 +32,8 @@ func TestRoutingReconcile(t *testing.T) { assertRouting(t, true) }
 
 // assertRouting replays routingLog through either the incremental (Poll -> applyEntry) path or the
 // reconcile-reload path and verifies each namespace landed in exactly the right table, that the
-// header and cluster-private ads are dropped everywhere, and that the proc chained its cluster's
-// Owner.
+// header ad routes to the header table, that the cluster-private ad is dropped everywhere, and that
+// the proc chained its cluster's Owner.
 func assertRouting(t *testing.T, reconcile bool) {
 	t.Helper()
 	dir := t.TempDir()
@@ -44,9 +44,10 @@ func assertRouting(t *testing.T, reconcile bool) {
 	users := openMem(t)
 	jobsets := openMem(t)
 	clusters := openMem(t)
+	header := openMem(t)
 
 	s := NewJobSync(jobs, JobSyncConfig{
-		Filename: logPath, Users: users, Jobsets: jobsets, Clusters: clusters,
+		Filename: logPath, Users: users, Jobsets: jobsets, Clusters: clusters, Header: header,
 	})
 	var err error
 	if reconcile {
@@ -62,17 +63,22 @@ func assertRouting(t *testing.T, reconcile bool) {
 	wantKeys(t, "users", users, "0.1")
 	wantKeys(t, "jobsets", jobsets, "1.-100")
 	wantKeys(t, "clusters", clusters, "01.-1")
+	wantKeys(t, "header", header, "0.0")
 
-	// The header (0.0) and the cluster-private ad (1.-2) are dropped from every table.
+	// The cluster-private ad (1.-2) is dropped from every table; the header (0.0) belongs only in
+	// the header table, not in any of the others.
 	for _, tbl := range []struct {
 		name string
 		db   *db.DB
 	}{{"jobs", jobs}, {"users", users}, {"jobsets", jobsets}, {"clusters", clusters}} {
 		for _, dropped := range []string{"0.0", "1.-2"} {
 			if _, ok := tbl.db.LookupClassAd(dropped); ok {
-				t.Errorf("dropped key %q present in %s table", dropped, tbl.name)
+				t.Errorf("misrouted key %q present in %s table", dropped, tbl.name)
 			}
 		}
+	}
+	if _, ok := header.LookupClassAd("1.-2"); ok {
+		t.Error("cluster-private ad 1.-2 leaked into the header table")
 	}
 
 	// The proc row inherits the cluster ad's Owner ("alice") even though it was written only on

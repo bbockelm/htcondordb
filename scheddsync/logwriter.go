@@ -8,10 +8,11 @@ package scheddsync
 // current queue state when replayed by a schedd or by JobSync.
 //
 // Fidelity notes (see the round-trip test):
-//   - The schedd header ad ("0.0"), cluster-private ads, and OCU ads are not stored
-//     by JobSync, so they are not reconstructed. A faithful *backup* (queue-counter
-//     preserving) additionally needs the header; a state reconstruction does not.
-//   - Emission order is users, jobsets, clusters, then jobs (procs). Emitting every
+//   - The header ad ("0.0", queue counters like NextClusterNum) is reconstructed when a
+//     Header table is supplied -- this is what makes the output a queue-counter-preserving
+//     backup rather than only a state reconstruction. Cluster-private ads and OCU ads are
+//     still not stored by JobSync, so they are not reconstructed.
+//   - Emission order is header, users, jobsets, clusters, then jobs (procs). Emitting every
 //     cluster ad's attributes BEFORE any proc NewClassAd is what keeps a replay
 //     correct: a cluster SetAttribute fans out onto its already-materialized proc
 //     rows, so if a proc overrode a cluster attribute, a late cluster set would clobber
@@ -39,6 +40,7 @@ type QueueLogWriter struct {
 	Users    *db.DB // owner/user records ("0.P")
 	Jobsets  *db.DB // jobset ads ("C.-100")
 	Clusters *db.DB // cluster ads ("0C.-1")
+	Header   *db.DB // schedd header ad ("0.0", queue counters)
 }
 
 // WriteFile reconstructs the log and writes it to path (truncating any existing file).
@@ -67,9 +69,10 @@ func (w *QueueLogWriter) WriteTo(out io.Writer) (int64, error) {
 	if _, err := bw.WriteString("105\n"); err != nil { // BeginTransaction
 		return cw.n, err
 	}
-	// Order matters: all non-proc namespaces (in particular every cluster ad) before any
-	// proc ad, so a cluster SetAttribute never fans out onto an already-materialized proc.
-	for _, table := range []*db.DB{w.Users, w.Jobsets, w.Clusters, w.Jobs} {
+	// Order matters: the header first (as in a real log), then all non-proc namespaces (in
+	// particular every cluster ad) before any proc ad, so a cluster SetAttribute never fans out
+	// onto an already-materialized proc.
+	for _, table := range []*db.DB{w.Header, w.Users, w.Jobsets, w.Clusters, w.Jobs} {
 		if err := writeTable(bw, table); err != nil {
 			return cw.n, err
 		}
