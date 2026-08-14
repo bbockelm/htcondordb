@@ -39,11 +39,13 @@ import (
 // Jobs is required; the sibling namespace tables are optional (a nil table contributes
 // no records).
 type QueueLogWriter struct {
-	Jobs     *db.DB // proc ads ("C.P") -- required
-	Users    *db.DB // owner/user records ("0.P")
-	Jobsets  *db.DB // jobset ads ("C.-100")
-	Clusters *db.DB // cluster ads ("0C.-1")
-	Header   *db.DB // schedd header ad ("0.0", queue counters)
+	Jobs           *db.DB // proc ads ("C.P") -- required
+	Users          *db.DB // owner/user records ("0.P")
+	Jobsets        *db.DB // jobset ads ("C.-100")
+	Clusters       *db.DB // cluster ads ("0C.-1")
+	Header         *db.DB // schedd header ad ("0.0", queue counters)
+	ClusterPrivate *db.DB // cluster-private ads ("C.-2")
+	LogMeta        *db.DB // single record: the log's 107 sequence header
 }
 
 // WriteFile reconstructs the log and writes it to path (truncating any existing file).
@@ -75,17 +77,28 @@ func (w *QueueLogWriter) WriteTo(out io.Writer) (int64, error) {
 	cw := &countingWriter{w: out}
 	bw := bufio.NewWriter(cw)
 	// A job_queue.log must begin with a LogHistoricalSequenceNumber (op 107):
-	// "107 <seq> CreationTimestamp <birthdate>\n". The mirror treats 107 as a no-op and does
-	// not capture the schedd's original sequence/birthdate, so a fresh sequence is emitted --
-	// historical-log-rotation bookkeeping resets on restore, which is harmless (the queue
-	// counters that matter live in the header ad, reconstructed below).
-	if _, err := bw.WriteString("107 1 CreationTimestamp 0\n"); err != nil {
+	// "107 <seq> CreationTimestamp <birthdate>\n". The sequence header is taken from the LogMeta
+	// record JobSync captured, so historical-log continuity holds across the round-trip; absent
+	// that (no LogMeta, or a log that had no 107), a fresh sequence is emitted -- harmless, since
+	// the queue counters that matter live in the header ad, reconstructed below.
+	seq, birthdate := int64(1), int64(0)
+	if w.LogMeta != nil {
+		if ad, ok := w.LogMeta.LookupClassAd(LogMetaKey); ok {
+			if v, ok := ad.EvaluateAttrInt(LogSeqAttr); ok {
+				seq = v
+			}
+			if v, ok := ad.EvaluateAttrInt(LogCreationTimeAttr); ok {
+				birthdate = v
+			}
+		}
+	}
+	if _, err := fmt.Fprintf(bw, "107 %d CreationTimestamp %d\n", seq, birthdate); err != nil {
 		return cw.n, err
 	}
-	// Order: header, users, jobsets, clusters, then procs. Emitting every cluster ad before any
-	// proc ad keeps a JobSync re-ingest correct (a cluster SetAttribute must not fan out onto an
-	// already-materialized proc); a real schedd is order-insensitive here.
-	for _, table := range []*db.DB{w.Header, w.Users, w.Jobsets, w.Clusters, w.Jobs} {
+	// Order: header, users, jobsets, clusters, cluster-private, then procs. Emitting every cluster
+	// ad before any proc ad keeps a JobSync re-ingest correct (a cluster SetAttribute must not fan
+	// out onto an already-materialized proc); a real schedd is order-insensitive here.
+	for _, table := range []*db.DB{w.Header, w.Users, w.Jobsets, w.Clusters, w.ClusterPrivate, w.Jobs} {
 		if err := writeTable(bw, table); err != nil {
 			return cw.n, err
 		}

@@ -85,6 +85,7 @@ func TestQueueLogRestartRestore(t *testing.T) {
 	n := tables(t)
 	js := NewJobSync(n.jobs, JobSyncConfig{
 		Filename: jobLog, Users: n.users, Jobsets: n.jobsets, Clusters: n.clusters, Header: n.header,
+		ClusterPrivate: n.clusterprivate, LogMeta: n.logmeta,
 	})
 	if err := js.Poll(ctx); err != nil {
 		t.Fatalf("mirror job_queue.log: %v", err)
@@ -94,6 +95,14 @@ func TestQueueLogRestartRestore(t *testing.T) {
 	}
 	if _, ok := n.header.LookupClassAd("0.0"); !ok {
 		t.Fatal("header ad 0.0 was not mirrored; the counter cannot be restored")
+	}
+	// The schedd creates a cluster-private ad ("C.-2") alongside every cluster, and every
+	// job_queue.log starts with a 107 sequence header -- both must be captured for a faithful backup.
+	if n.clusterprivate.Len() == 0 {
+		t.Fatal("no cluster-private ads (C.-2) mirrored; the schedd creates one per cluster")
+	}
+	if _, ok := n.logmeta.LookupClassAd(LogMetaKey); !ok {
+		t.Fatal("log sequence header (107) was not captured into logmeta")
 	}
 
 	// Reconstruct the log and atomically overwrite the schedd's spool copy.

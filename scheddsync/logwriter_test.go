@@ -9,8 +9,9 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 )
 
-// ns holds the five in-memory namespace tables JobSync routes a job_queue.log into.
-type ns struct{ jobs, users, jobsets, clusters, header *db.DB }
+// ns holds the in-memory namespace tables JobSync routes a job_queue.log into, plus the
+// captured log-metadata table.
+type ns struct{ jobs, users, jobsets, clusters, header, clusterprivate, logmeta *db.DB }
 
 // tables opens a fresh set of in-memory namespace tables.
 func tables(t *testing.T) ns {
@@ -23,7 +24,7 @@ func tables(t *testing.T) ns {
 		t.Cleanup(func() { d.Close() })
 		return d
 	}
-	return ns{open(), open(), open(), open(), open()}
+	return ns{open(), open(), open(), open(), open(), open(), open()}
 }
 
 // syncLog replays logPath into the given tables with a one-shot JobSync poll.
@@ -31,6 +32,7 @@ func syncLog(t *testing.T, logPath string, n ns) {
 	t.Helper()
 	s := NewJobSync(n.jobs, JobSyncConfig{
 		Filename: logPath, Users: n.users, Jobsets: n.jobsets, Clusters: n.clusters, Header: n.header,
+		ClusterPrivate: n.clusterprivate, LogMeta: n.logmeta,
 	})
 	if err := s.Poll(context.Background()); err != nil {
 		t.Fatalf("poll %s: %v", logPath, err)
@@ -39,7 +41,10 @@ func syncLog(t *testing.T, logPath string, n ns) {
 
 // writer builds a QueueLogWriter over a namespace set.
 func (n ns) writer() *QueueLogWriter {
-	return &QueueLogWriter{Jobs: n.jobs, Users: n.users, Jobsets: n.jobsets, Clusters: n.clusters, Header: n.header}
+	return &QueueLogWriter{
+		Jobs: n.jobs, Users: n.users, Jobsets: n.jobsets, Clusters: n.clusters, Header: n.header,
+		ClusterPrivate: n.clusterprivate, LogMeta: n.logmeta,
+	}
 }
 
 // assertTablesEqual checks two tables hold the same keys with Equal ads.
@@ -73,7 +78,7 @@ func assertTablesEqual(t *testing.T, name string, want, got *db.DB) {
 func TestQueueLogRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	orig := filepath.Join(dir, "job_queue.log")
-	writeFile(t, orig, `105
+	writeFile(t, orig, `107 42 CreationTimestamp 1700000000
 101 0.0 Header (unknown)
 103 0.0 NextClusterNum 3
 101 0.1 Owner (unknown)
@@ -83,6 +88,8 @@ func TestQueueLogRoundTrip(t *testing.T) {
 103 01.-1 Owner "alice"
 103 01.-1 Requirements (OpSys == "LINUX") && (Arch == "X86_64")
 103 01.-1 SharedAttr 42
+101 1.-2 ClusterPvt (unknown)
+103 1.-2 Secret "hunter2"
 101 1.0 Job Machine
 103 1.0 ProcId 0
 103 1.0 ClusterId 1
@@ -94,7 +101,6 @@ func TestQueueLogRoundTrip(t *testing.T) {
 103 1.1 JobStatus 1
 101 1.-100 JobSet (unknown)
 103 1.-100 JobSetName "myset"
-106
 `)
 
 	// Forward: original log -> tables (DB1).
@@ -121,6 +127,16 @@ func TestQueueLogRoundTrip(t *testing.T) {
 	} else if v, _ := ad.EvaluateAttrInt("NextClusterNum"); v != 3 {
 		t.Fatalf("header NextClusterNum = %d, want 3", v)
 	}
+	if ad, ok := n1.clusterprivate.LookupClassAd("1.-2"); !ok {
+		t.Fatal("cluster-private ad 1.-2 missing from the clusterprivate table")
+	} else if v, _ := ad.EvaluateAttrString("Secret"); v != "hunter2" {
+		t.Fatalf("cluster-private Secret = %q, want hunter2", v)
+	}
+	if ad, ok := n1.logmeta.LookupClassAd(LogMetaKey); !ok {
+		t.Fatal("log sequence not captured into logmeta")
+	} else if v, _ := ad.EvaluateAttrInt(LogSeqAttr); v != 42 {
+		t.Fatalf("captured log sequence = %d, want 42", v)
+	}
 
 	// Reverse: tables -> reconstructed log.
 	recon := filepath.Join(dir, "job_queue.reconstructed.log")
@@ -132,12 +148,15 @@ func TestQueueLogRoundTrip(t *testing.T) {
 	n2 := tables(t)
 	syncLog(t, recon, n2)
 
-	// The round-trip must preserve every namespace exactly -- including the header.
+	// The round-trip must preserve every namespace exactly -- header, cluster-private, and the
+	// captured log sequence included.
 	assertTablesEqual(t, "jobs", n1.jobs, n2.jobs)
 	assertTablesEqual(t, "users", n1.users, n2.users)
 	assertTablesEqual(t, "jobsets", n1.jobsets, n2.jobsets)
 	assertTablesEqual(t, "clusters", n1.clusters, n2.clusters)
 	assertTablesEqual(t, "header", n1.header, n2.header)
+	assertTablesEqual(t, "clusterprivate", n1.clusterprivate, n2.clusterprivate)
+	assertTablesEqual(t, "logmeta", n1.logmeta, n2.logmeta)
 }
 
 // TestQueueLogRoundTripStable proves the reconstruction is a fixed point: reserializing the

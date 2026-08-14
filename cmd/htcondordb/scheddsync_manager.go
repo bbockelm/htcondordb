@@ -293,16 +293,25 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("schedd-sync: creating header table: %w", err)
 		}
+		clusterprivate, err := m.svc.Catalog().CreateTable("clusterprivate")
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("schedd-sync: creating clusterprivate table: %w", err)
+		}
+		logmeta, err := m.svc.Catalog().CreateTable("logmeta")
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("schedd-sync: creating logmeta table: %w", err)
+		}
 		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{
 			Filename: s.jobLog, Logger: m.logger, Store: syncStore("jobs.pos"),
 			Users: users, Jobsets: jobsets, Clusters: clusters, Header: header,
+			ClusterPrivate: clusterprivate, LogMeta: logmeta,
 		})
 		wg.Add(1)
 		go func() { defer wg.Done(); _ = js.Run(ctx) }()
 		sources = append(sources, js)
 		resyncers["jobs"] = js
 		m.logger.Info("schedd-sync: mirroring job_queue.log", "file", s.jobLog,
-			"tables", "jobs,users,jobsets,clusters,header")
+			"tables", "jobs,users,jobsets,clusters,header,clusterprivate,logmeta")
 	}
 	if s.histFile != "" {
 		hist, err := m.svc.Catalog().CreateArchiveTable("history", db.ArchiveConfig{
