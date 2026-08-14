@@ -123,6 +123,16 @@ type Config struct {
 	// OnPhase the handler must be safe for concurrent use and must not block. Every open is reported, so
 	// per-table attribution holds under parallelism; only the SUM stops matching the wall clock.
 	OnTableOpen func(kind, name string, d time.Duration)
+	// OnSealMigration, when set, is called for each table whose open rewrote segments to encrypt
+	// private attributes written before they were always encrypted, with how many it rewrote.
+	//
+	// This is a one-off cost on the FIRST start after the upgrade, and it is proportional to how much
+	// history the table holds -- so on a large spool it is the kind of slow start that gets read as a
+	// regression, or as the daemon hanging. It is not: it happens once, and the next start skips it.
+	// Reporting it is the difference between an explained delay and an escalation.
+	//
+	// MAY BE CALLED CONCURRENTLY, like OnTableOpen: tables open in parallel.
+	OnSealMigration func(table string, segments int)
 	// EncryptedAttrs is the default set of attributes encrypted at rest, in addition to
 	// HTCondor private attributes (which are always encrypted when PoolKeys is set).
 	// Adjustable at runtime by a DAEMON via the encrypt.set meta-command.
@@ -187,10 +197,11 @@ func New(cfg Config) (*Service, error) {
 	}
 
 	cat, err := db.OpenCatalogConfig(db.CatalogConfig{
-		Dir:            cfg.Dir,
-		PoolKeys:       cfg.PoolKeys,
-		EncryptedAttrs: cfg.EncryptedAttrs,
-		OnOpenStep:     cfg.OnTableOpen,
+		Dir:             cfg.Dir,
+		PoolKeys:        cfg.PoolKeys,
+		EncryptedAttrs:  cfg.EncryptedAttrs,
+		OnOpenStep:      cfg.OnTableOpen,
+		OnSealMigration: cfg.OnSealMigration,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("server: opening catalog: %w", err)

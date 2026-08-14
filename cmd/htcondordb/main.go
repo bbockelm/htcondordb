@@ -184,16 +184,17 @@ func run() error {
 	logQueries := configBool(cfg, "HTCONDORDB_LOG_QUERIES")
 	memoryTables := splitAttrs(getStr(cfg, "HTCONDORDB_MEMORY_TABLES"))
 	svc, err := server.New(server.Config{
-		OnPhase:        boot.record,
-		OnTableOpen:    boot.recordTableOpen,
-		Dir:            databaseDir(d, cfg),
-		Authorize:      authorize,
-		ForceReadOnly:  ha.forceReadOnly,
-		Logger:         d.Slog(),
-		LogQueries:     logQueries,
-		MemoryTables:   memoryTables,
-		PoolKeys:       poolKeys,
-		EncryptedAttrs: encAttrs,
+		OnPhase:         boot.record,
+		OnTableOpen:     boot.recordTableOpen,
+		OnSealMigration: boot.recordSealMigration,
+		Dir:             databaseDir(d, cfg),
+		Authorize:       authorize,
+		ForceReadOnly:   ha.forceReadOnly,
+		Logger:          d.Slog(),
+		LogQueries:      logQueries,
+		MemoryTables:    memoryTables,
+		PoolKeys:        poolKeys,
+		EncryptedAttrs:  encAttrs,
 	})
 	if err != nil {
 		return err
