@@ -22,9 +22,11 @@ func TestArchiveDiagMeta(t *testing.T) {
 	if strings.Contains(out, "no such table") {
 		t.Fatalf(".stats history errored: %q", out)
 	}
-	// Rich stats now (not just a row count): record count + storage + op timings.
-	if !strings.Contains(out, "records:    3") {
-		t.Errorf(".stats history = %q, want a record count of 3", out)
+	// Rich stats (not just a row count): ad count + storage + op timings. The label is "ads" for both
+	// table kinds -- an archive stores ads like any other table, and two labels for one number was part
+	// of why the two reports read as different systems.
+	if !strings.Contains(out, "ads:        3") {
+		t.Errorf(".stats history = %q, want an ad count of 3", out)
 	}
 	if !strings.Contains(out, "operational timings") {
 		t.Errorf(".stats history missing op timings (impoverished output):\n%s", out)

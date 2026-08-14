@@ -43,7 +43,8 @@ func TestArchiveStatsRich(t *testing.T) {
 	defer cleanup()
 	s := &session{exec: e, table: "jobs"}
 	out := runMeta(t, s, ".stats", "history")
-	for _, want := range []string{"records:", "segments:", "arena:", "used:", "disk:", "codec:", "operational timings"} {
+	for _, want := range []string{"kind:", "ads:", "segments:", "arena:", "used:", "disk:", "codec:",
+		"encrypted:", "columnar:", "operational timings"} {
 		if !strings.Contains(out, want) {
 			t.Errorf(".stats history missing %q:\n%s", want, out)
 		}

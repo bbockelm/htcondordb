@@ -257,30 +257,38 @@ func (s *session) showArchiveIndexes(w io.Writer, d *dbrpc.Diagnostics) {
 	fmt.Fprintln(w, "  an index change rebuilds each segment's index sidecar in place; segment data is not rewritten")
 }
 
+// showStats renders one table's storage and timing report. ONE path for both table kinds: an archive
+// and a mutable table are the same storage engine, so they are reported in the same terms, in the same
+// order, under the same labels. The two used to diverge line by line -- a different count label, sidecar
+// and disk lines only for the archive, the columnar section only for the mutable table -- which made two
+// tables that differ in one respect look like two different systems.
+//
+// What genuinely differs is kept, and only that: how dead bytes come back (compaction vs rotation),
+// retention (a mutable table does not rotate), and zone maps.
 func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 	st := d.Stats
+	kind := "mutable table"
 	if d.Archive {
-		// An append log measures the same way a mutable table does; only the labels and the
-		// reclamation model differ (rotation drops whole segments; there is no compaction).
-		fmt.Fprintf(w, "records:    %d\n", st.Ads)
-	} else {
-		fmt.Fprintf(w, "ads:        %d\n", st.Ads)
+		kind = "append-only history archive"
 	}
+	fmt.Fprintf(w, "kind:       %s\n", kind)
+	fmt.Fprintf(w, "ads:        %d\n", st.Ads)
 	fmt.Fprintf(w, "segments:   %d\n", st.Segments)
 	fmt.Fprintf(w, "arena:      %s (reserved)\n", humanBytes(st.ArenaBytes))
 	fmt.Fprintf(w, "used:       %s\n", humanBytes(st.UsedBytes))
 	fmt.Fprintf(w, "live:       %s\n", humanBytes(st.LiveBytes()))
+	// Always shown, including zero: "dead: 0 B" is information, and suppressing the line on one kind was
+	// one of the ways the two reports stopped lining up.
+	reclaim := "reclaimable by compaction"
 	if d.Archive {
-		if st.DeadBytes > 0 {
-			fmt.Fprintf(w, "dead:       %s (reclaimed on next retrain/rewrite)\n", humanBytes(st.DeadBytes))
-		}
-		if d.SidecarSizes.MappedBytes > 0 {
-			fmt.Fprintf(w, "sidecar:    %s (index; mmap-backed, evictable)\n", humanBytes(d.SidecarSizes.MappedBytes))
-		}
-		fmt.Fprintf(w, "disk:       %s (segments + index sidecars)\n", humanBytes(st.ArenaBytes+d.SidecarSizes.MappedBytes))
-	} else {
-		fmt.Fprintf(w, "dead:       %s (reclaimable by compaction)\n", humanBytes(st.DeadBytes))
+		reclaim = "reclaimed on next retrain/rewrite; rotation drops whole segments"
 	}
+	fmt.Fprintf(w, "dead:       %s (%s)\n", humanBytes(st.DeadBytes), reclaim)
+	if d.SidecarSizes.MappedBytes > 0 {
+		fmt.Fprintf(w, "sidecar:    %s (index; mmap-backed, evictable)\n", humanBytes(d.SidecarSizes.MappedBytes))
+	}
+	fmt.Fprintf(w, "disk:       %s (segments + index sidecars)\n",
+		humanBytes(st.ArenaBytes+d.SidecarSizes.MappedBytes))
 	cs := d.Codec
 	retrain := "never (compression not retrained this run)"
 	if !cs.LastRetrain.IsZero() {
@@ -297,22 +305,41 @@ func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 	if cs.Codec == "identity" {
 		fmt.Fprintln(w, "  (no compression configured; enable ZSTD or run .retrain to train a dictionary)")
 	}
+	// Encryption at rest, for both kinds -- and the answer is not the same for both. An archive is never
+	// sealed (its open path passes no data key), so a table can report "on" while its history reports
+	// "off". Reporting only the mutable table's state left that as something an operator had to know
+	// rather than read.
+	if d.EncryptionEnabled {
+		enc := "on (at rest; master key wrapped under pool keys)"
+		if len(d.EncryptedAttrs) > 0 {
+			enc += fmt.Sprintf("; also sealing %s", strings.Join(d.EncryptedAttrs, ", "))
+		}
+		fmt.Fprintf(w, "encrypted:  %s\n", enc)
+	} else if d.Archive {
+		fmt.Fprintln(w, "encrypted:  off — history holds private attributes in the clear, even where the "+
+			"mutable tables are encrypted")
+	} else {
+		fmt.Fprintln(w, "encrypted:  off (private attributes are still sealed, but the key sits beside the "+
+			"data; configure pool keys for encryption at rest)")
+	}
+	// The per-segment columnar accelerator, for both kinds: an archive carries columnar blocks too, and
+	// gating this on the table kind made history look like it had no accelerator at all.
+	if ss := d.SchemaScan; ss.Enabled {
+		fmt.Fprintf(w, "columnar:   on — %d/%d sealed segments covered, %d schema fields\n",
+			ss.CoveredSegments, ss.SealedSegments, ss.SchemaFields)
+		if len(ss.HotFields) > 0 {
+			fmt.Fprintf(w, "  hot cols: %s (COUNT(*) WHERE on these takes the columnar fast path)\n",
+				strings.Join(ss.HotFields, ", "))
+		}
+	} else {
+		fmt.Fprintln(w, "columnar:   off (numeric COUNT(*) WHERE uses the row path; enabled by maintenance / .analyze)")
+	}
+	if len(d.ZoneAttrs) > 0 {
+		fmt.Fprintf(w, "zone maps:  %s (a range query skips segments whose [min,max] cannot match)\n",
+			strings.Join(d.ZoneAttrs, ", "))
+	}
 	if d.Archive && d.Retention != nil {
 		fmt.Fprintf(w, "retention:  %s\n", retentionSummary(*d.Retention))
-	}
-	if !d.Archive {
-		// The per-segment columnar accelerator: whether a numeric COUNT(*) WHERE takes the
-		// columnar fast path instead of a row scan, and how much of the table it covers.
-		if ss := d.SchemaScan; ss.Enabled {
-			fmt.Fprintf(w, "columnar:   on — %d/%d sealed segments covered, %d schema fields\n",
-				ss.CoveredSegments, ss.SealedSegments, ss.SchemaFields)
-			if len(ss.HotFields) > 0 {
-				fmt.Fprintf(w, "  hot cols: %s (COUNT(*) WHERE on these takes the columnar fast path)\n",
-					strings.Join(ss.HotFields, ", "))
-			}
-		} else {
-			fmt.Fprintln(w, "columnar:   off (numeric COUNT(*) WHERE uses the row path; enabled by maintenance / .analyze)")
-		}
 	}
 	showOpStats(w, d.OpStats)
 }
