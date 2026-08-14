@@ -27,7 +27,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          # Install the latest 1.25.x (matching every other workflow), not the root go.mod's
+          # exact directive: the release also builds the exporter modules, and opensearchsync
+          # requires go >= 1.25.9 (opensearch-go/v4 v4.7.x sets that), so pinning to the root's
+          # 1.25.7 failed the build under GOTOOLCHAIN=local.
+          go-version: '1.25'
 
       - name: Build release archives (linux/darwin, amd64/arm64)
         env:
