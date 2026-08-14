@@ -83,11 +83,14 @@ type scheddSyncSettings struct {
 	posDir    string
 
 	// History-archive tuning. archiveSegSize applies only when the archive is first
-	// created (archiveconfig.json is authoritative on reopen); the index attributes are
-	// reconciled onto an existing archive at startup. See launch.
-	archiveSegSize  int
-	archiveCatAttrs string
-	archiveValAttrs string
+	// created (archiveconfig.json is authoritative on reopen); the index attributes and the
+	// row-group budget are applied to an existing archive at startup. See launch.
+	archiveSegSize int
+	// archiveRowGroupBytes is the uncompressed record-bytes budget for one columnar row group.
+	// 0 leaves the archive's own default (or whatever it was last set to) alone.
+	archiveRowGroupBytes int
+	archiveCatAttrs      string
+	archiveValAttrs      string
 }
 
 func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
@@ -122,9 +125,13 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		// SPOOL-configured deployments with no persisted resume position.
 		posDir: resolveDBDir(cfg),
 
-		archiveSegSize:  segSize,
-		archiveCatAttrs: canonicalAttrList(catAttrs),
-		archiveValAttrs: canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS"), "ClusterId")),
+		archiveSegSize: segSize,
+		// Unlike the segment size this can be changed on an existing archive -- see
+		// applyArchiveRowGroupBytes -- so it is worth reading on every start rather than only at
+		// creation.
+		archiveRowGroupBytes: configInt(cfg, "HTCONDORDB_ARCHIVE_ROW_GROUP_BYTES"),
+		archiveCatAttrs:      canonicalAttrList(catAttrs),
+		archiveValAttrs:      canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS"), "ClusterId")),
 	}
 }
 
@@ -149,6 +156,31 @@ func canonicalAttrList(s string) string {
 // archiveconfig.json. Without that, the reopen path restores the creation-time index set,
 // this reconciliation finds the attribute missing again on every restart, and the backfill
 // re-runs each time -- growing from minutes to hours as the archive matures.
+// applyArchiveRowGroupBytes puts the configured row-group budget onto an archive that already exists.
+//
+// The ArchiveConfig passed at creation is ignored on reopen (archiveconfig.json is authoritative), so
+// a knob that only travelled that way would apply to a brand new archive and never to the one an
+// operator actually wants to tune. Unlike the index attributes this needs no backfill: every columnar
+// block records the layout it was written with, so the new budget governs segments sealed from now on
+// and everything already on disk keeps reading as before.
+//
+// Zero means "not configured" and leaves whatever the archive last persisted alone, so removing the
+// setting does not silently reset a deliberately tuned archive back to the default.
+func (m *scheddSyncManager) applyArchiveRowGroupBytes(t *db.ArchiveTable, name string, s scheddSyncSettings) {
+	if s.archiveRowGroupBytes == 0 || t.RowGroupBytes() == s.archiveRowGroupBytes {
+		return
+	}
+	was := t.RowGroupBytes()
+	if err := t.SetRowGroupBytes(s.archiveRowGroupBytes); err != nil {
+		m.logger.Error("schedd-sync: setting archive row-group budget", "archive", name,
+			"bytes", s.archiveRowGroupBytes, "err", err)
+		return
+	}
+	m.logger.Info("schedd-sync: archive row-group budget set", "archive", name,
+		"bytes", s.archiveRowGroupBytes, "was", was,
+		"note", "applies to segments sealed from now on; existing segments keep their layout")
+}
+
 func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, hist *db.ArchiveTable, s scheddSyncSettings) {
 	haveCat, haveVal := hist.IndexedAttrs()
 	missing := func(want []string, have []string) []string {
@@ -316,6 +348,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	if s.histFile != "" {
 		hist, err := m.svc.Catalog().CreateArchiveTable("history", db.ArchiveConfig{
 			SegmentSize:      s.archiveSegSize,
+			RowGroupBytes:    s.archiveRowGroupBytes,
 			CategoricalAttrs: splitAttrList(s.archiveCatAttrs),
 			ValueAttrs:       splitAttrList(s.archiveValAttrs),
 			// Zone-map both the job's completion time and htcondordb's ingest time
@@ -334,6 +367,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// immediately (segments full-scan for the new attribute until their sidecars are
 		// rebuilt), so serving during the backfill is safe.
 		m.reconcileArchiveIndexes(ctx, hist, s)
+		m.applyArchiveRowGroupBytes(hist, "history", s)
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
 			Filename: s.histFile,
 			Logger:   m.logger,
@@ -352,6 +386,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	if s.epochFile != "" {
 		ep, err := m.svc.Catalog().CreateArchiveTable("epoch_history", db.ArchiveConfig{
 			SegmentSize:      s.archiveSegSize,
+			RowGroupBytes:    s.archiveRowGroupBytes,
 			CategoricalAttrs: splitAttrList(s.archiveCatAttrs),
 			ValueAttrs:       splitAttrList(s.archiveValAttrs),
 			// Zone-map the epoch write time and htcondordb's ingest time so range
@@ -363,6 +398,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			return nil, nil, nil, fmt.Errorf("schedd-sync: creating epoch archive: %w", err)
 		}
 		m.reconcileArchiveIndexes(ctx, ep, s)
+		m.applyArchiveRowGroupBytes(ep, "epoch_history", s)
 		es := scheddsync.NewJobEpochSync(ep, scheddsync.HistorySyncConfig{
 			Filename: s.epochFile,
 			Logger:   m.logger,

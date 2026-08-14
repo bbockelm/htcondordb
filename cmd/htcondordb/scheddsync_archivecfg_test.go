@@ -198,3 +198,59 @@ func TestReconcileArchiveIndexesSurvivesRestart(t *testing.T) {
 		t.Error("re-adding the persisted index reported a change; the daemon would re-backfill every restart")
 	}
 }
+
+// TestArchiveRowGroupBytesRead checks the knob is read, and that leaving it out reports 0 rather
+// than a number -- 0 is what tells applyArchiveRowGroupBytes to leave a tuned archive alone.
+func TestArchiveRowGroupBytesRead(t *testing.T) {
+	if s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn)); s.archiveRowGroupBytes != 0 {
+		t.Errorf("unset archiveRowGroupBytes = %d, want 0", s.archiveRowGroupBytes)
+	}
+	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_ARCHIVE_ROW_GROUP_BYTES = 131072\n"))
+	if s.archiveRowGroupBytes != 131072 {
+		t.Errorf("archiveRowGroupBytes = %d, want 131072", s.archiveRowGroupBytes)
+	}
+}
+
+// TestApplyArchiveRowGroupBytes covers the half of this knob that config alone cannot do.
+//
+// An ArchiveConfig is only honoured when the archive is CREATED -- archiveconfig.json is
+// authoritative on reopen -- so a budget that travelled only that way would apply to a brand new
+// archive and never to the one an operator wants to tune. This applies it to an archive that already
+// exists, and requires the records written before the change to still read back: a new budget governs
+// segments sealed from now on, and blocks already written keep the layout they recorded.
+func TestApplyArchiveRowGroupBytes(t *testing.T) {
+	cat, err := db.OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	// An archive as it exists in a deployment today: created without the knob.
+	hist, err := cat.CreateArchiveTable("history", db.ArchiveConfig{ValueAttrs: []string{"ClusterId"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if err := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nOwner = \"alice\"", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := hist.RowGroupBytes(); got != 0 {
+		t.Fatalf("archive starts at RowGroupBytes=%d, want 0", got)
+	}
+
+	m := &scheddSyncManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_ARCHIVE_ROW_GROUP_BYTES = 131072\n"))
+	m.applyArchiveRowGroupBytes(hist, "history", s)
+	if got := hist.RowGroupBytes(); got != 131072 {
+		t.Errorf("after apply RowGroupBytes = %d, want 131072", got)
+	}
+	if n := hist.Count(); n != 50 {
+		t.Errorf("%d records after the change, want 50", n)
+	}
+
+	// Unset must not reset a deliberately tuned archive.
+	m.applyArchiveRowGroupBytes(hist, "history", resolveScheddSyncSettings(mkSyncCfg(t, syncOn)))
+	if got := hist.RowGroupBytes(); got != 131072 {
+		t.Errorf("removing the setting reset the archive to %d; unset means leave it alone", got)
+	}
+}
