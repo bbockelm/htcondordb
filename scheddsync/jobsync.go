@@ -36,16 +36,19 @@ const DefaultPollInterval = 200 * time.Millisecond
 // table. It reuses classadlog's parser/prober for parsing + rotation detection, but keeps
 // no in-memory copy of the queue -- the DB table is the materialized state.
 type JobSync struct {
-	// target is the jobs table (real proc ads). users, jobsets, and clusters are the sibling
-	// tables the other job_queue.log namespaces flatten into: user/owner records, jobset ads,
-	// and cluster ads. A key's "cluster.proc" namespace (see tableFor) routes it to exactly one
-	// of these -- or to none (the schedd header, cluster-private ads, OCU ads are dropped).
-	// Cluster ads get their own durable table so a proc materializing into a pre-existing
-	// cluster after a resume-from-offset restart can still chain its cluster's attributes.
+	// target is the jobs table (real proc ads). users, jobsets, clusters, and header are the
+	// sibling tables the other job_queue.log namespaces flatten into: user/owner records, jobset
+	// ads, cluster ads, and the single schedd header ad ("0.0", holding queue counters like
+	// NextClusterNum). A key's "cluster.proc" namespace (see tableFor) routes it to exactly one of
+	// these -- or to none (cluster-private ads and OCU ads are still dropped). Cluster ads get
+	// their own durable table so a proc materializing into a pre-existing cluster after a
+	// resume-from-offset restart can still chain its cluster's attributes; the header gets one so a
+	// job_queue.log reconstruction can restore the schedd's queue counters (id-reuse safety).
 	target   *db.DB
 	users    *db.DB
 	jobsets  *db.DB
 	clusters *db.DB
+	header   *db.DB
 	parser   *classadlog.Parser
 	prober   *classadlog.Prober
 	interval time.Duration
@@ -105,13 +108,14 @@ type JobSyncConfig struct {
 	Filename     string        // path to job_queue.log (required)
 	PollInterval time.Duration // default 200ms
 	Logger       *slog.Logger  // default slog.Default()
-	// Users, Jobsets, and Clusters are the sibling tables the non-proc job_queue.log namespaces
-	// flatten into (the jobs table is the NewJobSync target). When any is nil a private in-memory
-	// table stands in, so routing and cluster-ad chaining still work for callers that only inspect
-	// the jobs table (e.g. tests).
+	// Users, Jobsets, Clusters, and Header are the sibling tables the non-proc job_queue.log
+	// namespaces flatten into (the jobs table is the NewJobSync target). When any is nil a private
+	// in-memory table stands in, so routing and cluster-ad chaining still work for callers that only
+	// inspect the jobs table (e.g. tests). Header holds the single schedd header ad ("0.0").
 	Users    *db.DB
 	Jobsets  *db.DB
 	Clusters *db.DB
+	Header   *db.DB
 	// Store, if set, durably records the resume position so a restart resumes instead of
 	// replaying the whole log, and recovers correctly if the log was compacted while down.
 	Store PositionStore
@@ -129,7 +133,7 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	users, jobsets, clusters := cfg.Users, cfg.Jobsets, cfg.Clusters
+	users, jobsets, clusters, header := cfg.Users, cfg.Jobsets, cfg.Clusters, cfg.Header
 	if users == nil {
 		users = mustMemTable()
 	}
@@ -139,11 +143,15 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 	if clusters == nil {
 		clusters = mustMemTable()
 	}
+	if header == nil {
+		header = mustMemTable()
+	}
 	return &JobSync{
 		target:   target,
 		users:    users,
 		jobsets:  jobsets,
 		clusters: clusters,
+		header:   header,
 		parser:   classadlog.NewParser(cfg.Filename),
 		prober:   classadlog.NewProber(),
 		interval: interval,
@@ -249,6 +257,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	beforeUsers := s.users.Keys()
 	beforeJobsets := s.jobsets.Keys()
 	beforeClusters := s.clusters.Keys()
+	beforeHeader := s.header.Keys()
 	seen := map[*db.DB]map[string]struct{}{}
 
 	if oerr := s.parser.Open(); oerr != nil {
@@ -274,7 +283,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	defer closeParser()
 
 	rec := &reconciler{
-		jobs: s.target, users: s.users, jobsets: s.jobsets, clusters: s.clusters,
+		jobs: s.target, users: s.users, jobsets: s.jobsets, clusters: s.clusters, header: s.header,
 		seen: seen, log: s.log, batches: map[*db.DB]*db.Txn{},
 	}
 	for {
@@ -313,6 +322,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	}{
 		{s.target, beforeJobs}, {s.users, beforeUsers},
 		{s.jobsets, beforeJobsets}, {s.clusters, beforeClusters},
+		{s.header, beforeHeader},
 	} {
 		if err = s.sweepKeys(sw.table, sw.before, seen[sw.table]); err != nil {
 			return err
@@ -410,7 +420,7 @@ func (s *JobSync) sweepKeys(table *db.DB, before []string, seen map[string]struc
 // the key's last run and every submission attribute would vanish. The op handling mirrors
 // JobSync.applyEntry; keep the two in sync.
 type reconciler struct {
-	jobs, users, jobsets, clusters *db.DB
+	jobs, users, jobsets, clusters, header *db.DB
 	// seen is PER TABLE: the keys given a live ad in each table this reconcile. It must not be a
 	// single global set -- a key legitimately routed to one table (e.g. an owner "0O.-1" in users)
 	// would then protect a stale, misrouted row under the SAME key in another table (a pre-routing
@@ -439,7 +449,7 @@ func (r *reconciler) apply(e *classadlog.LogEntry) error {
 			return err
 		}
 		r.curKey, r.curAd, r.curDels, r.destroy = e.Key, classad.New(), nil, false
-		r.curTable = routeTable(e.Key, r.jobs, r.users, r.jobsets, r.clusters)
+		r.curTable = routeTable(e.Key, r.jobs, r.users, r.jobsets, r.clusters, r.header)
 	}
 	switch e.OpType {
 	case classadlog.OpNewClassAd:
@@ -835,12 +845,12 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 // mirror (the schedd header "0.0", cluster-private ads "C.-2", OCU ads "C.-99"). The namespace
 // is encoded in the "cluster.proc" key; see the is*Key classifiers.
 func (s *JobSync) tableFor(key string) *db.DB {
-	return routeTable(key, s.target, s.users, s.jobsets, s.clusters)
+	return routeTable(key, s.target, s.users, s.jobsets, s.clusters, s.header)
 }
 
 // routeTable classifies a job_queue.log key and returns the table it flattens into, or nil for a
 // dropped namespace. Shared by the incremental (applyEntry) and reconcile (reconciler) paths.
-func routeTable(key string, jobs, users, jobsets, clusters *db.DB) *db.DB {
+func routeTable(key string, jobs, users, jobsets, clusters, header *db.DB) *db.DB {
 	switch {
 	case isJobKey(key):
 		return jobs
@@ -850,6 +860,8 @@ func routeTable(key string, jobs, users, jobsets, clusters *db.DB) *db.DB {
 		return jobsets
 	case isUserKey(key):
 		return users
+	case isHeaderKey(key):
+		return header
 	default:
 		return nil
 	}
@@ -908,6 +920,14 @@ func isJobsetKey(key string) bool {
 func isUserKey(key string) bool {
 	c, p, ok := parseJobKey(key)
 	return ok && c == 0 && p > 0
+}
+
+// isHeaderKey reports whether key names the single schedd header ad ("0.0", cluster==0,
+// proc==0) -- the queue-metadata ad (NextClusterNum, ...). Stored so a job_queue.log
+// reconstruction can restore the schedd's counters; not a job row.
+func isHeaderKey(key string) bool {
+	c, p, ok := parseJobKey(key)
+	return ok && c == 0 && p == 0
 }
 
 // clusterKeyOf returns the parent cluster ad key for a proc ad key of the form "C.P"

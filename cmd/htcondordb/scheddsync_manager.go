@@ -268,9 +268,11 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	var wg sync.WaitGroup
 
 	if s.jobLog != "" {
-		// job_queue.log flattens into four tables by key namespace: proc ads -> jobs, cluster ads
+		// job_queue.log flattens into five tables by key namespace: proc ads -> jobs, cluster ads
 		// -> clusters (their own durable table so late procs still chain), jobset ads -> jobsets,
-		// user/owner records -> users. CreateTable is idempotent (returns the existing table).
+		// user/owner records -> users, and the schedd header ad ("0.0") -> header (queue counters,
+		// so a reconstruction can restore them). CreateTable is idempotent (returns the existing
+		// table).
 		jobs, err := m.svc.Catalog().CreateTable("jobs")
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("schedd-sync: creating jobs table: %w", err)
@@ -287,16 +289,20 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("schedd-sync: creating clusters table: %w", err)
 		}
+		header, err := m.svc.Catalog().CreateTable("header")
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("schedd-sync: creating header table: %w", err)
+		}
 		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{
 			Filename: s.jobLog, Logger: m.logger, Store: syncStore("jobs.pos"),
-			Users: users, Jobsets: jobsets, Clusters: clusters,
+			Users: users, Jobsets: jobsets, Clusters: clusters, Header: header,
 		})
 		wg.Add(1)
 		go func() { defer wg.Done(); _ = js.Run(ctx) }()
 		sources = append(sources, js)
 		resyncers["jobs"] = js
 		m.logger.Info("schedd-sync: mirroring job_queue.log", "file", s.jobLog,
-			"tables", "jobs,users,jobsets,clusters")
+			"tables", "jobs,users,jobsets,clusters,header")
 	}
 	if s.histFile != "" {
 		hist, err := m.svc.Catalog().CreateArchiveTable("history", db.ArchiveConfig{
