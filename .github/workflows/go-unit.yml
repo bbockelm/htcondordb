@@ -1,0 +1,54 @@
+name: go-unit
+
+# Runs the ROOT module's Go unit tests (go vet/build/test ./...) on every push and PR.
+#
+# This closes a coverage hole: the other workflows that run `go test ./...` do so inside a
+# submodule (archivedropbox/, grafana/, kafkasync/, opensearchsync/) or with a narrow -run
+# filter (sync-integration runs only *Integration* in ./scheddsync; droppriv runs a single
+# test), so the root module's plain unit tests -- e.g. the cmd/htcondordb schedd-sync manager
+# tests and the scheddsync log round-trip / routing tests -- were not executed by any job and
+# could rot silently.
+#
+# HTCondor is deliberately NOT installed here, so the schedd-sync integration tests self-skip
+# (SetupCondorHarness skips when condor_master is absent). Real-HTCondor integration coverage
+# lives in sync-integration.yml; this job is the fast, service-free unit tier.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests (Go, no HTCondor)
+    runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -mod=mod
+      GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+    steps:
+      - name: Checkout htcondordb
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: htcondordb }
+      - name: Checkout classad
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: PelicanPlatform/classad, path: golang-classads }
+      - name: Checkout cedar
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bbockelm/cedar, path: golang-cedar }
+      - name: Checkout golang-htcondor
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bbockelm/golang-htcondor, path: golang-htcondor }
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version: '1.25' }
+
+      - name: Vet + build + unit test
+        working-directory: htcondordb
+        run: |
+          go vet ./...
+          go build ./...
+          go test -race -count=1 -timeout 15m ./...
