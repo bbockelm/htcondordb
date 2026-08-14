@@ -114,6 +114,15 @@ type Config struct {
 	// was seconds, it pointed at the catalog open -- which can be a small fraction of it. This lets
 	// the caller report where the time actually went.
 	OnPhase func(name string, d time.Duration)
+	// OnTableOpen, when set, is called once per table and archive the catalog open touched, with how
+	// long that one took. It is the level below OnPhase: "catalog-open" is itself a loop over every
+	// directory under Dir, so a catalog open that owns a startup stays one opaque number with nothing
+	// inside it until each table reports for itself.
+	//
+	// kind is "table" or "archive". MAY BE CALLED CONCURRENTLY -- tables open in parallel -- so unlike
+	// OnPhase the handler must be safe for concurrent use and must not block. Every open is reported, so
+	// per-table attribution holds under parallelism; only the SUM stops matching the wall clock.
+	OnTableOpen func(kind, name string, d time.Duration)
 	// EncryptedAttrs is the default set of attributes encrypted at rest, in addition to
 	// HTCondor private attributes (which are always encrypted when PoolKeys is set).
 	// Adjustable at runtime by a DAEMON via the encrypt.set meta-command.
@@ -181,6 +190,7 @@ func New(cfg Config) (*Service, error) {
 		Dir:            cfg.Dir,
 		PoolKeys:       cfg.PoolKeys,
 		EncryptedAttrs: cfg.EncryptedAttrs,
+		OnOpenStep:     cfg.OnTableOpen,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("server: opening catalog: %w", err)

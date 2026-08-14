@@ -5,6 +5,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bbockelm/golang-htcondor/logging"
@@ -26,6 +27,16 @@ import (
 // while; a second spent reading config files does not.
 const slowPhase = time.Second
 
+// slowTableOpen is the threshold for calling out one table's open. It is far below slowPhase because
+// the failure mode is arithmetic rather than a single stall: sixty tables at 250ms is a fifteen-second
+// startup in which no individual open looks remarkable, and that is exactly the shape that went
+// unexplained. A quarter second to open one table is already worth a line.
+const slowTableOpen = 250 * time.Millisecond
+
+// slowestKept bounds how many table opens the summary names. A catalog can hold hundreds; naming them
+// all would push the line past what any log reader will read, and the tail is not what anyone acts on.
+const slowestKept = 5
+
 // startupTimer accumulates startup phase durations.
 //
 // Two levels. phases are the top-level spans, measured as deltas between mark calls. detail holds
@@ -38,6 +49,14 @@ type startupTimer struct {
 	last   time.Time
 	phases []phaseTime
 	detail []phaseTime
+
+	// Per-table catalog opens, reported concurrently from the goroutines that open them -- hence the
+	// mutex, which the delta-based fields above do not need. They are aggregated rather than appended
+	// because there is one per table and a summary listing hundreds is a summary of nothing.
+	tblMu    sync.Mutex
+	tblCount int
+	tblSum   time.Duration
+	tblSlow  []phaseTime // the slowestKept slowest, descending
 }
 
 type phaseTime struct {
@@ -87,6 +106,40 @@ func (t *startupTimer) record(name string, d time.Duration) {
 	}
 }
 
+// recordTableOpen notes one table or archive open. Safe for concurrent use and safe on a nil timer,
+// because the catalog calls it from whichever goroutine did the open.
+//
+// An open past slowTableOpen is logged immediately with its name, which is the whole point: the summary
+// only appears once the command socket is up, so a daemon that is still grinding through a catalog
+// reports the table it is grinding on rather than nothing at all.
+func (t *startupTimer) recordTableOpen(kind, name string, d time.Duration) {
+	if t == nil {
+		return
+	}
+	t.tblMu.Lock()
+	t.tblCount++
+	t.tblSum += d
+	label := kind + " " + name
+	// Insertion sort into a fixed-size descending top-N: cheaper and simpler than sorting hundreds of
+	// entries later, and it means the slice never grows with the catalog.
+	if len(t.tblSlow) < slowestKept || d > t.tblSlow[len(t.tblSlow)-1].d {
+		i := sort.Search(len(t.tblSlow), func(i int) bool { return t.tblSlow[i].d < d })
+		t.tblSlow = append(t.tblSlow, phaseTime{})
+		copy(t.tblSlow[i+1:], t.tblSlow[i:])
+		t.tblSlow[i] = phaseTime{label, d}
+		if len(t.tblSlow) > slowestKept {
+			t.tblSlow = t.tblSlow[:slowestKept]
+		}
+	}
+	log := t.log
+	t.tblMu.Unlock()
+
+	if d >= slowTableOpen && log != nil {
+		log.Info(logging.DestinationGeneral, "slow table open",
+			"kind", kind, "name", name, "took", d.Round(time.Millisecond).String())
+	}
+}
+
 // done logs the whole breakdown, slowest first, with the total. Called once the command socket is
 // listening -- the point the old log line marked with no explanation of what preceded it.
 func (t *startupTimer) done() {
@@ -106,6 +159,7 @@ func (t *startupTimer) done() {
 	}
 	t.log.Info(logging.DestinationGeneral, "startup timing",
 		"total", total.Round(time.Millisecond).String(), "phases", b.String())
+	t.logTableOpens()
 	if len(t.detail) == 0 {
 		return
 	}
@@ -120,6 +174,29 @@ func (t *startupTimer) done() {
 		fmt.Fprintf(&d, "%s=%s", p.name, p.d.Round(time.Millisecond))
 	}
 	t.log.Info(logging.DestinationGeneral, "startup detail", "steps", d.String())
+}
+
+// logTableOpens reports how many tables the catalog opened, the summed open time and the slowest few by
+// name. The sum is reported as "cpu" rather than a wall-clock share because opens run in parallel: it
+// can exceed the catalog-open phase it sits inside, and reading it as elapsed time would be wrong.
+func (t *startupTimer) logTableOpens() {
+	t.tblMu.Lock()
+	count, sum := t.tblCount, t.tblSum
+	slow := make([]phaseTime, len(t.tblSlow))
+	copy(slow, t.tblSlow)
+	t.tblMu.Unlock()
+	if count == 0 {
+		return
+	}
+	var b strings.Builder
+	for i, p := range slow {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s=%s", p.name, p.d.Round(time.Millisecond))
+	}
+	t.log.Info(logging.DestinationGeneral, "startup catalog opens",
+		"opened", count, "cpu", sum.Round(time.Millisecond).String(), "slowest", b.String())
 }
 
 // buildIdentity reports this binary's own version and the classad version it was compiled

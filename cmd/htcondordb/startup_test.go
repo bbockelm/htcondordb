@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -84,4 +86,63 @@ func TestBuildIdentityReportsClassadVersion(t *testing.T) {
 	if !strings.HasPrefix(classad, "v") {
 		t.Errorf("classad version = %q, want something like v0.25.3", classad)
 	}
+}
+
+// TestRecordTableOpenKeepsSlowest checks the top-N aggregation, which is the whole content of the
+// summary line: a catalog can open hundreds of tables and only the slowest few are actionable. Feeding
+// them in ASCENDING order is deliberate -- an implementation that keeps the first N it sees, or that
+// compares against the wrong end of the slice, passes on descending input.
+func TestRecordTableOpenKeepsSlowest(t *testing.T) {
+	tm := newStartupTimer(nil)
+	for i := 1; i <= 20; i++ {
+		tm.recordTableOpen("table", fmt.Sprintf("t%02d", i), time.Duration(i)*time.Millisecond)
+	}
+	if tm.tblCount != 20 {
+		t.Errorf("counted %d opens, want 20", tm.tblCount)
+	}
+	if want := 210 * time.Millisecond; tm.tblSum != want {
+		t.Errorf("summed %v, want %v", tm.tblSum, want)
+	}
+	if len(tm.tblSlow) != slowestKept {
+		t.Fatalf("kept %d slow entries, want %d", len(tm.tblSlow), slowestKept)
+	}
+	// Descending, and the slowest five are t20..t16.
+	for i, want := range []string{"table t20", "table t19", "table t18", "table t17", "table t16"} {
+		if tm.tblSlow[i].name != want {
+			t.Errorf("slow[%d] = %q, want %q (order is what the summary prints)", i, tm.tblSlow[i].name, want)
+		}
+	}
+	tm.done() // must not panic with a nil logger
+}
+
+// TestRecordTableOpenConcurrent runs the reporter the way the catalog does -- from many goroutines at
+// once, since tables open in parallel. Under -race an unguarded aggregator fails here; without the race
+// detector a lost update shows up as a wrong count.
+func TestRecordTableOpenConcurrent(t *testing.T) {
+	tm := newStartupTimer(nil)
+	const goroutines, each = 8, 50
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				tm.recordTableOpen("table", fmt.Sprintf("t%d-%d", g, i), time.Millisecond)
+			}
+		}(g)
+	}
+	wg.Wait()
+	if want := goroutines * each; tm.tblCount != want {
+		t.Errorf("counted %d opens, want %d (a lost update means the aggregation is not atomic)",
+			tm.tblCount, want)
+	}
+	if want := time.Duration(goroutines*each) * time.Millisecond; tm.tblSum != want {
+		t.Errorf("summed %v, want %v", tm.tblSum, want)
+	}
+}
+
+// TestRecordTableOpenNilTimer covers the nil receiver: the hook is passed to the catalog unconditionally.
+func TestRecordTableOpenNilTimer(t *testing.T) {
+	var tm *startupTimer
+	tm.recordTableOpen("table", "jobs", time.Second)
 }
