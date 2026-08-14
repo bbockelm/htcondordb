@@ -193,29 +193,6 @@ func TestJobSyncReconcileSkipsUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var deletes, upserts []string
-	deadline := time.After(3 * time.Second)
-collect:
-	for {
-		select {
-		case ev := <-events:
-			switch ev.Kind {
-			case db.WatchDelete:
-				deletes = append(deletes, ev.Key)
-			case db.WatchUpsert:
-				upserts = append(upserts, ev.Key)
-			}
-			for _, k := range deletes {
-				if k == "2.0" { // the sweep's delete is the final commit of the reload
-					break collect
-				}
-			}
-		case <-deadline:
-			break collect
-		}
-	}
-	cancel()
-
 	has := func(s []string, key string) bool {
 		for _, k := range s {
 			if k == key {
@@ -224,6 +201,29 @@ collect:
 		}
 		return false
 	}
+	// Collect until BOTH definitive deltas are observed -- the new job's upsert (3.0) and the
+	// removed job's delete (2.0) -- or the deadline. Waiting for the final state rather than
+	// breaking on the first 2.0 delete makes the assertions independent of watch event-delivery
+	// order across the reconcile's separate commits. Breaking on the delete assumed 3.0's upsert
+	// had already been delivered and read; under load (CI, -race) the 2.0 delete could be read
+	// first, so the loop exited with an empty upserts set and the test flaked.
+	var deletes, upserts []string
+	deadline := time.After(10 * time.Second)
+collect:
+	for !(has(upserts, "3.0") && has(deletes, "2.0")) {
+		select {
+		case ev := <-events:
+			switch ev.Kind {
+			case db.WatchDelete:
+				deletes = append(deletes, ev.Key)
+			case db.WatchUpsert:
+				upserts = append(upserts, ev.Key)
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+	cancel()
 	if has(upserts, "1.0") {
 		t.Errorf("1.0 was re-published though unchanged; reconcile must skip it. upserts=%v", upserts)
 	}
