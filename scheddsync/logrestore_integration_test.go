@@ -136,6 +136,98 @@ func TestQueueLogRestartRestoreIntegration(t *testing.T) {
 		len(survivors), newID, maxCluster)
 }
 
+// TestMirrorOutRestartRestoreIntegration is the follower-daemon end-to-end proof: a real schedd
+// must accept the job_queue.log that MirrorOut writes (not QueueLogWriter called directly, and
+// not a round-trip through our own JobSync). It submits held jobs, opens a cluster-id gap, stops
+// the schedd, mirrors its job_queue.log into the tables, then has MirrorOut regenerate the log
+// atomically straight onto the schedd's spool path, restarts the schedd, and asserts condor_q
+// reports the same surviving jobs and a new submission continues the counter past the gap.
+func TestMirrorOutRestartRestoreIntegration(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("must run unprivileged (the schedd's spool must not be read/written as root)")
+	}
+	for _, tool := range []string{"condor_off", "condor_on"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not found in PATH", tool)
+		}
+	}
+
+	h := htcondor.SetupCondorHarness(t)
+	if err := h.WaitForDaemons(); err != nil {
+		t.Fatalf("daemons failed to start: %v", err)
+	}
+	cfg, err := h.GetConfig()
+	if err != nil {
+		t.Fatalf("harness config: %v", err)
+	}
+	jobLog := configOr(cfg, "JOB_QUEUE_LOG", filepath.Join(h.GetSpoolDir(), "job_queue.log"))
+	cfgFile := h.GetConfigFile()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
+	defer cancel()
+
+	collector := htcondor.NewCollector(h.GetCollectorAddr())
+	schedd := locateSchedd(t, ctx, collector)
+
+	const held = "universe = vanilla\nexecutable = /bin/sleep\narguments = 300\nhold = true\nqueue\n"
+	var clusterIDs []int
+	for i := 0; i < 3; i++ {
+		id, err := schedd.Submit(ctx, held)
+		if err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+		c, _ := strconv.Atoi(id)
+		clusterIDs = append(clusterIDs, c)
+	}
+	sort.Ints(clusterIDs)
+	maxCluster := clusterIDs[len(clusterIDs)-1]
+
+	if _, err := schedd.RemoveJobsByID(ctx, []string{fmt.Sprintf("%d.0", maxCluster)}, "mirror-out restore gap"); err != nil {
+		t.Fatalf("remove cluster %d: %v", maxCluster, err)
+	}
+	survivors := clusterIDs[:len(clusterIDs)-1]
+	waitForJobKeys(t, ctx, schedd, jobKeys(survivors))
+	before := queryJobMap(t, ctx, schedd)
+
+	// Stop the schedd, mirror its static job_queue.log into the tables.
+	runCondorTool(t, cfgFile, "condor_off", "-schedd")
+	waitScheddDown(t, ctx, schedd)
+
+	n := tables(t)
+	js := NewJobSync(n.jobs, JobSyncConfig{
+		Filename: jobLog, Users: n.users, Jobsets: n.jobsets, Clusters: n.clusters, Header: n.header,
+		ClusterPrivate: n.clusterprivate, LogMeta: n.logmeta,
+	})
+	if err := js.Poll(ctx); err != nil {
+		t.Fatalf("mirror job_queue.log: %v", err)
+	}
+
+	// The follower path under test: MirrorOut regenerates the log with its own atomic write,
+	// straight onto the schedd's spool path (temp + rename). This is exactly what the follower
+	// daemon does, so a successful restart proves a real schedd loads MirrorOut's output.
+	mirror := NewMirrorOut(n.mirrorConfig(jobLog))
+	if err := mirror.Regenerate(); err != nil {
+		t.Fatalf("MirrorOut regenerate onto spool: %v", err)
+	}
+
+	runCondorTool(t, cfgFile, "condor_on", "-schedd")
+	schedd = waitScheddUp(t, ctx, collector, h)
+
+	after := queryJobMap(t, ctx, schedd)
+	assertJobMapsEqual(t, before, after)
+
+	newIDStr, err := schedd.Submit(ctx, held)
+	if err != nil {
+		t.Fatalf("post-restore submit: %v", err)
+	}
+	newID, _ := strconv.Atoi(newIDStr)
+	if newID <= maxCluster {
+		t.Fatalf("post-restore submit reused cluster id %d (<= retired %d); header counter not restored via MirrorOut", newID, maxCluster)
+	}
+	t.Logf("MirrorOut output loaded by a real schedd: restored %d jobs; new cluster %d (> retired %d)",
+		len(survivors), newID, maxCluster)
+}
+
 // jobKeys returns the "C.0" key for each cluster id.
 func jobKeys(clusters []int) []string {
 	keys := make([]string, len(clusters))
