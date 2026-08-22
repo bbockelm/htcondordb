@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
@@ -86,6 +87,20 @@ func run() error {
 	// Time each startup phase: everything from here to the listener used to be silent, so a slow
 	// start showed only as a gap between two timestamps.
 	boot := newStartupTimer(log)
+
+	// Explain a slow reopen: log when a table's/archive's sealed segments were NOT all
+	// index-adopted at open (classad #208), so the rebuild that dominates a slow startup names
+	// its cause (no sidecar file / rejected sidecar / stale attribute section) instead of showing
+	// only as elapsed time. Silent on a clean fast open (every segment adopted). Set once, before
+	// the catalog opens below.
+	collections.OpenIndexDiagHook = func(dg collections.OpenIndexDiag) {
+		if dg.AttrIndexAdopted < dg.SealedSegments {
+			log.Info(logging.DestinationGeneral, "columnar index adoption at open",
+				"dir", dg.Dir, "sealed", dg.SealedSegments, "sidecarFiles", dg.SidecarFiles,
+				"keyAdopted", dg.KeyIndexAdopted, "attrAdopted", dg.AttrIndexAdopted,
+				"reasons", fmt.Sprint(dg.Reasons))
+		}
+	}
 
 	// Server-side security policy for our command socket (SEC_* knobs). The
 	// negotiated command is DBSession; DAEMON is the strongest level we serve.
