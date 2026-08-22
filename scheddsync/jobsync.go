@@ -56,11 +56,15 @@ type JobSync struct {
 	// sequence number + creation timestamp that head every job_queue.log). It is NOT routed
 	// from an ad key -- 107 carries no key -- so it is captured out of band from the log's
 	// first line (captureLogMeta) and is never touched by the reconcile sweep.
-	logmeta *db.DB
-	parser  *classadlog.Parser
+	logmeta  *db.DB
+	parser   *classadlog.Parser
 	prober   *classadlog.Prober
 	interval time.Duration
-	log      *slog.Logger
+	// saveInterval throttles position checkpoints on the steady append path (0 = save every
+	// batch); lastSaveAt is when the position was last durably saved.
+	saveInterval time.Duration
+	lastSaveAt   time.Time
+	log          *slog.Logger
 
 	// txs holds one open DB transaction per target table for the on-disk transaction being
 	// replayed -- writes across the four tables are separate *db.Txn, opened lazily and committed
@@ -131,6 +135,12 @@ type JobSyncConfig struct {
 	// Store, if set, durably records the resume position so a restart resumes instead of
 	// replaying the whole log, and recovers correctly if the log was compacted while down.
 	Store PositionStore
+	// SaveInterval throttles how often the resume position is checkpointed on the steady append
+	// path: at most one save per interval, so a busy log does not rewrite the position file on
+	// every poll. 0 (default) saves after every batch. A crash loses at most one interval of
+	// progress, which the syncer re-applies idempotently on restart; rotation/compaction and a
+	// clean shutdown always checkpoint regardless.
+	SaveInterval time.Duration
 }
 
 // NewJobSync creates a syncer that mirrors cfg.Filename into target (the jobs table) and routes
@@ -176,6 +186,7 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 		parser:         classadlog.NewParser(cfg.Filename),
 		prober:         classadlog.NewProber(),
 		interval:       interval,
+		saveInterval:   cfg.SaveInterval,
 		log:            logger,
 		children:       map[string]map[string]struct{}{},
 		txs:            map[*db.DB]*db.Txn{},
@@ -204,6 +215,10 @@ func (s *JobSync) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Persist the latest position the append-path throttle may have skipped, so a clean
+			// shutdown does not force a re-apply on the next start. No-op if a transaction is
+			// still open (checkpoint refuses mid-transaction) -- abort then rolls it back.
+			s.checkpoint()
 			s.abort()
 			return ctx.Err()
 		case <-ticker.C:
@@ -307,7 +322,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	rec := &reconciler{
 		jobs: s.target, users: s.users, jobsets: s.jobsets, clusters: s.clusters, header: s.header,
 		clusterprivate: s.clusterprivate,
-		seen: seen, log: s.log, batches: map[*db.DB]*db.Txn{},
+		seen:           seen, log: s.log, batches: map[*db.DB]*db.Txn{},
 	}
 	for {
 		select {
@@ -352,8 +367,8 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 			return err
 		}
 	}
-	s.captureLogMeta()             // the leading 107 sequence header (offset was reset to 0)
-	s.checkpoint()                 // position recorded only after the reconciled table matches the log
+	s.captureLogMeta() // the leading 107 sequence header (offset was reset to 0)
+	s.checkpoint()     // position recorded only after the reconciled table matches the log
 	s.publishStatus(true)
 	return nil
 }
@@ -720,7 +735,22 @@ func (s *JobSync) checkpoint() {
 	}
 	if serr := s.store.Save(blob); serr != nil {
 		s.log.Warn("scheddsync: saving job position failed", "err", serr.Error())
+		return
 	}
+	s.lastSaveAt = time.Now()
+}
+
+// maybeCheckpoint records the resume position on the steady append path, throttled to at most
+// one save per saveInterval so a busy log does not rewrite the position file on every poll. The
+// first save of a run and any save once the interval has elapsed go through; the rest are
+// skipped, so a crash re-applies at most one interval of the log (idempotent). checkpoint()
+// itself stays unconditional and is used where a save must not be dropped: after a
+// rotation/compaction reload and on a clean shutdown.
+func (s *JobSync) maybeCheckpoint() {
+	if s.saveInterval > 0 && !s.lastSaveAt.IsZero() && time.Since(s.lastSaveAt) < s.saveInterval {
+		return
+	}
+	s.checkpoint()
 }
 
 // readAndApply reads entries from the current offset to EOF, applying them. reload marks a
@@ -746,7 +776,7 @@ func (s *JobSync) readAndApply(ctx context.Context, reload bool) (err error) {
 			s.curID, s.haveID = id, true
 		}
 		if err == nil {
-			s.checkpoint()
+			s.maybeCheckpoint()
 		}
 		s.publishStatus(err == nil)
 	}()
@@ -772,12 +802,10 @@ func (s *JobSync) readAndApply(ctx context.Context, reload bool) (err error) {
 	if !s.explicit {
 		err = s.commitAll()
 	}
-	// Durably record how far we got, but only at a clean boundary (no open explicit
-	// transaction) so a resume never lands mid-transaction. Saved after the commit above, so
-	// the position never runs ahead of applied data.
-	if err == nil {
-		s.checkpoint()
-	}
+	// The resume position is checkpointed exactly once, by the deferred cleanup above -- after
+	// parser.Close() finalizes the offset (checkpoint's own precondition) and after this
+	// commit. Checkpointing here too wrote jobs.pos twice per poll (and the pre-Close copy
+	// carried a stale offset), so it was dropped.
 	return err
 }
 

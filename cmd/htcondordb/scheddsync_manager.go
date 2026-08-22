@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/bbockelm/golang-htcondor/config"
@@ -81,6 +82,10 @@ type scheddSyncSettings struct {
 	histFile  string
 	epochFile string
 	posDir    string
+	// saveInterval throttles how often the job syncer rewrites its resume position file on the
+	// steady append path (0 = every batch). A crash re-applies at most this much of the log,
+	// idempotently; rotation and clean shutdown always checkpoint.
+	saveInterval time.Duration
 
 	// History-archive tuning. archiveSegSize applies only when the archive is first
 	// created (archiveconfig.json is authoritative on reopen); the index attributes and the
@@ -124,6 +129,9 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		// (HTCONDORDB_DIR or $(SPOOL)/htcondordb) -- not HTCONDORDB_DIR alone, which left
 		// SPOOL-configured deployments with no persisted resume position.
 		posDir: resolveDBDir(cfg),
+		// Throttle position-file rewrites on a busy log. Default 5s; a negative value disables
+		// the throttle (save every batch, the pre-throttle behavior).
+		saveInterval: scheddSyncSaveInterval(cfg),
 
 		archiveSegSize: segSize,
 		// Unlike the segment size this can be changed on an existing archive -- see
@@ -133,6 +141,19 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		archiveCatAttrs:      canonicalAttrList(catAttrs),
 		archiveValAttrs:      canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS"), "ClusterId")),
 	}
+}
+
+// scheddSyncSaveInterval resolves the job syncer's position-checkpoint throttle from
+// HTCONDORDB_SCHEDDSYNC_SAVE_SECONDS. Unset defaults to 5s; a value <= 0 disables the throttle
+// (checkpoint after every batch, the pre-throttle behavior).
+func scheddSyncSaveInterval(cfg *config.Config) time.Duration {
+	if strings.TrimSpace(getStr(cfg, "HTCONDORDB_SCHEDDSYNC_SAVE_SECONDS")) == "" {
+		return 5 * time.Second
+	}
+	if n := configInt(cfg, "HTCONDORDB_SCHEDDSYNC_SAVE_SECONDS"); n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return 0
 }
 
 // canonicalAttrList normalizes a comma- and/or space-separated attribute list to a stable
@@ -337,6 +358,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			Filename: s.jobLog, Logger: m.logger, Store: syncStore("jobs.pos"),
 			Users: users, Jobsets: jobsets, Clusters: clusters, Header: header,
 			ClusterPrivate: clusterprivate, LogMeta: logmeta,
+			SaveInterval: s.saveInterval,
 		})
 		wg.Add(1)
 		go func() { defer wg.Done(); _ = js.Run(ctx) }()
