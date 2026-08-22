@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/bbockelm/golang-htcondor/config"
@@ -64,6 +67,23 @@ func (m *scheddSyncManager) ResyncTargets() []string {
 	return out
 }
 
+// runGuardedTailer runs a tailer's Run with panic recovery, so a bug in one syncer degrades
+// that syncer instead of crashing the whole daemon. Crashing is doubly costly here: it also
+// skips the DB's clean-shutdown checkpoint, so the next start pays the full archive-open scan.
+// A tailer that panics stays down until the next daemon restart -- deliberately not
+// auto-restarted, since a persistently panicking tailer would otherwise spin in a tight loop.
+func (m *scheddSyncManager) runGuardedTailer(ctx context.Context, name string, run func(context.Context) error) {
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error("schedd-sync tailer panicked; stopping it, daemon stays up",
+				"tailer", name, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+		}
+	}()
+	if err := run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		m.logger.Warn("schedd-sync tailer exited with error", "tailer", name, "err", err.Error())
+	}
+}
+
 // defaultArchiveCategoricalAttrs are the history archive's categorical (string equality)
 // indexes when HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS is unset. Owner is the one grouping
 // dimension every pool has. Sites that group by AccountingGroup, ProjectName, or a custom
@@ -81,6 +101,10 @@ type scheddSyncSettings struct {
 	histFile  string
 	epochFile string
 	posDir    string
+	// saveInterval throttles how often the job syncer rewrites its resume position file on the
+	// steady append path (0 = every batch). A crash re-applies at most this much of the log,
+	// idempotently; rotation and clean shutdown always checkpoint.
+	saveInterval time.Duration
 
 	// History-archive tuning. archiveSegSize applies only when the archive is first
 	// created (archiveconfig.json is authoritative on reopen); the index attributes and the
@@ -124,6 +148,9 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		// (HTCONDORDB_DIR or $(SPOOL)/htcondordb) -- not HTCONDORDB_DIR alone, which left
 		// SPOOL-configured deployments with no persisted resume position.
 		posDir: resolveDBDir(cfg),
+		// Throttle position-file rewrites on a busy log. Default 5s; a negative value disables
+		// the throttle (save every batch, the pre-throttle behavior).
+		saveInterval: scheddSyncSaveInterval(cfg),
 
 		archiveSegSize: segSize,
 		// Unlike the segment size this can be changed on an existing archive -- see
@@ -133,6 +160,19 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		archiveCatAttrs:      canonicalAttrList(catAttrs),
 		archiveValAttrs:      canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS"), "ClusterId")),
 	}
+}
+
+// scheddSyncSaveInterval resolves the job syncer's position-checkpoint throttle from
+// HTCONDORDB_SCHEDDSYNC_SAVE_SECONDS. Unset defaults to 5s; a value <= 0 disables the throttle
+// (checkpoint after every batch, the pre-throttle behavior).
+func scheddSyncSaveInterval(cfg *config.Config) time.Duration {
+	if strings.TrimSpace(getStr(cfg, "HTCONDORDB_SCHEDDSYNC_SAVE_SECONDS")) == "" {
+		return 5 * time.Second
+	}
+	if n := configInt(cfg, "HTCONDORDB_SCHEDDSYNC_SAVE_SECONDS"); n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return 0
 }
 
 // canonicalAttrList normalizes a comma- and/or space-separated attribute list to a stable
@@ -337,9 +377,10 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			Filename: s.jobLog, Logger: m.logger, Store: syncStore("jobs.pos"),
 			Users: users, Jobsets: jobsets, Clusters: clusters, Header: header,
 			ClusterPrivate: clusterprivate, LogMeta: logmeta,
+			SaveInterval: s.saveInterval,
 		})
 		wg.Add(1)
-		go func() { defer wg.Done(); _ = js.Run(ctx) }()
+		go func() { defer wg.Done(); m.runGuardedTailer(ctx, "jobs", js.Run) }()
 		sources = append(sources, js)
 		resyncers["jobs"] = js
 		m.logger.Info("schedd-sync: mirroring job_queue.log", "file", s.jobLog,
@@ -378,7 +419,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			},
 		})
 		wg.Add(1)
-		go func() { defer wg.Done(); _ = hs.Run(ctx) }()
+		go func() { defer wg.Done(); m.runGuardedTailer(ctx, "history", hs.Run) }()
 		sources = append(sources, hs)
 		resyncers["history"] = hs
 		m.logger.Info("schedd-sync: tailing history file", "file", s.histFile, "archive", "history")
@@ -409,7 +450,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			},
 		})
 		wg.Add(1)
-		go func() { defer wg.Done(); _ = es.Run(ctx) }()
+		go func() { defer wg.Done(); m.runGuardedTailer(ctx, "epoch", es.Run) }()
 		sources = append(sources, es)
 		resyncers["epoch"] = es
 		m.logger.Info("schedd-sync: tailing epoch history file", "file", s.epochFile, "archive", "epoch_history")
