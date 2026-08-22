@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
@@ -94,6 +95,15 @@ type Executor struct {
 	// list error just retries next time.
 	archives   map[string]bool
 	archivesOK bool
+
+	// numericOrderCols caches, per table, the attributes that are safe and efficient to order by
+	// on the server: value-indexed / zone-mapped attributes, which the collection guarantees are
+	// numeric (a value index / zone map is a numeric [min,max] structure). Server-side TopK orders
+	// numerically, so routing a string order key to it would wrongly skip every row -- this set is
+	// how execSelect knows an ORDER BY column is a valid TopK key. Loaded lazily (a Diagnostics
+	// call) only when a query shape could actually use TopK, then reused; a table absent from the
+	// map has not been probed yet.
+	numericOrderCols map[string]map[string]bool
 
 	// Explicit-transaction state, set by BEGIN and cleared by COMMIT/ROLLBACK. txActive
 	// is the flag BEGIN sets; tx is the server-side transaction, opened lazily on the
@@ -991,6 +1001,18 @@ func (e *Executor) queryAdsForClientScan(st *Statement) ([]*classad.ClassAd, err
 // server-side projection op (QueryRawProject), which streams the old-ClassAd render of the
 // projected subset. limit > 0 caps the scan server-side.
 func (e *Executor) queryAdsProjected(table, where string, attrs []string, limit int) ([]*classad.ClassAd, error) {
+	// EXPLAIN ANALYZE: take the stats-carrying projection stream so the report can show the
+	// server-side scan breakdown (Phase 2). It also serves the rows, so a successful call returns
+	// here; the wire and plain-text paths below are for the ordinary (non-explain) case and for a
+	// server too old to carry the stats trailer.
+	if e.explain != nil {
+		if ads, ok, err := e.queryAdsProjectedStats(table, where, attrs, limit); err != nil {
+			return nil, err
+		} else if ok {
+			return ads, nil
+		}
+		// fall through: the server lacks the stats op; serve the rows without a Phase-2 breakdown.
+	}
 	// Wire-form rows first: the row leaves storage as wire bytes and is rebuilt into an AST
 	// here, so rendering it to old-ClassAd text in between costs a render plus a parse for
 	// nothing. queryAdsWire hands back a fallback error -- an older server, a table that
@@ -1017,10 +1039,37 @@ func (e *Executor) queryAdsProjected(table, where string, attrs []string, limit 
 	if err != nil {
 		return nil, err
 	}
+	return parseProjectedAds(texts)
+}
+
+// queryAdsProjectedStats serves the projected rows via the stats-carrying refs projection stream
+// and records the server-side scan breakdown into the active explain trace (Phase 2). ok=false with
+// a nil error means the server does not implement the stats op, so the caller serves the rows by its
+// ordinary path (without a breakdown). Only called when e.explain != nil.
+func (e *Executor) queryAdsProjectedStats(table, where string, attrs []string, limit int) ([]*classad.ClassAd, bool, error) {
+	var stats collections.ScanStats
+	var texts []string
+	err := e.c.QueryRawProjectRefsStreamStats(e.opCtx(), table, constraint(where), attrs, limit,
+		func(row string) bool { texts = append(texts, row); return true }, &stats)
+	if errors.Is(err, dbrpc.ErrProjectRefsUnsupported) {
+		return nil, false, nil // server too old for the stats op: let the caller serve rows plainly
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	ads, perr := parseProjectedAds(texts)
+	if perr != nil {
+		return nil, false, perr
+	}
+	e.explain.scan, e.explain.scanOK = stats, true
+	return ads, true, nil
+}
+
+// parseProjectedAds parses the old-ClassAd text rows a projection op streams (unlike QueryTable's
+// bracketed new-ClassAd form) into ads.
+func parseProjectedAds(texts []string) ([]*classad.ClassAd, error) {
 	ads := make([]*classad.ClassAd, 0, len(texts))
 	for _, t := range texts {
-		// The projection op streams the old-ClassAd text form (unlike QueryTable's bracketed
-		// new-ClassAd form), so parse with ParseOld.
 		ad, perr := classad.ParseOld(t)
 		if perr != nil {
 			return nil, fmt.Errorf("parsing a projected ad: %w", perr)
@@ -1037,6 +1086,12 @@ type explainTrace struct {
 	sortDur      time.Duration
 	rowsFetched  int
 	rowsReturned int
+	// scan is the server-side scan breakdown for a projected row scan (Phase 2): how many
+	// segments were pruned vs scanned, and how many records were answered from columns vs
+	// reassembled. scanOK marks it as filled -- an older server without the stats op leaves it
+	// clear, and the report says so.
+	scan   collections.ScanStats
+	scanOK bool
 }
 
 // execExplain implements EXPLAIN [ANALYZE] <SELECT>. Plain EXPLAIN reports the chosen plan; with
@@ -1068,6 +1123,7 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 			lines = append(lines,
 				fmt.Sprintf("  fetch=%s  sort=%s", roundDur(tr.fetchDur), roundDur(tr.sortDur)),
 				fmt.Sprintf("rows: fetched=%d  returned=%d", tr.rowsFetched, tr.rowsReturned))
+			lines = append(lines, scanStatsLines(tr)...)
 		} else {
 			lines = append(lines, "  (server-side aggregate; per-phase scan stats arrive with Phase 2)")
 		}
@@ -1077,6 +1133,29 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 		res.Rows = append(res.Rows, []string{l})
 	}
 	return res, nil
+}
+
+// scanStatsLines renders the server-side scan breakdown (Phase 2) for an EXPLAIN ANALYZE of a
+// projected row scan: how many segments were pruned by zone maps vs actually scanned, and how many
+// records the columnar accelerator answered from columns alone vs had to reassemble from the wire
+// record -- the difference between a fast projected read and the slow per-record LookupByName path.
+// It reports nothing when the run took a path that carries no scan stats (a server-side aggregate,
+// server-side TopK, a wire-form or whole-ad fetch, or a server too old for the stats op).
+func scanStatsLines(tr *explainTrace) []string {
+	if !tr.scanOK {
+		return nil
+	}
+	s := tr.scan
+	out := []string{
+		fmt.Sprintf("scan: segments scanned=%d pruned=%d of %d", s.SegmentsScanned, s.SegmentsPruned, s.SegmentsTotal),
+		fmt.Sprintf("      records visited=%d  column-decided=%d  reassembled=%d  matched=%d",
+			s.RecordsVisited, s.RecordsColumnDecided, s.RecordsReassembled, s.RowsMatched),
+	}
+	if s.RecordsReassembled > 0 && s.RecordsVisited > 0 {
+		out = append(out, fmt.Sprintf("      note: %d record(s) reassembled from the wire form (per-record attribute lookup); "+
+			"a value index or columnar coverage on the filtered/ordered attributes avoids it", s.RecordsReassembled))
+	}
+	return out
 }
 
 // roundDur formats a duration for the EXPLAIN report at a sensible precision.
@@ -1101,6 +1180,24 @@ func (e *Executor) describePlan(st *Statement) []string {
 	}
 	groupBy := effectiveGroupBy(st)
 	aggregate := len(groupBy) > 0 || hasAggregate(st)
+	// Server-side TopK: ORDER BY + LIMIT both push down (see topKPlan). Report it as its own plan
+	// so the report matches what execSelect runs, and skip the client-side order/limit lines below.
+	if !aggregate && !hasWindow(st) {
+		if proj, orderCol, desc, ok := e.topKPlan(st); ok {
+			dir := "ASC"
+			if desc {
+				dir = "DESC"
+			}
+			out = append(out,
+				fmt.Sprintf("  path: server-side top-K (ORDER BY %s %s LIMIT %d pushed down); attrs=[%s]",
+					orderCol, dir, st.Limit, strings.Join(proj, ", ")),
+				fmt.Sprintf("  order+limit: server returns only the %d ordered rows (numeric-indexed key %q)", st.Limit, orderCol))
+			if st.AsOf != "" {
+				out = append(out, "  as-of: "+st.AsOf+" (point-in-time read; no projection/aggregate push-down)")
+			}
+			return out
+		}
+	}
 	switch {
 	case aggregate && e.isArchive(st.Table):
 		out = append(out, "  path: columnar aggregate on the archive (only the grouped result crosses the wire)")
@@ -1183,6 +1280,23 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 		return e.execSelectWindow(st)
 	}
 
+	// Server-side TopK: ORDER BY <numeric-indexed col> {ASC|DESC} LIMIT k with a plain-column
+	// projection pushes BOTH the ordering and the limit to the server, so only k rows cross the
+	// wire instead of the whole match set fetched and sorted here (the motivating case: "the newest
+	// few of a million"). tryTopK returns ok=false for any query that does not qualify, which then
+	// runs the normal fetch-and-sort path below.
+	fetchStart := time.Now()
+	if ads, ok, err := e.tryTopK(st); err != nil {
+		return nil, err
+	} else if ok {
+		if e.explain != nil {
+			e.explain.fetchDur = time.Since(fetchStart)
+			e.explain.rowsFetched = len(ads)
+			e.explain.rowsReturned = len(ads)
+		}
+		return e.renderSelectRows(st, ads)
+	}
+
 	// Push LIMIT to the server only when the final row set is a prefix of the scan
 	// order -- i.e. no client-side reordering (ORDER BY) or row-reduction
 	// (DISTINCT) happens after the fetch. Otherwise fetch all and cap last.
@@ -1196,7 +1310,7 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	// projectionAttrs).
 	var ads []*classad.ClassAd
 	var err error
-	fetchStart := time.Now()
+	fetchStart = time.Now()
 	if proj := e.projectionAttrs(st); proj != nil {
 		ads, err = e.queryAdsProjected(st.Table, st.Where, proj, pushLimit)
 	} else {
@@ -1226,6 +1340,14 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	if e.explain != nil {
 		e.explain.rowsReturned = len(limited)
 	}
+	return e.renderSelectRows(st, limited)
+}
+
+// renderSelectRows builds the tabular Result from the already-ordered, already-limited ads of a
+// row-scan SELECT: SELECT * expands to every attribute, otherwise each selected item renders by
+// name or by evaluating its expression. Shared by the normal fetch-and-sort path and the
+// server-side TopK fast path, which both arrive here with the final ad set.
+func (e *Executor) renderSelectRows(st *Statement, limited []*classad.ClassAd) (*Result, error) {
 	res := &Result{IsSelect: true, Ads: limited}
 
 	// SELECT * : every attribute, each rendered by name.
@@ -1267,6 +1389,82 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 		res.Rows = append(res.Rows, row)
 	}
 	return res, nil
+}
+
+// tryTopK routes a qualifying ORDER BY <col> {ASC|DESC} LIMIT k to the server-side TopK op and
+// returns its k rows (already ordered and limited). ok=false means the query does not qualify --
+// the caller runs the normal fetch-and-sort path. It qualifies when: there is a positive LIMIT and
+// exactly one ORDER BY term on a plain column; the SELECT projects to a fixed plain-column set
+// (projectionAttrs != nil, which already excludes SELECT *, expression columns, DISTINCT, AS OF,
+// and in-transaction reads); and the order column is a value-indexed / zone-mapped attribute, hence
+// numeric -- TopK orders numerically, so a string key would wrongly skip every row. An older server
+// without the op reports ErrTopKUnsupported and we fall back.
+func (e *Executor) tryTopK(st *Statement) ([]*classad.ClassAd, bool, error) {
+	proj, orderCol, desc, ok := e.topKPlan(st)
+	if !ok {
+		return nil, false, nil
+	}
+	texts, err := e.c.TopK(e.opCtx(), st.Table, constraint(st.Where), proj, orderCol, desc, st.Limit)
+	if errors.Is(err, dbrpc.ErrTopKUnsupported) {
+		return nil, false, nil // older server: fall back to fetch-and-sort
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	ads := make([]*classad.ClassAd, 0, len(texts))
+	for _, t := range texts {
+		ad, perr := classad.ParseOld(t)
+		if perr != nil {
+			return nil, false, fmt.Errorf("parsing a TopK row: %w", perr)
+		}
+		ads = append(ads, ad)
+	}
+	return ads, true, nil
+}
+
+// topKPlan reports whether st can be served by the server-side TopK op, and if so the projection,
+// order column, and direction to send. It is the single gate shared by tryTopK (which executes it)
+// and describePlan (which reports it), so EXPLAIN never disagrees with what runs. See tryTopK for
+// the qualifying conditions.
+func (e *Executor) topKPlan(st *Statement) (proj []string, orderCol string, desc bool, ok bool) {
+	if st.Limit <= 0 || len(st.OrderBy) != 1 {
+		return nil, "", false, false
+	}
+	term := st.OrderBy[0]
+	proj = e.projectionAttrs(st)
+	if proj == nil || term.Item.Col == "" || term.Item.IsAggregate() {
+		return nil, "", false, false
+	}
+	if !e.numericOrderCol(st.Table, term.Item.Col) {
+		return nil, "", false, false
+	}
+	return proj, term.Item.Col, term.Desc, true
+}
+
+// numericOrderCol reports whether col is safe to use as a server-side TopK order key for table:
+// a value-indexed or zone-mapped attribute, which the collection maintains as a numeric [min,max]
+// structure. The per-table set is loaded once from Diagnostics (only ever reached for a query shape
+// that could use TopK) and cached; a load error returns false without caching, so it retries.
+func (e *Executor) numericOrderCol(table, col string) bool {
+	set, ok := e.numericOrderCols[table]
+	if !ok {
+		d, err := e.c.DiagnosticsTable(e.opCtx(), table)
+		if err != nil {
+			return false // couldn't learn the schema: do not risk a wrong-typed order key
+		}
+		set = make(map[string]bool, len(d.ValueIndexes)+len(d.ZoneAttrs))
+		for _, a := range d.ValueIndexes {
+			set[strings.ToLower(a)] = true
+		}
+		for _, a := range d.ZoneAttrs {
+			set[strings.ToLower(a)] = true
+		}
+		if e.numericOrderCols == nil {
+			e.numericOrderCols = map[string]map[string]bool{}
+		}
+		e.numericOrderCols[table] = set
+	}
+	return set[strings.ToLower(col)]
 }
 
 // hasAggregate reports whether any selected item is computed per group -- a bare aggregate
