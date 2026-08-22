@@ -100,6 +100,19 @@ func run() error {
 				"keyAdopted", dg.KeyIndexAdopted, "attrAdopted", dg.AttrIndexAdopted,
 				"reasons", fmt.Sprint(dg.Reasons))
 		}
+		// Name the phase that dominated a slow open (classad #214). When every sidecar adopts
+		// cleanly the adoption line above stays silent, so a slow reopen would otherwise show only
+		// as one elapsed number; this breaks it into phases. Thresholded so a fast open is quiet.
+		if t := dg.Timing; openTimingTotal(t) >= time.Second {
+			ms := func(d time.Duration) string { return d.Round(time.Millisecond).String() }
+			log.Info(logging.DestinationGeneral, "table open phase timing",
+				"dir", dg.Dir, "sealed", dg.SealedSegments,
+				"mapSegments", ms(t.MapSegments), "dirRestore", ms(t.DirRestore), "dirRebuilt", t.DirRebuilt,
+				"publishDict", ms(t.PublishDict), "publishColumns", ms(t.PublishColumns),
+				"loadSidecars", ms(t.LoadSidecars), "zoneRecompute", ms(t.ZoneRecompute),
+				"reindex", ms(t.Reindex), "rebuildOrdered", ms(t.RebuildOrdered),
+				"adoptSchema", ms(t.AdoptSchema), "loadDicts", ms(t.LoadDicts), "loadDemand", ms(t.LoadDemand))
+		}
 	}
 
 	// Server-side security policy for our command socket (SEC_* knobs). The
@@ -439,6 +452,14 @@ func run() error {
 		"ha_mode", ha.mode, "role", ha.role, "read_only", ha.forceReadOnly)
 
 	return d.Serve(ctx, ln, srv.Serve)
+}
+
+// openTimingTotal sums an open's sequential phases into a rough wall-clock, for the "is this open
+// slow enough to log its breakdown" threshold. ZoneRecompute is excluded because it is a sub-timer
+// of LoadSidecars (counting it would double-count).
+func openTimingTotal(t collections.OpenTiming) time.Duration {
+	return t.MapSegments + t.DirRestore + t.PublishDict + t.PublishColumns + t.LoadSidecars +
+		t.Reindex + t.RebuildOrdered + t.AdoptSchema + t.LoadDicts + t.LoadDemand
 }
 
 // databaseDir resolves the on-disk database directory: HTCONDORDB_DIR if set,
