@@ -116,11 +116,19 @@ const (
 	StmtBegin
 	StmtCommit
 	StmtRollback
+	// StmtExplain wraps another statement: EXPLAIN [ANALYZE] <stmt> reports the chosen
+	// execution plan (and, with ANALYZE, runs it and reports where the time and work went).
+	StmtExplain
 )
 
 // Statement is one parsed SQL-like statement.
 type Statement struct {
 	Kind StmtKind
+
+	// EXPLAIN fields: Inner is the wrapped statement (StmtExplain only); Analyze runs it and
+	// reports execution stats rather than only the plan.
+	Inner   *Statement
+	Analyze bool
 
 	// Table is the FROM/INTO/UPDATE target table, or the table a DDL statement
 	// acts on.
@@ -525,6 +533,8 @@ func (p *parser) atPunct(s string) bool {
 
 func (p *parser) parseStatement() (*Statement, error) {
 	switch {
+	case p.takeKeyword("EXPLAIN"):
+		return p.parseExplain()
 	case p.takeKeyword("SELECT"):
 		return p.parseSelect()
 	case p.takeKeyword("INSERT"):
@@ -550,6 +560,22 @@ func (p *parser) parseStatement() (*Statement, error) {
 	default:
 		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, MATCH, WATCH, BEGIN, COMMIT, or ROLLBACK)", p.peek().text)
 	}
+}
+
+// parseExplain parses EXPLAIN [ANALYZE] <statement>. Plain EXPLAIN reports the plan without
+// running; EXPLAIN ANALYZE runs the statement and reports where the time and work went. Only a
+// SELECT is meaningfully explainable today; other kinds are parsed and rejected in the executor
+// with a clear message.
+func (p *parser) parseExplain() (*Statement, error) {
+	analyze := p.takeKeyword("ANALYZE")
+	inner, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	if inner.Kind == StmtExplain {
+		return nil, fmt.Errorf("EXPLAIN cannot wrap another EXPLAIN")
+	}
+	return &Statement{Kind: StmtExplain, Analyze: analyze, Inner: inner}, nil
 }
 
 // parseTransaction parses a transaction-control statement. The noise words SQL allows
