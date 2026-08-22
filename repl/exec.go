@@ -84,6 +84,10 @@ type Executor struct {
 	// the field. Not settable from config.
 	wireRowsOff bool
 
+	// explain, when non-nil, collects execution-phase timings and row counts during an
+	// EXPLAIN ANALYZE run of a SELECT (set by execExplain, read back to render the report).
+	explain *explainTrace
+
 	// archives caches the set of append-only (history) table names, so a SELECT can be routed
 	// to the archive query path -- archives are not mutable tables and the regular query op
 	// does not resolve them. Loaded lazily; archivesOK gates a successful load so a transient
@@ -371,6 +375,8 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 		return e.execCommit()
 	case StmtRollback:
 		return e.execRollback()
+	case StmtExplain:
+		return e.execExplain(st)
 	default:
 		return nil, fmt.Errorf("unknown statement kind")
 	}
@@ -1024,6 +1030,117 @@ func (e *Executor) queryAdsProjected(table, where string, attrs []string, limit 
 	return ads, nil
 }
 
+// explainTrace collects EXPLAIN ANALYZE execution stats for a row-scan SELECT: how long the
+// server fetch and the client-side sort took, and how many rows were fetched vs returned.
+type explainTrace struct {
+	fetchDur     time.Duration
+	sortDur      time.Duration
+	rowsFetched  int
+	rowsReturned int
+}
+
+// execExplain implements EXPLAIN [ANALYZE] <SELECT>. Plain EXPLAIN reports the chosen plan; with
+// ANALYZE it also runs the query and reports where the time and rows went. This Phase-1 report
+// covers the client-visible plan (path, projection/limit push-down, ordering) and the client
+// phase timings; the server-side scan breakdown (segments scanned/pruned, records decided from
+// columns vs reassembled) is Phase 2, carried back on the query op's stats trailer.
+func (e *Executor) execExplain(st *Statement) (*Result, error) {
+	inner := st.Inner
+	if inner == nil {
+		return nil, fmt.Errorf("EXPLAIN: nothing to explain")
+	}
+	if inner.Kind != StmtSelect {
+		return nil, fmt.Errorf("EXPLAIN currently supports SELECT only")
+	}
+	lines := e.describePlan(inner)
+	if st.Analyze {
+		tr := &explainTrace{}
+		e.explain = tr
+		start := time.Now()
+		_, rerr := e.Exec(inner)
+		total := time.Since(start)
+		e.explain = nil
+		if rerr != nil {
+			return nil, rerr
+		}
+		lines = append(lines, "", fmt.Sprintf("time: total=%s", roundDur(total)))
+		if tr.rowsFetched > 0 || tr.fetchDur > 0 {
+			lines = append(lines,
+				fmt.Sprintf("  fetch=%s  sort=%s", roundDur(tr.fetchDur), roundDur(tr.sortDur)),
+				fmt.Sprintf("rows: fetched=%d  returned=%d", tr.rowsFetched, tr.rowsReturned))
+		} else {
+			lines = append(lines, "  (server-side aggregate; per-phase scan stats arrive with Phase 2)")
+		}
+	}
+	res := &Result{IsSelect: true, Columns: []string{"QUERY PLAN"}}
+	for _, l := range lines {
+		res.Rows = append(res.Rows, []string{l})
+	}
+	return res, nil
+}
+
+// roundDur formats a duration for the EXPLAIN report at a sensible precision.
+func roundDur(d time.Duration) string {
+	if d >= time.Millisecond {
+		return d.Round(100 * time.Microsecond).String()
+	}
+	return d.Round(time.Microsecond).String()
+}
+
+// describePlan renders the client-visible execution plan for a SELECT: table kind, the chosen
+// read path, whether the projection and LIMIT are pushed to the server, and whether ordering
+// happens client-side. It mirrors execSelect's routing so the report matches what will run.
+func (e *Executor) describePlan(st *Statement) []string {
+	kind := "table"
+	if e.isArchive(st.Table) {
+		kind = "archive"
+	}
+	out := []string{fmt.Sprintf("SELECT on %s %q", kind, st.Table)}
+	if st.Where != "" {
+		out = append(out, "  filter: "+st.Where)
+	}
+	groupBy := effectiveGroupBy(st)
+	aggregate := len(groupBy) > 0 || hasAggregate(st)
+	switch {
+	case aggregate && e.isArchive(st.Table):
+		out = append(out, "  path: columnar aggregate on the archive (only the grouped result crosses the wire)")
+	case aggregate:
+		out = append(out, "  path: server-side aggregate")
+	case hasWindow(st):
+		out = append(out, "  path: window function (whole ads fetched; ranking computed client-side)")
+	default:
+		if proj := e.projectionAttrs(st); proj != nil {
+			transport := "old-ClassAd text projection"
+			if e.wireEligible(st.Table) {
+				transport = "wire-form rows"
+			}
+			out = append(out, fmt.Sprintf("  path: projected row scan (%s); attrs=[%s]", transport, strings.Join(proj, ", ")))
+		} else {
+			out = append(out, "  path: whole-ad row fetch (no projection push-down)")
+		}
+	}
+	if st.Limit > 0 {
+		if len(st.OrderBy) == 0 && !st.Distinct && !aggregate {
+			out = append(out, fmt.Sprintf("  limit: %d pushed to the server", st.Limit))
+		} else {
+			blocker := "ORDER BY"
+			if st.Distinct {
+				blocker = "DISTINCT"
+			} else if aggregate {
+				blocker = "aggregation"
+			}
+			out = append(out, fmt.Sprintf("  limit: %d applied client-side (after %s; not pushed down)", st.Limit, blocker))
+		}
+	}
+	if len(st.OrderBy) > 0 {
+		out = append(out, "  order: client-side sort of the fetched rows")
+	}
+	if st.AsOf != "" {
+		out = append(out, "  as-of: "+st.AsOf+" (point-in-time read; no projection/aggregate push-down)")
+	}
+	return out
+}
+
 func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	// GROUP BY / aggregates -- and DISTINCT over explicit columns, which is just
 	// GROUP BY those columns -- are computed server-side (hash-map aggregation):
@@ -1079,6 +1196,7 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	// projectionAttrs).
 	var ads []*classad.ClassAd
 	var err error
+	fetchStart := time.Now()
 	if proj := e.projectionAttrs(st); proj != nil {
 		ads, err = e.queryAdsProjected(st.Table, st.Where, proj, pushLimit)
 	} else {
@@ -1087,16 +1205,27 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if e.explain != nil {
+		e.explain.fetchDur = time.Since(fetchStart)
+		e.explain.rowsFetched = len(ads)
+	}
 	if st.Distinct { // DISTINCT * : de-duplicate whole ads
 		ads = dedupeAds(ads)
 	}
+	sortStart := time.Now()
 	if len(st.OrderBy) > 0 {
 		if err := sortAds(ads, st.OrderBy); err != nil {
 			return nil, err
 		}
 	}
+	if e.explain != nil {
+		e.explain.sortDur = time.Since(sortStart)
+	}
 
 	limited := applyLimit(ads, st.Limit)
+	if e.explain != nil {
+		e.explain.rowsReturned = len(limited)
+	}
 	res := &Result{IsSelect: true, Ads: limited}
 
 	// SELECT * : every attribute, each rendered by name.

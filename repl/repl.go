@@ -232,6 +232,11 @@ Notes:
     (evaluated server-side); DISTINCT and ORDER BY (ASC/DESC) are supported.
     A projected column may be an expression over aggregates, e.g.
     SELECT SUM(Cpus) / COUNT(*) AS avg_cpus FROM jobs.
+  - EXPLAIN [ANALYZE] <SELECT> shows the chosen execution plan (read path,
+    projection/LIMIT push-down, client-side ordering); ANALYZE also runs the
+    query and reports where the time and rows went:
+    EXPLAIN ANALYZE SELECT ClusterId FROM history WHERE ProcId == 5
+      ORDER BY ClusterId DESC LIMIT 1;
   - Ranking windows: ROW_NUMBER()/RANK()/DENSE_RANK() OVER (PARTITION BY cols
     ORDER BY cols), filtered with QUALIFY -- "top N per group":
     SELECT Owner, ClusterId,
