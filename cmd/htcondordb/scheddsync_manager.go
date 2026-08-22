@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -63,6 +65,23 @@ func (m *scheddSyncManager) ResyncTargets() []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+// runGuardedTailer runs a tailer's Run with panic recovery, so a bug in one syncer degrades
+// that syncer instead of crashing the whole daemon. Crashing is doubly costly here: it also
+// skips the DB's clean-shutdown checkpoint, so the next start pays the full archive-open scan.
+// A tailer that panics stays down until the next daemon restart -- deliberately not
+// auto-restarted, since a persistently panicking tailer would otherwise spin in a tight loop.
+func (m *scheddSyncManager) runGuardedTailer(ctx context.Context, name string, run func(context.Context) error) {
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error("schedd-sync tailer panicked; stopping it, daemon stays up",
+				"tailer", name, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+		}
+	}()
+	if err := run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		m.logger.Warn("schedd-sync tailer exited with error", "tailer", name, "err", err.Error())
+	}
 }
 
 // defaultArchiveCategoricalAttrs are the history archive's categorical (string equality)
@@ -361,7 +380,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			SaveInterval: s.saveInterval,
 		})
 		wg.Add(1)
-		go func() { defer wg.Done(); _ = js.Run(ctx) }()
+		go func() { defer wg.Done(); m.runGuardedTailer(ctx, "jobs", js.Run) }()
 		sources = append(sources, js)
 		resyncers["jobs"] = js
 		m.logger.Info("schedd-sync: mirroring job_queue.log", "file", s.jobLog,
@@ -400,7 +419,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			},
 		})
 		wg.Add(1)
-		go func() { defer wg.Done(); _ = hs.Run(ctx) }()
+		go func() { defer wg.Done(); m.runGuardedTailer(ctx, "history", hs.Run) }()
 		sources = append(sources, hs)
 		resyncers["history"] = hs
 		m.logger.Info("schedd-sync: tailing history file", "file", s.histFile, "archive", "history")
@@ -431,7 +450,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			},
 		})
 		wg.Add(1)
-		go func() { defer wg.Done(); _ = es.Run(ctx) }()
+		go func() { defer wg.Done(); m.runGuardedTailer(ctx, "epoch", es.Run) }()
 		sources = append(sources, es)
 		resyncers["epoch"] = es
 		m.logger.Info("schedd-sync: tailing epoch history file", "file", s.epochFile, "archive", "epoch_history")
