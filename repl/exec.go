@@ -1139,8 +1139,9 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 // projected row scan: how many segments were pruned by zone maps vs actually scanned, and how many
 // records the columnar accelerator answered from columns alone vs had to reassemble from the wire
 // record -- the difference between a fast projected read and the slow per-record LookupByName path.
+// It also renders the top-K cutoff scan (the two-pass server-side TopK fills the same breakdown).
 // It reports nothing when the run took a path that carries no scan stats (a server-side aggregate,
-// server-side TopK, a wire-form or whole-ad fetch, or a server too old for the stats op).
+// a wire-form or whole-ad fetch, or a server too old for the stats op).
 func scanStatsLines(tr *explainTrace) []string {
 	if !tr.scanOK {
 		return nil
@@ -1404,7 +1405,7 @@ func (e *Executor) tryTopK(st *Statement) ([]*classad.ClassAd, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
-	texts, err := e.c.TopK(e.opCtx(), st.Table, constraint(st.Where), proj, orderCol, desc, st.Limit)
+	texts, err := e.topKRows(st.Table, constraint(st.Where), proj, orderCol, desc, st.Limit)
 	if errors.Is(err, dbrpc.ErrTopKUnsupported) {
 		return nil, false, nil // older server: fall back to fetch-and-sort
 	}
@@ -1420,6 +1421,28 @@ func (e *Executor) tryTopK(st *Statement) ([]*classad.ClassAd, bool, error) {
 		ads = append(ads, ad)
 	}
 	return ads, true, nil
+}
+
+// topKRows runs the server-side top-K and returns the k projected old-ClassAd rows. Outside EXPLAIN
+// ANALYZE it uses the plain op. Under EXPLAIN ANALYZE it uses the stats-carrying op and records the
+// cutoff-scan breakdown (segments, records column-decided vs reassembled) into the active explain
+// trace so scanStatsLines can render it; against a server that has plain TopK but not the stats op
+// it falls back to TopK for the rows without a breakdown, and ErrTopKUnsupported propagates up so the
+// caller drops to the ordinary fetch-and-sort path.
+func (e *Executor) topKRows(table, where string, proj []string, orderCol string, desc bool, k int) ([]string, error) {
+	if e.explain != nil {
+		var stats collections.ScanStats
+		texts, err := e.c.TopKStats(e.opCtx(), table, where, proj, orderCol, desc, k, &stats)
+		if err == nil {
+			e.explain.scan, e.explain.scanOK = stats, true
+			return texts, nil
+		}
+		if !errors.Is(err, dbrpc.ErrTopKUnsupported) {
+			return nil, err
+		}
+		// Server too old for the stats op: still use plain TopK for the rows, without a breakdown.
+	}
+	return e.c.TopK(e.opCtx(), table, where, proj, orderCol, desc, k)
 }
 
 // topKPlan reports whether st can be served by the server-side TopK op, and if so the projection,

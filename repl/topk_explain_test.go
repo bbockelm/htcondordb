@@ -106,3 +106,20 @@ func TestExplainAnalyzeScanStats(t *testing.T) {
 		t.Errorf("EXPLAIN ANALYZE did not report the Phase-2 scan breakdown:\n%s", plan)
 	}
 }
+
+// TestTopKExplainAnalyzeScanStats checks EXPLAIN ANALYZE of a top-K-routed query carries the
+// cutoff-scan breakdown -- the top-K path used to be blind to EXPLAIN ANALYZE (it uses its own op,
+// not the projection stats op), so the report must now name the server-side top-K plan AND show the
+// scan breakdown from the stats-carrying top-K op.
+func TestTopKExplainAnalyzeScanStats(t *testing.T) {
+	e, cleanup := newArchiveExec(t)
+	defer cleanup()
+
+	plan := planText(mustExec(t, e, "EXPLAIN ANALYZE SELECT ClusterId FROM history ORDER BY ClusterId DESC LIMIT 1"))
+	if !strings.Contains(plan, "server-side top-K") {
+		t.Errorf("EXPLAIN ANALYZE did not report the top-K path:\n%s", plan)
+	}
+	if !strings.Contains(plan, "scan:") || !strings.Contains(plan, "records visited=") {
+		t.Errorf("EXPLAIN ANALYZE of a top-K query did not report the cutoff-scan breakdown:\n%s", plan)
+	}
+}
