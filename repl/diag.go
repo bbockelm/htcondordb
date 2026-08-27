@@ -305,22 +305,16 @@ func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 	if cs.Codec == "identity" {
 		fmt.Fprintln(w, "  (no compression configured; enable ZSTD or run .retrain to train a dictionary)")
 	}
-	// Encryption at rest, for both kinds -- and the answer is not the same for both. An archive is never
-	// sealed (its open path passes no data key), so a table can report "on" while its history reports
-	// "off". Reporting only the mutable table's state left that as something an operator had to know
-	// rather than read.
+	// Encryption at rest. An archive is never sealed (its open path passes no data key), so a table
+	// can report "on" while its history reports "off".
 	if d.EncryptionEnabled {
-		enc := "on (at rest; master key wrapped under pool keys)"
+		enc := "on"
 		if len(d.EncryptedAttrs) > 0 {
-			enc += fmt.Sprintf("; also sealing %s", strings.Join(d.EncryptedAttrs, ", "))
+			enc += fmt.Sprintf(" (sealing %s)", strings.Join(d.EncryptedAttrs, ", "))
 		}
 		fmt.Fprintf(w, "encrypted:  %s\n", enc)
-	} else if d.Archive {
-		fmt.Fprintln(w, "encrypted:  off — history holds private attributes in the clear, even where the "+
-			"mutable tables are encrypted")
 	} else {
-		fmt.Fprintln(w, "encrypted:  off (private attributes are still sealed, but the key sits beside the "+
-			"data; configure pool keys for encryption at rest)")
+		fmt.Fprintln(w, "encrypted:  off")
 	}
 	// The per-segment columnar accelerator, for both kinds: an archive carries columnar blocks too, and
 	// gating this on the table kind made history look like it had no accelerator at all.

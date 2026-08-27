@@ -1002,7 +1002,7 @@ func (e *Executor) queryAdsForClientScan(st *Statement) ([]*classad.ClassAd, err
 // projected subset. limit > 0 caps the scan server-side.
 func (e *Executor) queryAdsProjected(table, where string, attrs []string, limit int) ([]*classad.ClassAd, error) {
 	// EXPLAIN ANALYZE: take the stats-carrying projection stream so the report can show the
-	// server-side scan breakdown (Phase 2). It also serves the rows, so a successful call returns
+	// server-side scan breakdown. It also serves the rows, so a successful call returns
 	// here; the wire and plain-text paths below are for the ordinary (non-explain) case and for a
 	// server too old to carry the stats trailer.
 	if e.explain != nil {
@@ -1043,7 +1043,7 @@ func (e *Executor) queryAdsProjected(table, where string, attrs []string, limit 
 }
 
 // queryAdsProjectedStats serves the projected rows via the stats-carrying refs projection stream
-// and records the server-side scan breakdown into the active explain trace (Phase 2). ok=false with
+// and records the server-side scan breakdown into the active explain trace. ok=false with
 // a nil error means the server does not implement the stats op, so the caller serves the rows by its
 // ordinary path (without a breakdown). Only called when e.explain != nil.
 func (e *Executor) queryAdsProjectedStats(table, where string, attrs []string, limit int) ([]*classad.ClassAd, bool, error) {
@@ -1086,7 +1086,7 @@ type explainTrace struct {
 	sortDur      time.Duration
 	rowsFetched  int
 	rowsReturned int
-	// scan is the server-side scan breakdown for a projected row scan (Phase 2): how many
+	// scan is the server-side scan breakdown for a projected row scan: how many
 	// segments were pruned vs scanned, and how many records were answered from columns vs
 	// reassembled. scanOK marks it as filled -- an older server without the stats op leaves it
 	// clear, and the report says so.
@@ -1095,10 +1095,11 @@ type explainTrace struct {
 }
 
 // execExplain implements EXPLAIN [ANALYZE] <SELECT>. Plain EXPLAIN reports the chosen plan; with
-// ANALYZE it also runs the query and reports where the time and rows went. This Phase-1 report
-// covers the client-visible plan (path, projection/limit push-down, ordering) and the client
-// phase timings; the server-side scan breakdown (segments scanned/pruned, records decided from
-// columns vs reassembled) is Phase 2, carried back on the query op's stats trailer.
+// ANALYZE it also runs the query and reports where the time and rows went: the client-visible plan
+// (path, projection/limit push-down, ordering), the client phase timings, and -- for the ops that
+// carry a stats trailer (projected row scans and top-K) -- the server-side scan breakdown (segments
+// scanned/pruned, records decided from columns vs reassembled). The aggregate ops do not yet carry
+// that trailer.
 func (e *Executor) execExplain(st *Statement) (*Result, error) {
 	inner := st.Inner
 	if inner == nil {
@@ -1125,7 +1126,7 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 				fmt.Sprintf("rows: fetched=%d  returned=%d", tr.rowsFetched, tr.rowsReturned))
 			lines = append(lines, scanStatsLines(tr)...)
 		} else {
-			lines = append(lines, "  (server-side aggregate; per-phase scan stats arrive with Phase 2)")
+			lines = append(lines, "  (server-side aggregate: only the result crosses the wire; this path reports no per-segment scan breakdown)")
 		}
 	}
 	res := &Result{IsSelect: true, Columns: []string{"QUERY PLAN"}}
@@ -1135,7 +1136,7 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 	return res, nil
 }
 
-// scanStatsLines renders the server-side scan breakdown (Phase 2) for an EXPLAIN ANALYZE of a
+// scanStatsLines renders the server-side scan breakdown for an EXPLAIN ANALYZE of a
 // projected row scan: how many segments were pruned by zone maps vs actually scanned, and how many
 // records the columnar accelerator answered from columns alone vs had to reassemble from the wire
 // record -- the difference between a fast projected read and the slow per-record LookupByName path.

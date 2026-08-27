@@ -17,21 +17,40 @@ import (
 // expected, and it can drift as the workload changes, and neither shows up in the coverage counts
 // `.stats` prints. These three views are how an operator sees that and acts on it.
 
-// schemaCmd dispatches `.schema`, `.schema fit`, and `.schema rebuild`.
+// schemaCmd dispatches `.schema`, `.schema fit`, `.schema groups`, and `.schema rebuild`.
 //
-//	.schema [table]                    the derived schema, field by field
-//	.schema fit [table] [sampleMax]    per-field escape rates against a fresh sample
-//	.schema rebuild [table] [max topN] re-derive the schema and rebuild every columnar block
+//	.schema [table]                     the derived schema, field by field
+//	.schema fit [table] [sampleMax]     per-field escape rates against a fresh sample
+//	.schema groups [table] [sampleMax]  candidate secondary schemas (co-occurring attributes)
+//	.schema rebuild [table] [max topN]  re-derive the schema and rebuild every columnar block
 func (s *session) schemaCmd(console io.Writer, arg string) {
 	fields := strings.Fields(arg)
 	switch {
 	case len(fields) > 0 && strings.EqualFold(fields[0], "fit"):
 		s.schemaFit(console, fields[1:])
+	case len(fields) > 0 && strings.EqualFold(fields[0], "groups"):
+		s.schemaGroups(console, fields[1:])
 	case len(fields) > 0 && strings.EqualFold(fields[0], "rebuild"):
 		s.schemaRebuild(console, fields[1:])
 	default:
 		s.withDiag(console, s.tableArg(arg), s.showSchema)
 	}
+}
+
+// schemaGroups reports the candidate secondary (group) schemas: clusters of attributes that
+// co-occur outside the base schema, derived from a fresh server-side sample. The admin action
+// returns a preformatted report (or a plain message when the accelerator is off), so print it as-is.
+func (s *session) schemaGroups(console io.Writer, args []string) {
+	table, rest := s.tableAndArgs(args)
+	msg, err := s.exec.Admin(table, "schema.groups", rest...)
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		if h := HintFor(err); h != "" {
+			fmt.Fprintf(console, "  hint: %s\n", h)
+		}
+		return
+	}
+	fmt.Fprintln(console, msg)
 }
 
 // showSchema renders the derived schema: what the sampler decided the ads look like.
@@ -67,7 +86,16 @@ func (s *session) showSchema(w io.Writer, d *dbrpc.Diagnostics) {
 		}
 		fmt.Fprintf(w, "  %-25s %-8s %5s  %s\n", f.Name, kind, width, tier)
 	}
-	fmt.Fprintln(w, "  hot columns read with no decode; a bool's value is bit-packed, so it has no width")
+	// Secondary (group) schemas capture clusters of co-occurring attributes that fall outside the
+	// base schema. They are committed only after the same cluster recurs across several maintenance
+	// derivations, so a table can be freshly accelerated and still have none; `.schema groups` shows
+	// the candidates from a fresh sample even before any is committed.
+	if ss.GroupSchemas > 0 {
+		fmt.Fprintf(w, "  %d secondary schema(s), %d field(s) total — see `.schema groups`\n",
+			ss.GroupSchemas, ss.GroupSchemaFields)
+	} else {
+		fmt.Fprintln(w, "  no secondary schemas yet; `.schema groups` shows co-occurring-attribute candidates")
+	}
 	fmt.Fprintln(w, "  run `.schema fit` to see whether the schema still matches the data")
 }
 
