@@ -97,6 +97,17 @@ type JobSync struct {
 	curID  fileIdentity
 	haveID bool
 
+	// curSeq is the op-107 LogHistoricalSequenceNumber of the file we last read; the schedd bumps
+	// it by one on every compaction/rotation. It is the AUTHORITATIVE rotation signal (HTCondor's
+	// own C++ tailer keys off it, not the inode): captured at the START of a poll -- i.e. from the
+	// file we are about to read -- and compared on the next poll, it catches a compaction the inode
+	// check misses because that check re-stats the PATH after the read (a read->stat TOCTOU), and a
+	// compaction that produces a same-or-larger file the size prober misreads. haveSeq gates it
+	// until the first seq is known; a log with no 107 header (older formats, tests) leaves it clear
+	// and falls back to the inode check.
+	curSeq  int64
+	haveSeq bool
+
 	// status holds the latest published SyncStatus snapshot, read lock-free by Status().
 	status atomic.Pointer[SyncStatus]
 
@@ -244,10 +255,20 @@ func (s *JobSync) Poll(ctx context.Context) error {
 		s.log.Info("scheddsync: job resync requested; rebuilding jobs mirror from the current log")
 		return s.reconcileReload(ctx)
 	}
-	// Detect rotation/compaction independently of the size-based prober: if the path now
-	// names a different inode than the file we last read, the schedd replaced the log (a
-	// new inode whose size may equal or exceed our offset, which the prober's size heuristic
-	// would misread as a plain append and read our stale offset into the new file).
+	// Authoritative rotation signal: the op-107 LogHistoricalSequenceNumber at the head of the
+	// current file. Read it BEFORE the body so it reflects the file we are about to consume; a value
+	// differing from the one we last read means the schedd compacted/rotated the log, so rebuild
+	// from the current log rather than resume at a now-meaningless byte offset. This is what
+	// HTCondor's own C++ tailer keys off, and it closes the read->stat inode TOCTOU below (the inode
+	// there is re-stat'd from the PATH after the read, so a compaction in that window binds the old
+	// offset to the new inode; the seq, captured pre-read, does not move with it).
+	headSeq, _, seqKnown := readLogSequence(s.parser.GetFilename())
+	if s.haveSeq && seqKnown && headSeq != s.curSeq {
+		return s.reconcileReload(ctx)
+	}
+	// Secondary signal, for logs with no 107 header (older formats, tests): the path now names a
+	// different inode than the file we last read (a new inode whose size may equal or exceed our
+	// offset, which the prober's size heuristic would misread as a plain append).
 	if s.haveID {
 		if cur, serr := statIdentity(s.parser.GetFilename()); serr == nil && !sameFileIdentity(cur, s.curID) {
 			return s.reconcileReload(ctx)
@@ -263,7 +284,16 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	case classadlog.ProbeCompressed:
 		return s.reconcileReload(ctx)
 	case classadlog.ProbeAddition:
-		return s.readAndApply(ctx, false)
+		if aerr := s.readAndApply(ctx, false); aerr != nil {
+			return aerr
+		}
+		// Record the seq of the file we just read. Captured pre-read (headSeq), so a compaction that
+		// landed DURING the read leaves curSeq at the old value and the next poll's seq check fires
+		// -- rather than a post-read re-read that would adopt the new file's seq and mask it.
+		if seqKnown {
+			s.curSeq, s.haveSeq = headSeq, true
+		}
+		return nil
 	default:
 		// ProbeError / ProbeFatalError / unknown.
 		return errors.New("scheddsync: probe error on " + s.parser.GetFilename())
@@ -285,6 +315,10 @@ func (s *JobSync) Poll(ctx context.Context) error {
 func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	s.abort()
 	s.children = map[string]map[string]struct{}{}
+	// The sequence number of the file we are about to reload in full, captured before the read so a
+	// compaction landing during the reload leaves curSeq behind and the next poll reconciles again
+	// (converging) rather than adopting a seq for a file it did not fully read.
+	reloadSeq, _, reloadSeqOK := readLogSequence(s.parser.GetFilename())
 	s.parser.SetNextOffset(0)
 	s.prober.Reset()
 	// Snapshot each table's keys before the reload so the post-reconcile sweep can delete the
@@ -315,6 +349,9 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 		}
 		if id, ierr := statIdentity(s.parser.GetFilename()); ierr == nil {
 			s.curID, s.haveID = id, true
+		}
+		if reloadSeqOK {
+			s.curSeq, s.haveSeq = reloadSeq, true
 		}
 	}
 	defer closeParser()
@@ -656,8 +693,16 @@ func (s *JobSync) restore(ctx context.Context) error {
 	}
 	if ok {
 		if pos, derr := decodeJobPosition(blob); derr == nil {
-			if cur, serr := statIdentity(s.parser.GetFilename()); serr == nil &&
-				sameFileIdentity(cur, pos.File) && cur.Size >= pos.Offset {
+			cur, serr := statIdentity(s.parser.GetFilename())
+			headSeq, _, seqKnown := readLogSequence(s.parser.GetFilename())
+			// When the current log carries an op-107 sequence number, require it to match the one
+			// saved with the offset before resuming in place. A mismatch -- or a saved position with
+			// no recorded seq (0) against a seq'd log -- means the offset may point into a different,
+			// compacted file (inode reuse + a same-or-larger size would otherwise slip past the
+			// identity/size checks), so rebuild instead. A log with no 107 header leaves seqKnown
+			// false and preserves the prior inode+size behavior.
+			resumeSeqOK := !seqKnown || pos.Seq == headSeq
+			if serr == nil && sameFileIdentity(cur, pos.File) && cur.Size >= pos.Offset && resumeSeqOK {
 				// One-time migration: a jobs table written before record-type routing holds
 				// cluster/jobset/user/header ads too. Resuming does not rewrite them (they are
 				// not in the tail we replay), so sweep them now -- jobs holds only proc ads, and
@@ -667,6 +712,9 @@ func (s *JobSync) restore(ctx context.Context) error {
 				}
 				s.parser.SetNextOffset(pos.Offset)
 				s.curID, s.haveID = cur, true
+				if seqKnown {
+					s.curSeq, s.haveSeq = headSeq, true
+				}
 				return nil
 			}
 			s.log.Info("scheddsync: job_queue.log rotated/compacted while down; rebuilding")
@@ -729,7 +777,15 @@ func (s *JobSync) checkpoint() {
 	if err != nil {
 		return
 	}
-	blob, err := jobPosition{File: id, Offset: s.parser.GetNextOffset()}.encode()
+	// Seq is s.curSeq -- the sequence number of the file we actually read, captured pre-read -- not
+	// a fresh read of the (possibly just-compacted) path. So even if a mid-read compaction made id
+	// the NEW inode, the saved seq stays the OLD file's, and restore's seq check rebuilds rather
+	// than resuming a stale offset into the new file.
+	pos := jobPosition{File: id, Offset: s.parser.GetNextOffset()}
+	if s.haveSeq {
+		pos.Seq = s.curSeq
+	}
+	blob, err := pos.encode()
 	if err != nil {
 		return
 	}
