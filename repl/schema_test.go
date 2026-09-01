@@ -85,6 +85,47 @@ func TestSchemaCommandShowsFields(t *testing.T) {
 	}
 }
 
+// TestSchemaShowsGroupLine covers that the schema display now names the secondary (group) schema
+// state -- previously the group-schema counts arrived over the wire but were never rendered, so an
+// operator could not tell they existed. A freshly accelerated table has no committed groups yet, so
+// this exercises the "none yet" branch and its pointer to `.schema groups`.
+func TestSchemaShowsGroupLine(t *testing.T) {
+	sess, d, out, cleanup := schemaSession(t, 3000)
+	defer cleanup()
+	if !d.EnableSchemaScan(4000, 4) {
+		t.Skip("no sealed segments to sample")
+	}
+
+	sess.schemaCmd(out, "")
+	got := out.String()
+	if !strings.Contains(got, "secondary schema") {
+		t.Errorf("schema display should name the secondary-schema state:\n%s", got)
+	}
+	if !strings.Contains(got, ".schema groups") {
+		t.Errorf("schema display should point at `.schema groups`:\n%s", got)
+	}
+}
+
+// TestSchemaGroupsCommand covers the `.schema groups` report: it reaches the server's schema.groups
+// admin action and prints its (preformatted) candidate-group report rather than erroring or dumping
+// raw JSON.
+func TestSchemaGroupsCommand(t *testing.T) {
+	sess, d, out, cleanup := schemaSession(t, 3000)
+	defer cleanup()
+	if !d.EnableSchemaScan(4000, 4) {
+		t.Skip("no sealed segments to sample")
+	}
+
+	sess.schemaCmd(out, "groups")
+	got := out.String()
+	if strings.Contains(strings.ToLower(got), "error") {
+		t.Errorf(".schema groups errored:\n%s", got)
+	}
+	if !strings.Contains(got, "sampled") || !strings.Contains(got, "base schema") {
+		t.Errorf(".schema groups did not render the candidate-group report:\n%s", got)
+	}
+}
+
 // TestSchemaFitCommand covers the fit report, including that it renders the JSON the admin action
 // returns rather than dumping it raw.
 func TestSchemaFitCommand(t *testing.T) {

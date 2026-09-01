@@ -95,6 +95,23 @@ func TestTopKExplainReportsPath(t *testing.T) {
 	}
 }
 
+// TestAggregateExplainAnalyzeScanStats checks EXPLAIN ANALYZE of a server-side aggregate over a
+// history table now carries the scan breakdown -- previously the aggregate path printed only "no
+// per-segment scan breakdown". It must name the aggregate path AND show the records line.
+func TestAggregateExplainAnalyzeScanStats(t *testing.T) {
+	e, cleanup := newArchiveExec(t)
+	defer cleanup()
+
+	plan := planText(mustExec(t, e, "EXPLAIN ANALYZE SELECT MAX(ClusterId) FROM history WHERE JobStatus == 4"))
+	if !strings.Contains(plan, "server-side aggregate") {
+		t.Errorf("EXPLAIN ANALYZE did not name the aggregate path:\n%s", plan)
+	}
+	if !strings.Contains(plan, "scan:") || !strings.Contains(plan, "records visited=") {
+		t.Errorf("EXPLAIN ANALYZE of an aggregate did not report the scan breakdown:\n%s", plan)
+	}
+	t.Logf("plan:\n%s", plan)
+}
+
 // TestExplainAnalyzeScanStats checks EXPLAIN ANALYZE of a projected row scan carries the Phase-2
 // server-side scan breakdown (segments/records), proving the stats trailer round-trips end to end.
 func TestExplainAnalyzeScanStats(t *testing.T) {
@@ -104,5 +121,22 @@ func TestExplainAnalyzeScanStats(t *testing.T) {
 	plan := planText(mustExec(t, e, "EXPLAIN ANALYZE SELECT ClusterId FROM history WHERE JobStatus == 4"))
 	if !strings.Contains(plan, "scan:") || !strings.Contains(plan, "records visited=") {
 		t.Errorf("EXPLAIN ANALYZE did not report the Phase-2 scan breakdown:\n%s", plan)
+	}
+}
+
+// TestTopKExplainAnalyzeScanStats checks EXPLAIN ANALYZE of a top-K-routed query carries the
+// cutoff-scan breakdown -- the top-K path used to be blind to EXPLAIN ANALYZE (it uses its own op,
+// not the projection stats op), so the report must now name the server-side top-K plan AND show the
+// scan breakdown from the stats-carrying top-K op.
+func TestTopKExplainAnalyzeScanStats(t *testing.T) {
+	e, cleanup := newArchiveExec(t)
+	defer cleanup()
+
+	plan := planText(mustExec(t, e, "EXPLAIN ANALYZE SELECT ClusterId FROM history ORDER BY ClusterId DESC LIMIT 1"))
+	if !strings.Contains(plan, "server-side top-K") {
+		t.Errorf("EXPLAIN ANALYZE did not report the top-K path:\n%s", plan)
+	}
+	if !strings.Contains(plan, "scan:") || !strings.Contains(plan, "records visited=") {
+		t.Errorf("EXPLAIN ANALYZE of a top-K query did not report the cutoff-scan breakdown:\n%s", plan)
 	}
 }

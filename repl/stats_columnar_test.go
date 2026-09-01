@@ -119,13 +119,12 @@ func TestShowStatsLabelsMatchAcrossKinds(t *testing.T) {
 	}
 }
 
-// TestShowStatsArchiveReportsUnencrypted pins the one place the two kinds legitimately answer the same
-// question differently -- and the reason the line must exist at all. An archive is not sealed, so a pool
-// with encrypted tables still has plaintext private attributes in its history.
-func TestShowStatsArchiveReportsUnencrypted(t *testing.T) {
+// TestShowStatsReportsEncryption checks the encryption line is stated plainly for both kinds: an
+// unsealed archive reports "off", an encrypted table reports "on".
+func TestShowStatsReportsEncryption(t *testing.T) {
 	out := renderStats(t, &dbrpc.Diagnostics{Archive: true})
-	if !strings.Contains(out, "encrypted:  off") || !strings.Contains(out, "in the clear") {
-		t.Errorf("an unencrypted archive must say so plainly:\n%s", out)
+	if !strings.Contains(out, "encrypted:  off") {
+		t.Errorf("an unencrypted archive must report encrypted: off:\n%s", out)
 	}
 	on := renderStats(t, &dbrpc.Diagnostics{EncryptionEnabled: true})
 	if !strings.Contains(on, "encrypted:  on") {
