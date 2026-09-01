@@ -95,6 +95,23 @@ func TestTopKExplainReportsPath(t *testing.T) {
 	}
 }
 
+// TestAggregateExplainAnalyzeScanStats checks EXPLAIN ANALYZE of a server-side aggregate over a
+// history table now carries the scan breakdown -- previously the aggregate path printed only "no
+// per-segment scan breakdown". It must name the aggregate path AND show the records line.
+func TestAggregateExplainAnalyzeScanStats(t *testing.T) {
+	e, cleanup := newArchiveExec(t)
+	defer cleanup()
+
+	plan := planText(mustExec(t, e, "EXPLAIN ANALYZE SELECT MAX(ClusterId) FROM history WHERE JobStatus == 4"))
+	if !strings.Contains(plan, "server-side aggregate") {
+		t.Errorf("EXPLAIN ANALYZE did not name the aggregate path:\n%s", plan)
+	}
+	if !strings.Contains(plan, "scan:") || !strings.Contains(plan, "records visited=") {
+		t.Errorf("EXPLAIN ANALYZE of an aggregate did not report the scan breakdown:\n%s", plan)
+	}
+	t.Logf("plan:\n%s", plan)
+}
+
 // TestExplainAnalyzeScanStats checks EXPLAIN ANALYZE of a projected row scan carries the Phase-2
 // server-side scan breakdown (segments/records), proving the stats trailer round-trips end to end.
 func TestExplainAnalyzeScanStats(t *testing.T) {

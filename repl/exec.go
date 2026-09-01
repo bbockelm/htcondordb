@@ -1125,8 +1125,15 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 				fmt.Sprintf("  fetch=%s  sort=%s", roundDur(tr.fetchDur), roundDur(tr.sortDur)),
 				fmt.Sprintf("rows: fetched=%d  returned=%d", tr.rowsFetched, tr.rowsReturned))
 			lines = append(lines, scanStatsLines(tr)...)
+		} else if tr.scanOK {
+			// A server-side aggregate: only the grouped result crossed the wire (no per-row fetch),
+			// but the aggregate op carried its scan breakdown -- so show it. A large reassembled
+			// count here is the signature of an aggregate over an attribute the columnar accelerator
+			// does not cover (a MAX/MIN/etc. that fell to a per-record scan).
+			lines = append(lines, "  (server-side aggregate: only the result crosses the wire)")
+			lines = append(lines, scanStatsLines(tr)...)
 		} else {
-			lines = append(lines, "  (server-side aggregate: only the result crosses the wire; this path reports no per-segment scan breakdown)")
+			lines = append(lines, "  (server-side aggregate: only the result crosses the wire; no per-segment scan breakdown on this path)")
 		}
 	}
 	res := &Result{IsSelect: true, Columns: []string{"QUERY PLAN"}}
@@ -1552,7 +1559,7 @@ func (e *Executor) execAggregate(st *Statement, groupBy []string) (*Result, erro
 // ErrArchiveAggregateUnsupported, so we fall back to client-side aggregation over the rows.
 func (e *Executor) execArchiveAggregate(st *Statement, groupBy []string) (*Result, error) {
 	aggs, groupIdx := aggSpecs(st, groupBy)
-	rows, err := e.c.ArchiveAggregate(e.opCtx(), st.Table, constraint(st.Where), groupBy, aggs)
+	rows, err := e.archiveAggregateRows(st.Table, constraint(st.Where), groupBy, aggs)
 	if errors.Is(err, dbrpc.ErrArchiveAggregateUnsupported) {
 		return e.execAggregateAsOf(st, groupBy) // client-side fetch-and-reduce fallback
 	}
@@ -1560,6 +1567,33 @@ func (e *Executor) execArchiveAggregate(st *Statement, groupBy []string) (*Resul
 		return nil, err
 	}
 	return formatAggResult(st, groupIdx, rows)
+}
+
+// archiveAggregateRows runs the server-side archive aggregate. Outside EXPLAIN ANALYZE it uses the
+// plain op; under it, the stats-carrying op, recording the scan breakdown into the explain trace so
+// scanStatsLines can render it -- a large RecordsReassembled marks an aggregate over an attribute
+// the columnar accelerator does not cover (a MAX/MIN/etc. that fell to a per-record scan). Against a
+// server that has the plain aggregate but not the stats op it falls back to the plain op (no
+// breakdown); ErrArchiveAggregateUnsupported propagates so execArchiveAggregate drops to the
+// client-side fetch-and-reduce path.
+func (e *Executor) archiveAggregateRows(table, where string, groupBy []string, aggs []dbrpc.AggSpec) ([]dbrpc.AggRow, error) {
+	if e.explain != nil {
+		groups := make([]dbrpc.GroupCol, len(groupBy))
+		for i, g := range groupBy {
+			groups[i] = dbrpc.GroupCol{Attr: g}
+		}
+		var stats collections.ScanStats
+		rows, err := e.c.ArchiveAggregateStats(e.opCtx(), table, where, groups, aggs, &stats)
+		if err == nil {
+			e.explain.scan, e.explain.scanOK = stats, true
+			return rows, nil
+		}
+		// Server too old for the stats op (bad opcode): use the plain op for the rows, no breakdown.
+		if !errors.Is(err, dbrpc.ErrArchiveAggregateUnsupported) && !errors.Is(err, dbrpc.ErrExtendedAggregateUnsupported) {
+			return nil, err
+		}
+	}
+	return e.c.ArchiveAggregate(e.opCtx(), table, where, groupBy, aggs)
 }
 
 // archiveRowCount returns the number of rows in an append-only history table via the
