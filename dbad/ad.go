@@ -137,6 +137,9 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 		ad.InsertAttr(p+"FileSize", s.FileSize)
 		ad.InsertAttr(p+"LagBytes", s.LagBytes)
 		ad.InsertAttrBool(p+"CaughtUp", s.CaughtUp)
+		// Partial-ad ("orphan") diagnostics (observe-only counters).
+		ad.InsertAttr(p+"SetAttrAbsentKey", s.SetAttrAbsentKey)
+		ad.InsertAttr(p+"Reconciles", s.Reconciles)
 		if !s.LastSync.IsZero() {
 			ad.InsertAttr(p+"LastSyncTime", s.LastSync.Unix())
 			secs := int64(in.Now.Sub(s.LastSync).Seconds())

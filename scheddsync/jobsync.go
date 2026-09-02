@@ -108,6 +108,14 @@ type JobSync struct {
 	curSeq  int64
 	haveSeq bool
 
+	// mAbsentKey and mReconciles are observe-only diagnostic counters for the partial-ad ("orphan")
+	// investigation (see SyncStatus). mAbsentKey counts Set/DeleteAttribute ops applied to a key not
+	// present in the tailer's view -- the operation that fabricates an identity-less orphan (a fresh
+	// ad holding only the update's attributes). They only COUNT; behavior is unchanged, so a
+	// deployed build measures the real rate without risk. mReconciles counts full reconcile runs.
+	mAbsentKey  atomic.Int64
+	mReconciles atomic.Int64
+
 	// status holds the latest published SyncStatus snapshot, read lock-free by Status().
 	status atomic.Pointer[SyncStatus]
 
@@ -313,6 +321,7 @@ func (s *JobSync) Poll(ctx context.Context) error {
 // checkpointed only after the sweep commits, so a crash mid-reload re-runs the idempotent
 // reconcile rather than resuming past an unfinished table.
 func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
+	s.mReconciles.Add(1) // observe-only: confirms how often the full-reload path fires
 	s.abort()
 	s.children = map[string]map[string]struct{}{}
 	// The sequence number of the file we are about to reload in full, captured before the read so a
@@ -936,6 +945,14 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 			delete(s.children, e.Key) // a destroyed cluster ad drops its child set
 		}
 	case classadlog.OpSetAttribute:
+		// Observe-only diagnostic: a SetAttribute on a key not present in the tailer's view will
+		// fabricate an identity-less orphan (db.Txn.SetAttribute creates an empty ad on a Get miss).
+		// A valid log always writes a key's NewClassAd before its SetAttributes, so this should be
+		// ~0; a climbing count on a busy schedd (where reconcile is rare) localizes the orphan churn
+		// to updates landing on keys the store cannot resolve. Behavior is unchanged (still applied).
+		if _, present := tx.LookupClassAd(e.Key); !present {
+			s.mAbsentKey.Add(1)
+		}
 		if err := tx.SetAttribute(e.Key, e.Name, e.Value); err != nil {
 			// A single malformed value must not abort the whole sync; skip it.
 			s.log.Warn("job_queue.log: skipping unparseable attribute",
@@ -952,6 +969,9 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 			}
 		}
 	case classadlog.OpDeleteAttribute:
+		if _, present := tx.LookupClassAd(e.Key); !present {
+			s.mAbsentKey.Add(1) // observe-only (DeleteAttribute on an absent key is a no-op, but same signal)
+		}
 		tx.DeleteAttribute(e.Key, e.Name)
 		if kids := s.children[e.Key]; len(kids) > 0 {
 			jtx := s.ensureTx(s.target)
