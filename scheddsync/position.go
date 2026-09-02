@@ -76,9 +76,17 @@ func sameFileIdentity(a, b fileIdentity) bool { return a.Dev == b.Dev && a.Ino =
 // jobPosition is JobSync's persisted resume point: how far into which job_queue.log file we
 // applied. On restart a changed identity, or a size below the saved offset, means the log was
 // compacted/rotated while we were down and the table must be rebuilt from scratch.
+//
+// Seq is the op-107 LogHistoricalSequenceNumber of that file (0 if the log had no 107 header, or a
+// position saved before this field existed). It is the authoritative rotation check on resume: the
+// schedd bumps it on every compaction, so a saved offset whose seq no longer matches the current
+// log points into the wrong file even if the inode was reused and the size grew -- the read->stat
+// TOCTOU that produced identity-less orphan rows. When the current log carries a seq, restore
+// requires it to match this one to resume in place; otherwise it rebuilds.
 type jobPosition struct {
 	File   fileIdentity `json:"file"`
 	Offset int64        `json:"offset"`
+	Seq    int64        `json:"seq,omitempty"`
 }
 
 func (p jobPosition) encode() ([]byte, error) { return json.Marshal(p) }
