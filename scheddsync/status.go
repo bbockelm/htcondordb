@@ -20,6 +20,15 @@ type SyncStatus struct {
 	LastSync   time.Time // wall-clock of the last read pass that made progress
 	Resyncs    int64     // cumulative durability-gap (resync) events seen (history only)
 	LastResync time.Time // time of the most recent resync event, zero if none
+
+	// Diagnostics for the "partial-ad / orphan" investigation (jobs present but missing JobStatus).
+	// All are cumulative since process start, observe-only (they do not change behavior). A
+	// constantly-climbing SetAttrAbsentKey on a busy schedd -- where reconcile is rare -- is the
+	// signal that updates are landing on keys the store cannot resolve (which fabricate an
+	// identity-less orphan via db.Txn.SetAttribute's create-on-absent). Reconciles confirms how
+	// often the full-reload path actually fires (expected: ~once per compaction, i.e. rare).
+	SetAttrAbsentKey int64 // Set/DeleteAttribute ops whose target key was absent when applied
+	Reconciles       int64 // reconcileReload runs (full-replay-and-sweep)
 }
 
 // Status exposes the latest published snapshot (zero value before the first read pass). Both
@@ -54,6 +63,8 @@ func (s *JobSync) publishStatus(progressed bool) {
 	src := s.parser.GetFilename()
 	size, lag := lagAndFile(src, off)
 	st := SyncStatus{Kind: "job_queue.log", Source: src, Offset: off, FileSize: size, LagBytes: lag, CaughtUp: lag == 0}
+	st.SetAttrAbsentKey = s.mAbsentKey.Load()
+	st.Reconciles = s.mReconciles.Load()
 	if prev := s.status.Load(); prev != nil {
 		st.LastSync = prev.LastSync
 	}

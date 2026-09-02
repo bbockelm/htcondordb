@@ -281,25 +281,27 @@ type syncCollector struct {
 	exporters func() []dbad.ExporterStatus
 	importers func() []dbad.ImporterStatus
 
-	syncLag      *prometheus.Desc
-	syncCaughtUp *prometheus.Desc
-	syncFileSize *prometheus.Desc
-	syncOffset   *prometheus.Desc
-	syncLastTime *prometheus.Desc
-	syncResyncs  *prometheus.Desc
-	expUp        *prometheus.Desc
-	expRestarts  *prometheus.Desc
-	expIndexed   *prometheus.Desc
-	expSkipped   *prometheus.Desc
-	expInFlight  *prometheus.Desc
-	expLastBeat  *prometheus.Desc
-	impUp        *prometheus.Desc
-	impRestarts  *prometheus.Desc
-	impImported  *prometheus.Desc
-	impSchedds   *prometheus.Desc
-	impFailures  *prometheus.Desc
-	impLastBeat  *prometheus.Desc
-	impLastCycle *prometheus.Desc
+	syncLag        *prometheus.Desc
+	syncCaughtUp   *prometheus.Desc
+	syncFileSize   *prometheus.Desc
+	syncOffset     *prometheus.Desc
+	syncLastTime   *prometheus.Desc
+	syncResyncs    *prometheus.Desc
+	syncAbsentKey  *prometheus.Desc
+	syncReconciles *prometheus.Desc
+	expUp          *prometheus.Desc
+	expRestarts    *prometheus.Desc
+	expIndexed     *prometheus.Desc
+	expSkipped     *prometheus.Desc
+	expInFlight    *prometheus.Desc
+	expLastBeat    *prometheus.Desc
+	impUp          *prometheus.Desc
+	impRestarts    *prometheus.Desc
+	impImported    *prometheus.Desc
+	impSchedds     *prometheus.Desc
+	impFailures    *prometheus.Desc
+	impLastBeat    *prometheus.Desc
+	impLastCycle   *prometheus.Desc
 }
 
 func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus, importers func() []dbad.ImporterStatus) *syncCollector {
@@ -322,6 +324,10 @@ func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dba
 			"Unix time of the schedd-sync tailer's last successful sync, by kind and source. Staleness (now minus this) flags a wedged tailer.", sync, nil),
 		syncResyncs: prometheus.NewDesc(namespace+"_sync_resyncs_total",
 			"Number of full resyncs the history tailer has performed (a gap/rotation was detected), by kind and source.", sync, nil),
+		syncAbsentKey: prometheus.NewDesc(namespace+"_sync_setattr_absent_key_total",
+			"Set/DeleteAttribute ops the schedd-sync tailer applied to a key not present in its view, by kind and source. Each fabricates an identity-less 'orphan' ad (only the update's attributes); a valid log writes a key's NewClassAd first, so this should be ~0. A climbing value localizes partial-ad churn to updates landing on unresolvable keys.", sync, nil),
+		syncReconciles: prometheus.NewDesc(namespace+"_sync_reconciles_total",
+			"Full reconcile-reload runs the schedd-sync tailer has performed (replay + sweep), by kind and source. Expected to be rare (about one per source-file compaction).", sync, nil),
 		expUp: prometheus.NewDesc(namespace+"_exporter_up",
 			"1 if the daemon-managed change-data exporter process is running, else 0, by exporter and kind.", exp, nil),
 		expRestarts: prometheus.NewDesc(namespace+"_exporter_restarts_total",
@@ -367,6 +373,8 @@ func (c *syncCollector) Collect(ch chan<- prometheus.Metric) {
 				g(c.syncLastTime, float64(s.LastSync.Unix()))
 			}
 			ch <- prometheus.MustNewConstMetric(c.syncResyncs, prometheus.CounterValue, float64(s.Resyncs), s.Kind, s.Source)
+			ch <- prometheus.MustNewConstMetric(c.syncAbsentKey, prometheus.CounterValue, float64(s.SetAttrAbsentKey), s.Kind, s.Source)
+			ch <- prometheus.MustNewConstMetric(c.syncReconciles, prometheus.CounterValue, float64(s.Reconciles), s.Kind, s.Source)
 		}
 	}
 	if c.exporters != nil {
