@@ -326,6 +326,27 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 	return nil
 }
 
+// Stop cancels the running tailers and WAITS for them to exit. It must be called,
+// and must return, before the service/catalog is closed on shutdown: a tailer
+// mid-commit writes into the collections' mmap'd segments, and Catalog.Close
+// munmaps them -- a concurrent write then faults (a SIGSEGV in segment.append
+// when shutdown races an in-flight reconcile). Cancelling the daemon's context
+// alone does not prevent this; only joining the goroutines does. Idempotent and
+// safe to call when already stopped.
+func (m *scheddSyncManager) Stop() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cancel != nil {
+		m.cancel()
+		<-m.done
+		m.cancel = nil
+		m.done = nil
+	}
+	m.sources = nil
+	m.resyncers = nil
+	m.current = scheddSyncSettings{}
+}
+
 // launch starts the tailers for settings s under ctx and returns their live
 // status sources plus a channel closed when all of them have exited.
 func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([]dbad.StatusSource, map[string]resyncer, chan struct{}, error) {

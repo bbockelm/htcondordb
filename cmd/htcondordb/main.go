@@ -316,6 +316,11 @@ func run() error {
 	// The manager (re)starts the tailers so a JOB_QUEUE_LOG / HISTORY /
 	// HTCONDORDB_SYNC_SCHEDD change takes effect on condor_reconfig without a restart.
 	syncMgr := &scheddSyncManager{parent: ctx, svc: svc, logger: d.Slog()}
+	// Stop the tailers (and WAIT for them) before svc.Close runs: a tailer
+	// mid-commit writes the collections' mmap'd segments, which Close munmaps --
+	// racing them faults (SIGSEGV in segment.append). Deferred after svc.Close is
+	// deferred, so LIFO runs this first. Cancelling ctx alone does not join them.
+	defer syncMgr.Stop()
 	if serr := syncMgr.apply(cfg); serr != nil {
 		return serr
 	}
@@ -359,6 +364,8 @@ func run() error {
 	// tables/archives into local targets, selectively and Src-stamped, over a normal DBSession.
 	// Reapplied on reconfigure. Off unless HTCONDORDB_REPLICATE_SOURCES is set.
 	cedarMgr := &cedarSyncManager{parent: ctx, cat: svc.Catalog(), logger: d.Slog()}
+	// Like syncMgr, an in-process writer: stop-and-wait before svc.Close munmaps.
+	defer cedarMgr.Stop()
 	if cerr := cedarMgr.apply(cfg); cerr != nil {
 		return cerr
 	}

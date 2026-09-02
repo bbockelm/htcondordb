@@ -135,6 +135,62 @@ func TestScheddSyncManagerReconcile(t *testing.T) {
 	}
 }
 
+// TestScheddSyncManagerStopWaitsForTailer is the regression for the shutdown crash:
+// a tailer mid-commit writes the collections' mmap'd segments, and Catalog.Close
+// munmaps them, so a SIGSEGV (segment.append) results if shutdown does not WAIT for
+// the tailer to exit before closing. Cancelling the daemon context alone does not
+// join the goroutine; Stop must. This asserts the tailer's done channel is closed
+// by the time Stop returns.
+func TestScheddSyncManagerStopWaitsForTailer(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("schedd-sync refuses to run as root")
+	}
+	dir := t.TempDir()
+	svc, err := server.New(server.Config{Dir: dir, Authorize: func(_, _, _ string) bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = svc.Close() }()
+
+	logDir := t.TempDir()
+	jobLog := filepath.Join(logDir, "job_queue.log")
+	if err := os.WriteFile(jobLog, []byte("101 1.0 Job Machine\n103 1.0 ProcId 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &scheddSyncManager{parent: context.Background(), svc: svc, logger: slog.Default()}
+	if err := m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nHTCONDORDB_DIR = "+dir+"\nHISTORY =\nHTCONDORDB_JOB_QUEUE_LOG = "+jobLog+"\n")); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Sources()) != 1 {
+		t.Fatalf("enabled: %d sources, want 1", len(m.Sources()))
+	}
+
+	// Capture the tailers' done channel before Stop nils it. Stop must not return
+	// until this is closed (every tailer goroutine has exited) -- otherwise a
+	// concurrent write could still be in flight when the catalog is closed.
+	done := m.done
+	if done == nil {
+		t.Fatal("no done channel after enabling schedd-sync")
+	}
+
+	m.Stop()
+
+	select {
+	case <-done:
+		// closed: the tailer goroutine exited before Stop returned. Good.
+	default:
+		t.Fatal("Stop returned before the tailer goroutine exited; a mid-commit write could race Catalog.Close (SIGSEGV)")
+	}
+	if m.cancel != nil || m.done != nil {
+		t.Error("Stop did not reset the manager's running state")
+	}
+	if got := len(m.Sources()); got != 0 {
+		t.Errorf("after Stop: %d sources, want 0", got)
+	}
+	m.Stop() // idempotent: safe to call again
+}
+
 // TestScheddSyncManagerEnabledNoPaths verifies the misconfiguration guard.
 func TestScheddSyncManagerEnabledNoPaths(t *testing.T) {
 	if os.Geteuid() == 0 {
