@@ -343,12 +343,14 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 			return
 		}
 		closed = true
+		// fstat the fd we read (before Close) so curID is the file we actually reloaded, not a path
+		// stat a concurrent compaction could have changed.
+		if fi, ferr := s.parser.StatOpen(); ferr == nil {
+			s.curID, s.haveID = identityFromInfo(fi), true
+		}
 		_ = s.parser.Close()
 		if uerr := s.prober.Update(s.parser.GetFilename()); uerr != nil && err == nil {
 			err = uerr
-		}
-		if id, ierr := statIdentity(s.parser.GetFilename()); ierr == nil {
-			s.curID, s.haveID = id, true
 		}
 		if reloadSeqOK {
 			s.curSeq, s.haveSeq = reloadSeq, true
@@ -773,14 +775,18 @@ func (s *JobSync) checkpoint() {
 	if s.store == nil || s.explicit {
 		return
 	}
-	id, err := statIdentity(s.parser.GetFilename())
-	if err != nil {
-		return
+	// File is the identity of the fd we actually read (curID, captured by fstat pre-Close), not a
+	// fresh stat of the path -- so the persisted (File, Offset, Seq) describes one file atomically
+	// even if the log was compacted during or right after the read. Seq (s.curSeq, captured
+	// pre-read) is the authoritative rotation signal; File/Offset are the resume position for a log
+	// that has not rotated. Fall back to a path stat only before the first read has set curID.
+	id := s.curID
+	if !s.haveID {
+		var serr error
+		if id, serr = statIdentity(s.parser.GetFilename()); serr != nil {
+			return
+		}
 	}
-	// Seq is s.curSeq -- the sequence number of the file we actually read, captured pre-read -- not
-	// a fresh read of the (possibly just-compacted) path. So even if a mid-read compaction made id
-	// the NEW inode, the saved seq stays the OLD file's, and restore's seq check rebuilds rather
-	// than resuming a stale offset into the new file.
 	pos := jobPosition{File: id, Offset: s.parser.GetNextOffset()}
 	if s.haveSeq {
 		pos.Seq = s.curSeq
@@ -821,15 +827,18 @@ func (s *JobSync) readAndApply(ctx context.Context, reload bool) (err error) {
 		return oerr
 	}
 	defer func() {
+		// Record the identity of the fd we actually read, by fstat BEFORE Close -- so a compaction
+		// that replaced the path during the read cannot bind this read's offset to the new file's
+		// inode (the read->stat-by-path race that fabricated identity-less rows). The offset Close
+		// finalizes below is relative to this same fd, so the (identity, offset) pair is atomic.
+		if fi, ferr := s.parser.StatOpen(); ferr == nil {
+			s.curID, s.haveID = identityFromInfo(fi), true
+		}
 		// Close finalizes the parser's next offset to the current file position; only after
 		// it is the offset accurate to checkpoint.
 		_ = s.parser.Close()
 		if uerr := s.prober.Update(s.parser.GetFilename()); uerr != nil && err == nil {
 			err = uerr
-		}
-		// Record the inode we just read so the next poll can detect a rotation to a new file.
-		if id, ierr := statIdentity(s.parser.GetFilename()); ierr == nil {
-			s.curID, s.haveID = id, true
 		}
 		if err == nil {
 			s.maybeCheckpoint()
