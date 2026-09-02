@@ -119,6 +119,21 @@ func (m *cedarSyncManager) apply(cfg *config.Config) error {
 	return nil
 }
 
+// Stop cancels the running replicators and WAITS for them to exit -- like
+// scheddSyncManager.Stop, it must return before the catalog is closed, since a
+// cedarsync replicator writes local target tables in process and Catalog.Close
+// munmaps their segments. Idempotent and safe to call when already stopped.
+func (m *cedarSyncManager) Stop() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cancel != nil {
+		m.cancel()
+		<-m.done
+		m.cancel, m.done = nil, nil
+	}
+	m.sig = ""
+}
+
 // run starts one cedarsync.Runner per source and waits for them all to exit (on ctx cancel).
 func (m *cedarSyncManager) run(ctx context.Context, cfg *config.Config, s cedarSyncSettings, done chan struct{}) {
 	defer close(done)
