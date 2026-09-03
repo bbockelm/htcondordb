@@ -3,18 +3,18 @@ module github.com/bbockelm/htcondordb/grafana
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.29.6
-	github.com/PelicanPlatform/classad/dbrpc v0.29.6
+	github.com/PelicanPlatform/classad v0.29.7
+	github.com/PelicanPlatform/classad/dbrpc v0.29.7
 	github.com/bbockelm/cedar v0.6.11
-	github.com/bbockelm/golang-htcondor v0.12.5
+	github.com/bbockelm/golang-htcondor v0.12.10
 	github.com/bbockelm/htcondordb v0.0.0
 	github.com/grafana/grafana-plugin-sdk-go v0.291.0
 )
 
 require (
 	github.com/BurntSushi/toml v1.5.0 // indirect
-	github.com/PelicanPlatform/classad/collections v0.29.6 // indirect
-	github.com/PelicanPlatform/classad/db v0.29.6 // indirect
+	github.com/PelicanPlatform/classad/collections v0.29.7 // indirect
+	github.com/PelicanPlatform/classad/db v0.29.7 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
 	github.com/apache/arrow-go/v18 v18.5.2 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
@@ -97,16 +97,16 @@ require (
 	go.opentelemetry.io/otel/sdk v1.42.0 // indirect
 	go.opentelemetry.io/otel/trace v1.42.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.9.0 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp v0.0.0-20260112195511-716be5621a96 // indirect
-	golang.org/x/mod v0.37.0 // indirect
+	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/telemetry v0.0.0-20260625142307-59b4966ccb57 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/telemetry v0.0.0-20260708182218-49f421fb7959 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
-	golang.org/x/tools v0.47.0 // indirect
+	golang.org/x/tools v0.48.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260209200024-4cfbd4190f57 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
