@@ -84,6 +84,10 @@ CREATE/DROP TABLE and CREATE/DROP INDEX. WHERE is a ClassAd expression
 var version = "dev"
 
 func main() {
+	// The shell's .version command reports this alongside the
+	// component versions the toolchain embeds.
+	repl.BuildVersion = version
+
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "htcondordb-cli:", err)
 		os.Exit(1)
