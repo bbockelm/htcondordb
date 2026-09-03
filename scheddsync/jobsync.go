@@ -596,43 +596,57 @@ func (r *reconciler) flush() error {
 		return r.maybeCommit()
 	}
 
-	_, reappeared := tableSeen[key]
 	tableSeen[key] = struct{}{}
 	tx := r.batchTx(table)
 
-	if !reappeared {
-		// First run: establish the ad. Stamp the storage key (as applyEntry does) so the row is
-		// addressable by the REPL's key attribute; stamped before the Equal check so an
-		// already-stamped stored ad reconciles as unchanged (no spurious write/watch event).
-		ad.InsertAttrString(KeyAttr, key)
-		if cur, ok := tx.LookupClassAd(key); !ok || !cur.Equal(ad) {
-			tx.NewClassAd(key, ad)
-			r.n++
-		}
-		return r.maybeCommit()
-	}
-
-	// A later, non-contiguous run: merge this run's sets/deletes onto the ad already written this
-	// reconcile (read back through tx, which sees the earlier flush whether committed or buffered).
-	base, ok := tx.LookupClassAd(key)
-	if !ok {
-		// Defensive: the earlier flush found the ad unchanged AND the table had no row -- treat
-		// this run as the base.
-		ad.InsertAttrString(KeyAttr, key)
-		tx.NewClassAd(key, ad)
-		r.n++
-		return r.maybeCommit()
+	// Merge this run's sets and deletes onto whatever row is already present -- the STORED row on a
+	// key's first run this reconcile, or the row this reconcile already wrote on a later,
+	// non-contiguous run (read back through tx, which sees an earlier flush whether committed or
+	// still buffered). Merging rather than blindly replacing with only this run's attributes is what
+	// keeps a key from transiently losing attributes the schedd logged in a DIFFERENT run: the
+	// on-disk log sets ~75% of jobs' JobStatus (and much else) in a run separate from the NewClassAd,
+	// so a first-run replace made those jobs read JobStatus-undefined for the whole duration of a
+	// reconcile (self-healing only once their later run was reached -- a large, misleading transient
+	// spike on every reconcile). For a healthy mirror the final state is identical (every stored
+	// attribute is re-set by some log run), so this changes the outcome only for a genuinely stale
+	// attribute -- present on the row but set by no log run -- which the per-table key sweep does not
+	// address anyway.
+	base, hadRow := tx.LookupClassAd(key)
+	// Track whether the merge actually changes the stored row, so an unchanged row produces no
+	// spurious write/watch event -- without a second LookupClassAd copy just to compare against.
+	// A brand-new row is always a write; otherwise a change is a set to a new/different value, a
+	// delete that removed something, or a missing key stamp.
+	changed := !hadRow
+	if !hadRow {
+		base = classad.New()
 	}
 	for _, name := range ad.GetAttributes() {
-		if expr, ok := ad.Lookup(name); ok {
-			base.InsertExpr(name, expr)
+		expr, ok := ad.Lookup(name)
+		if !ok {
+			continue
 		}
+		if !changed {
+			if old, had := base.Lookup(name); !had || !expr.Equal(old) {
+				changed = true
+			}
+		}
+		base.InsertExpr(name, expr)
 	}
 	for _, name := range dels {
-		base.Delete(name)
+		if base.Delete(name) {
+			changed = true
+		}
 	}
-	tx.NewClassAd(key, base)
-	r.n++
+	// KeyAttr is stamped by the sync, not the log, so a stored ad may already carry it (== key,
+	// which is invariant); only a missing stamp is a change.
+	if _, had := base.Lookup(KeyAttr); !had {
+		changed = true
+	}
+	base.InsertAttrString(KeyAttr, key)
+	if changed {
+		tx.NewClassAd(key, base)
+		r.n++
+	}
 	return r.maybeCommit()
 }
 
@@ -674,8 +688,16 @@ func (r *reconciler) commit() error {
 	}
 	r.batches = map[*db.DB]*db.Txn{}
 	r.n = 0
+	if reconcileBatchCommittedHook != nil {
+		reconcileBatchCommittedHook()
+	}
 	return firstErr
 }
+
+// reconcileBatchCommittedHook, when non-nil, is invoked after each reconcile batch commits.
+// Test-only (nil in production); a test uses it to sample the committed state at batch boundaries
+// and assert the reconcile never exposes a partially-rebuilt (e.g. JobStatus-undefined) row.
+var reconcileBatchCommittedHook func()
 
 // finish flushes the last accumulated key and commits any remaining buffered writes.
 func (r *reconciler) finish() error {
