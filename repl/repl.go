@@ -126,6 +126,8 @@ func (s *session) runMeta(console io.Writer, line string) bool {
 		return true
 	case ".help", "\\h", ".h", "\\?":
 		fmt.Fprint(console, helpText)
+	case ".version", ".ver":
+		runVersion(console)
 	case ".format", ".mode":
 		s.setFormat(console, arg)
 	case ".output", ".out", "\\o":
@@ -290,6 +292,7 @@ Meta-commands:
   .output <file>        send query output to a file; .output stdout to restore
   .views                list materialized views
   .export [view]        Prometheus text exposition for a view (all views if omitted)
+  .version              this build: release, revision, and component versions
   .quit                 exit
 
 Diagnostics (current table, or an explicit one where noted):
