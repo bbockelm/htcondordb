@@ -142,3 +142,43 @@ func TestAugmentLiveLag(t *testing.T) {
 		t.Error("HistoryCaughtUp should be false with live lag")
 	}
 }
+
+// TestLiveStatusesCaughtUpFreshness: a small residual lag on a busy source still counts as caught
+// up while the syncer keeps making progress (fresh LastSync), but a stalled syncer (stale LastSync)
+// with the same lag reads as behind. LagBytes reports the true tail in both cases.
+func TestLiveStatusesCaughtUpFreshness(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "job_queue.log")
+	const size = 5 << 20 // 5 MiB, well above caughtUpLagTolerance
+	if err := os.WriteFile(path, make([]byte, size), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	nearEOF := int64(size - 776) // a 776-byte churn tail (the busy-queue case)
+
+	sources := func() []StatusSource {
+		return []StatusSource{
+			// Small tail + fresh: expected churn on a keeping-pace queue -> caught up.
+			fakeSource{st: scheddsync.SyncStatus{Kind: "job_queue.log", Source: path, Offset: nearEOF, LastSync: now.Add(-time.Second)}},
+			// Small tail + stale: a syncer that stalled near EOF -> behind.
+			fakeSource{st: scheddsync.SyncStatus{Kind: "history", Source: path, Offset: nearEOF, LastSync: now.Add(-caughtUpSyncFreshness - time.Minute)}},
+			// Large lag + fresh: actively catching up (fresh progress) but still MiB behind -> behind.
+			// Freshness alone would mislabel this caught up; the lag tolerance is what keeps it false
+			// (and preserves a real false->true edge for the early-advertise trigger).
+			fakeSource{st: scheddsync.SyncStatus{Kind: "epoch", Source: path, Offset: 0, LastSync: now.Add(-time.Second)}},
+		}
+	}
+	got := LiveStatuses(sources)
+	if len(got) != 3 {
+		t.Fatalf("got %d statuses, want 3", len(got))
+	}
+	if got[0].LagBytes != 776 || !got[0].CaughtUp {
+		t.Errorf("small tail + fresh: lag=%d caughtUp=%v, want lag=776 caughtUp=true", got[0].LagBytes, got[0].CaughtUp)
+	}
+	if got[1].LagBytes != 776 || got[1].CaughtUp {
+		t.Errorf("small tail + stale: lag=%d caughtUp=%v, want lag=776 caughtUp=false", got[1].LagBytes, got[1].CaughtUp)
+	}
+	if got[2].LagBytes != size || got[2].CaughtUp {
+		t.Errorf("large lag + fresh: lag=%d caughtUp=%v, want lag=%d caughtUp=false", got[2].LagBytes, got[2].CaughtUp, size)
+	}
+}
