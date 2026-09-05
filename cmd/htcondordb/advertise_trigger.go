@@ -33,16 +33,20 @@ func newCaughtUpTrigger(minGap time.Duration) *caughtUpTrigger {
 }
 
 // observe records the current source states and reports whether an early advertise should fire now:
-// true when some source's CaughtUp flipped since the last observation AND at least minGap has passed
-// since the last fire. A flip during the gap is remembered (pending) and fires once the gap elapses,
-// so no transition is missed and none flaps. A source's FIRST observation is not a transition.
+// true when some source's CaughtUp differs from its last-known value AND at least minGap has passed
+// since the last fire. A change during the gap is remembered (pending) and fires once the gap
+// elapses, so no change is missed and none flaps. A source's last-known value defaults to false
+// (behind): a source FIRST seen already caught up is therefore a false->true edge and fires. This
+// matters because the syncer can reach caught-up before the trigger's first sample -- the flip
+// would happen unobserved, so keying only on sample-to-sample transitions (with the first sample
+// treated as a non-edge) would silently never fire.
 func (c *caughtUpTrigger) observe(statuses []scheddsync.SyncStatus, now time.Time) bool {
 	for _, s := range statuses {
 		if s.Kind == "" {
 			continue // not yet reporting
 		}
 		k := s.Kind + "\x00" + s.Source
-		if prev, seen := c.last[k]; seen && prev != s.CaughtUp {
+		if c.last[k] != s.CaughtUp { // a not-yet-seen source defaults to false (behind)
 			c.pending = true
 		}
 		c.last[k] = s.CaughtUp
@@ -60,6 +64,17 @@ func (c *caughtUpTrigger) observe(statuses []scheddsync.SyncStatus, now time.Tim
 // second signal while one is already pending is dropped rather than queued.
 func runCaughtUpTrigger(ctx context.Context, sourcesFunc func() []dbad.StatusSource, trigger chan<- struct{}) {
 	c := newCaughtUpTrigger(caughtUpMinGap)
+	check := func(now time.Time) {
+		if c.observe(dbad.LiveStatuses(sourcesFunc), now) {
+			select {
+			case trigger <- struct{}{}:
+			default:
+			}
+		}
+	}
+	// Sample immediately rather than waiting a full interval, so a source already caught up at
+	// startup (or one that catches up within the first interval) is not missed.
+	check(time.Now())
 	t := time.NewTicker(caughtUpSampleInterval)
 	defer t.Stop()
 	for {
@@ -67,12 +82,7 @@ func runCaughtUpTrigger(ctx context.Context, sourcesFunc func() []dbad.StatusSou
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			if c.observe(dbad.LiveStatuses(sourcesFunc), now) {
-				select {
-				case trigger <- struct{}{}:
-				default:
-				}
-			}
+			check(now)
 		}
 	}
 }
