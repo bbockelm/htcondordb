@@ -23,7 +23,7 @@ type syncController struct {
 // handle runs one request ClassAd and returns the response ClassAd. Request attributes:
 //
 //	Action = "resync"   (default if absent)
-//	Target = "jobs" | "history" | "<exporter-name>"
+//	Target = "jobs" | "history" | "epoch" | "<exporter-name>"
 //
 // Response: Ok (bool); on failure Error (string); on success Note (string).
 func (sc *syncController) handle(reqAd *classad.ClassAd) *classad.ClassAd {
@@ -52,13 +52,13 @@ func fail(resp *classad.ClassAd, msg string) *classad.ClassAd {
 	return resp
 }
 
-// resync routes a target to its owning manager. "jobs"/"history" are the schedd-sync tailers;
-// any other name is looked up among the managed exporters.
+// resync routes a target to its owning manager. "jobs"/"history"/"epoch" are the schedd-sync
+// tailers; any other name is looked up among the managed exporters.
 func (sc *syncController) resync(target string) error {
 	switch target {
 	case "":
-		return fmt.Errorf("resync requires a target (jobs, history, or an exporter name)")
-	case "jobs", "history":
+		return fmt.Errorf("resync requires a target (jobs, history, epoch, or an exporter name)")
+	case "jobs", "history", "epoch":
 		if sc.sched == nil {
 			return fmt.Errorf("schedd-sync is not configured on this daemon")
 		}

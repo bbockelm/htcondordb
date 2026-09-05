@@ -71,6 +71,30 @@ func TestExporterResyncClearsStateAndRestarts(t *testing.T) {
 	}
 }
 
+// fakeResyncer records whether Resync was called, to prove routing reached a schedd-sync tailer.
+type fakeResyncer struct{ called bool }
+
+func (f *fakeResyncer) Resync() { f.called = true }
+
+// TestSyncControllerRoutesEpochToSchedd guards the fix for `.resync epoch` misrouting: epoch must
+// reach the schedd-sync manager (which registers an "epoch" resyncer), not fall through to the
+// exporter branch. With an "epoch" resyncer registered, the request succeeds and the tailer is hit.
+func TestSyncControllerRoutesEpochToSchedd(t *testing.T) {
+	fake := &fakeResyncer{}
+	sched := &scheddSyncManager{resyncers: map[string]resyncer{"epoch": fake}}
+	// Empty exporter manager: had epoch wrongly routed here, it would error instead of succeeding.
+	sc := &syncController{sched: sched, exp: &exporterManager{}}
+
+	resp := sc.handle(mkReq("resync", "epoch"))
+	if ok, _ := resp.EvaluateAttrBool("Ok"); !ok {
+		e, _ := resp.EvaluateAttrString("Error")
+		t.Fatalf("resync epoch should succeed via the schedd manager; got error %q", e)
+	}
+	if !fake.called {
+		t.Error("resync epoch did not reach the schedd-sync tailer")
+	}
+}
+
 func mkReq(action, target string) *classad.ClassAd {
 	ad := classad.New()
 	ad.InsertAttrString("Action", action)
