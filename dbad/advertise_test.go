@@ -149,33 +149,36 @@ func TestAugmentLiveLag(t *testing.T) {
 func TestLiveStatusesCaughtUpFreshness(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "job_queue.log")
-	// File is 10776 bytes; a syncer at offset 10000 trails by a 776-byte tail (the busy-queue case).
-	if err := os.WriteFile(path, make([]byte, 10776), 0o644); err != nil {
+	const size = 5 << 20 // 5 MiB, well above caughtUpLagTolerance
+	if err := os.WriteFile(path, make([]byte, size), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now()
+	nearEOF := int64(size - 776) // a 776-byte churn tail (the busy-queue case)
 
 	sources := func() []StatusSource {
 		return []StatusSource{
-			// Fresh: synced a moment ago -> the 776-byte tail is expected churn, caught up.
-			fakeSource{st: scheddsync.SyncStatus{Kind: "job_queue.log", Source: path, Offset: 10000, LastSync: now.Add(-time.Second)}},
-			// Stale: last progress well past the freshness window -> genuinely behind.
-			fakeSource{st: scheddsync.SyncStatus{Kind: "history", Source: path, Offset: 10000, LastSync: now.Add(-caughtUpSyncFreshness - time.Minute)}},
+			// Small tail + fresh: expected churn on a keeping-pace queue -> caught up.
+			fakeSource{st: scheddsync.SyncStatus{Kind: "job_queue.log", Source: path, Offset: nearEOF, LastSync: now.Add(-time.Second)}},
+			// Small tail + stale: a syncer that stalled near EOF -> behind.
+			fakeSource{st: scheddsync.SyncStatus{Kind: "history", Source: path, Offset: nearEOF, LastSync: now.Add(-caughtUpSyncFreshness - time.Minute)}},
+			// Large lag + fresh: actively catching up (fresh progress) but still MiB behind -> behind.
+			// Freshness alone would mislabel this caught up; the lag tolerance is what keeps it false
+			// (and preserves a real false->true edge for the early-advertise trigger).
+			fakeSource{st: scheddsync.SyncStatus{Kind: "epoch", Source: path, Offset: 0, LastSync: now.Add(-time.Second)}},
 		}
 	}
 	got := LiveStatuses(sources)
-	if len(got) != 2 {
-		t.Fatalf("got %d statuses, want 2", len(got))
+	if len(got) != 3 {
+		t.Fatalf("got %d statuses, want 3", len(got))
 	}
-	for _, st := range got {
-		if st.LagBytes != 776 {
-			t.Errorf("%s LagBytes = %d, want 776", st.Kind, st.LagBytes)
-		}
+	if got[0].LagBytes != 776 || !got[0].CaughtUp {
+		t.Errorf("small tail + fresh: lag=%d caughtUp=%v, want lag=776 caughtUp=true", got[0].LagBytes, got[0].CaughtUp)
 	}
-	if !got[0].CaughtUp {
-		t.Error("fresh syncer with a 776-byte tail should be CaughtUp")
+	if got[1].LagBytes != 776 || got[1].CaughtUp {
+		t.Errorf("small tail + stale: lag=%d caughtUp=%v, want lag=776 caughtUp=false", got[1].LagBytes, got[1].CaughtUp)
 	}
-	if got[1].CaughtUp {
-		t.Error("stale syncer with the same tail should NOT be CaughtUp")
+	if got[2].LagBytes != size || got[2].CaughtUp {
+		t.Errorf("large lag + fresh: lag=%d caughtUp=%v, want lag=%d caughtUp=false", got[2].LagBytes, got[2].CaughtUp, size)
 	}
 }
