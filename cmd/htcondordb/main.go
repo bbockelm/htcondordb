@@ -211,11 +211,21 @@ func run() error {
 	boot.mark("ha-detect")
 	logQueries := configBool(cfg, "HTCONDORDB_LOG_QUERIES")
 	memoryTables := splitAttrs(getStr(cfg, "HTCONDORDB_MEMORY_TABLES"))
+	// Take an exclusive lock on the database directory before opening it, so a second daemon
+	// pointed at the same dir (e.g. a restart that overlaps the old process, or a misconfigured
+	// second instance) refuses to start rather than double-opening the mmap'd segments and
+	// corrupting them. No-op for an in-memory database (empty dir).
+	dbDir := databaseDir(d, cfg)
+	unlockDB, err := lockDatabaseDir(dbDir)
+	if err != nil {
+		return err
+	}
+	defer unlockDB()
 	svc, err := server.New(server.Config{
 		OnPhase:         boot.record,
 		OnTableOpen:     boot.recordTableOpen,
 		OnSealMigration: boot.recordSealMigration,
-		Dir:             databaseDir(d, cfg),
+		Dir:             dbDir,
 		Authorize:       authorize,
 		ForceReadOnly:   ha.forceReadOnly,
 		Logger:          d.Slog(),
