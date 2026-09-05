@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PelicanPlatform/classad/db"
 	"github.com/bbockelm/golang-htcondor/config"
 
 	"github.com/bbockelm/htcondordb/server"
@@ -189,6 +190,72 @@ func TestScheddSyncManagerStopWaitsForTailer(t *testing.T) {
 		t.Errorf("after Stop: %d sources, want 0", got)
 	}
 	m.Stop() // idempotent: safe to call again
+}
+
+// TestScheddSyncManagerStopWaitsForIndexBackfill verifies Stop (and thus daemon shutdown) waits
+// for an in-flight archive index backfill before returning -- so the catalog is not closed
+// (segments munmapped) while AddIndex is still writing them. The backfill runs detached but is
+// registered on the manager's WaitGroup; a regression that de-registers it would let Stop return
+// early and this test would fail.
+func TestScheddSyncManagerStopWaitsForIndexBackfill(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("schedd-sync refuses to run as root")
+	}
+	// Block the backfill goroutine until we release it, and signal when it has started.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	archiveBackfillHook = func() { close(started); <-release }
+	t.Cleanup(func() { archiveBackfillHook = nil })
+
+	dir := t.TempDir()
+	svc, err := server.New(server.Config{Dir: dir, Authorize: func(_, _, _ string) bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = svc.Close() }()
+
+	// Pre-create the history archive with NO categorical index and one record, so the manager's
+	// reconcile finds the configured Owner index missing and schedules a backfill.
+	hist, err := svc.Catalog().CreateArchiveTable("history", db.ArchiveConfig{ValueAttrs: []string{"ClusterId"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hist.AppendOld("ClusterId = 1\nOwner = \"alice\""); err != nil {
+		t.Fatal(err)
+	}
+	histFile := filepath.Join(t.TempDir(), "history")
+	if err := os.WriteFile(histFile, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &scheddSyncManager{parent: context.Background(), svc: svc, logger: slog.Default()}
+	if err := m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nHTCONDORDB_DIR = "+dir+
+		"\nJOB_QUEUE_LOG =\nHTCONDORDB_HISTORY = "+histFile+"\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("index backfill did not start")
+	}
+
+	// Stop must block while the backfill is in flight.
+	stopped := make(chan struct{})
+	go func() { m.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned while the index backfill was still in flight (catalog could be closed mid-AddIndex)")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Release the backfill; Stop must now return.
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return after the backfill completed")
+	}
 }
 
 // TestScheddSyncManagerEnabledNoPaths verifies the misconfiguration guard.

@@ -43,6 +43,11 @@ type scheddSyncManager struct {
 // resyncer is a running sync a caller can ask to re-read its source from scratch.
 type resyncer interface{ Resync() }
 
+// archiveBackfillHook, when non-nil, is invoked at the start of the index-backfill goroutine. A
+// test-only seam to make an in-flight backfill observable/controllable (e.g. to prove Stop joins
+// it). Nil in production.
+var archiveBackfillHook func()
+
 // Resync asks the named tailer ("jobs" or "history") to re-read its source non-destructively on
 // its next poll. It errors if schedd-sync is disabled or the target is unknown.
 func (m *scheddSyncManager) Resync(target string) error {
@@ -221,7 +226,15 @@ func (m *scheddSyncManager) applyArchiveRowGroupBytes(t *db.ArchiveTable, name s
 		"note", "applies to segments sealed from now on; existing segments keep their layout")
 }
 
-func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, hist *db.ArchiveTable, s scheddSyncSettings) {
+// reconcileArchiveIndexes registers the backfill goroutine on wg so it is joined on
+// stop/reconfigure BEFORE the catalog is closed. AddIndex writes the archive's segments and is
+// not interruptible once started; if a shutdown munmapped them mid-backfill (Catalog.Close) it
+// would fault, the same use-after-munmap the tailers' join prevents. Joining means a shutdown that
+// lands during a (possibly long) backfill waits it out -- bounded in practice by condor_master's
+// SIGKILL, which is crash-free (the OS reclaims the mapping; the backfill is idempotent and
+// retried next start). ctx is checked before the goroutine starts, so a stop before the backfill
+// begins skips it; once AddIndex is running only the join can end it cleanly.
+func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, hist *db.ArchiveTable, s scheddSyncSettings, wg *sync.WaitGroup) {
 	haveCat, haveVal := hist.IndexedAttrs()
 	missing := func(want []string, have []string) []string {
 		var out []string
@@ -240,7 +253,12 @@ func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, hist *d
 	if ctx.Err() != nil {
 		return
 	}
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+		if archiveBackfillHook != nil {
+			archiveBackfillHook()
+		}
 		stale, sealed := hist.StaleIndexSegments()
 		m.logger.Info("schedd-sync: backfilling history archive indexes",
 			"categorical", addCat, "value", addVal, "segments", sealed, "stale_before", stale)
@@ -428,7 +446,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// and hours on a mature one, and must not hold up daemon startup. AddIndex is correct
 		// immediately (segments full-scan for the new attribute until their sidecars are
 		// rebuilt), so serving during the backfill is safe.
-		m.reconcileArchiveIndexes(ctx, hist, s)
+		m.reconcileArchiveIndexes(ctx, hist, s, &wg)
 		m.applyArchiveRowGroupBytes(hist, "history", s)
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
 			Filename: s.histFile,
@@ -459,7 +477,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("schedd-sync: creating epoch archive: %w", err)
 		}
-		m.reconcileArchiveIndexes(ctx, ep, s)
+		m.reconcileArchiveIndexes(ctx, ep, s, &wg)
 		m.applyArchiveRowGroupBytes(ep, "epoch_history", s)
 		es := scheddsync.NewJobEpochSync(ep, scheddsync.HistorySyncConfig{
 			Filename: s.epochFile,

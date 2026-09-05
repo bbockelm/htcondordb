@@ -6,8 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"sync"
 	"testing"
-	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 )
@@ -94,19 +94,14 @@ func TestReconcileArchiveIndexesAdds(t *testing.T) {
 
 	m := &scheddSyncManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
-	m.reconcileArchiveIndexes(context.Background(), hist, s)
+	// The backfill runs in its own goroutine (so it cannot stall daemon startup) but is
+	// registered on wg, which the manager joins on stop; the test joins it the same way.
+	var wg sync.WaitGroup
+	m.reconcileArchiveIndexes(context.Background(), hist, s, &wg)
+	wg.Wait()
 
-	// The backfill is asynchronous so it cannot stall daemon startup.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if c, _ := hist.IndexedAttrs(); slices.Contains(c, "Owner") {
-			break
-		}
-		if time.Now().After(deadline) {
-			c, _ := hist.IndexedAttrs()
-			t.Fatalf("Owner was not backfilled; categorical = %v", c)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if c, _ := hist.IndexedAttrs(); !slices.Contains(c, "Owner") {
+		t.Fatalf("Owner was not backfilled; categorical = %v", c)
 	}
 }
 
@@ -132,10 +127,10 @@ func TestReconcileArchiveIndexesNeverDrops(t *testing.T) {
 	m := &scheddSyncManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	// Config names only Owner; AccountingGroup was added out of band.
 	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
-	m.reconcileArchiveIndexes(context.Background(), hist, s)
+	var wg sync.WaitGroup
+	m.reconcileArchiveIndexes(context.Background(), hist, s, &wg)
+	wg.Wait() // join the backfill (adding the ClusterId value index) before asserting
 
-	// Nothing to add, so this is synchronous -- but give any stray goroutine a chance.
-	time.Sleep(100 * time.Millisecond)
 	c, _ := hist.IndexedAttrs()
 	if !slices.Contains(c, "AccountingGroup") {
 		t.Errorf("categorical = %v, want AccountingGroup retained (reconciliation must not drop)", c)
@@ -167,17 +162,15 @@ func TestReconcileArchiveIndexesSurvivesRestart(t *testing.T) {
 	}
 	m := &scheddSyncManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
-	m.reconcileArchiveIndexes(context.Background(), hist, s)
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if c, _ := hist.IndexedAttrs(); slices.Contains(c, "Owner") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("Owner was not backfilled")
-		}
-		time.Sleep(10 * time.Millisecond)
+	// Join the backfill via wg (as the manager does on stop): wg.Wait returns only after
+	// AddIndex has BOTH reindexed and persisted archiveconfig.json, so the reopen below sees the
+	// persisted index. Polling IndexedAttrs instead raced the persist step (IndexedAttrs flips
+	// after the reindex, before saveIndexConfig) and flaked.
+	var wg sync.WaitGroup
+	m.reconcileArchiveIndexes(context.Background(), hist, s, &wg)
+	wg.Wait()
+	if c, _ := hist.IndexedAttrs(); !slices.Contains(c, "Owner") {
+		t.Fatalf("Owner was not backfilled; categorical = %v", c)
 	}
 	cat.Close()
 
