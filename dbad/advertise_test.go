@@ -142,3 +142,40 @@ func TestAugmentLiveLag(t *testing.T) {
 		t.Error("HistoryCaughtUp should be false with live lag")
 	}
 }
+
+// TestLiveStatusesCaughtUpFreshness: a small residual lag on a busy source still counts as caught
+// up while the syncer keeps making progress (fresh LastSync), but a stalled syncer (stale LastSync)
+// with the same lag reads as behind. LagBytes reports the true tail in both cases.
+func TestLiveStatusesCaughtUpFreshness(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "job_queue.log")
+	// File is 10776 bytes; a syncer at offset 10000 trails by a 776-byte tail (the busy-queue case).
+	if err := os.WriteFile(path, make([]byte, 10776), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+
+	sources := func() []StatusSource {
+		return []StatusSource{
+			// Fresh: synced a moment ago -> the 776-byte tail is expected churn, caught up.
+			fakeSource{st: scheddsync.SyncStatus{Kind: "job_queue.log", Source: path, Offset: 10000, LastSync: now.Add(-time.Second)}},
+			// Stale: last progress well past the freshness window -> genuinely behind.
+			fakeSource{st: scheddsync.SyncStatus{Kind: "history", Source: path, Offset: 10000, LastSync: now.Add(-caughtUpSyncFreshness - time.Minute)}},
+		}
+	}
+	got := LiveStatuses(sources)
+	if len(got) != 2 {
+		t.Fatalf("got %d statuses, want 2", len(got))
+	}
+	for _, st := range got {
+		if st.LagBytes != 776 {
+			t.Errorf("%s LagBytes = %d, want 776", st.Kind, st.LagBytes)
+		}
+	}
+	if !got[0].CaughtUp {
+		t.Error("fresh syncer with a 776-byte tail should be CaughtUp")
+	}
+	if got[1].CaughtUp {
+		t.Error("stale syncer with the same tail should NOT be CaughtUp")
+	}
+}
