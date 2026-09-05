@@ -48,15 +48,27 @@ func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []
 	}
 }
 
+// caughtUpSyncFreshness is how recently a syncer must have made progress for a nonzero residual
+// lag to still count as caught up. A busy source is appended between polls, so the mirror's offset
+// trails the live file by a handful of bytes even while it is keeping pace; reporting that as
+// CaughtUp=false is misleading (and flaps the early-advertise trigger). A syncer that has genuinely
+// stalled stops making progress, so its LastSync goes stale and CaughtUp flips false once this
+// window elapses -- while LagBytes keeps reporting the true, growing backlog throughout. Sized well
+// above the sub-second default poll interval so a healthy syncer never flaps.
+const caughtUpSyncFreshness = 10 * time.Second
+
 // LiveStatuses snapshots each source's status, recomputing the lag against the LIVE file size:
 // a syncer's own snapshot measures lag right after a poll drains to EOF, so it reads ~0; a
 // stalled syncer whose offset is frozen while the schedd keeps appending must instead show a
-// growing LagBytes, not a misleading zero. Shared by the collector ad and the Prometheus
-// exporter so both report the same live-lag numbers.
+// growing LagBytes, not a misleading zero. CaughtUp allows a small residual lag as long as the
+// syncer synced recently (see caughtUpSyncFreshness), so a busy-but-keeping-pace queue does not
+// read as behind. Shared by the collector ad and the Prometheus exporter so both report the same
+// live-lag numbers.
 func LiveStatuses(sources func() []StatusSource) []scheddsync.SyncStatus {
 	if sources == nil {
 		return nil
 	}
+	now := time.Now()
 	srcs := sources()
 	out := make([]scheddsync.SyncStatus, 0, len(srcs))
 	for _, s := range srcs {
@@ -68,7 +80,8 @@ func LiveStatuses(sources func() []StatusSource) []scheddsync.SyncStatus {
 				if st.FileSize > st.Offset {
 					st.LagBytes = st.FileSize - st.Offset
 				}
-				st.CaughtUp = st.LagBytes == 0
+				st.CaughtUp = st.LagBytes == 0 ||
+					(!st.LastSync.IsZero() && now.Sub(st.LastSync) <= caughtUpSyncFreshness)
 			}
 		}
 		out = append(out, st)
