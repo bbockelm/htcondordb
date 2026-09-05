@@ -104,7 +104,7 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 func (s *session) resync(console io.Writer, arg string) {
 	target := strings.TrimSpace(arg)
 	if target == "" {
-		fmt.Fprintln(console, "usage: .resync <jobs|history|exporter-name>   (re-read/re-export a sync source from the start; non-destructive)")
+		fmt.Fprintln(console, "usage: .resync <jobs|history|epoch|exporter-name>   (re-read/re-export a sync source from the start; non-destructive)")
 		return
 	}
 	if err := s.exec.Resync(target); err != nil {

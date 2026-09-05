@@ -327,7 +327,7 @@ CompletionDate); with none, the current table:
                                                (maxBytes takes a KiB/MiB/GiB suffix; 0=none)
   .truncate <table>                            empty a table (needs DAEMON, destructive);
                                                a history archive re-syncs from the start
-  .resync <jobs|history|exporter>              re-read/re-export a sync source from the start
+  .resync <jobs|history|epoch|exporter>        re-read/re-export a sync source from the start
                                                (needs DAEMON, non-destructive: heals a mirror
                                                or re-exports without wiping the target)
   .memory [table]                              drop a table's on-disk backing, keeping
