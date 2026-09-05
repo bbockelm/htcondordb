@@ -32,6 +32,10 @@ func NewJobEpochSync(archive *db.ArchiveTable, cfg HistorySyncConfig) *HistorySy
 	s.kind = "job_epoch"
 	s.keyConstraint = epochKeyConstraint
 	s.eventTime = epochEventTime
+	// Re-publish now that the kind is final, so the initial status carries "job_epoch" (NewHistorySync
+	// published it as "history"). Synchronous, before the advertise loop, so the intermediate label is
+	// never observed.
+	s.publishStatus(false)
 	return s
 }
 
