@@ -194,7 +194,7 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 	if logmeta == nil {
 		logmeta = mustMemTable()
 	}
-	return &JobSync{
+	s := &JobSync{
 		target:         target,
 		users:          users,
 		jobsets:        jobsets,
@@ -211,6 +211,13 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 		txs:            map[*db.DB]*db.Txn{},
 		store:          cfg.Store,
 	}
+	// Publish an initial status at construction (resume position, CaughtUp reflecting the current
+	// file) so the source is present in the VERY FIRST collector ad rather than only after the first
+	// poll completes -- dbad skips a source whose status is still zero (Kind ""), so without this the
+	// JobQueue* attributes are absent until the next advertise cycle. The manager constructs the
+	// syncers synchronously before the advertise loop starts, so this wins the race.
+	s.publishStatus(false)
+	return s
 }
 
 // mustMemTable opens a private in-memory table for a sibling namespace a caller did not supply.

@@ -141,13 +141,17 @@ func NewHistorySync(archive *db.ArchiveTable, cfg HistorySyncConfig) *HistorySyn
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &HistorySync{
+	s := &HistorySync{
 		filename: cfg.Filename, archive: archive, interval: interval, log: logger,
 		store: cfg.Store, onResync: cfg.OnResync, now: time.Now,
 		kind:          "history",
 		keyConstraint: historyKeyConstraint,
 		eventTime:     historyEventTime,
 	}
+	// Advertise the source from construction (see the note in NewJobSync) so History* attributes
+	// appear in the first collector ad. NewJobEpochSync re-publishes after overriding kind.
+	s.publishStatus(false)
+	return s
 }
 
 // historyKeyConstraint identifies a completed-job record: one per (ClusterId, ProcId)
