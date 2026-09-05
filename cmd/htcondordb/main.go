@@ -540,9 +540,15 @@ func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.
 	// COLLECTOR_HOST list, the HTCONDORDB_UPDATE_INTERVAL cadence, and INVALIDATE-on-shutdown.
 	// dbad supplies only the HTCondorDB-specific attributes (table gauges, sync + exporter health,
 	// capabilities, reachable address). It is a no-op when COLLECTOR_HOST is empty.
+	// Push an early advertise when a sync source catches up or falls behind, so its JobQueue*
+	// CaughtUp/Lag attributes reach the collector within seconds instead of at the next
+	// HTCONDORDB_UPDATE_INTERVAL. Debounced (see runCaughtUpTrigger) so it cannot flap.
+	trigger := make(chan struct{}, 1)
+	go runCaughtUpTrigger(ctx, sourcesFunc, trigger)
 	go d.Advertise(ctx, daemon.AdvertiseConfig{
 		MyType:  dbad.AdType,
 		Augment: dbad.Augment(svc.Catalog(), sourcesFunc, exportersFunc, importersFunc, addr),
+		Trigger: trigger,
 		Logger:  d.Slog(),
 	})
 }
