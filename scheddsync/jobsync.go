@@ -115,6 +115,27 @@ type JobSync struct {
 	// deployed build measures the real rate without risk. mReconciles counts full reconcile runs.
 	mAbsentKey  atomic.Int64
 	mReconciles atomic.Int64
+	// mConflicts counts commit ConflictErrors recovered by the rewind-and-retry path (see Poll's
+	// ProbeAddition handling). Observe-only.
+	mConflicts atomic.Int64
+
+	// persistedOffset is the durable resume position -- the offset a restart would resume from,
+	// tracked in memory so a commit conflict can rewind to it. It is only ever a transaction
+	// boundary (checkpoint saves only when no explicit transaction is open), so re-reading from it
+	// re-applies any in-flight explicit transaction in full -- unlike the current pass start, which
+	// for a transaction that spans a poll boundary sits AFTER its BeginTransaction and would drop
+	// its earlier ops. 0 until the first checkpoint (replay-from-start).
+	persistedOffset int64
+
+	// conflictOffset/conflictRuns bound the commit-conflict retry. A commit conflict on the
+	// incremental append path means another writer superseded one of this pass's keys after our
+	// snapshot -- in a single serialized tailer, that is a second writer (e.g. an overlapping
+	// resync that double-launched a tailer). Poll then rewinds to persistedOffset and re-applies
+	// next tick on a fresh snapshot (every op is an idempotent upsert/delete). conflictRuns counts
+	// consecutive conflicts rewinding to the SAME offset; after maxConflictRetries Poll escalates
+	// to a full reconcileReload rather than spin forever against a persistent second writer.
+	conflictOffset int64
+	conflictRuns   int
 
 	// status holds the latest published SyncStatus snapshot, read lock-free by Status().
 	status atomic.Pointer[SyncStatus]
@@ -300,8 +321,14 @@ func (s *JobSync) Poll(ctx context.Context) error {
 		return s.reconcileReload(ctx)
 	case classadlog.ProbeAddition:
 		if aerr := s.readAndApply(ctx, false); aerr != nil {
+			var conflict *db.ConflictError
+			if errors.As(aerr, &conflict) {
+				return s.handleCommitConflict(ctx, conflict)
+			}
 			return aerr
 		}
+		// A clean pass clears any prior conflict streak.
+		s.conflictOffset, s.conflictRuns = 0, 0
 		// Record the seq of the file we just read. Captured pre-read (headSeq), so a compaction that
 		// landed DURING the read leaves curSeq at the old value and the next poll's seq check fires
 		// -- rather than a post-read re-read that would adopt the new file's seq and mask it.
@@ -313,6 +340,44 @@ func (s *JobSync) Poll(ctx context.Context) error {
 		// ProbeError / ProbeFatalError / unknown.
 		return errors.New("scheddsync: probe error on " + s.parser.GetFilename())
 	}
+}
+
+// maxConflictRetries bounds in-place commit-conflict re-applies at one offset before Poll escalates
+// to a full reconcileReload. Small: a transient conflict clears in a tick or two; a persistent one
+// (a stuck second writer) should heal via reconcile promptly, not spin.
+const maxConflictRetries = 3
+
+// handleCommitConflict recovers from a commit ConflictError on the incremental append path. A
+// conflict means another writer superseded one of this pass's keys after our snapshot -- in a
+// single serialized tailer, that is a second writer (e.g. an overlapping resync that double-launched
+// a tailer). The failed commit was partial: the non-conflicted writes landed, the listed keys did
+// not, and the durable position was NOT advanced (readAndApply checkpoints only on a clean pass, and
+// commitAll already cleared the open txns). So we rewind the in-memory read position to the durable
+// resume offset -- always a transaction boundary, so an in-flight explicit transaction that spanned
+// the poll boundary is re-read in full -- and reset the prober, so the next poll re-reads and
+// re-applies from there on a fresh snapshot; every op is an idempotent upsert/delete, so the
+// already-landed writes simply repeat. It is bounded: repeated conflicts at the same offset (a
+// persistent second writer) escalate to a full reconcileReload after maxConflictRetries rather than
+// spin, and the WARN names the stuck offset.
+func (s *JobSync) handleCommitConflict(ctx context.Context, conflict *db.ConflictError) error {
+	s.mConflicts.Add(1)
+	rewind := s.persistedOffset
+	s.parser.SetNextOffset(rewind)
+	s.prober.Reset()
+	if rewind == s.conflictOffset {
+		s.conflictRuns++
+	} else {
+		s.conflictOffset, s.conflictRuns = rewind, 1
+	}
+	if s.conflictRuns >= maxConflictRetries {
+		s.log.Warn("scheddsync: job commit kept conflicting; rebuilding jobs mirror from the current log",
+			"offset", rewind, "attempts", s.conflictRuns, "keys", len(conflict.Keys))
+		s.conflictOffset, s.conflictRuns = 0, 0
+		return s.reconcileReload(ctx)
+	}
+	s.log.Warn("scheddsync: job commit conflicted; will re-apply next poll",
+		"offset", rewind, "attempt", s.conflictRuns, "keys", len(conflict.Keys))
+	return nil
 }
 
 // reconcileReload rebuilds the table from the current log after a rotation/compaction WITHOUT
@@ -751,6 +816,7 @@ func (s *JobSync) restore(ctx context.Context) error {
 					return err
 				}
 				s.parser.SetNextOffset(pos.Offset)
+				s.persistedOffset = pos.Offset // resume point; a later commit conflict rewinds here
 				s.curID, s.haveID = cur, true
 				if seqKnown {
 					s.curSeq, s.haveSeq = headSeq, true
@@ -838,6 +904,7 @@ func (s *JobSync) checkpoint() {
 		return
 	}
 	s.lastSaveAt = time.Now()
+	s.persistedOffset = pos.Offset // the durable resume point; a commit conflict rewinds here
 }
 
 // maybeCheckpoint records the resume position on the steady append path, throttled to at most
