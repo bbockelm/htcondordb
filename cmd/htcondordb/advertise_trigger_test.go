@@ -59,3 +59,24 @@ func TestCaughtUpTriggerIgnoresUnreportedSource(t *testing.T) {
 		t.Fatal("an unreported (empty-Kind) source must never fire")
 	}
 }
+
+// TestCaughtUpTriggerFiresOnFirstSeenCaughtUp: a source first observed ALREADY caught up must fire.
+// A new source is assumed behind (last-known false), so its first true is a false->true edge. This
+// is the case that silently never fired before: the syncer can reach caught-up before the trigger's
+// first sample, so the flip is only ever visible as an already-true first observation.
+func TestCaughtUpTriggerFiresOnFirstSeenCaughtUp(t *testing.T) {
+	c := newCaughtUpTrigger(15 * time.Second)
+	base := time.Unix(1_000_000, 0)
+	if !c.observe(jobStatus(true), base) {
+		t.Fatal("a source first observed caught up should fire")
+	}
+	// Steady caught-up afterward is not a new edge.
+	if c.observe(jobStatus(true), base.Add(time.Second)) {
+		t.Fatal("steady caught-up should not re-fire")
+	}
+	// A source first observed BEHIND is not an edge (false == assumed-false), so it must not fire.
+	c2 := newCaughtUpTrigger(15 * time.Second)
+	if c2.observe(jobStatus(false), base) {
+		t.Fatal("a source first observed behind should not fire")
+	}
+}
