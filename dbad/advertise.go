@@ -48,22 +48,35 @@ func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []
 	}
 }
 
-// caughtUpSyncFreshness is how recently a syncer must have made progress for a nonzero residual
-// lag to still count as caught up. A busy source is appended between polls, so the mirror's offset
-// trails the live file by a handful of bytes even while it is keeping pace; reporting that as
-// CaughtUp=false is misleading (and flaps the early-advertise trigger). A syncer that has genuinely
-// stalled stops making progress, so its LastSync goes stale and CaughtUp flips false once this
-// window elapses -- while LagBytes keeps reporting the true, growing backlog throughout. Sized well
-// above the sub-second default poll interval so a healthy syncer never flaps.
-const caughtUpSyncFreshness = 10 * time.Second
+// A source counts as caught up when its unconsumed tail is small AND it synced recently -- both
+// conditions, so neither a stalled-but-near-EOF syncer nor an actively-catching-up one that is
+// still far behind is mislabeled:
+//
+//   - caughtUpLagTolerance bounds the residual tail. A busy source is appended between the
+//     tailer's polls, so its offset trails the live file by the last poll's worth of writes even
+//     while it keeps pace; that churn (bytes to low KB, occasionally more on a burst) must still
+//     read as caught up. A real backlog (many MB to GB) must not. 1 MiB sits well above per-poll
+//     churn and far below any genuine backlog. Requiring a SMALL lag -- not merely a fresh sync --
+//     is what makes CaughtUp false during the initial catch-up (LastSync is fresh on every poll
+//     while catching up, so freshness alone would read caught-up while still GB behind) and gives
+//     the early-advertise trigger a real false->true edge when the mirror reaches the tail.
+//   - caughtUpSyncFreshness bounds staleness. A syncer that has stalled stops making progress, so
+//     its LastSync goes stale and CaughtUp flips false once this window elapses even if it froze
+//     near EOF -- while LagBytes keeps reporting the true, growing backlog throughout. Sized well
+//     above the sub-second default poll interval so a healthy syncer never flaps.
+const (
+	caughtUpLagTolerance  = 1 << 20 // 1 MiB
+	caughtUpSyncFreshness = 10 * time.Second
+)
 
 // LiveStatuses snapshots each source's status, recomputing the lag against the LIVE file size:
 // a syncer's own snapshot measures lag right after a poll drains to EOF, so it reads ~0; a
 // stalled syncer whose offset is frozen while the schedd keeps appending must instead show a
-// growing LagBytes, not a misleading zero. CaughtUp allows a small residual lag as long as the
-// syncer synced recently (see caughtUpSyncFreshness), so a busy-but-keeping-pace queue does not
-// read as behind. Shared by the collector ad and the Prometheus exporter so both report the same
-// live-lag numbers.
+// growing LagBytes, not a misleading zero. CaughtUp is true when the residual lag is small AND
+// the sync is recent (see caughtUpLagTolerance / caughtUpSyncFreshness): a busy-but-keeping-pace
+// queue reads caught up over its churn tail, while a real backlog (large lag) or a stall (stale
+// sync) reads behind. Shared by the collector ad and the Prometheus exporter so both report the
+// same live-lag numbers.
 func LiveStatuses(sources func() []StatusSource) []scheddsync.SyncStatus {
 	if sources == nil {
 		return nil
@@ -81,7 +94,8 @@ func LiveStatuses(sources func() []StatusSource) []scheddsync.SyncStatus {
 					st.LagBytes = st.FileSize - st.Offset
 				}
 				st.CaughtUp = st.LagBytes == 0 ||
-					(!st.LastSync.IsZero() && now.Sub(st.LastSync) <= caughtUpSyncFreshness)
+					(st.LagBytes <= caughtUpLagTolerance &&
+						!st.LastSync.IsZero() && now.Sub(st.LastSync) <= caughtUpSyncFreshness)
 			}
 		}
 		out = append(out, st)
