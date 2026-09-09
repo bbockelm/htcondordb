@@ -25,7 +25,7 @@ func TestHandlerExposesStorageAndOpMetrics(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	Handler(cat, nil, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	Handler(t.Context(), cat, nil, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -80,7 +80,7 @@ func TestHandlerExposesSyncExporterAndImporterMetrics(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	Handler(cat, sources, exporters, importers).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	Handler(t.Context(), cat, sources, exporters, importers).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -89,6 +89,7 @@ func TestHandlerExposesSyncExporterAndImporterMetrics(t *testing.T) {
 	want := []string{
 		`htcondordb_sync_lag_bytes{kind="history",source=""} 200`,
 		`htcondordb_sync_caught_up{kind="history",source=""} 0`,
+		`htcondordb_sync_behind_seconds_total{kind="history",source=""} `, // present (value grows over time)
 		`htcondordb_sync_resyncs_total{kind="history",source=""} 2`,
 		`htcondordb_exporter_up{exporter="jobs-os",kind="opensearch"} 1`,
 		`htcondordb_exporter_restarts_total{exporter="jobs-os",kind="opensearch"} 1`,
@@ -145,7 +146,7 @@ func TestHandlerExposesArchiveMetrics(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	Handler(cat, nil, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	Handler(t.Context(), cat, nil, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -168,5 +169,34 @@ func TestHandlerExposesArchiveMetrics(t *testing.T) {
 	// that cannot exhaust its mapping budget, which is the opposite of the truth.
 	if strings.Contains(body, `htcondordb_segments{table="history"} 0`) {
 		t.Error("archive segment count reported as 0 despite multiple segments")
+	}
+}
+
+// TestBehindTrackerIntegratesTimeBehind checks the accumulator adds wall time only for sources
+// that are NOT caught up, and reports 0 (present, not absent) for a caught-up source.
+func TestBehindTrackerIntegratesTimeBehind(t *testing.T) {
+	sources := func() []dbad.StatusSource {
+		// No Source path, so LiveStatuses leaves CaughtUp as set here (no live stat).
+		return []dbad.StatusSource{
+			fakeSource{st: scheddsync.SyncStatus{Kind: "jobs", CaughtUp: false}},   // behind
+			fakeSource{st: scheddsync.SyncStatus{Kind: "history", CaughtUp: true}}, // caught up
+		}
+	}
+	b := newBehindTracker(sources)
+	base := time.Unix(1_000_000, 0)
+	b.sample(base)                      // seed: dt=0, both series created at 0
+	b.sample(base.Add(3 * time.Second)) // dt=3: behind +3, caught-up +0
+	b.sample(base.Add(5 * time.Second)) // dt=2: behind +2 -> 5 total
+
+	behind := sourceKey{"jobs", ""}
+	up := sourceKey{"history", ""}
+	if got := b.total[behind]; got != 5 {
+		t.Errorf("behind source accumulated %v s, want 5", got)
+	}
+	if _, ok := b.total[up]; !ok {
+		t.Error("caught-up source should still have a (zero) series")
+	}
+	if got := b.total[up]; got != 0 {
+		t.Errorf("caught-up source accumulated %v s, want 0", got)
 	}
 }

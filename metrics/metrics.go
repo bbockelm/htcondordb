@@ -6,11 +6,14 @@
 package metrics
 
 import (
+	"context"
 	"fmt"
-	"github.com/PelicanPlatform/classad/collections"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -419,15 +422,112 @@ func b2f(b bool) float64 {
 	return 0
 }
 
+// behindSampleInterval is how often the behindTracker samples source state to integrate
+// time-behind. Short so a brief behind episode between Prometheus scrapes is still counted;
+// cheap (in-memory status snapshots plus one stat per source).
+const behindSampleInterval = time.Second
+
+// sourceKey identifies a sync source for the time-behind accumulator.
+type sourceKey struct{ kind, source string }
+
+// behindTracker integrates, per sync source, the wall-clock time the source is NOT caught up
+// (the caught-up definition is dbad.LiveStatuses': a small residual lag AND a fresh sync). It
+// answers "how much time has the mirror spent behind" -- a question a point-in-time lag gauge
+// cannot: rate() of the counter is the fraction of time behind, and its delta over a range is the
+// seconds behind in that range.
+//
+// Prometheus pulls, so nothing runs between scrapes; a background sampler (Run) accumulates the
+// integral at behindSampleInterval, and Collect folds in the sliver since the last sample so a
+// scrape is never stale. Sampling on a fixed cadence (not only per scrape) is what lets it count a
+// behind episode that starts and ends entirely between two scrapes.
+type behindTracker struct {
+	sources func() []dbad.StatusSource
+	desc    *prometheus.Desc
+
+	mu       sync.Mutex
+	total    map[sourceKey]float64 // cumulative seconds behind
+	lastTick time.Time
+}
+
+func newBehindTracker(sources func() []dbad.StatusSource) *behindTracker {
+	return &behindTracker{
+		sources: sources,
+		total:   map[sourceKey]float64{},
+		desc: prometheus.NewDesc(namespace+"_sync_behind_seconds_total",
+			"Cumulative wall-clock seconds the schedd-sync tailer has spent NOT caught up (a real lag or a stalled sync), by kind and source. rate() gives the fraction of time behind; the counter's delta over a range gives the seconds behind in that range.",
+			[]string{"kind", "source"}, nil),
+	}
+}
+
+// sample adds the time since the previous sample to every source currently behind, and ensures a
+// series exists (at its current total) for every source seen -- so a caught-up source still
+// reports 0 rather than being absent.
+func (b *behindTracker) sample(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var dt float64
+	if !b.lastTick.IsZero() {
+		dt = now.Sub(b.lastTick).Seconds()
+	}
+	b.lastTick = now
+	if b.sources == nil {
+		return
+	}
+	for _, s := range dbad.LiveStatuses(b.sources) {
+		if s.Kind == "" {
+			continue // not yet reporting
+		}
+		k := sourceKey{s.Kind, s.Source}
+		cur := b.total[k] // 0 if unseen; also registers the series
+		if dt > 0 && !s.CaughtUp {
+			cur += dt
+		}
+		b.total[k] = cur
+	}
+}
+
+// Run samples on a fixed cadence until ctx is cancelled.
+func (b *behindTracker) Run(ctx context.Context) {
+	b.sample(time.Now()) // seed lastTick so the first interval is measured, not counted
+	t := time.NewTicker(behindSampleInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			b.sample(now)
+		}
+	}
+}
+
+func (b *behindTracker) Describe(chan<- *prometheus.Desc) {}
+
+func (b *behindTracker) Collect(ch chan<- prometheus.Metric) {
+	b.sample(time.Now()) // fold the sliver since the last tick so the scrape is current
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for k, v := range b.total {
+		ch <- prometheus.MustNewConstMetric(b.desc, prometheus.CounterValue, v, k.kind, k.source)
+	}
+}
+
 // Handler returns an http.Handler serving Prometheus metrics for the catalog: the
 // per-table storage gauges and operational timing counters above, the materialized-view
 // gauges, the schedd-sync + exporter health gauges, plus the standard Go runtime and process
 // (RSS, open FDs, ...) collectors. sources, exporters, and importers may be nil (their metric
 // families are then simply absent). It uses a private registry so it can be mounted without
 // global-registry collisions.
-func Handler(cat *db.Catalog, sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus, importers func() []dbad.ImporterStatus) http.Handler {
+func Handler(ctx context.Context, cat *db.Catalog, sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus, importers func() []dbad.ImporterStatus) http.Handler {
+	// Integrate per-source time-behind in the background (Prometheus runs nothing between scrapes),
+	// stopped when ctx is cancelled. Registered as its own collector so the counter carries the
+	// same kind/source labels as the sync gauges.
+	behind := newBehindTracker(sources)
+	go behind.Run(ctx)
+
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
+		behind,
 		// Store integrity, deliberately process-wide rather than per table: it counts bucket-chain links that
 		// named a segment the shard does not have, which is a segment-LIFETIME bug -- a reader walking a
 		// mapping it did not hold alive -- and not a property of any one table's data.
