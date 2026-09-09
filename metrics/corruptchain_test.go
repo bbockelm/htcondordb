@@ -21,7 +21,7 @@ func TestCorruptChainLinksIsScrapeable(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	Handler(cat, nil, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	Handler(t.Context(), cat, nil, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	body := rec.Body.String()
 
 	const name = "htcondordb_store_corrupt_chain_links_total"
