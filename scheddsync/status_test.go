@@ -2,11 +2,51 @@ package scheddsync
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 )
+
+// TestJobSyncTrackBehind drives the behind-episode state machine: a small lag is not an episode; a
+// large lag starts one but does not log until behindLogThreshold; it tracks the peak; and recovery
+// clears it.
+func TestJobSyncTrackBehind(t *testing.T) {
+	s := &JobSync{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	base := time.Unix(1_000_000, 0)
+
+	s.trackBehind(base, 1024) // below behindLagThreshold -> not behind
+	if !s.behindSince.IsZero() {
+		t.Fatal("a small (churn) lag should not start an episode")
+	}
+
+	s.trackBehind(base.Add(time.Second), 5<<20) // large lag -> episode starts
+	if s.behindSince.IsZero() {
+		t.Fatal("a large lag should start an episode")
+	}
+	if s.behindLogged {
+		t.Fatal("must not log before behindLogThreshold elapses")
+	}
+
+	s.trackBehind(base.Add(2*time.Second), 9<<20) // peak grows
+	if s.behindPeak != 9<<20 {
+		t.Errorf("peak = %d, want %d", s.behindPeak, 9<<20)
+	}
+
+	// behindLogThreshold after the episode START (base+1s): fires the one-shot WARN.
+	s.trackBehind(base.Add(time.Second+behindLogThreshold), 6<<20)
+	if !s.behindLogged {
+		t.Fatal("should log once the source has been behind for behindLogThreshold")
+	}
+
+	s.trackBehind(base.Add(time.Minute), 0) // recovered
+	if !s.behindSince.IsZero() || s.behindLogged || s.behindPeak != 0 {
+		t.Fatal("recovery should clear the episode")
+	}
+}
 
 // TestJobSyncStatus: after a poll drains to EOF the status reports progress and caught-up, and
 // Status() is safe to call concurrently with a running Poll (run under -race).

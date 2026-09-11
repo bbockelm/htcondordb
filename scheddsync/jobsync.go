@@ -34,6 +34,22 @@ const KeyAttr = "Key"
 // DefaultPollInterval is how often job_queue.log is polled when unset.
 const DefaultPollInterval = 200 * time.Millisecond
 
+const (
+	// slowCommitThreshold is how slow a single incremental commit must be to warrant a WARN, so a
+	// stall (fsync spike, a Truncate/Restore holding the DB lock, write-lock contention) is visible
+	// in the log at the moment it happens rather than only as a metric an operator has to be
+	// watching. Steady commits are sub-millisecond; 1s is unambiguously abnormal.
+	slowCommitThreshold = time.Second
+	// behindLagThreshold is the unconsumed-tail size above which the tailer is considered "behind"
+	// for episode logging -- matched to dbad's caught-up lag tolerance so the log and the
+	// sync_behind_seconds_total metric agree on what "behind" means. Below it is expected churn.
+	behindLagThreshold = 1 << 20 // 1 MiB
+	// behindLogThreshold is how long a source must stay behind before the one-shot "falling behind"
+	// WARN fires -- so a brief backlog (a burst the tailer drains in a second) stays quiet and only
+	// a sustained lag is surfaced.
+	behindLogThreshold = 10 * time.Second
+)
+
 // JobSync tails a schedd job_queue.log and applies its committed changes to a mutable DB
 // table. It reuses classadlog's parser/prober for parsing + rotation detection, but keeps
 // no in-memory copy of the queue -- the DB table is the materialized state.
@@ -118,6 +134,24 @@ type JobSync struct {
 	// mConflicts counts commit ConflictErrors recovered by the rewind-and-retry path (see Poll's
 	// ProbeAddition handling). Observe-only.
 	mConflicts atomic.Int64
+
+	// mCommitNanos, mPollNanos, mReconcileNanos are cumulative wall-clock time (nanoseconds) the
+	// tailer spent committing (incremental commitAll), in Poll overall, and in full reconcile
+	// reloads -- surfaced as *_seconds_total counters so an operator can see WHERE a behind tailer
+	// spends its time (commit-bound vs read-bound vs reconciling). Read/apply time is derivable as
+	// poll - commit - reconcile.
+	mCommitNanos    atomic.Int64
+	mPollNanos      atomic.Int64
+	mReconcileNanos atomic.Int64
+
+	// behindSince/behindPeak/behindLogged track a "falling behind" episode for edge-triggered
+	// logging: set when the live lag first exceeds behindLagThreshold, cleared when it recovers.
+	// Touched only from the sync goroutine (publishStatus), so no lock. behindLogged makes the
+	// "behind" WARN fire at most once per episode (after behindLogThreshold), with a paired
+	// "caught up" INFO on recovery carrying the episode duration and peak lag.
+	behindSince  time.Time
+	behindPeak   int64
+	behindLogged bool
 
 	// persistedOffset is the durable resume position -- the offset a restart would resume from,
 	// tracked in memory so a commit conflict can rewind to it. It is only ever a transaction
@@ -279,6 +313,8 @@ func (s *JobSync) Run(ctx context.Context) error {
 // Poll probes the log and applies any new committed changes. Exported for synchronous
 // control in tests.
 func (s *JobSync) Poll(ctx context.Context) error {
+	start := nowFn()
+	defer func() { s.mPollNanos.Add(int64(nowFn().Sub(start))) }()
 	if !s.restored {
 		if err := s.restore(ctx); err != nil {
 			return err
@@ -393,6 +429,8 @@ func (s *JobSync) handleCommitConflict(ctx context.Context, conflict *db.Conflic
 // checkpointed only after the sweep commits, so a crash mid-reload re-runs the idempotent
 // reconcile rather than resuming past an unfinished table.
 func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
+	start := nowFn()
+	defer func() { s.mReconcileNanos.Add(int64(nowFn().Sub(start))) }()
 	s.mReconciles.Add(1) // observe-only: confirms how often the full-reload path fires
 	s.abort()
 	s.children = map[string]map[string]struct{}{}
@@ -489,6 +527,12 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	}
 	s.captureLogMeta() // the leading 107 sequence header (offset was reset to 0)
 	s.checkpoint()     // position recorded only after the reconciled table matches the log
+	// A reconcile is a full non-incremental replay, forced when the schedd rotated/compacted its
+	// log -- the tailer is "behind" for its whole duration, so log it (with the delta) to explain a
+	// periodic behind that lines up with the schedd's compaction cadence.
+	s.log.Info("scheddsync: reconcile reload (source rotated/compacted)",
+		"seconds", nowFn().Sub(start).Seconds(),
+		"jobs_before", len(beforeJobs), "jobs_after", s.target.Len(), "writes", rec.n)
 	s.publishStatus(true)
 	return nil
 }
@@ -1310,8 +1354,12 @@ func (s *JobSync) ensureTx(table *db.DB) *db.Txn {
 }
 
 // commitAll commits every open per-table transaction (the tables are independent, so order does
-// not matter) and clears the set. It returns the first commit error, if any.
+// not matter) and clears the set. It returns the first commit error, if any. It records the commit
+// wall time (mCommitNanos) and WARNs on a commit slower than slowCommitThreshold, so a DB-side
+// stall behind a commit is visible in the log at the moment it happens.
 func (s *JobSync) commitAll() error {
+	n := len(s.txs)
+	start := nowFn()
 	var firstErr error
 	for _, tx := range s.txs {
 		if err := tx.Commit(); err != nil && firstErr == nil {
@@ -1320,6 +1368,14 @@ func (s *JobSync) commitAll() error {
 	}
 	s.txs = map[*db.DB]*db.Txn{}
 	s.explicit = false
+	if n > 0 {
+		took := nowFn().Sub(start)
+		s.mCommitNanos.Add(int64(took))
+		if took >= slowCommitThreshold {
+			s.log.Warn("scheddsync: slow job commit",
+				"seconds", took.Seconds(), "tables", n, "offset", s.parser.GetNextOffset())
+		}
+	}
 	return firstErr
 }
 

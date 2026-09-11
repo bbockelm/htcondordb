@@ -91,6 +91,9 @@ func TestHandlerExposesSyncExporterAndImporterMetrics(t *testing.T) {
 		`htcondordb_sync_caught_up{kind="history",source=""} 0`,
 		`htcondordb_sync_behind_seconds_total{kind="history",source=""} `, // present (value grows over time)
 		`htcondordb_sync_resyncs_total{kind="history",source=""} 2`,
+		`htcondordb_sync_commit_seconds_total{kind="history",source=""} 0`,
+		`htcondordb_sync_poll_seconds_total{kind="history",source=""} 0`,
+		`htcondordb_sync_reconcile_seconds_total{kind="history",source=""} 0`,
 		`htcondordb_exporter_up{exporter="jobs-os",kind="opensearch"} 1`,
 		`htcondordb_exporter_restarts_total{exporter="jobs-os",kind="opensearch"} 1`,
 		`htcondordb_exporter_docs_indexed_total{exporter="jobs-os",kind="opensearch"} 4200`,
