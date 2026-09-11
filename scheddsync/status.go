@@ -29,6 +29,15 @@ type SyncStatus struct {
 	// often the full-reload path actually fires (expected: ~once per compaction, i.e. rare).
 	SetAttrAbsentKey int64 // Set/DeleteAttribute ops whose target key was absent when applied
 	Reconciles       int64 // reconcileReload runs (full-replay-and-sweep)
+
+	// Cumulative wall-clock time the tailer has spent, to localize WHERE a behind tailer's time
+	// goes (surfaced as *_seconds_total counters). CommitSeconds is incremental commits only;
+	// ReconcileSeconds is full reloads; PollSeconds is every poll (read+apply+commit+probe), so
+	// read/apply time is PollSeconds - CommitSeconds - ReconcileSeconds. Job source only (history
+	// appends self-persist and are not timed here); zero on the history source.
+	CommitSeconds    float64
+	PollSeconds      float64
+	ReconcileSeconds float64
 }
 
 // Status exposes the latest published snapshot (zero value before the first read pass). Both
@@ -59,19 +68,50 @@ func lagAndFile(path string, offset int64) (size, lag int64) {
 // data, refreshing LastSync. It preserves the accumulated LastSync/Resyncs/LastResync across
 // snapshots. Called only from the sync goroutine.
 func (s *JobSync) publishStatus(progressed bool) {
+	now := nowFn()
 	off := s.parser.GetNextOffset()
 	src := s.parser.GetFilename()
 	size, lag := lagAndFile(src, off)
 	st := SyncStatus{Kind: "job_queue.log", Source: src, Offset: off, FileSize: size, LagBytes: lag, CaughtUp: lag == 0}
 	st.SetAttrAbsentKey = s.mAbsentKey.Load()
 	st.Reconciles = s.mReconciles.Load()
+	st.CommitSeconds = float64(s.mCommitNanos.Load()) / 1e9
+	st.PollSeconds = float64(s.mPollNanos.Load()) / 1e9
+	st.ReconcileSeconds = float64(s.mReconcileNanos.Load()) / 1e9
 	if prev := s.status.Load(); prev != nil {
 		st.LastSync = prev.LastSync
 	}
 	if progressed {
-		st.LastSync = nowFn()
+		st.LastSync = now
 	}
+	s.trackBehind(now, lag)
 	s.status.Store(&st)
+}
+
+// trackBehind edge-logs a "falling behind" episode: it WARNs once when the source has been behind
+// (lag over behindLagThreshold) for at least behindLogThreshold, and INFOs on recovery with the
+// episode duration and peak lag. Called only from the sync goroutine (publishStatus), so its
+// episode fields need no lock. This is the human-readable companion to sync_behind_seconds_total.
+func (s *JobSync) trackBehind(now time.Time, lag int64) {
+	if lag > behindLagThreshold {
+		if s.behindSince.IsZero() {
+			s.behindSince, s.behindPeak = now, lag
+		}
+		if lag > s.behindPeak {
+			s.behindPeak = lag
+		}
+		if !s.behindLogged && now.Sub(s.behindSince) >= behindLogThreshold {
+			s.log.Warn("scheddsync: job mirror falling behind",
+				"behind_seconds", now.Sub(s.behindSince).Seconds(), "lag_bytes", lag)
+			s.behindLogged = true
+		}
+		return
+	}
+	if s.behindLogged { // recovered from a logged episode
+		s.log.Info("scheddsync: job mirror caught up",
+			"behind_seconds", now.Sub(s.behindSince).Seconds(), "peak_lag_bytes", s.behindPeak)
+	}
+	s.behindSince, s.behindPeak, s.behindLogged = time.Time{}, 0, false
 }
 
 func (s *HistorySync) publishStatus(progressed bool) {

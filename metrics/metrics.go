@@ -284,27 +284,30 @@ type syncCollector struct {
 	exporters func() []dbad.ExporterStatus
 	importers func() []dbad.ImporterStatus
 
-	syncLag        *prometheus.Desc
-	syncCaughtUp   *prometheus.Desc
-	syncFileSize   *prometheus.Desc
-	syncOffset     *prometheus.Desc
-	syncLastTime   *prometheus.Desc
-	syncResyncs    *prometheus.Desc
-	syncAbsentKey  *prometheus.Desc
-	syncReconciles *prometheus.Desc
-	expUp          *prometheus.Desc
-	expRestarts    *prometheus.Desc
-	expIndexed     *prometheus.Desc
-	expSkipped     *prometheus.Desc
-	expInFlight    *prometheus.Desc
-	expLastBeat    *prometheus.Desc
-	impUp          *prometheus.Desc
-	impRestarts    *prometheus.Desc
-	impImported    *prometheus.Desc
-	impSchedds     *prometheus.Desc
-	impFailures    *prometheus.Desc
-	impLastBeat    *prometheus.Desc
-	impLastCycle   *prometheus.Desc
+	syncLag          *prometheus.Desc
+	syncCaughtUp     *prometheus.Desc
+	syncFileSize     *prometheus.Desc
+	syncOffset       *prometheus.Desc
+	syncLastTime     *prometheus.Desc
+	syncResyncs      *prometheus.Desc
+	syncAbsentKey    *prometheus.Desc
+	syncReconciles   *prometheus.Desc
+	syncCommitSecs   *prometheus.Desc
+	syncPollSecs     *prometheus.Desc
+	syncReconcileSec *prometheus.Desc
+	expUp            *prometheus.Desc
+	expRestarts      *prometheus.Desc
+	expIndexed       *prometheus.Desc
+	expSkipped       *prometheus.Desc
+	expInFlight      *prometheus.Desc
+	expLastBeat      *prometheus.Desc
+	impUp            *prometheus.Desc
+	impRestarts      *prometheus.Desc
+	impImported      *prometheus.Desc
+	impSchedds       *prometheus.Desc
+	impFailures      *prometheus.Desc
+	impLastBeat      *prometheus.Desc
+	impLastCycle     *prometheus.Desc
 }
 
 func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus, importers func() []dbad.ImporterStatus) *syncCollector {
@@ -331,6 +334,12 @@ func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dba
 			"Set/DeleteAttribute ops the schedd-sync tailer applied to a key not present in its view, by kind and source. Each fabricates an identity-less 'orphan' ad (only the update's attributes); a valid log writes a key's NewClassAd first, so this should be ~0. A climbing value localizes partial-ad churn to updates landing on unresolvable keys.", sync, nil),
 		syncReconciles: prometheus.NewDesc(namespace+"_sync_reconciles_total",
 			"Full reconcile-reload runs the schedd-sync tailer has performed (replay + sweep), by kind and source. Expected to be rare (about one per source-file compaction).", sync, nil),
+		syncCommitSecs: prometheus.NewDesc(namespace+"_sync_commit_seconds_total",
+			"Cumulative wall-clock seconds the schedd-sync tailer spent in incremental commits, by kind and source. rate() rising during a behind period (vs poll_seconds) means the tailer is commit-bound -- a DB-side stall (fsync spike, write-lock contention, a Truncate/Restore holding the DB lock); cross-check the op_seconds_total{op=\"commit_sync\"/\"snapshot_lock\"/...} series.", sync, nil),
+		syncPollSecs: prometheus.NewDesc(namespace+"_sync_poll_seconds_total",
+			"Cumulative wall-clock seconds the schedd-sync tailer spent in poll passes (read+apply+commit+probe), by kind and source. poll_seconds - commit_seconds - reconcile_seconds is the read/apply time.", sync, nil),
+		syncReconcileSec: prometheus.NewDesc(namespace+"_sync_reconcile_seconds_total",
+			"Cumulative wall-clock seconds the schedd-sync tailer spent in full reconcile reloads (a source rotation/compaction forces a non-incremental replay), by kind and source. A behind period that lines up with rate(reconcile_seconds) rising is the schedd compacting its log, not a DB stall.", sync, nil),
 		expUp: prometheus.NewDesc(namespace+"_exporter_up",
 			"1 if the daemon-managed change-data exporter process is running, else 0, by exporter and kind.", exp, nil),
 		expRestarts: prometheus.NewDesc(namespace+"_exporter_restarts_total",
@@ -378,6 +387,9 @@ func (c *syncCollector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(c.syncResyncs, prometheus.CounterValue, float64(s.Resyncs), s.Kind, s.Source)
 			ch <- prometheus.MustNewConstMetric(c.syncAbsentKey, prometheus.CounterValue, float64(s.SetAttrAbsentKey), s.Kind, s.Source)
 			ch <- prometheus.MustNewConstMetric(c.syncReconciles, prometheus.CounterValue, float64(s.Reconciles), s.Kind, s.Source)
+			ch <- prometheus.MustNewConstMetric(c.syncCommitSecs, prometheus.CounterValue, s.CommitSeconds, s.Kind, s.Source)
+			ch <- prometheus.MustNewConstMetric(c.syncPollSecs, prometheus.CounterValue, s.PollSeconds, s.Kind, s.Source)
+			ch <- prometheus.MustNewConstMetric(c.syncReconcileSec, prometheus.CounterValue, s.ReconcileSeconds, s.Kind, s.Source)
 		}
 	}
 	if c.exporters != nil {
