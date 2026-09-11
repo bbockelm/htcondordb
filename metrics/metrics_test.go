@@ -38,6 +38,7 @@ func TestHandlerExposesStorageAndOpMetrics(t *testing.T) {
 		`htcondordb_op_ops_total{op="shard_write_hold",table="Machine"}`,
 		`htcondordb_op_seconds_total{op="sync",table="Machine"}`,
 		`htcondordb_op_ops_total{op="snapshot_lock",table="Machine"}`,
+		`htcondordb_op_seconds_total{op="snapshot_lock_wait",table="Machine"}`,
 	}
 	for _, w := range want {
 		if !strings.Contains(body, w) {

@@ -81,7 +81,7 @@ func newCatalogCollector(cat *db.Catalog) *catalogCollector {
 		segments: prometheus.NewDesc(namespace+"_segments",
 			"Number of arena segments, by table.", tbl, nil),
 		opSeconds: prometheus.NewDesc(namespace+"_op_seconds_total",
-			"Cumulative wall time spent in each store stall point (shard write lock wait/hold, segment allocation, durability sync, compaction/retrain/reindex, snapshot lock), by table and op.", tblOp, nil),
+			"Cumulative wall time spent in each store stall point (shard write lock wait/hold, segment allocation, durability sync, compaction/retrain/reindex, snapshot lock hold and the wait behind it), by table and op.", tblOp, nil),
 		opOps: prometheus.NewDesc(namespace+"_op_ops_total",
 			"Cumulative number of times each store stall point ran, by table and op. Divide op_seconds_total by this for mean latency.", tblOp, nil),
 		staleIndex: prometheus.NewDesc(namespace+"_stale_index_segments",
@@ -184,6 +184,7 @@ func opStatList(o db.OpStats) []struct {
 		{"retrain", o.Retrain},
 		{"reindex", o.Reindex},
 		{"snapshot_lock", o.SnapshotLock},
+		{"snapshot_lock_wait", o.SnapshotLockWait},
 	}
 }
 
