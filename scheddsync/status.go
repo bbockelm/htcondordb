@@ -17,7 +17,7 @@ type SyncStatus struct {
 	FileSize   int64     // current size of the current source file
 	LagBytes   int64     // unconsumed tail of the current file (FileSize-Offset, clamped >= 0)
 	CaughtUp   bool      // the last read pass reached end of file
-	LastSync   time.Time // wall-clock of the last read pass that made progress
+	LastSync   time.Time // wall-clock of the last read pass that verified the mirror against the source
 	Resyncs    int64     // cumulative durability-gap (resync) events seen (history only)
 	LastResync time.Time // time of the most recent resync event, zero if none
 
@@ -64,8 +64,9 @@ func lagAndFile(path string, offset int64) (size, lag int64) {
 	return size, lag
 }
 
-// publishStatus atomically stores a fresh snapshot. progressed marks a read pass that consumed
-// data, refreshing LastSync. It preserves the accumulated LastSync/Resyncs/LastResync across
+// publishStatus atomically stores a fresh snapshot. progressed marks a read pass that verified the
+// mirror against its source -- one that applied records, or one that confirmed there were none to
+// apply -- refreshing LastSync. It preserves the accumulated LastSync/Resyncs/LastResync across
 // snapshots. Called only from the sync goroutine.
 func (s *JobSync) publishStatus(progressed bool) {
 	now := nowFn()
