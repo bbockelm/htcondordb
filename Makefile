@@ -102,8 +102,16 @@ test: ## Run the test suite
 vet: ## Static checks
 	$(GOENV) $(GO) vet ./...
 
-tidy: ## Reconcile go.mod / go.sum
+tidy: ## Reconcile go.mod / go.sum (both modules)
 	$(GOENV) $(GO) mod tidy
+	# grafana/ is a separate module that requires this one (via a
+	# ../ replace) plus the same classad/cedar/golang-htcondor
+	# versions. Bumping a dependency here leaves it behind, and its
+	# CI job runs with -mod=readonly, so the drift surfaces there as
+	# "updates to go.mod needed, disabled by -mod=readonly" rather
+	# than anywhere near the change that caused it. Tidying both
+	# together is what keeps them in step.
+	cd grafana && $(GOENV) $(GO) mod tidy
 
 clean: ## Remove built binaries
 	rm -rf $(BIN_DIR)
