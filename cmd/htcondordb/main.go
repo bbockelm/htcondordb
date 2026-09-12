@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/bbockelm/cedar/security"
@@ -418,7 +419,14 @@ func run() error {
 	syncSources := func() []dbad.StatusSource {
 		return append(syncMgr.Sources(), mirrorMgr.Sources()...)
 	}
-	startCollectorAdvertise(ctx, d, cfg, svc, advertisedAddr(d, ln), syncSources, expMgr.Statuses, impMgr.Statuses)
+	dbAugment := dbad.Augment(svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, advertisedAddr(d, ln))
+	startCollectorAdvertise(ctx, d, cfg, syncSources, dbAugment)
+
+	// Point-to-point sync health (DBSyncStatus): answer the same ad over the command port. A
+	// client that found this daemon through its address file has no collector to read the
+	// advertisement from, and a reader that must not trust a mirror which has fallen behind needs
+	// that health before it queries. Same ad, so one parser serves both paths.
+	registerSyncStatus(srv, d.PublishAd, dbAugment)
 
 	// Start any background HA machinery (a follower's replicator, or the raft
 	// coordinator and its command handlers in consistent mode).
@@ -541,7 +549,7 @@ func encryptionConfig(cfg *config.Config) (poolKeys []db.KEK, attrs []string, er
 // explicitly disabled (HTCONDORDB_ADVERTISE=false). The ad carries the daemon's command
 // address for discovery plus per-table storage gauges and per-source sync health for
 // monitoring.
-func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, addr string, sourcesFunc func() []dbad.StatusSource, exportersFunc func() []dbad.ExporterStatus, importersFunc func() []dbad.ImporterStatus) {
+func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.Config, sourcesFunc func() []dbad.StatusSource, augment func(*classad.ClassAd)) {
 	if v := getStr(cfg, "HTCONDORDB_ADVERTISE"); strings.TrimSpace(v) != "" && !configBool(cfg, "HTCONDORDB_ADVERTISE") {
 		return // explicitly disabled
 	}
@@ -557,7 +565,7 @@ func startCollectorAdvertise(ctx context.Context, d *daemon.Daemon, cfg *config.
 	go runCaughtUpTrigger(ctx, sourcesFunc, trigger)
 	go d.Advertise(ctx, daemon.AdvertiseConfig{
 		MyType:  dbad.AdType,
-		Augment: dbad.Augment(svc.Catalog(), sourcesFunc, exportersFunc, importersFunc, addr),
+		Augment: augment,
 		Trigger: trigger,
 		Logger:  d.Slog(),
 	})
