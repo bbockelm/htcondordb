@@ -41,4 +41,18 @@ const (
 	// request/response protocol. Currently: resync a source (re-read/re-export from the start).
 	// DAEMON-level; registered in every mode (not just HA).
 	DBSyncControl = Base + 4 // 74004
+
+	// DBSyncStatus reports the daemon's per-source sync health -- how far behind each schedd-sync
+	// tailer is, when it last synced, and whether it hit a durability gap -- as a ClassAd shaped
+	// exactly like the one the daemon advertises to the collector.
+	//
+	// This exists because the collector ad is not always reachable. A client that finds the daemon
+	// through its address file (no collector in the picture) can read the command address but has
+	// nowhere to learn freshness from, and a client that must not read a mirror that has fallen
+	// behind then has no way to tell. Asking the daemon directly, over the connection it already
+	// has, closes that gap.
+	//
+	// READ-level, unlike the DAEMON-level DBSyncControl above: this only reads health, and the
+	// clients that need it (readers deciding whether to trust the mirror) are readers.
+	DBSyncStatus = Base + 5 // 74005
 )
