@@ -115,6 +115,10 @@ type scheddSyncSettings struct {
 	// wants a less chatty mirror (or a more responsive one) had no way to say so.
 	pollInterval    time.Duration
 	idleMaxInterval time.Duration
+	// disableNotify turns off the filesystem watch that wakes a tailer before its next
+	// scheduled poll. The watch never changes what gets noticed, only how soon, so this is
+	// an escape hatch for a host where inotify misbehaves -- not a tuning knob.
+	disableNotify bool
 
 	// History-archive tuning. archiveSegSize applies only when the archive is first
 	// created (archiveconfig.json is authoritative on reopen); the index attributes and the
@@ -164,6 +168,9 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		// Tailer cadence. Unset leaves the package defaults (200ms base, 2s idle cap).
 		pollInterval:    scheddSyncMillis(cfg, "HTCONDORDB_SCHEDDSYNC_POLL_MS"),
 		idleMaxInterval: scheddSyncMillis(cfg, "HTCONDORDB_SCHEDDSYNC_IDLE_MAX_MS"),
+		// Default on: a watch that cannot be established degrades to polling by itself, so
+		// the only reason to set this is a host where it establishes and then misleads.
+		disableNotify: configBool(cfg, "HTCONDORDB_SCHEDDSYNC_DISABLE_NOTIFY"),
 
 		archiveSegSize: segSize,
 		// Unlike the segment size this can be changed on an existing archive -- see
@@ -435,7 +442,8 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{
 			Filename: s.jobLog, Logger: m.logger, Store: syncStore("jobs.pos"),
 			PollInterval: s.pollInterval, IdleMaxInterval: s.idleMaxInterval,
-			Users: users, Jobsets: jobsets, Clusters: clusters, Header: header,
+			DisableNotify: s.disableNotify,
+			Users:         users, Jobsets: jobsets, Clusters: clusters, Header: header,
 			ClusterPrivate: clusterprivate, LogMeta: logmeta,
 			SaveInterval: s.saveInterval,
 		})
@@ -473,6 +481,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			Filename:        s.histFile,
 			PollInterval:    s.pollInterval,
 			IdleMaxInterval: s.idleMaxInterval,
+			DisableNotify:   s.disableNotify,
 			Logger:          m.logger,
 			Store:           syncStore("history.pos"),
 			OnResync: func(ev scheddsync.ResyncEvent) {
@@ -506,6 +515,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			Filename:        s.epochFile,
 			PollInterval:    s.pollInterval,
 			IdleMaxInterval: s.idleMaxInterval,
+			DisableNotify:   s.disableNotify,
 			Logger:          m.logger,
 			Store:           syncStore("epoch.pos"),
 			OnResync: func(ev scheddsync.ResyncEvent) {

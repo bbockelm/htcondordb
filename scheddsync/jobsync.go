@@ -85,6 +85,8 @@ type JobSync struct {
 	// idleMax caps the backoff Run applies while the log is not moving. The base interval
 	// still governs how fast the mirror reacts once it is.
 	idleMax time.Duration
+	// noNotify disables the filesystem watch, leaving the tailer purely timer-driven.
+	noNotify bool
 	// saveInterval throttles position checkpoints on the steady append path (0 = save every
 	// batch); lastSaveAt is when the position was last durably saved.
 	saveInterval time.Duration
@@ -210,7 +212,11 @@ type JobSyncConfig struct {
 	// IdleMaxInterval caps the backoff applied while the log is not moving (default 2s).
 	// Set equal to PollInterval to poll at a fixed rate.
 	IdleMaxInterval time.Duration
-	Logger          *slog.Logger // default slog.Default()
+	// DisableNotify turns off the filesystem watch that lets an idle tailer react before
+	// its next scheduled poll. Polling is unaffected -- the watch never changes what gets
+	// noticed, only how soon -- so this is a safety valve, not a tuning knob.
+	DisableNotify bool
+	Logger        *slog.Logger // default slog.Default()
 	// Users, Jobsets, Clusters, Header, and ClusterPrivate are the sibling tables the non-proc
 	// job_queue.log namespaces flatten into (the jobs table is the NewJobSync target). When any is
 	// nil a private in-memory table stands in, so routing and cluster-ad chaining still work for
@@ -285,6 +291,7 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 		prober:         classadlog.NewProber(),
 		interval:       interval,
 		idleMax:        idleMax,
+		noNotify:       cfg.DisableNotify,
 		saveInterval:   cfg.SaveInterval,
 		log:            logger,
 		children:       map[string]map[string]struct{}{},
@@ -322,9 +329,21 @@ func (s *JobSync) Run(ctx context.Context) error {
 	// base rate for nothing. Doubling up to idleMaxInterval and snapping back to the base the
 	// instant a poll finds work keeps the busy-case latency the base interval buys, which is
 	// when a consumer actually notices it.
+	//
+	// A filesystem watch, where one is available, only ever makes a poll happen EARLIER --
+	// it is never what makes a change get noticed. See fileWatcher for the three ways
+	// inotify goes quiet; each of them degrades to the timer noticing on its next tick,
+	// which is the behavior with no watcher at all.
+	watcher := newWatcher(s.parser.GetFilename(), s.noNotify, s.log)
+	defer watcher.Close()
+
 	delay := s.interval
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
+	// time.Now, deliberately not nowFn: that package var is pinned to a fixed instant by
+	// tests exercising status freshness, which would freeze this pacing. Rate limiting the
+	// watch is wall-clock work and unrelated to what the status reports.
+	lastPoll := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -334,14 +353,26 @@ func (s *JobSync) Run(ctx context.Context) error {
 			s.checkpoint()
 			s.abort()
 			return ctx.Err()
-		case <-timer.C:
-			before := s.parser.GetNextOffset()
-			if err := s.Poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				s.log.Warn("job_queue.log poll failed", "err", err.Error())
+		case <-watcher.Changed():
+			// Rate-limit the watch to the polling interval. A busy schedd writes its log
+			// continuously, so events arrive far faster than 1/interval, and polling on each
+			// one would let the watch RAISE the poll rate well above what polling alone
+			// permits. Deferring to the interval boundary keeps the ceiling exactly where it
+			// was and spends the notification on latency instead -- an idle mirror reacts at
+			// once rather than after a backed-off wait.
+			if wait := s.interval - time.Since(lastPoll); wait > 0 {
+				timer.Reset(wait)
+				continue
 			}
-			delay = nextDelay(delay, s.interval, s.idleMax, s.parser.GetNextOffset() != before)
-			timer.Reset(delay)
+		case <-timer.C:
 		}
+		before := s.parser.GetNextOffset()
+		if err := s.Poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			s.log.Warn("job_queue.log poll failed", "err", err.Error())
+		}
+		lastPoll = time.Now()
+		delay = nextDelay(delay, s.interval, s.idleMax, s.parser.GetNextOffset() != before)
+		timer.Reset(delay)
 	}
 }
 

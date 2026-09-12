@@ -49,9 +49,11 @@ type HistorySync struct {
 	interval time.Duration
 	// idleMax caps the backoff applied while the file is not moving.
 	idleMax time.Duration
-	log     *slog.Logger
-	store   PositionStore
-	now     func() time.Time // ingest-time clock; overridable in tests
+	// noNotify disables the filesystem watch, leaving the tailer purely timer-driven.
+	noNotify bool
+	log      *slog.Logger
+	store    PositionStore
+	now      func() time.Time // ingest-time clock; overridable in tests
 
 	// The tailer is source-parameterized so the same append-only-file machinery
 	// (offset resume, rotation chain, recovery dedup) serves both the completed-job
@@ -119,7 +121,10 @@ type HistorySyncConfig struct {
 	// IdleMaxInterval caps the backoff applied while the file is not moving (default 2s).
 	// Set equal to PollInterval to poll at a fixed rate.
 	IdleMaxInterval time.Duration
-	Logger          *slog.Logger // default slog.Default()
+	// DisableNotify turns off the filesystem watch that lets an idle tailer react before its
+	// next scheduled poll. Polling is unaffected.
+	DisableNotify bool
+	Logger        *slog.Logger // default slog.Default()
 	// Store, if set, durably records the resume position so a restart resumes instead of
 	// re-appending the whole file, recovering across rotation via archive dedup.
 	Store PositionStore
@@ -154,7 +159,8 @@ func NewHistorySync(archive *db.ArchiveTable, cfg HistorySyncConfig) *HistorySyn
 		logger = slog.Default()
 	}
 	s := &HistorySync{
-		filename: cfg.Filename, archive: archive, interval: interval, idleMax: idleMax, log: logger,
+		filename: cfg.Filename, archive: archive, interval: interval, idleMax: idleMax,
+		noNotify: cfg.DisableNotify, log: logger,
 		store: cfg.Store, onResync: cfg.OnResync, now: time.Now,
 		kind:          "history",
 		keyConstraint: historyKeyConstraint,
@@ -197,22 +203,42 @@ func (s *HistorySync) Run(ctx context.Context) error {
 	// Back off while the file is quiet, snapping back to the base interval the moment it
 	// moves -- see JobSync.Run. Completed jobs arrive in bursts separated by long silences,
 	// so an idle history tailer polling at the busy rate is almost all of its lifetime.
+	//
+	// As in JobSync.Run, a filesystem watch only makes a poll happen earlier and is never
+	// what makes a change get noticed. It matters more here than for the job log: the
+	// history file is silent for long stretches, so a completed job would otherwise wait
+	// out a fully backed-off interval.
+	watcher := newWatcher(s.filename, s.noNotify, s.log)
+	defer watcher.Close()
+
 	delay := s.interval
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
+	// time.Now, deliberately not s.now: that clock stamps ingest times on records and tests
+	// pin it to a fixed instant, which would freeze this pacing. This is wall-clock rate
+	// limiting and has nothing to do with what timestamp a record gets.
+	lastPoll := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			s.close()
 			return ctx.Err()
-		case <-timer.C:
-			before := s.offset
-			if err := s.Poll(ctx); err != nil {
-				s.log.Warn("history poll failed", "err", err.Error())
+		case <-watcher.Changed():
+			// Held to the polling interval so the watch cannot raise the poll rate above
+			// what polling alone allows; see JobSync.Run.
+			if wait := s.interval - time.Since(lastPoll); wait > 0 {
+				timer.Reset(wait)
+				continue
 			}
-			delay = nextDelay(delay, s.interval, s.idleMax, s.offset != before)
-			timer.Reset(delay)
+		case <-timer.C:
 		}
+		before := s.offset
+		if err := s.Poll(ctx); err != nil {
+			s.log.Warn("history poll failed", "err", err.Error())
+		}
+		lastPoll = time.Now()
+		delay = nextDelay(delay, s.interval, s.idleMax, s.offset != before)
+		timer.Reset(delay)
 	}
 }
 
