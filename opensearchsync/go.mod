@@ -1,6 +1,6 @@
 module github.com/bbockelm/htcondordb/opensearchsync
 
-go 1.25.9
+go 1.26.0
 
 require (
 	github.com/PelicanPlatform/classad v0.29.9

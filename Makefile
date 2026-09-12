@@ -48,7 +48,7 @@ lib-check-linux: ## Compile the C client for Linux in a container (catches macOS
 	# same check without the round trip. Needs docker; the module cache is shared read-only.
 	docker run --rm -v "$(CURDIR)":/src:ro -v "$$(go env GOMODCACHE)":/gomod:ro -w /src \
 		-e GOWORK=off -e GOFLAGS=-mod=mod -e GOPROXY=off -e GOMODCACHE=/gomod \
-		golang:1.25 go build -buildmode=c-shared -o /tmp/libhtcondordb_client.so ./capi
+		golang:1.27 go build -buildmode=c-shared -o /tmp/libhtcondordb_client.so ./capi
 
 archive: ## Build the C client as a static archive (for C/C++ callers to link)
 	$(GOENV) $(GO) build -buildmode=c-archive -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/libhtcondordb_client.a ./capi
