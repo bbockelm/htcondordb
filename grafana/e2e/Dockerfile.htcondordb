@@ -1,7 +1,7 @@
 # Build the htcondordb server + CLI (standalone, tagged deps) and run them with a
 # permissive config + sample data, for the Grafana plugin E2E test.
 # Build context is the repo root (see docker-compose.e2e.yaml).
-FROM golang:1.25.7-bookworm AS build
+FROM golang:1.27.1-bookworm AS build
 WORKDIR /src
 COPY . .
 ENV GOWORK=off CGO_ENABLED=0
