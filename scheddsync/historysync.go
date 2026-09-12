@@ -572,7 +572,11 @@ func (s *HistorySync) drainToEOF() error {
 		s.processRecords(data)
 		s.checkpoint()
 	}
-	s.publishStatus(len(data) > 0)
+	// A drain that read nothing still verified the mirror against the source, so it refreshes
+	// LastSync exactly as one that read records does. Reporting freshness only when data arrives
+	// makes an idle source indistinguishable from a stalled one. This runs only with the file
+	// open, so a source whose file does not exist still reports no sync at all.
+	s.publishStatus(true)
 	return nil
 }
 

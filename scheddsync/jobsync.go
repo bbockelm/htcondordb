@@ -352,6 +352,13 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	}
 	switch result {
 	case classadlog.ProbeNoChange:
+		// Nothing new in the log -- but the probe just confirmed that, which is what a consumer
+		// gating on freshness needs to know. Republish so LastSync advances: without it an idle
+		// queue looks identical to a wedged tailer, the reported lag grows with the wall clock,
+		// and every consumer's staleness gate eventually closes against a mirror that is in fact
+		// exactly current. A tailer that has actually stopped stops probing, so this still leaves
+		// LastSync frozen in the case the gate exists to catch.
+		s.publishStatus(true)
 		return nil
 	case classadlog.ProbeCompressed:
 		return s.reconcileReload(ctx)
