@@ -31,8 +31,14 @@ import (
 // REPL can address the row for UPDATE/DELETE (its default key attribute is "Key").
 const KeyAttr = "Key"
 
-// DefaultPollInterval is how often job_queue.log is polled when unset.
+// DefaultPollInterval is how often job_queue.log is polled when unset -- and, with the idle
+// backoff, how fast it returns to polling once the log moves.
 const DefaultPollInterval = 200 * time.Millisecond
+
+// DefaultIdleMaxInterval is how far apart polls may drift while the log is quiet. It bounds
+// how stale a published status can get on an idle source, so it stays well inside any
+// consumer's freshness gate.
+const DefaultIdleMaxInterval = 2 * time.Second
 
 const (
 	// slowCommitThreshold is how slow a single incremental commit must be to warrant a WARN, so a
@@ -76,6 +82,9 @@ type JobSync struct {
 	parser   *classadlog.Parser
 	prober   *classadlog.Prober
 	interval time.Duration
+	// idleMax caps the backoff Run applies while the log is not moving. The base interval
+	// still governs how fast the mirror reacts once it is.
+	idleMax time.Duration
 	// saveInterval throttles position checkpoints on the steady append path (0 = save every
 	// batch); lastSaveAt is when the position was last durably saved.
 	saveInterval time.Duration
@@ -123,6 +132,11 @@ type JobSync struct {
 	// and falls back to the inode check.
 	curSeq  int64
 	haveSeq bool
+	// seqBuf is the scan buffer readLogSequence uses to read the 107 header. It is reused
+	// across polls: the header is re-read on EVERY poll (idle included), and allocating a
+	// fresh 64 KiB buffer each time was the single largest source of garbage in an
+	// otherwise-idle daemon.
+	seqBuf []byte
 
 	// mAbsentKey and mReconciles are observe-only diagnostic counters for the partial-ad ("orphan")
 	// investigation (see SyncStatus). mAbsentKey counts Set/DeleteAttribute ops applied to a key not
@@ -193,7 +207,10 @@ const reconcileBatch = 4096
 type JobSyncConfig struct {
 	Filename     string        // path to job_queue.log (required)
 	PollInterval time.Duration // default 200ms
-	Logger       *slog.Logger  // default slog.Default()
+	// IdleMaxInterval caps the backoff applied while the log is not moving (default 2s).
+	// Set equal to PollInterval to poll at a fixed rate.
+	IdleMaxInterval time.Duration
+	Logger          *slog.Logger // default slog.Default()
 	// Users, Jobsets, Clusters, Header, and ClusterPrivate are the sibling tables the non-proc
 	// job_queue.log namespaces flatten into (the jobs table is the NewJobSync target). When any is
 	// nil a private in-memory table stands in, so routing and cluster-ad chaining still work for
@@ -224,6 +241,13 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 	interval := cfg.PollInterval
 	if interval <= 0 {
 		interval = DefaultPollInterval
+	}
+	idleMax := cfg.IdleMaxInterval
+	if idleMax <= 0 {
+		idleMax = DefaultIdleMaxInterval
+	}
+	if idleMax < interval {
+		idleMax = interval
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -260,9 +284,11 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 		parser:         classadlog.NewParser(cfg.Filename),
 		prober:         classadlog.NewProber(),
 		interval:       interval,
+		idleMax:        idleMax,
 		saveInterval:   cfg.SaveInterval,
 		log:            logger,
 		children:       map[string]map[string]struct{}{},
+		seqBuf:         make([]byte, 0, 64*1024),
 		txs:            map[*db.DB]*db.Txn{},
 		store:          cfg.Store,
 	}
@@ -291,8 +317,14 @@ func (s *JobSync) Run(ctx context.Context) error {
 	if err := s.Poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		s.log.Warn("job_queue.log initial poll failed", "err", err.Error())
 	}
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
+	// Back off while the log is quiet. A mirror polls to bound staleness, and staleness only
+	// matters when something is changing -- so a schedd with nothing to say is charged the
+	// base rate for nothing. Doubling up to idleMaxInterval and snapping back to the base the
+	// instant a poll finds work keeps the busy-case latency the base interval buys, which is
+	// when a consumer actually notices it.
+	delay := s.interval
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -302,12 +334,35 @@ func (s *JobSync) Run(ctx context.Context) error {
 			s.checkpoint()
 			s.abort()
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
+			before := s.parser.GetNextOffset()
 			if err := s.Poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				s.log.Warn("job_queue.log poll failed", "err", err.Error())
 			}
+			delay = nextDelay(delay, s.interval, s.idleMax, s.parser.GetNextOffset() != before)
+			timer.Reset(delay)
 		}
 	}
+}
+
+// nextDelay is the idle backoff both tailers use: on progress, back to base immediately;
+// otherwise double, capped at idleMax. Pure, so the policy is tested directly rather than
+// through a timing test that has to sit through several intervals to observe one decision.
+func nextDelay(cur, base, idleMax time.Duration, progressed bool) time.Duration {
+	if progressed {
+		return base
+	}
+	if cur < base {
+		return base
+	}
+	next := cur * 2
+	if next > idleMax || next <= 0 { // next <= 0 guards the doubling overflowing
+		next = idleMax
+	}
+	if next < base {
+		next = base
+	}
+	return next
 }
 
 // Poll probes the log and applies any new committed changes. Exported for synchronous
@@ -334,7 +389,7 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	// HTCondor's own C++ tailer keys off, and it closes the read->stat inode TOCTOU below (the inode
 	// there is re-stat'd from the PATH after the read, so a compaction in that window binds the old
 	// offset to the new inode; the seq, captured pre-read, does not move with it).
-	headSeq, _, seqKnown := readLogSequence(s.parser.GetFilename())
+	headSeq, _, seqKnown := readLogSequence(s.parser.GetFilename(), s.seqBuf)
 	if s.haveSeq && seqKnown && headSeq != s.curSeq {
 		return s.reconcileReload(ctx)
 	}
@@ -444,7 +499,7 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	// The sequence number of the file we are about to reload in full, captured before the read so a
 	// compaction landing during the reload leaves curSeq behind and the next poll reconciles again
 	// (converging) rather than adopting a seq for a file it did not fully read.
-	reloadSeq, _, reloadSeqOK := readLogSequence(s.parser.GetFilename())
+	reloadSeq, _, reloadSeqOK := readLogSequence(s.parser.GetFilename(), s.seqBuf)
 	s.parser.SetNextOffset(0)
 	s.prober.Reset()
 	// Snapshot each table's keys before the reload so the post-reconcile sweep can delete the
@@ -850,7 +905,7 @@ func (s *JobSync) restore(ctx context.Context) error {
 	if ok {
 		if pos, derr := decodeJobPosition(blob); derr == nil {
 			cur, serr := statIdentity(s.parser.GetFilename())
-			headSeq, _, seqKnown := readLogSequence(s.parser.GetFilename())
+			headSeq, _, seqKnown := readLogSequence(s.parser.GetFilename(), s.seqBuf)
 			// When the current log carries an op-107 sequence number, require it to match the one
 			// saved with the offset before resuming in place. A mismatch -- or a saved position with
 			// no recorded seq (0) against a seq'd log -- means the offset may point into a different,
@@ -1234,7 +1289,7 @@ const (
 // capturing it on every read-from-start keeps it current. A log without a 107 leaves logmeta
 // untouched (the writer then emits a fresh sequence).
 func (s *JobSync) captureLogMeta() {
-	seq, ts, ok := readLogSequence(s.parser.GetFilename())
+	seq, ts, ok := readLogSequence(s.parser.GetFilename(), s.seqBuf)
 	if !ok {
 		return
 	}
@@ -1255,14 +1310,14 @@ func (s *JobSync) captureLogMeta() {
 // readLogSequence opens filename and returns the sequence number and creation timestamp from its
 // leading LogHistoricalSequenceNumber record ("107 <seq> CreationTimestamp <birthdate>"). ok is
 // false if the file cannot be read or its first real record is not a valid 107.
-func readLogSequence(filename string) (seq, ts int64, ok bool) {
+func readLogSequence(filename string, buf []byte) (seq, ts int64, ok bool) {
 	f, err := os.Open(filename)
 	if err != nil {
 		return 0, 0, false
 	}
 	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	sc.Buffer(buf, 1<<20)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
