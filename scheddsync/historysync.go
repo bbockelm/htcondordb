@@ -47,9 +47,11 @@ type HistorySync struct {
 	filename string
 	archive  *db.ArchiveTable
 	interval time.Duration
-	log      *slog.Logger
-	store    PositionStore
-	now      func() time.Time // ingest-time clock; overridable in tests
+	// idleMax caps the backoff applied while the file is not moving.
+	idleMax time.Duration
+	log     *slog.Logger
+	store   PositionStore
+	now     func() time.Time // ingest-time clock; overridable in tests
 
 	// The tailer is source-parameterized so the same append-only-file machinery
 	// (offset resume, rotation chain, recovery dedup) serves both the completed-job
@@ -114,7 +116,10 @@ type ResyncEvent struct {
 type HistorySyncConfig struct {
 	Filename     string        // path to the history file (required)
 	PollInterval time.Duration // default 200ms
-	Logger       *slog.Logger  // default slog.Default()
+	// IdleMaxInterval caps the backoff applied while the file is not moving (default 2s).
+	// Set equal to PollInterval to poll at a fixed rate.
+	IdleMaxInterval time.Duration
+	Logger          *slog.Logger // default slog.Default()
 	// Store, if set, durably records the resume position so a restart resumes instead of
 	// re-appending the whole file, recovering across rotation via archive dedup.
 	Store PositionStore
@@ -137,12 +142,19 @@ func NewHistorySync(archive *db.ArchiveTable, cfg HistorySyncConfig) *HistorySyn
 	if interval <= 0 {
 		interval = DefaultPollInterval
 	}
+	idleMax := cfg.IdleMaxInterval
+	if idleMax <= 0 {
+		idleMax = DefaultIdleMaxInterval
+	}
+	if idleMax < interval {
+		idleMax = interval
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	s := &HistorySync{
-		filename: cfg.Filename, archive: archive, interval: interval, log: logger,
+		filename: cfg.Filename, archive: archive, interval: interval, idleMax: idleMax, log: logger,
 		store: cfg.Store, onResync: cfg.OnResync, now: time.Now,
 		kind:          "history",
 		keyConstraint: historyKeyConstraint,
@@ -182,17 +194,24 @@ func (s *HistorySync) Run(ctx context.Context) error {
 	if err := s.Poll(ctx); err != nil {
 		s.log.Warn("history initial poll failed", "err", err.Error())
 	}
-	ticker := time.NewTicker(s.interval)
-	defer ticker.Stop()
+	// Back off while the file is quiet, snapping back to the base interval the moment it
+	// moves -- see JobSync.Run. Completed jobs arrive in bursts separated by long silences,
+	// so an idle history tailer polling at the busy rate is almost all of its lifetime.
+	delay := s.interval
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			s.close()
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
+			before := s.offset
 			if err := s.Poll(ctx); err != nil {
 				s.log.Warn("history poll failed", "err", err.Error())
 			}
+			delay = nextDelay(delay, s.interval, s.idleMax, s.offset != before)
+			timer.Reset(delay)
 		}
 	}
 }

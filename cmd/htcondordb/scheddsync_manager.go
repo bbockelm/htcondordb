@@ -110,6 +110,11 @@ type scheddSyncSettings struct {
 	// steady append path (0 = every batch). A crash re-applies at most this much of the log,
 	// idempotently; rotation and clean shutdown always checkpoint.
 	saveInterval time.Duration
+	// pollInterval is how often each tailer checks its source, and idleMaxInterval caps the
+	// backoff applied while that source is quiet. Both were fixed constants; a deployment that
+	// wants a less chatty mirror (or a more responsive one) had no way to say so.
+	pollInterval    time.Duration
+	idleMaxInterval time.Duration
 
 	// History-archive tuning. archiveSegSize applies only when the archive is first
 	// created (archiveconfig.json is authoritative on reopen); the index attributes and the
@@ -156,6 +161,9 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		// Throttle position-file rewrites on a busy log. Default 5s; a negative value disables
 		// the throttle (save every batch, the pre-throttle behavior).
 		saveInterval: scheddSyncSaveInterval(cfg),
+		// Tailer cadence. Unset leaves the package defaults (200ms base, 2s idle cap).
+		pollInterval:    scheddSyncMillis(cfg, "HTCONDORDB_SCHEDDSYNC_POLL_MS"),
+		idleMaxInterval: scheddSyncMillis(cfg, "HTCONDORDB_SCHEDDSYNC_IDLE_MAX_MS"),
 
 		archiveSegSize: segSize,
 		// Unlike the segment size this can be changed on an existing archive -- see
@@ -165,6 +173,18 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		archiveCatAttrs:      canonicalAttrList(catAttrs),
 		archiveValAttrs:      canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS"), "ClusterId")),
 	}
+}
+
+// scheddSyncMillis reads an optional millisecond-valued knob, returning 0 when unset or
+// non-positive so the syncer falls back to its own default.
+func scheddSyncMillis(cfg *config.Config, key string) time.Duration {
+	if strings.TrimSpace(getStr(cfg, key)) == "" {
+		return 0
+	}
+	if n := configInt(cfg, key); n > 0 {
+		return time.Duration(n) * time.Millisecond
+	}
+	return 0
 }
 
 // scheddSyncSaveInterval resolves the job syncer's position-checkpoint throttle from
@@ -414,6 +434,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		}
 		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{
 			Filename: s.jobLog, Logger: m.logger, Store: syncStore("jobs.pos"),
+			PollInterval: s.pollInterval, IdleMaxInterval: s.idleMaxInterval,
 			Users: users, Jobsets: jobsets, Clusters: clusters, Header: header,
 			ClusterPrivate: clusterprivate, LogMeta: logmeta,
 			SaveInterval: s.saveInterval,
@@ -449,9 +470,11 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		m.reconcileArchiveIndexes(ctx, hist, s, &wg)
 		m.applyArchiveRowGroupBytes(hist, "history", s)
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
-			Filename: s.histFile,
-			Logger:   m.logger,
-			Store:    syncStore("history.pos"),
+			Filename:        s.histFile,
+			PollInterval:    s.pollInterval,
+			IdleMaxInterval: s.idleMaxInterval,
+			Logger:          m.logger,
+			Store:           syncStore("history.pos"),
 			OnResync: func(ev scheddsync.ResyncEvent) {
 				m.logger.Error("schedd-sync: history durability gap; completed jobs lost to rotation",
 					"reason", ev.Reason, "oldest_available_completion", ev.OldestAvailableCompletion)
@@ -480,9 +503,11 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		m.reconcileArchiveIndexes(ctx, ep, s, &wg)
 		m.applyArchiveRowGroupBytes(ep, "epoch_history", s)
 		es := scheddsync.NewJobEpochSync(ep, scheddsync.HistorySyncConfig{
-			Filename: s.epochFile,
-			Logger:   m.logger,
-			Store:    syncStore("epoch.pos"),
+			Filename:        s.epochFile,
+			PollInterval:    s.pollInterval,
+			IdleMaxInterval: s.idleMaxInterval,
+			Logger:          m.logger,
+			Store:           syncStore("epoch.pos"),
 			OnResync: func(ev scheddsync.ResyncEvent) {
 				m.logger.Error("schedd-sync: epoch durability gap; run-instance records lost to rotation",
 					"reason", ev.Reason)
