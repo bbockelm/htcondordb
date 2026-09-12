@@ -66,8 +66,9 @@ ORDER BY time
 
 A column named `time` renders as the graph's time axis. Add a plain column (e.g.
 `Owner AS label_owner`) to the SELECT and GROUP BY for one series per group. Bucketing
-is evaluated by htcondordb's SQL engine (`repl`); see the repo's `TIME_SERIES_DESIGN.md`
-for the roadmap (server-side pushdown and continuous aggregates).
+is evaluated by htcondordb's SQL engine (`repl`); see the repo's
+`docs/design/time-series.md` for the roadmap (server-side pushdown and continuous
+aggregates).
 
 **Builder shortcut:** in builder mode, set **Format** to *Time series* and pick a
 **Time field** — the builder buckets it by the panel interval automatically (emitting
