@@ -1183,7 +1183,11 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 		// A valid log always writes a key's NewClassAd before its SetAttributes, so this should be
 		// ~0; a climbing count on a busy schedd (where reconcile is rare) localizes the orphan churn
 		// to updates landing on keys the store cannot resolve. Behavior is unchanged (still applied).
-		if _, present := tx.LookupClassAd(e.Key); !present {
+		//
+		// Has, not LookupClassAd: the question is presence, and LookupClassAd decodes the whole ad
+		// to answer it -- which SetAttribute below then does AGAIN, so the first update to each key
+		// in a transaction decoded a multi-KB job ad twice just to move this counter.
+		if !tx.Has(e.Key) {
 			s.mAbsentKey.Add(1)
 		}
 		if err := tx.SetAttribute(e.Key, e.Name, e.Value); err != nil {
@@ -1202,7 +1206,7 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 			}
 		}
 	case classadlog.OpDeleteAttribute:
-		if _, present := tx.LookupClassAd(e.Key); !present {
+		if !tx.Has(e.Key) {
 			s.mAbsentKey.Add(1) // observe-only (DeleteAttribute on an absent key is a no-op, but same signal)
 		}
 		tx.DeleteAttribute(e.Key, e.Name)
