@@ -3,10 +3,10 @@ module github.com/bbockelm/htcondordb/opensearchsync
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.29.9
+	github.com/PelicanPlatform/classad v0.29.11
 	github.com/PelicanPlatform/classad/db v0.29.9
 	github.com/PelicanPlatform/classad/dbrpc v0.29.9
-	github.com/bbockelm/cedar v0.6.12
+	github.com/bbockelm/cedar v0.6.16
 	github.com/bbockelm/golang-htcondor v0.13.0
 	github.com/opensearch-project/opensearch-go/v4 v4.7.2
 )
