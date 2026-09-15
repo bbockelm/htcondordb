@@ -5,10 +5,19 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 )
+
+// humanSince formats a non-negative number of seconds as a short duration string (e.g. "112h10m35s").
+func humanSince(secs int64) string {
+	if secs < 0 {
+		secs = 0
+	}
+	return (time.Duration(secs) * time.Second).String()
+}
 
 // The `.schema` command: see the derived schema, judge whether it still fits, rebuild it.
 //
@@ -37,10 +46,24 @@ func (s *session) schemaCmd(console io.Writer, arg string) {
 	}
 }
 
-// schemaGroups reports the candidate secondary (group) schemas: clusters of attributes that
-// co-occur outside the base schema, derived from a fresh server-side sample. The admin action
-// returns a preformatted report (or a plain message when the accelerator is off), so print it as-is.
+// schemaGroups reports the secondary (group) schemas. By default it shows the COMMITTED groups and
+// their churn history at READ level, read from diagnostics with no recompute: which attribute
+// clusters the accelerator actually committed to, how much the committed set has changed (with each
+// change's diff and reason), and the last per-segment agreement. `.schema groups sample [max]` runs
+// the DAEMON candidate derivation from a fresh sample instead (the old default).
 func (s *session) schemaGroups(console io.Writer, args []string) {
+	if len(args) > 0 && strings.EqualFold(args[0], "sample") {
+		s.schemaGroupsSample(console, args[1:])
+		return
+	}
+	table, _ := s.tableAndArgs(args)
+	s.withDiag(console, table, s.showGroups)
+}
+
+// schemaGroupsSample runs the DAEMON candidate-group derivation from a fresh sample. The admin
+// action returns a preformatted report (or a plain message when the accelerator is off), so print
+// it as-is.
+func (s *session) schemaGroupsSample(console io.Writer, args []string) {
 	table, rest := s.tableAndArgs(args)
 	msg, err := s.exec.Admin(table, "schema.groups", rest...)
 	if err != nil {
@@ -51,6 +74,94 @@ func (s *session) schemaGroups(console io.Writer, args []string) {
 		return
 	}
 	fmt.Fprintln(console, msg)
+}
+
+// showGroups renders the committed group schemas and their churn from READ-level diagnostics.
+func (s *session) showGroups(w io.Writer, d *dbrpc.Diagnostics) {
+	ss := d.SchemaScan
+	if !ss.Enabled {
+		fmt.Fprintln(w, "columnar accelerator: off — no group schemas")
+		return
+	}
+	if len(ss.Groups) == 0 {
+		fmt.Fprintln(w, "no committed secondary schemas yet")
+		fmt.Fprintln(w, "  (a group is committed only after its members keep co-occurring across several")
+		fmt.Fprintln(w, "   derivations; `.schema groups sample` shows the current candidates — needs DAEMON)")
+	} else {
+		fmt.Fprintf(w, "committed secondary schemas: %d (%d field(s) total)\n", ss.GroupSchemas, ss.GroupSchemaFields)
+		for i, g := range ss.Groups {
+			attrs := make([]string, len(g.Fields))
+			for j, f := range g.Fields {
+				attrs[j] = f.Name
+			}
+			fmt.Fprintf(w, "  group %d: %s\n", i+1, strings.Join(attrs, ", "))
+		}
+	}
+
+	// Churn: the count that matters (committed changes) vs the sampler's snapshot count.
+	dr := d.GroupDrift
+	if dr.Derivations > 0 {
+		span := ""
+		if dr.FirstUnix > 0 && dr.LastUnix > dr.FirstUnix {
+			span = " over " + humanSince(dr.LastUnix-dr.FirstUnix)
+		}
+		fmt.Fprintf(w, "churn: %d committed change(s); %d derivation snapshot(s)%s\n",
+			dr.CommittedChanges, dr.Derivations, span)
+		if dr.OfFirst > 0 {
+			fmt.Fprintf(w, "  %d of the earliest snapshot's %d group(s) still present; worst partial %.2f%%\n",
+				dr.Retained, dr.OfFirst, dr.MaxPartialFrac*100)
+		}
+	}
+
+	// Recent committed changes, newest first: the diff (magnitude) and the reason.
+	if n := len(d.GroupChanges); n > 0 {
+		fmt.Fprintln(w, "recent committed changes (newest first):")
+		show := n
+		if show > 5 {
+			show = 5
+		}
+		for k := 0; k < show; k++ {
+			ch := d.GroupChanges[n-1-k]
+			when := "?"
+			if ch.Unix > 0 {
+				when = humanSince(time.Now().Unix()-ch.Unix) + " ago"
+			}
+			fmt.Fprintf(w, "  %s: %s\n", when, ch.Reason)
+			for _, g := range ch.Added {
+				fmt.Fprintf(w, "      + {%s}\n", strings.Join(g, ","))
+			}
+			for _, dl := range ch.Changed {
+				line := "      ~ {" + strings.Join(dl.After, ",") + "}"
+				if len(dl.Added) > 0 {
+					line += " +" + strings.Join(dl.Added, ",")
+				}
+				if len(dl.Removed) > 0 {
+					line += " -" + strings.Join(dl.Removed, ",")
+				}
+				fmt.Fprintln(w, line)
+			}
+			for _, g := range ch.Removed {
+				fmt.Fprintf(w, "      - {%s}\n", strings.Join(g, ","))
+			}
+		}
+		if n > show {
+			fmt.Fprintf(w, "  … %d older change(s) not shown\n", n-show)
+		}
+	}
+
+	// Last per-segment agreement (persisted; read-only here).
+	if ag := d.GroupAgreement; ag != nil && len(ag.Groups) > 0 {
+		when := ""
+		if ag.Unix > 0 {
+			when = " (as of " + humanSince(time.Now().Unix()-ag.Unix) + " ago)"
+		}
+		fmt.Fprintf(w, "per-segment agreement%s, %d segment(s):\n", when, ag.Segments)
+		for _, g := range ag.Groups {
+			fmt.Fprintf(w, "  {%s}: %.0f%% of segments re-derived it\n", strings.Join(g.Attrs, ","), g.Frac*100)
+		}
+	}
+
+	fmt.Fprintln(w, "run `.schema groups sample` for a fresh candidate derivation from the current data (needs DAEMON)")
 }
 
 // showSchema renders the derived schema: what the sampler decided the ads look like.
