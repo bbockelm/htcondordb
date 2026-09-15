@@ -106,9 +106,10 @@ func TestSchemaShowsGroupLine(t *testing.T) {
 	}
 }
 
-// TestSchemaGroupsCommand covers the `.schema groups` report: it reaches the server's schema.groups
-// admin action and prints its (preformatted) candidate-group report rather than erroring or dumping
-// raw JSON.
+// TestSchemaGroupsCommand covers the `.schema groups` report. The default is the COMMITTED view at
+// READ level (no recompute): a freshly enabled table has no committed groups yet, so it says so and
+// points at the sample subcommand. `.schema groups sample` reaches the DAEMON schema.groups admin
+// action and prints its preformatted candidate-group report.
 func TestSchemaGroupsCommand(t *testing.T) {
 	sess, d, out, cleanup := schemaSession(t, 3000)
 	defer cleanup()
@@ -116,13 +117,28 @@ func TestSchemaGroupsCommand(t *testing.T) {
 		t.Skip("no sealed segments to sample")
 	}
 
+	// Default: committed view, READ, no recompute.
 	sess.schemaCmd(out, "groups")
 	got := out.String()
 	if strings.Contains(strings.ToLower(got), "error") {
 		t.Errorf(".schema groups errored:\n%s", got)
 	}
+	if !strings.Contains(got, "committed secondary schema") {
+		t.Errorf(".schema groups did not render the committed view:\n%s", got)
+	}
+	if !strings.Contains(got, ".schema groups sample") {
+		t.Errorf(".schema groups should point at the DAEMON sample path:\n%s", got)
+	}
+
+	// `.schema groups sample` runs the fresh candidate derivation (the old default).
+	out.Reset()
+	sess.schemaCmd(out, "groups sample")
+	got = out.String()
+	if strings.Contains(strings.ToLower(got), "error") {
+		t.Errorf(".schema groups sample errored:\n%s", got)
+	}
 	if !strings.Contains(got, "sampled") || !strings.Contains(got, "base schema") {
-		t.Errorf(".schema groups did not render the candidate-group report:\n%s", got)
+		t.Errorf(".schema groups sample did not render the candidate report:\n%s", got)
 	}
 }
 

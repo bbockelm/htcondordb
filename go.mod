@@ -3,11 +3,11 @@ module github.com/bbockelm/htcondordb
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.29.12
-	github.com/PelicanPlatform/classad/changefeed v0.29.12
-	github.com/PelicanPlatform/classad/collections v0.29.12
-	github.com/PelicanPlatform/classad/db v0.29.12
-	github.com/PelicanPlatform/classad/dbrpc v0.29.12
+	github.com/PelicanPlatform/classad v0.29.13
+	github.com/PelicanPlatform/classad/changefeed v0.29.13
+	github.com/PelicanPlatform/classad/collections v0.29.13
+	github.com/PelicanPlatform/classad/db v0.29.13
+	github.com/PelicanPlatform/classad/dbrpc v0.29.13
 	github.com/bbockelm/cedar v0.6.16
 	github.com/bbockelm/golang-htcondor v0.14.1
 	github.com/chzyer/readline v1.5.1
@@ -15,11 +15,11 @@ require (
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	github.com/prometheus/client_golang v1.24.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
-	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
+	github.com/RoaringBitmap/roaring/v2 v2.27.0 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -42,7 +42,7 @@ require (
 	github.com/jcmturner/gofork v1.7.6 // indirect
 	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
-	github.com/klauspost/compress v1.19.1 // indirect
+	github.com/klauspost/compress v1.20.0 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.23 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect

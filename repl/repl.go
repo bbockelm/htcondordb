@@ -301,7 +301,8 @@ Diagnostics (current table, or an explicit one where noted):
   .hot [table]          hot attributes (front-loaded in each ad)
   .schema [table]       the columnar accelerator's derived schema, field by field
   .schema fit [table]   whether that schema still fits the data (per-field escape rates)
-  .schema groups [table] candidate secondary schemas (clusters of co-occurring attributes)
+  .schema groups [table] committed secondary schemas + their churn history (READ)
+  .schema groups sample [table] candidate secondary schemas from a fresh sample (needs DAEMON)
   .suggest [table]      index add/drop suggestions from observed demand
   .suggest -i [table]   review suggestions interactively and apply the accepted ones
   .explain <expr>       how the current table's planner would run a constraint
