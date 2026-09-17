@@ -1,0 +1,73 @@
+# Package definition for htcondordb, built by `make rpm`.
+name: htcondordb
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+release: ${PKG_RELEASE}
+version_schema: none
+section: net
+priority: optional
+maintainer: ${PKG_MAINTAINER}
+description: |
+  Job and history database for HTCondor.
+
+  Mirrors an access point's queue and completed-job history into a local
+  database that answers ClassAd queries, so reporting and agent tooling can
+  read history without walking the schedd's files. Runs as a DaemonCore
+  daemon under condor_master.
+vendor: ${PKG_VENDOR}
+homepage: https://github.com/bbockelm/htcondordb
+license: Apache-2.0
+
+depends:
+  # Started by condor_master and reads the pool configuration.
+  - condor
+
+contents:
+  # Staged by `make rpm`: nfpm expands environment variables in scalar fields
+  # but globs contents.src literally, so a ${...} here finds no files.
+  - src: dist/pkgroot/htcondordb
+    dst: /usr/sbin/htcondordb
+    file_info:
+      mode: 0755
+
+  # The exporter launchers must live in the SAME directory as the daemon.
+  # exporter_manager.go resolves each Kind's binary by basename on PATH, else
+  # next to os.Executable() -- so a package that shipped the daemon alone
+  # would install cleanly and then silently skip every configured exporter
+  # ("not found: skip"), which is exactly what the release tarballs did
+  # before they started shipping these.
+  - src: dist/pkgroot/kafkasync
+    dst: /usr/sbin/kafkasync
+    file_info:
+      mode: 0755
+  - src: dist/pkgroot/opensearchsync
+    dst: /usr/sbin/opensearchsync
+    file_info:
+      mode: 0755
+  - src: dist/pkgroot/archivedropbox
+    dst: /usr/sbin/archivedropbox
+    file_info:
+      mode: 0755
+
+  # The query shell is for people, so it goes where people's PATH looks.
+  - src: dist/pkgroot/htcondordb-cli
+    dst: /usr/bin/htcondordb-cli
+    file_info:
+      mode: 0755
+
+  - src: packaging/htcondordb.conf
+    dst: /etc/condor/config.d/50-htcondordb.conf
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  - src: README.md
+    dst: /usr/share/doc/htcondordb/README.md
+    type: doc
+    file_info:
+      mode: 0644
+
+rpm:
+  group: System Environment/Daemons
+  compression: gzip

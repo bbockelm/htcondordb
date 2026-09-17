@@ -27,7 +27,7 @@ GO    ?= go
 LIB_EXT ?= $(if $(filter Darwin,$(shell uname -s)),dylib,so)
 LIB     := $(BIN_DIR)/libhtcondordb_client.$(LIB_EXT)
 
-.PHONY: all build daemon cli lib lib-check-linux archive python-test wheel wheel-macos wheel-linux wheel-validate wheel-clean test vet tidy clean version
+.PHONY: all build daemon cli lib lib-check-linux archive python-test wheel wheel-macos wheel-linux wheel-validate wheel-clean test vet tidy clean version rpm rpm-build exporters
 
 all: build
 
@@ -115,3 +115,44 @@ tidy: ## Reconcile go.mod / go.sum (both modules)
 
 clean: ## Remove built binaries
 	rm -rf $(BIN_DIR)
+
+# --- RPM packaging -------------------------------------------------------
+#
+# The package carries the exporter launchers as well as the daemon: they are
+# resolved by basename on PATH, else next to os.Executable(), so a package
+# with the daemon alone installs cleanly and then silently skips every
+# configured exporter.
+
+NFPM     ?= nfpm
+PKG_ARCH ?= $(shell go env GOARCH)
+PKG_DIR  ?= dist
+PKG_MAINTAINER ?= Brian Bockelman <bbockelman@morgridge.org>
+PKG_VENDOR     ?= HTCondor / PATh
+EXPORTERS := kafkasync opensearchsync archivedropbox
+
+rpm-build: ## Cross-build every packaged binary into $(PKG_DIR)/pkgroot for PKG_ARCH
+	@rm -rf $(PKG_DIR)/pkgroot && mkdir -p $(PKG_DIR)/pkgroot
+	@echo "Building htcondordb $(VERSION) for linux/$(PKG_ARCH)..."
+	@GOOS=linux GOARCH=$(PKG_ARCH) CGO_ENABLED=0 $(GOENV) $(GO) build -trimpath \
+		-ldflags '-s -w $(LDFLAGS)' -o $(PKG_DIR)/pkgroot/ ./cmd/htcondordb ./cmd/htcondordb-cli
+	@for exp in $(EXPORTERS); do \
+		echo "Building $$exp..."; \
+		(cd $$exp && GOOS=linux GOARCH=$(PKG_ARCH) CGO_ENABLED=0 GOWORK=off $(GO) build -trimpath \
+			-ldflags '-s -w' -o $(CURDIR)/$(PKG_DIR)/pkgroot/ ./cmd/$$exp) || exit 1; \
+	done
+	@ls -1 $(PKG_DIR)/pkgroot
+
+rpm: rpm-build ## Build an RPM for linux/$(PKG_ARCH) (PKG_ARCH=amd64|arm64)
+	@command -v $(NFPM) >/dev/null 2>&1 || { \
+		echo "nfpm not found. Build the pinned version:"; \
+		echo "  (cd .github/tools && GOWORK=off go build -o \"$$HOME/go/bin/nfpm\" github.com/goreleaser/nfpm/v2/cmd/nfpm)"; \
+		echo "or point NFPM at one you already have: make rpm NFPM=/path/to/nfpm"; \
+		exit 1; }
+	@set -e; \
+	set -- $$(packaging/rpm-version.sh "$(VERSION)"); \
+	PKG_VERSION=$$1; PKG_RELEASE=$$2; \
+	echo "Packaging htcondordb $$PKG_VERSION-$$PKG_RELEASE ($(PKG_ARCH))..."; \
+	PKG_VERSION=$$PKG_VERSION PKG_RELEASE=$$PKG_RELEASE PKG_ARCH=$(PKG_ARCH) \
+	PKG_MAINTAINER="$(PKG_MAINTAINER)" PKG_VENDOR="$(PKG_VENDOR)" \
+		$(NFPM) package --config packaging/nfpm.yaml --packager rpm --target $(PKG_DIR)
+	@ls -1 $(PKG_DIR)/*.rpm

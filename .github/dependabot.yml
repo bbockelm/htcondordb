@@ -13,3 +13,17 @@ updates:
           - "*"
     commit-message:
       prefix: "ci(deps)"
+
+  # The CI tool pins in .github/tools. A module of its own precisely so the
+  # pins are visible here: nothing imports it, so bumping one cannot affect
+  # the main module's build. See .github/tools/README.md.
+  - package-ecosystem: "gomod"
+    directory: "/.github/tools"
+    schedule:
+      interval: "weekly"
+    groups:
+      ci-tools:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci(deps)"
