@@ -15,6 +15,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/bbockelm/golang-htcondor/config"
+	"github.com/dustin/go-humanize"
 
 	"github.com/bbockelm/htcondordb/dbad"
 	"github.com/bbockelm/htcondordb/scheddsync"
@@ -129,6 +130,14 @@ type scheddSyncSettings struct {
 	archiveRowGroupBytes int
 	archiveCatAttrs      string
 	archiveValAttrs      string
+	// historyMaxBytes / epochMaxBytes cap the on-disk size (sealed-segment bytes) of the history
+	// and epoch_history archive tables. The periodic archive-maintenance pass drops the oldest
+	// whole segments until the table is under its cap. 0 = no limit. Configured from HTCondor
+	// config so a fleet manages it via puppet, not per-database commands. Unlike the segment size
+	// these apply to an existing archive at every start/reconfig (retention is set at runtime,
+	// not persisted), so a puppet change takes effect on condor_reconfig.
+	historyMaxBytes int64
+	epochMaxBytes   int64
 }
 
 func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
@@ -153,6 +162,8 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 	if strings.TrimSpace(catAttrs) == "" {
 		catAttrs = defaultArchiveCategoricalAttrs
 	}
+	// Shared default size cap for both archives; per-table knobs override it below.
+	defArchiveMaxBytes := configBytes(cfg, "HTCONDORDB_ARCHIVE_MAX_BYTES")
 	return scheddSyncSettings{
 		enabled:   true,
 		jobLog:    firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG")),
@@ -179,7 +190,39 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		archiveRowGroupBytes: configInt(cfg, "HTCONDORDB_ARCHIVE_ROW_GROUP_BYTES"),
 		archiveCatAttrs:      canonicalAttrList(catAttrs),
 		archiveValAttrs:      canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS"), "ClusterId")),
+		// Space limits: a shared default (HTCONDORDB_ARCHIVE_MAX_BYTES) applied to both archives,
+		// with per-table overrides. An explicit per-table value wins even when it is 0 (that table
+		// is uncapped while the default caps the other); an unset per-table knob inherits the
+		// default. Values accept a unit suffix ("10 GB", "500MiB") or plain bytes.
+		historyMaxBytes: configBytesOr(cfg, "HTCONDORDB_HISTORY_MAX_BYTES", defArchiveMaxBytes),
+		epochMaxBytes:   configBytesOr(cfg, "HTCONDORDB_EPOCH_HISTORY_MAX_BYTES", defArchiveMaxBytes),
 	}
+}
+
+// configBytes reads a byte-size knob, accepting a unit suffix ("10 GB", "500MiB", "2t") or plain
+// bytes ("1073741824"). Returns 0 when unset/blank, and logs nothing here (callers that care log).
+// A malformed value returns 0 rather than an error, so a typo caps nothing rather than wedging
+// startup -- the safe direction for a size ceiling.
+func configBytes(cfg *config.Config, key string) int64 {
+	s := strings.TrimSpace(getStr(cfg, key))
+	if s == "" {
+		return 0
+	}
+	n, err := humanize.ParseBytes(s)
+	if err != nil {
+		return 0
+	}
+	return int64(n)
+}
+
+// configBytesOr returns the parsed byte-size for key when it is set in the config (even to 0, which
+// means "explicitly uncapped"), otherwise fallback. This lets a per-table knob override a shared
+// default in either direction.
+func configBytesOr(cfg *config.Config, key string, fallback int64) int64 {
+	if _, set := cfg.Get(key); !set {
+		return fallback
+	}
+	return configBytes(cfg, key)
 }
 
 // scheddSyncMillis reads an optional millisecond-valued knob, returning 0 when unset or
@@ -251,6 +294,32 @@ func (m *scheddSyncManager) applyArchiveRowGroupBytes(t *db.ArchiveTable, name s
 	m.logger.Info("schedd-sync: archive row-group budget set", "archive", name,
 		"bytes", s.archiveRowGroupBytes, "was", was,
 		"note", "applies to segments sealed from now on; existing segments keep their layout")
+}
+
+// applyArchiveMaxBytes puts the configured on-disk size cap onto an archive's retention. The
+// periodic archive-maintenance pass (RunPeriodicArchiveMaintenanceEvery -> Rotate) then drops the
+// oldest whole segments whenever the table exceeds the cap. Retention is a runtime setting (not
+// persisted), so this is re-asserted on every start and reconfig, which is exactly how a
+// puppet-managed fleet drives it -- change the HTCondor config, condor_reconfig, done.
+//
+// maxBytes 0 means "no limit"; it is still applied (clearing a previously-set cap), so removing the
+// knob and reconfiguring lifts the ceiling rather than leaving a stale one in force. A no-op when the
+// archive already carries this cap, so a steady reconfigure does no work.
+func (m *scheddSyncManager) applyArchiveMaxBytes(t *db.ArchiveTable, name string, maxBytes int64) {
+	r := t.Retention()
+	if r.MaxBytes == maxBytes {
+		return
+	}
+	was := r.MaxBytes
+	r.MaxBytes = maxBytes
+	if err := t.SetRetention(r); err != nil {
+		m.logger.Error("schedd-sync: setting archive size limit", "archive", name,
+			"max_bytes", maxBytes, "err", err)
+		return
+	}
+	m.logger.Info("schedd-sync: archive size limit set", "archive", name,
+		"max_bytes", maxBytes, "was", was,
+		"note", "oldest whole segments are dropped past the cap on the archive-maintenance pass")
 }
 
 // reconcileArchiveIndexes registers the backfill goroutine on wg so it is joined on
@@ -477,6 +546,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// rebuilt), so serving during the backfill is safe.
 		m.reconcileArchiveIndexes(ctx, hist, s, &wg)
 		m.applyArchiveRowGroupBytes(hist, "history", s)
+		m.applyArchiveMaxBytes(hist, "history", s.historyMaxBytes)
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
 			Filename:        s.histFile,
 			PollInterval:    s.pollInterval,
@@ -511,6 +581,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		}
 		m.reconcileArchiveIndexes(ctx, ep, s, &wg)
 		m.applyArchiveRowGroupBytes(ep, "epoch_history", s)
+		m.applyArchiveMaxBytes(ep, "epoch_history", s.epochMaxBytes)
 		es := scheddsync.NewJobEpochSync(ep, scheddsync.HistorySyncConfig{
 			Filename:        s.epochFile,
 			PollInterval:    s.pollInterval,

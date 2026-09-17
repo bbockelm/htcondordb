@@ -96,5 +96,22 @@ inherits the condor config and drops to the condor user.
 | `HTCONDORDB_JOB_QUEUE_LOG` | `$(JOB_QUEUE_LOG)` | Schedd job-queue log to tail (live `jobs`). |
 | `HTCONDORDB_HISTORY` | `$(HISTORY)` | Schedd history file to tail (`history` archive). |
 | `HTCONDORDB_ARCHIVE_ROTATE_INTERVAL` | `3600` | Archive-table retention sweep interval (seconds; `0` disables). |
+| `HTCONDORDB_ARCHIVE_MAX_BYTES` | — | On-disk size cap applied to both archives; oldest whole segments drop past the cap on the sweep. Accepts `10 GB` / `500MiB` / plain bytes; unset = no limit. |
+| `HTCONDORDB_HISTORY_MAX_BYTES` | inherits default | Per-table size cap for `history` (overrides the shared default; `0` uncaps). |
+| `HTCONDORDB_EPOCH_HISTORY_MAX_BYTES` | inherits default | Per-table size cap for `epoch_history`. |
+
+### Bounding disk usage
+
+The archives grow without bound by default. To cap them from the HTCondor config (so a fleet
+manages it via configuration management rather than per-database commands), set a byte ceiling:
+
+```conf
+HTCONDORDB_ARCHIVE_MAX_BYTES = 20 GB           # applies to both history and epoch_history
+HTCONDORDB_EPOCH_HISTORY_MAX_BYTES = 5 GB      # optional per-table override
+```
+
+The periodic retention sweep (`HTCONDORDB_ARCHIVE_ROTATE_INTERVAL`) drops the oldest whole
+segments once a table exceeds its cap. The caps are applied on every start and `condor_reconfig`,
+so a configuration-management change takes effect without recreating the database.
 
 See [Configuration](configuration.md) for the full knob list.
