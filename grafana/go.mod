@@ -3,21 +3,21 @@ module github.com/bbockelm/htcondordb/grafana
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.29.12
-	github.com/PelicanPlatform/classad/dbrpc v0.29.12
-	github.com/bbockelm/cedar v0.6.16
-	github.com/bbockelm/golang-htcondor v0.14.1
+	github.com/PelicanPlatform/classad v0.29.14
+	github.com/PelicanPlatform/classad/dbrpc v0.29.14
+	github.com/bbockelm/cedar v0.6.18
+	github.com/bbockelm/golang-htcondor v0.14.8
 	github.com/bbockelm/htcondordb v0.0.0
 	github.com/grafana/grafana-plugin-sdk-go v0.291.0
 )
 
 require (
 	github.com/BurntSushi/toml v1.5.0 // indirect
-	github.com/PelicanPlatform/classad/collections v0.29.12 // indirect
-	github.com/PelicanPlatform/classad/db v0.29.12 // indirect
-	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
+	github.com/PelicanPlatform/classad/collections v0.29.14 // indirect
+	github.com/PelicanPlatform/classad/db v0.29.14 // indirect
+	github.com/RoaringBitmap/roaring/v2 v2.27.0 // indirect
 	github.com/apache/arrow-go/v18 v18.5.2 // indirect
-	github.com/bbockelm/gosssd v0.0.1 // indirect
+	github.com/bbockelm/gosssd v0.0.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
@@ -55,7 +55,7 @@ require (
 	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.19.1 // indirect
+	github.com/klauspost/compress v1.20.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/magefile/mage v1.16.1 // indirect
 	github.com/mattetti/filebuffer v1.0.1 // indirect
@@ -102,7 +102,7 @@ require (
 	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260708182218-49f421fb7959 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
