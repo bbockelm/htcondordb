@@ -3,13 +3,13 @@ module github.com/bbockelm/htcondordb
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.29.13
-	github.com/PelicanPlatform/classad/changefeed v0.29.13
-	github.com/PelicanPlatform/classad/collections v0.29.13
-	github.com/PelicanPlatform/classad/db v0.29.13
-	github.com/PelicanPlatform/classad/dbrpc v0.29.13
-	github.com/bbockelm/cedar v0.6.17
-	github.com/bbockelm/golang-htcondor v0.14.6
+	github.com/PelicanPlatform/classad v0.29.14
+	github.com/PelicanPlatform/classad/changefeed v0.29.14
+	github.com/PelicanPlatform/classad/collections v0.29.14
+	github.com/PelicanPlatform/classad/db v0.29.14
+	github.com/PelicanPlatform/classad/dbrpc v0.29.14
+	github.com/bbockelm/cedar v0.6.18
+	github.com/bbockelm/golang-htcondor v0.14.8
 	github.com/chzyer/readline v1.5.1
 	github.com/dustin/go-humanize v1.0.1
 	github.com/hashicorp/go-hclog v1.6.3
@@ -22,7 +22,7 @@ require (
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.27.0 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
-	github.com/bbockelm/gosssd v0.0.1 // indirect
+	github.com/bbockelm/gosssd v0.0.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
