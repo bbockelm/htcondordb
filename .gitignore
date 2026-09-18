@@ -19,3 +19,6 @@ python/htcondordb/_lib/
 .DS_Store
 # Local git worktrees for parallel branches; never repository content.
 .worktrees/
+
+# Packaging output: `make rpm` stages into dist/pkgroot and writes the package there.
+/dist/

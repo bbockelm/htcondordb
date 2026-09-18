@@ -71,6 +71,29 @@ jobs:
           (cd dist && sha256sum *.tar.gz > SHA256SUMS.txt)
           echo "Built archives:"; ls -l dist
 
+      # The admins who deploy this manage software with RPMs, so a release carries one per
+      # Linux architecture alongside the tarballs. `make rpm` cross-builds every packaged
+      # binary -- including the exporter launchers, which must sit beside the daemon -- and
+      # nfpm turns the staging tree into the package.
+      - name: Install nfpm (version pinned in .github/tools)
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          (cd .github/tools && GOWORK=off go build -o "$RUNNER_TEMP/bin/nfpm" github.com/goreleaser/nfpm/v2/cmd/nfpm)
+
+      - name: Build RPMs (amd64, arm64)
+        env:
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            make rpm NFPM="$RUNNER_TEMP/bin/nfpm" PKG_ARCH="${arch}" VERSION="${GITHUB_REF_NAME}"
+          done
+          # pkgroot is staging, not an asset.
+          rm -rf dist/pkgroot
+          (cd dist && sha256sum *.rpm >> SHA256SUMS.txt)
+          ls -l dist/*.rpm
+
       # The Grafana datasource plugin, zipped for manual install. Its CI workflow only produced
       # a workflow artifact, which expires and has no stable URL -- so there was no way to install
       # a released version without building the frontend yourself. The zip's top-level directory
@@ -134,7 +157,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          assets=(dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt)
+          assets=(dist/*.tar.gz dist/*.zip dist/*.rpm dist/SHA256SUMS.txt)
           # Idempotent: attach to an existing release (e.g. one created by hand or a
           # re-run) instead of failing; otherwise create it. --clobber replaces assets
           # so re-runs are safe.
