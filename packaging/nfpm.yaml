@@ -24,9 +24,10 @@ depends:
   - condor
 
 contents:
-  # Staged by `make rpm`: nfpm expands environment variables in scalar fields
-  # but globs contents.src literally, so a ${...} here finds no files.
-  - src: dist/pkgroot/htcondordb
+  # Staged by `make rpm` (PKG_STAGE): nfpm expands environment variables in
+  # scalar fields but globs contents.src literally, so a ${...} here finds no
+  # files. These paths and PKG_STAGE are one fact written twice.
+  - src: packaging/staging/htcondordb
     dst: /usr/sbin/htcondordb
     file_info:
       mode: 0755
@@ -37,21 +38,21 @@ contents:
   # would install cleanly and then silently skip every configured exporter
   # ("not found: skip"), which is exactly what the release tarballs did
   # before they started shipping these.
-  - src: dist/pkgroot/kafkasync
+  - src: packaging/staging/kafkasync
     dst: /usr/sbin/kafkasync
     file_info:
       mode: 0755
-  - src: dist/pkgroot/opensearchsync
+  - src: packaging/staging/opensearchsync
     dst: /usr/sbin/opensearchsync
     file_info:
       mode: 0755
-  - src: dist/pkgroot/archivedropbox
+  - src: packaging/staging/archivedropbox
     dst: /usr/sbin/archivedropbox
     file_info:
       mode: 0755
 
   # The query shell is for people, so it goes where people's PATH looks.
-  - src: dist/pkgroot/htcondordb-cli
+  - src: packaging/staging/htcondordb-cli
     dst: /usr/bin/htcondordb-cli
     file_info:
       mode: 0755

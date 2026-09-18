@@ -126,21 +126,28 @@ clean: ## Remove built binaries
 NFPM     ?= nfpm
 PKG_ARCH ?= $(shell go env GOARCH)
 PKG_DIR  ?= dist
+# Where the payload is assembled for nfpm. Deliberately NOT derived from
+# PKG_DIR and deliberately not overridable: nfpm globs contents.src literally
+# (it expands environment variables in scalar fields but not there), so this
+# path is spelled out in packaging/nfpm.yaml and the two must agree. Tying it
+# to PKG_DIR means overriding the output directory stages the binaries
+# somewhere nfpm never looks.
+PKG_STAGE := packaging/staging
 PKG_MAINTAINER ?= Brian Bockelman <bbockelman@morgridge.org>
 PKG_VENDOR     ?= HTCondor / PATh
 EXPORTERS := kafkasync opensearchsync archivedropbox
 
-rpm-build: ## Cross-build every packaged binary into $(PKG_DIR)/pkgroot for PKG_ARCH
-	@rm -rf $(PKG_DIR)/pkgroot && mkdir -p $(PKG_DIR)/pkgroot
+rpm-build: ## Cross-build every packaged binary into $(PKG_STAGE) for PKG_ARCH
+	@rm -rf $(PKG_STAGE) && mkdir -p $(PKG_STAGE)
 	@echo "Building htcondordb $(VERSION) for linux/$(PKG_ARCH)..."
 	@GOOS=linux GOARCH=$(PKG_ARCH) CGO_ENABLED=0 $(GOENV) $(GO) build -trimpath \
-		-ldflags '-s -w $(LDFLAGS)' -o $(PKG_DIR)/pkgroot/ ./cmd/htcondordb ./cmd/htcondordb-cli
+		-ldflags '-s -w $(LDFLAGS)' -o $(PKG_STAGE)/ ./cmd/htcondordb ./cmd/htcondordb-cli
 	@for exp in $(EXPORTERS); do \
 		echo "Building $$exp..."; \
 		(cd $$exp && GOOS=linux GOARCH=$(PKG_ARCH) CGO_ENABLED=0 GOWORK=off $(GO) build -trimpath \
-			-ldflags '-s -w' -o $(CURDIR)/$(PKG_DIR)/pkgroot/ ./cmd/$$exp) || exit 1; \
+			-ldflags '-s -w' -o $(CURDIR)/$(PKG_STAGE)/ ./cmd/$$exp) || exit 1; \
 	done
-	@ls -1 $(PKG_DIR)/pkgroot
+	@ls -1 $(PKG_STAGE)
 
 rpm: rpm-build ## Build an RPM for linux/$(PKG_ARCH) (PKG_ARCH=amd64|arm64)
 	@command -v $(NFPM) >/dev/null 2>&1 || { \
@@ -148,6 +155,9 @@ rpm: rpm-build ## Build an RPM for linux/$(PKG_ARCH) (PKG_ARCH=amd64|arm64)
 		echo "  (cd .github/tools && GOWORK=off go build -o \"$$HOME/go/bin/nfpm\" github.com/goreleaser/nfpm/v2/cmd/nfpm)"; \
 		echo "or point NFPM at one you already have: make rpm NFPM=/path/to/nfpm"; \
 		exit 1; }
+	# nfpm writes to --target as a FILE unless the path is an existing
+	# directory, so this has to exist before it runs.
+	@mkdir -p $(PKG_DIR)
 	@set -e; \
 	set -- $$(packaging/rpm-version.sh "$(VERSION)"); \
 	PKG_VERSION=$$1; PKG_RELEASE=$$2; \
