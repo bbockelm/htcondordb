@@ -89,8 +89,6 @@ jobs:
           for arch in amd64 arm64; do
             make rpm NFPM="$RUNNER_TEMP/bin/nfpm" PKG_ARCH="${arch}" VERSION="${GITHUB_REF_NAME}"
           done
-          # pkgroot is staging, not an asset.
-          rm -rf dist/pkgroot
           (cd dist && sha256sum *.rpm >> SHA256SUMS.txt)
           ls -l dist/*.rpm
 
