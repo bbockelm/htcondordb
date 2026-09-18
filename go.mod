@@ -8,7 +8,7 @@ require (
 	github.com/PelicanPlatform/classad/collections v0.29.14
 	github.com/PelicanPlatform/classad/db v0.29.14
 	github.com/PelicanPlatform/classad/dbrpc v0.29.14
-	github.com/bbockelm/cedar v0.6.18
+	github.com/bbockelm/cedar v0.6.19
 	github.com/bbockelm/golang-htcondor v0.14.8
 	github.com/chzyer/readline v1.5.1
 	github.com/dustin/go-humanize v1.0.1

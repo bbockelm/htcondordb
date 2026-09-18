@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/PelicanPlatform/classad v0.29.14
 	github.com/PelicanPlatform/classad/dbrpc v0.29.14
-	github.com/bbockelm/cedar v0.6.18
+	github.com/bbockelm/cedar v0.6.19
 	github.com/bbockelm/golang-htcondor v0.14.8
 	github.com/bbockelm/htcondordb v0.0.0
 	github.com/grafana/grafana-plugin-sdk-go v0.291.0
