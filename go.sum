@@ -23,8 +23,12 @@ github.com/bbockelm/cedar v0.6.19 h1:kvdL3DxV3xLuytx9+1IUxxtcdT6+/cRSMnEVLmjgXUM
 github.com/bbockelm/cedar v0.6.19/go.mod h1:1SABFonyJbC729ODTx03voZhpMSBQqqy+Q+6TvpE08s=
 github.com/bbockelm/golang-htcondor v0.14.8 h1:lnzi+vNhHzVvWiYzimxYlc9Njn3qEl2rEvo2e2HV1A8=
 github.com/bbockelm/golang-htcondor v0.14.8/go.mod h1:EbSC9raXbCMeTugN8vxcTGzO3G5pffh2rfROuyJpyXE=
+github.com/bbockelm/golang-htcondor v0.16.1 h1:Pfktb+ZeRnIOIjkPgmYL7w07zrEU9TJFBt9QRm/UPzg=
+github.com/bbockelm/golang-htcondor v0.16.1/go.mod h1:01XB7PPBGabuLyCJYh+dGU3oudc6FgBohhucNPhnxYE=
 github.com/bbockelm/gosssd v0.0.2 h1:g/GTPvcmackmfOmUjMt/Efka5YJwuVTeSvblxOjUv5c=
 github.com/bbockelm/gosssd v0.0.2/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
+github.com/bbockelm/gosssd v0.0.3 h1:Rtp3c26AhmolQ+NVs8IRpIKyiPrZqnEuqrLV3yRoqLc=
+github.com/bbockelm/gosssd v0.0.3/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24TaqPxmxbtue+5NUziq4I4S80YR8gNf3Q=
 github.com/beorn7/perks v1.0.0/go.mod h1:KWe93zE9D1o94FZ5RNwFwVgaQK1VOXiVxmqh+CedLV8=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
