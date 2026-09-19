@@ -1,6 +1,7 @@
 package dbad
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -99,5 +100,61 @@ func TestCountersTrackClassad(t *testing.T) {
 		if !ok || got != want {
 			t.Errorf("%s on the ad = %v (ok=%v), want %d", name, got, ok, want)
 		}
+	}
+}
+
+// TestDeltaWriteSplitIsAdvertised guards the POSITIVE CONTROL.
+//
+// The DeltaFallback* counters only count writes that could NOT be stored as a delta. All of them
+// reading zero on a live daemon is therefore ambiguous: it is what a healthy delta store looks
+// like, and equally what a store with delta mode OFF looks like, because a nil tracker increments
+// nothing -- not even Ineligible. That ambiguity cost a round trip on a production incident. The
+// per-table Deltas/Fulls split resolves it, so it has to reach the ad.
+func TestDeltaWriteSplitIsAdvertised(t *testing.T) {
+	ad := classad.New()
+	AddAttrs(ad, Input{Tables: []TableStat{{Name: "jobs", Ads: 10, Deltas: 17, Fulls: 4}}})
+	for name, want := range map[string]int64{"Table_jobs_Deltas": 17, "Table_jobs_Fulls": 4} {
+		got, ok := ad.EvaluateAttrInt(name)
+		if !ok {
+			t.Errorf("%s not on the ad: the control an operator reads is missing", name)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s = %d, want %d", name, got, want)
+		}
+	}
+}
+
+// TestDeltaWriteSplitReadsThrough: a real delta write must move the advertised split, or the
+// control is a literal and answers nothing.
+func TestDeltaWriteSplitReadsThrough(t *testing.T) {
+	d, err := db.OpenConfig(db.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ad := classad.New()
+	ad.InsertAttr("ClusterId", int64(1))
+	ad.InsertAttr("JobStatus", int64(1))
+	for i := 0; i < 20; i++ {
+		ad.InsertAttr("Pad"+string(rune('a'+i)), int64(i))
+	}
+	tx := d.Begin()
+	tx.NewClassAd("1.0", ad)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 2; i < 6; i++ {
+		tx := d.Begin()
+		if err := tx.SetAttribute("1.0", "JobStatus", fmt.Sprint(i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deltas, fulls := d.DeltaStats()
+	if deltas == 0 {
+		t.Fatalf("no delta records written (deltas=%d fulls=%d): the control cannot prove anything", deltas, fulls)
 	}
 }
