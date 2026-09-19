@@ -128,12 +128,15 @@ func CatalogTables(cat *db.Catalog) []TableStat {
 			continue
 		}
 		st := t.Stats()
+		deltas, fulls := t.DeltaStats()
 		out = append(out, TableStat{
 			Name:      name,
 			Ads:       int64(st.Ads),
 			LiveBytes: int64(st.LiveBytes()),
 			DeadBytes: int64(st.DeadBytes),
 			Segments:  int64(st.Segments),
+			Deltas:    deltas,
+			Fulls:     fulls,
 		})
 	}
 	for _, name := range cat.ArchiveTables() {

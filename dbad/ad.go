@@ -30,6 +30,15 @@ type TableStat struct {
 	LiveBytes int64
 	DeadBytes int64
 	Segments  int64
+
+	// Deltas and Fulls are this table's delta-record write split, from db.DeltaStats. They are
+	// the POSITIVE CONTROL for the DeltaFallback* counters: those only count writes that could
+	// not be stored as a delta, so all of them reading zero is ambiguous -- it looks identical
+	// whether every patch write is succeeding as a delta or delta mode is off and none are being
+	// attempted. Deltas > 0 distinguishes the two. Both zero means delta mode is off for this
+	// table (or nothing has been written).
+	Deltas int64
+	Fulls  int64
 }
 
 // Capabilities describes optional DB features an agent may want to discover.
@@ -128,6 +137,8 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 		ad.InsertAttr(p+"DeadBytes", t.DeadBytes)
 		ad.InsertAttr(p+"Segments", t.Segments)
 		ad.InsertAttrBool(p+"Archive", t.Archive)
+		ad.InsertAttr(p+"Deltas", t.Deltas)
+		ad.InsertAttr(p+"Fulls", t.Fulls)
 	}
 	ad.InsertAttr("NumTables", int64(len(in.Tables)))
 	// Delta-record write outcomes, process-wide (not per table: the counters are package-level in
