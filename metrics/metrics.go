@@ -292,6 +292,7 @@ type syncCollector struct {
 	syncLastTime     *prometheus.Desc
 	syncResyncs      *prometheus.Desc
 	syncAbsentKey    *prometheus.Desc
+	deltaFallback    *prometheus.Desc
 	syncReconciles   *prometheus.Desc
 	syncCommitSecs   *prometheus.Desc
 	syncPollSecs     *prometheus.Desc
@@ -333,6 +334,9 @@ func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dba
 			"Number of full resyncs the history tailer has performed (a gap/rotation was detected), by kind and source.", sync, nil),
 		syncAbsentKey: prometheus.NewDesc(namespace+"_sync_setattr_absent_key_total",
 			"Set/DeleteAttribute ops the schedd-sync tailer applied to a key not present in its view, by kind and source. Each fabricates an identity-less 'orphan' ad (only the update's attributes); a valid log writes a key's NewClassAd first, so this should be ~0. A climbing value localizes partial-ad churn to updates landing on unresolvable keys.", sync, nil),
+		deltaFallback: prometheus.NewDesc(namespace+"_delta_fallback_total",
+			"Patch writes that did NOT store a delta record, by reason. \"removal\": the write deleted an attribute, which a delta cannot express. \"bound\": the key's chain reached DeltaMax. \"no_base\": no whole record to chain to (a create). \"ineligible\": delta records not in use for the write. \"unreadable_base\": REFUSED -- the key was present but its current record could not be read; before that refusal existed each of these stored the transaction's attributes as a whole record, producing an identity-less row (no ClusterId/JobStatus/Key). A climbing unreadable_base means the store is failing to resolve keys it holds.",
+			[]string{"reason"}, nil),
 		syncReconciles: prometheus.NewDesc(namespace+"_sync_reconciles_total",
 			"Full reconcile-reload runs the schedd-sync tailer has performed (replay + sweep), by kind and source. Expected to be rare (about one per source-file compaction).", sync, nil),
 		syncCommitSecs: prometheus.NewDesc(namespace+"_sync_commit_seconds_total",
@@ -373,6 +377,17 @@ func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dba
 func (c *syncCollector) Describe(chan<- *prometheus.Desc) {}
 
 func (c *syncCollector) Collect(ch chan<- prometheus.Metric) {
+	// Process-wide (not per source): the delta counters live at package level in classad.
+	d := dbad.CurrentDeltaStat()
+	for reason, v := range map[string]int64{
+		"removal":         d.Removal,
+		"bound":           d.Bound,
+		"no_base":         d.NoBase,
+		"ineligible":      d.Ineligible,
+		"unreadable_base": d.UnreadableBase,
+	} {
+		ch <- prometheus.MustNewConstMetric(c.deltaFallback, prometheus.CounterValue, float64(v), reason)
+	}
 	if c.sources != nil {
 		for _, s := range dbad.LiveStatuses(c.sources) {
 			g := func(d *prometheus.Desc, v float64) {

@@ -50,9 +50,20 @@ type Input struct {
 	Tables       []TableStat
 	Capabilities Capabilities
 	Sources      []scheddsync.SyncStatus
+	Delta        DeltaStat
 	Exporters    []ExporterStatus
 	Importers    []ImporterStatus
 	Now          time.Time
+}
+
+// DeltaStat is the process-wide delta-record write accounting. Observe-only: these say why patch
+// writes fell back to whole records, and how many were refused outright.
+type DeltaStat struct {
+	Removal        int64 // an attribute removal, which a delta cannot express
+	Bound          int64 // the chain reached DeltaMax
+	NoBase         int64 // no whole record to chain to yet (a create)
+	Ineligible     int64 // delta records not in use for this write
+	UnreadableBase int64 // REFUSED: key present, current record unreadable
 }
 
 // ExporterStatus is one change-data exporter's health as the daemon's exporter manager sees it:
@@ -119,6 +130,17 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 		ad.InsertAttrBool(p+"Archive", t.Archive)
 	}
 	ad.InsertAttr("NumTables", int64(len(in.Tables)))
+	// Delta-record write outcomes, process-wide (not per table: the counters are package-level in
+	// classad). Why a patch write had to store a WHOLE record rather than a delta, and -- the one
+	// that matters for partial-ad reports -- how many were refused because the key was present but
+	// its current record could not be read. A climbing DeltaUnreadableBase means the store is
+	// failing to resolve keys it holds; before the refusal existed, each of those became an
+	// identity-less row holding only the attributes one transaction touched.
+	ad.InsertAttr("DeltaFallbackRemoval", in.Delta.Removal)
+	ad.InsertAttr("DeltaFallbackBound", in.Delta.Bound)
+	ad.InsertAttr("DeltaFallbackNoBase", in.Delta.NoBase)
+	ad.InsertAttr("DeltaFallbackIneligible", in.Delta.Ineligible)
+	ad.InsertAttr("DeltaUnreadableBase", in.Delta.UnreadableBase)
 	ad.InsertAttr("TotalAds", totalAds)
 	ad.InsertAttr("TotalLiveBytes", totalLive)
 	ad.InsertAttr("TotalDeadBytes", totalDead)

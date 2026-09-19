@@ -43,8 +43,23 @@ func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []
 			Sources:      LiveStatuses(sources),
 			Exporters:    exp,
 			Importers:    imp,
+			Delta:        CurrentDeltaStat(),
 			Now:          time.Now(),
 		})
+	}
+}
+
+// CurrentDeltaStat reads the process-wide delta write counters out of classad. They are package
+// level there rather than per collection, so this is the whole daemon's accounting, not one
+// table's.
+func CurrentDeltaStat() DeltaStat {
+	removal, bound, noBase, ineligible := db.FallbackReasons()
+	return DeltaStat{
+		Removal:        removal,
+		Bound:          bound,
+		NoBase:         noBase,
+		Ineligible:     ineligible,
+		UnreadableBase: db.UnreadableBaseRefusals(),
 	}
 }
 
