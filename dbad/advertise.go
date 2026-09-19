@@ -59,7 +59,7 @@ func CurrentDeltaStat() DeltaStat {
 		Bound:          bound,
 		NoBase:         noBase,
 		Ineligible:     ineligible,
-		UnreadableBase: 0, // needs classad > v0.30.0; see the PR that adds the refusal
+		UnreadableBase: db.UnreadableBaseRefusals(),
 	}
 }
 
