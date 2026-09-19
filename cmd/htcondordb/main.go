@@ -222,6 +222,14 @@ func run() error {
 		return err
 	}
 	defer unlockDB()
+	// HTCONDORDB_DELTA_MAX bounds delta-record chains; unset (0) takes the library default, which
+	// is ENABLED. Negative turns delta records off for new writes -- see server.Config.DeltaMax
+	// for why turning them off is not the same as never having had them.
+	deltaMax := configInt(cfg, "HTCONDORDB_DELTA_MAX")
+	if deltaMax < 0 {
+		log.Info(logging.DestinationGeneral, "delta records disabled (HTCONDORDB_DELTA_MAX < 0)")
+	}
+
 	svc, err := server.New(server.Config{
 		OnPhase:         boot.record,
 		OnTableOpen:     boot.recordTableOpen,
@@ -234,6 +242,7 @@ func run() error {
 		MemoryTables:    memoryTables,
 		PoolKeys:        poolKeys,
 		EncryptedAttrs:  encAttrs,
+		DeltaMax:        deltaMax,
 	})
 	if err != nil {
 		return err

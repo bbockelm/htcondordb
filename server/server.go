@@ -98,6 +98,19 @@ type Config struct {
 	// present (e.g. the default table) keep their existing on-disk backing.
 	MemoryTables []string
 
+	// DeltaMax bounds the delta-record chain length for every table in this catalog: a write
+	// that changes a few attributes of a wide ad stores only those attributes, and a read walks
+	// back along the chain to the last whole record. Zero takes the classad default (16, i.e.
+	// enabled); negative disables it (db.DeltaMaxOff).
+	//
+	// Worth an explicit knob rather than leaving it to the library default, because enabling it
+	// is a ONE-WAY DOOR per store: the first delta write sets an on-disk marker, and a store that
+	// holds delta records replays them for the rest of its life. Turning DeltaMax off afterwards
+	// stops new deltas but does not remove the ones already written. So the way back from a
+	// problem is a resync, not a config change -- and an operator who needs to stop the bleeding
+	// first wants this to exist.
+	DeltaMax int
+
 	// PoolKeys enables encryption at rest: every table's master key is wrapped under
 	// these HTCondor pool/signing keys (any one opens the DB; a rotated-in key is added
 	// on the next start). Built from htcondor.LoadSigningKeys. Empty disables encryption.
@@ -198,6 +211,7 @@ func New(cfg Config) (*Service, error) {
 
 	cat, err := db.OpenCatalogConfig(db.CatalogConfig{
 		Dir:             cfg.Dir,
+		DeltaMax:        cfg.DeltaMax,
 		PoolKeys:        cfg.PoolKeys,
 		EncryptedAttrs:  cfg.EncryptedAttrs,
 		OnOpenStep:      cfg.OnTableOpen,
