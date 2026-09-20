@@ -5,8 +5,31 @@
 ```
 htcondordb-cli                       # interactive, auto-locate the daemon
 htcondordb-cli -addr '<host:port>'   # against a specific daemon
+htcondordb-cli -pool cm.example.com -name db.example.com   # locate via a collector
 htcondordb-cli -e "SELECT COUNT(*) FROM ads"   # one-shot
 ```
+
+## Finding the daemon
+
+Three ways name the daemon, in descending order of directness.
+
+- `-addr <host:port>` is the address itself, and consults nothing else.
+- `-pool <host:port>` / `-name <name>` ask a collector, the way `condor_status
+  -pool ... -name ...` locates any other daemon: the daemon advertises an
+  `HTCondorDB` ad carrying its address, and the CLI reads the address out of it.
+  `-pool` defaults to `COLLECTOR_HOST`, so `-name` alone works within a pool.
+  `-name` takes either the advertised name or the host: unless `HTCONDORDB_NAME`
+  is set, a daemon calls itself `htcondordb@<host>`, and `-name <host>` finds it
+  anyway. With several databases in the pool and no `-name`, the CLI lists them
+  and stops rather than picking one.
+- With neither, the daemon is whichever one this host is configured for:
+  `HTCONDORDB_ADDRESS_FILE` (by default `$(LOG)/.htcondordb_address`), else
+  `HTCONDORDB_HOST`. Both can be set in the environment or the HTCondor
+  configuration; the environment wins, and wins as a pair.
+
+`-addr` together with `-pool`/`-name` is an error: they can name different
+daemons, and running the query against the wrong database is worse than a
+refusal.
 
 The database holds one or more **tables**, each an independent ClassAd
 collection (no joins) with its own indexes, hot set, and persisted config. The

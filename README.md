@@ -63,7 +63,8 @@ bin/htcondordb-cli -e "SELECT COUNT(*) FROM history WHERE CompletionDate > 17000
 ```
 
 `htcondordb-cli` with no arguments opens the interactive shell and auto-locates
-the daemon. Reading requires READ authorization; the sync writes in-process and
+the daemon; `-pool`/`-name` locate one through a collector instead (see
+[REPL reference](docs/repl.md#finding-the-daemon)). Reading requires READ authorization; the sync writes in-process and
 needs no client credentials. See [Schedd sync mode](docs/schedd-sync.md) for the
 full walkthrough and file-path overrides.
 

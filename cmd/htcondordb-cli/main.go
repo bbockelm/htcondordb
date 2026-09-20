@@ -7,6 +7,7 @@
 //
 //	htcondordb-cli                       # interactive, auto-locate the daemon
 //	htcondordb-cli -addr '<host:port>'   # interactive against a specific daemon
+//	htcondordb-cli -pool cm.example.com -name db.example.com   # locate via the collector
 //	htcondordb-cli -e "SELECT COUNT(*) FROM ads"   # one-shot
 package main
 
@@ -53,6 +54,9 @@ Usage:
 Flags:
   -addr <host:port>   daemon address (default: HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST,
                       from the environment or the configuration)
+  -pool <host:port>   collector to locate the daemon through (default: COLLECTOR_HOST)
+  -name <name>        daemon to locate in that pool, as a name or a host; required when
+                      more than one database advertises there
   -e <sql>            execute one statement, print the result, and exit
   -format <mode>      output format for -e: table (default) | json | classad | classad-new
   -key-attr <name>    attribute holding each row's primary key (default: Key)
@@ -121,16 +125,13 @@ func run() error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	addr := fs.addr
-	if addr == "" {
-		addr, err = locateDaemon(cfg)
-		if err != nil {
-			return err
-		}
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	addr, err := resolveAddress(ctx, cfg, fs)
+	if err != nil {
+		return err
+	}
 
 	// Subcommand: `load` ingests a ClassAd stream from stdin.
 	if len(fs.args) > 0 && fs.args[0] == "load" {
@@ -223,6 +224,8 @@ func historyFile() string {
 
 type flags struct {
 	addr       string
+	pool       string // collector to locate the daemon through (-pool)
+	name       string // daemon to locate in that pool (-name)
 	keyAttr    string
 	stmt       string
 	consistent bool
@@ -247,6 +250,16 @@ func parseFlags() *flags {
 			i++
 			if i < len(args) {
 				f.addr = args[i]
+			}
+		case "-pool", "--pool":
+			i++
+			if i < len(args) {
+				f.pool = args[i]
+			}
+		case "-name", "--name":
+			i++
+			if i < len(args) {
+				f.name = args[i]
 			}
 		case "-e", "--execute":
 			i++
@@ -301,14 +314,40 @@ func oneShotStatements(f *flags) string {
 	return ""
 }
 
+// collectorLookupTimeout bounds the -pool/-name query. The collector answers in milliseconds
+// when it is up; this is only here so an unreachable one fails with its own message instead of
+// hanging before the shell ever prints a prompt.
+const collectorLookupTimeout = 20 * time.Second
+
+// resolveAddress decides which daemon this invocation talks to. Three ways name one, in
+// descending order of directness: -addr is the address itself; -pool/-name ask a collector,
+// the way condor_status and friends locate a daemon; otherwise the daemon is whichever one
+// this host is configured for. Resolved once -- the CLI is short-lived and does not reconnect.
+func resolveAddress(ctx context.Context, cfg *config.Config, fs *flags) (string, error) {
+	named := fs.pool != "" || fs.name != ""
+	if fs.addr != "" {
+		if named {
+			// Both name a daemon, and they can name different ones. Refuse rather than
+			// silently honoring one: the query would run somewhere the user did not ask for.
+			return "", fmt.Errorf("-addr and -pool/-name both name a daemon; pass one")
+		}
+		return fs.addr, nil
+	}
+	if named {
+		lookupCtx, cancel := context.WithTimeout(ctx, collectorLookupTimeout)
+		defer cancel()
+		return locate.DaemonInPool(lookupCtx, cfg, fs.pool, fs.name)
+	}
+	return locateDaemon(cfg)
+}
+
 // locateDaemon resolves the daemon's command address through package locate, so this CLI,
 // the Python driver and history-import all agree on where the daemon is and on which
-// environment variables redirect them. Resolved once: the CLI is short-lived and does not
-// reconnect.
+// environment variables redirect them.
 func locateDaemon(cfg *config.Config) (string, error) {
 	addr, err := locate.Daemon(cfg)
 	if err != nil {
-		return "", fmt.Errorf("%w -- or pass -addr", err)
+		return "", fmt.Errorf("%w -- or pass -addr, or -pool/-name to find it through a collector", err)
 	}
 	return addr, nil
 }
