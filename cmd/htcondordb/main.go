@@ -247,7 +247,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = svc.Close() }()
+	// Closing the store runs AFTER Serve returns, so it happens after the daemon has already
+	// logged "** HTCONDORDB stopped". Closing waits for an in-flight maintenance pass to reach
+	// a safe boundary, which is not instant, and without these lines that wait is a silent gap:
+	// the log says the daemon stopped and the process then sits there, so a shutdown killed
+	// during the gap leaves a log showing a clean exit that never happened.
+	defer func() {
+		start := time.Now()
+		log.Info(logging.DestinationGeneral, "closing store")
+		_ = svc.Close()
+		log.Info(logging.DestinationGeneral, "store closed",
+			"seconds", time.Since(start).Round(time.Millisecond).Seconds())
+	}()
 	if logQueries {
 		log.Info(logging.DestinationGeneral, "per-query logging enabled (HTCONDORDB_LOG_QUERIES)")
 	}
