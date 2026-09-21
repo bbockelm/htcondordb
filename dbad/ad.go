@@ -73,6 +73,21 @@ type DeltaStat struct {
 	NoBase         int64 // no whole record to chain to yet (a create)
 	Ineligible     int64 // delta records not in use for this write
 	UnreadableBase int64 // REFUSED: key present, current record unreadable
+	// UnreadableReasons breaks UnreadableBase down by WHY, keyed by classad's reason names.
+	// The total says a refusal happened; only the reason says what to repair.
+	UnreadableReasons map[string]int64
+}
+
+// unreadableReasons are the reason names classad reports, paired with the ad attribute suffix
+// each is published under. The list is fixed rather than driven off the map so that every reason
+// has an attribute at all times: a reason that shows up only once it is non-zero is, to an
+// operator querying it, indistinguishable from one that does not exist.
+var unreadableReasons = []struct{ reason, suffix string }{
+	{"not-visible", "NotVisible"},
+	{"segment-gone", "SegmentGone"},
+	{"reassemble", "Reassemble"},
+	{"delta-chain", "DeltaChain"},
+	{"decode", "Decode"},
 }
 
 // ExporterStatus is one change-data exporter's health as the daemon's exporter manager sees it:
@@ -152,6 +167,13 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 	ad.InsertAttr("DeltaFallbackNoBase", in.Delta.NoBase)
 	ad.InsertAttr("DeltaFallbackIneligible", in.Delta.Ineligible)
 	ad.InsertAttr("DeltaUnreadableBase", in.Delta.UnreadableBase)
+	// ... and which failure each refusal was. DeltaUnreadableBase climbing says the store cannot
+	// resolve keys it holds; these say whether that is an MVCC/snapshot miss, a reaped segment, a
+	// lost columnar payload, an unresolvable delta chain or a decode failure -- five unrelated
+	// causes whose repairs have nothing in common.
+	for _, r := range unreadableReasons {
+		ad.InsertAttr("DeltaUnreadable"+r.suffix, in.Delta.UnreadableReasons[r.reason])
+	}
 	ad.InsertAttr("TotalAds", totalAds)
 	ad.InsertAttr("TotalLiveBytes", totalLive)
 	ad.InsertAttr("TotalDeadBytes", totalDead)
