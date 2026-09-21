@@ -174,6 +174,7 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 		ad.InsertAttr(p+"SetAttrAbsentKey", s.SetAttrAbsentKey)
 		ad.InsertAttr(p+"Reconciles", s.Reconciles)
 		ad.InsertAttr(p+"ReconcileLookupMiss", s.ReconcileLookupMiss)
+		ad.InsertAttr(p+"Unapplied", s.Unapplied)
 		if !s.LastSync.IsZero() {
 			ad.InsertAttr(p+"LastSyncTime", s.LastSync.Unix())
 			secs := int64(in.Now.Sub(s.LastSync).Seconds())

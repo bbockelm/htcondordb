@@ -33,6 +33,9 @@ type SyncStatus struct {
 	// but the lookup missed -- each one a full ad saved from being replaced by one log run's
 	// attributes. Nonzero is a storage-side key-resolution fault, not a sync one.
 	ReconcileLookupMiss int64
+	// Unapplied counts writes the store refused to compose at all (db.UnappliedError): the update
+	// did not land and is not retried, because retrying cannot succeed.
+	Unapplied int64
 
 	// Cumulative wall-clock time the tailer has spent, to localize WHERE a behind tailer's time
 	// goes (surfaced as *_seconds_total counters). CommitSeconds is incremental commits only;
@@ -80,6 +83,7 @@ func (s *JobSync) publishStatus(progressed bool) {
 	st := SyncStatus{Kind: "job_queue.log", Source: src, Offset: off, FileSize: size, LagBytes: lag, CaughtUp: lag == 0}
 	st.SetAttrAbsentKey = s.mAbsentKey.Load()
 	st.ReconcileLookupMiss = s.mReconcileLookupMiss.Load()
+	st.Unapplied = s.mUnapplied.Load()
 	st.Reconciles = s.mReconciles.Load()
 	st.CommitSeconds = float64(s.mCommitNanos.Load()) / 1e9
 	st.PollSeconds = float64(s.mPollNanos.Load()) / 1e9
