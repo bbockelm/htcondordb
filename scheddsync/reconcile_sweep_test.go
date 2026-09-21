@@ -54,7 +54,7 @@ func TestReconcileSweepsMisroutedRows(t *testing.T) {
 	}
 
 	s := NewJobSync(jobs, JobSyncConfig{Filename: logPath, Users: users})
-	if err := s.reconcileReload(context.Background()); err != nil {
+	if err := s.reconcileReload(context.Background(), "test"); err != nil {
 		t.Fatalf("reconcileReload: %v", err)
 	}
 

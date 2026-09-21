@@ -415,7 +415,7 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	// without truncating). Consume the request before probing so it runs exactly once.
 	if s.resyncReq.Swap(false) {
 		s.log.Info("scheddsync: job resync requested; rebuilding jobs mirror from the current log")
-		return s.reconcileReload(ctx)
+		return s.reconcileReload(ctx, "operator resync request")
 	}
 	// Authoritative rotation signal: the op-107 LogHistoricalSequenceNumber at the head of the
 	// current file. Read it BEFORE the body so it reflects the file we are about to consume; a value
@@ -426,14 +426,16 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	// offset to the new inode; the seq, captured pre-read, does not move with it).
 	headSeq, _, seqKnown := readLogSequence(s.parser.GetFilename(), s.seqBuf)
 	if s.haveSeq && seqKnown && headSeq != s.curSeq {
-		return s.reconcileReload(ctx)
+		s.log.Info("scheddsync: log sequence changed; rebuilding", "was", s.curSeq, "now", headSeq)
+		return s.reconcileReload(ctx, "log sequence changed (compaction)")
 	}
 	// Secondary signal, for logs with no 107 header (older formats, tests): the path now names a
 	// different inode than the file we last read (a new inode whose size may equal or exceed our
 	// offset, which the prober's size heuristic would misread as a plain append).
 	if s.haveID {
 		if cur, serr := statIdentity(s.parser.GetFilename()); serr == nil && !sameFileIdentity(cur, s.curID) {
-			return s.reconcileReload(ctx)
+			s.log.Info("scheddsync: log file identity changed; rebuilding")
+			return s.reconcileReload(ctx, "log file identity changed (rotation)")
 		}
 	}
 	result, err := s.prober.Probe(s.parser.GetFilename(), s.parser.GetNextOffset())
@@ -451,7 +453,7 @@ func (s *JobSync) Poll(ctx context.Context) error {
 		s.publishStatus(true)
 		return nil
 	case classadlog.ProbeCompressed:
-		return s.reconcileReload(ctx)
+		return s.reconcileReload(ctx, "prober reported the log was compacted")
 	case classadlog.ProbeAddition:
 		if aerr := s.readAndApply(ctx, false); aerr != nil {
 			var conflict *db.ConflictError
@@ -503,13 +505,15 @@ func (s *JobSync) handleCommitConflict(ctx context.Context, conflict *db.Conflic
 		s.conflictOffset, s.conflictRuns = rewind, 1
 	}
 	if s.conflictRuns >= maxConflictRetries {
+		// The keys themselves, not just how many: one key that can never be written escalates
+		// every time, and without its name the log shows an endless rebuild with nothing to act on.
 		s.log.Warn("scheddsync: job commit kept conflicting; rebuilding jobs mirror from the current log",
-			"offset", rewind, "attempts", s.conflictRuns, "keys", len(conflict.Keys))
+			"offset", rewind, "attempts", s.conflictRuns, "keys", conflict.Keys)
 		s.conflictOffset, s.conflictRuns = 0, 0
-		return s.reconcileReload(ctx)
+		return s.reconcileReload(ctx, "commit kept conflicting")
 	}
 	s.log.Warn("scheddsync: job commit conflicted; will re-apply next poll",
-		"offset", rewind, "attempt", s.conflictRuns, "keys", len(conflict.Keys))
+		"offset", rewind, "attempt", s.conflictRuns, "keys", conflict.Keys)
 	return nil
 }
 
@@ -525,8 +529,13 @@ func (s *JobSync) handleCommitConflict(ctx context.Context, conflict *db.Conflic
 // key sets the sweep already needs; there is no second copy of the queue. The position is
 // checkpointed only after the sweep commits, so a crash mid-reload re-runs the idempotent
 // reconcile rather than resuming past an unfinished table.
-func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
+func (s *JobSync) reconcileReload(ctx context.Context, reason string) (err error) {
 	start := nowFn()
+	// Logged on the WAY IN as well as out. A reconcile of a large log takes minutes, during which
+	// the tailer falls behind and says nothing, and the end line used to assert
+	// "(source rotated/compacted)" whatever the actual trigger was -- so a mirror rebuilt 285
+	// times by commit-conflict escalation reported 285 rotations that never happened.
+	s.log.Info("scheddsync: reconcile starting", "reason", reason, "offset", s.parser.GetNextOffset())
 	defer func() { s.mReconcileNanos.Add(int64(nowFn().Sub(start))) }()
 	s.mReconciles.Add(1) // observe-only: confirms how often the full-reload path fires
 	s.abort()
@@ -648,7 +657,8 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	// A reconcile is a full non-incremental replay, forced when the schedd rotated/compacted its
 	// log -- the tailer is "behind" for its whole duration, so log it (with the delta) to explain a
 	// periodic behind that lines up with the schedd's compaction cadence.
-	s.log.Info("scheddsync: reconcile reload (source rotated/compacted)",
+	s.log.Info("scheddsync: reconcile reload complete",
+		"reason", reason,
 		"seconds", nowFn().Sub(start).Seconds(),
 		"jobs_before", len(beforeJobs), "jobs_after", s.target.Len(), "writes", rec.n,
 		"lookup_misses", rec.lookupMiss)
@@ -1043,7 +1053,7 @@ func (s *JobSync) restore(ctx context.Context) error {
 			s.log.Warn("scheddsync: unreadable saved position; rebuilding", "err", derr.Error())
 		}
 	}
-	return s.reconcileReload(ctx)
+	return s.reconcileReload(ctx, "resume position unusable")
 }
 
 // migrateJobsTable removes any key in the jobs table that does not belong there under the

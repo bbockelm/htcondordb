@@ -77,7 +77,7 @@ func assertVia(t *testing.T, log string, reconcile bool, want procExpect) {
 	defer target.Close()
 	s := NewJobSync(target, JobSyncConfig{Filename: logPath})
 	if reconcile {
-		err = s.reconcileReload(context.Background())
+		err = s.reconcileReload(context.Background(), "test")
 	} else {
 		err = s.Poll(context.Background())
 	}

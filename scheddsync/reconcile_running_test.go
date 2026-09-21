@@ -43,7 +43,7 @@ func TestReconcileRunningJobNonContiguous(t *testing.T) {
 	}
 	defer target.Close()
 	s := NewJobSync(target, JobSyncConfig{Filename: logPath})
-	if err := s.reconcileReload(context.Background()); err != nil {
+	if err := s.reconcileReload(context.Background(), "test"); err != nil {
 		t.Fatalf("reconcileReload: %v", err)
 	}
 
