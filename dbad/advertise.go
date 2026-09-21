@@ -55,11 +55,12 @@ func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []
 func CurrentDeltaStat() DeltaStat {
 	removal, bound, noBase, ineligible := db.FallbackReasons()
 	return DeltaStat{
-		Removal:        removal,
-		Bound:          bound,
-		NoBase:         noBase,
-		Ineligible:     ineligible,
-		UnreadableBase: db.UnreadableBaseRefusals(),
+		Removal:           removal,
+		Bound:             bound,
+		NoBase:            noBase,
+		Ineligible:        ineligible,
+		UnreadableBase:    db.UnreadableBaseRefusals(),
+		UnreadableReasons: db.UnreadableBaseReasons(),
 	}
 }
 
