@@ -173,6 +173,7 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 		// Partial-ad ("orphan") diagnostics (observe-only counters).
 		ad.InsertAttr(p+"SetAttrAbsentKey", s.SetAttrAbsentKey)
 		ad.InsertAttr(p+"Reconciles", s.Reconciles)
+		ad.InsertAttr(p+"ReconcileLookupMiss", s.ReconcileLookupMiss)
 		if !s.LastSync.IsZero() {
 			ad.InsertAttr(p+"LastSyncTime", s.LastSync.Unix())
 			secs := int64(in.Now.Sub(s.LastSync).Seconds())
