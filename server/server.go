@@ -335,9 +335,19 @@ func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error 
 	// encrypted stream was corrupted (e.g. a client that writes concurrently on one
 	// connection without serializing) -- is a real operational signal, so surface it at
 	// Warn even at the default log level.
-	if isCleanClose(err) {
+	switch {
+	case isPeerHangup(err):
+		// A bare io.EOF means the header read got ZERO bytes: the peer closed exactly on a
+		// frame boundary, having sent every request it intended to. That is a client hanging
+		// up, not a failure, and reporting it as err="failed to read frame header: EOF" reads
+		// like one. The wire already distinguishes this from a truncated frame (io.ReadFull
+		// returns io.ErrUnexpectedEOF when a header arrives partially), so no goodbye message
+		// is needed to tell them apart -- an explicit close RPC would add protocol surface and
+		// a compatibility matrix without telling the server anything it cannot already see.
+		s.log.Debug("htcondordb session closed by peer", "remote", c.RemoteAddr)
+	case isCleanClose(err):
 		s.log.Debug("htcondordb session closed", "remote", c.RemoteAddr, "err", errString(err))
-	} else {
+	default:
 		s.log.Warn("htcondordb session closed with error", "remote", c.RemoteAddr, "err", errString(err))
 	}
 	return err
@@ -424,6 +434,18 @@ func errString(err error) string {
 // peer hung up (EOF), or the daemon is shutting down (context cancelled) / the listener
 // was closed. Anything else (a decode/authentication failure, an unexpected transport
 // error) is an anomaly worth logging at Warn rather than burying at Debug.
+// isPeerHangup reports whether a connection ended with the peer simply closing it between
+// requests: io.ReadFull on the 5-byte frame header consumed nothing and returned io.EOF. It is
+// the ordinary end of every well-behaved client session, so it carries no error worth printing.
+//
+// A header that arrives only partially yields io.ErrUnexpectedEOF, which is a truncated frame
+// and NOT this. No guard is needed to exclude it -- the two are distinct sentinels and
+// errors.Is(io.ErrUnexpectedEOF, io.EOF) is false -- but the distinction is the whole point of
+// matching on the bare EOF, so TestPeerHangupIsDistinguishedFromTruncation pins it.
+func isPeerHangup(err error) bool {
+	return errors.Is(err, io.EOF)
+}
+
 func isCleanClose(err error) bool {
 	return err == nil ||
 		errors.Is(err, io.EOF) ||
