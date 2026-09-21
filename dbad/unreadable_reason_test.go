@@ -15,16 +15,21 @@ func TestUnreadableReasonsReachTheAd(t *testing.T) {
 	ad := classad.New()
 	AddAttrs(ad, Input{Delta: DeltaStat{
 		UnreadableBase:    9,
-		UnreadableReasons: map[string]int64{"reassemble": 6, "delta-chain": 3},
+		UnreadableReasons: map[string]int64{"reassemble": 6, "delta-no-base": 2, "delta-flag-mismatch": 1},
 	}})
 
 	for name, want := range map[string]int64{
-		"DeltaUnreadableBase":        9,
-		"DeltaUnreadableReassemble":  6,
-		"DeltaUnreadableDeltaChain":  3,
-		"DeltaUnreadableNotVisible":  0,
-		"DeltaUnreadableSegmentGone": 0,
-		"DeltaUnreadableDecode":      0,
+		"DeltaUnreadableBase":            9,
+		"DeltaUnreadableReassemble":      6,
+		"DeltaUnreadableNoBase":          2,
+		"DeltaUnreadableFlagMismatch":    1,
+		"DeltaUnreadableNotVisible":      0,
+		"DeltaUnreadableSegmentGone":     0,
+		"DeltaUnreadableDecode":          0,
+		"DeltaUnreadableNoVersions":      0,
+		"DeltaUnreadableChainReassemble": 0,
+		"DeltaUnreadableChainDecompress": 0,
+		"DeltaUnreadableChainDecode":     0,
 	} {
 		got, ok := ad.EvaluateAttrInt(name)
 		if !ok {

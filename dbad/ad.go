@@ -86,8 +86,17 @@ var unreadableReasons = []struct{ reason, suffix string }{
 	{"not-visible", "NotVisible"},
 	{"segment-gone", "SegmentGone"},
 	{"reassemble", "Reassemble"},
-	{"delta-chain", "DeltaChain"},
 	{"decode", "Decode"},
+	// The delta-chain reasons. These replaced a single "delta-chain" count, which on this
+	// deployment absorbed 100% of the refusals and so said only that the fault was somewhere
+	// in the chain walk. NoBase is the one that means a live delta's whole record is gone;
+	// FlagMismatch means a rewrite dropped a record's wire flags. Different bugs.
+	{"delta-no-versions", "NoVersions"},
+	{"delta-no-base", "NoBase"},
+	{"delta-reassemble", "ChainReassemble"},
+	{"delta-decompress", "ChainDecompress"},
+	{"delta-flag-mismatch", "FlagMismatch"},
+	{"delta-decode", "ChainDecode"},
 }
 
 // ExporterStatus is one change-data exporter's health as the daemon's exporter manager sees it:
