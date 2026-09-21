@@ -145,8 +145,12 @@ type JobSync struct {
 	// present in the tailer's view -- the operation that fabricates an identity-less orphan (a fresh
 	// ad holding only the update's attributes). They only COUNT; behavior is unchanged, so a
 	// deployed build measures the real rate without risk. mReconciles counts full reconcile runs.
-	mAbsentKey  atomic.Int64
-	mReconciles atomic.Int64
+	mAbsentKey atomic.Int64
+	// mReconcileLookupMiss counts rows a reconcile REFUSED to rewrite because the table held the
+	// key but the lookup missed. Each one is a full ad that would otherwise have been replaced by
+	// a single log run's attributes. Nonzero means the store is failing to resolve keys it holds.
+	mReconcileLookupMiss atomic.Int64
+	mReconciles          atomic.Int64
 	// mConflicts counts commit ConflictErrors recovered by the rewind-and-retry path (see Poll's
 	// ProbeAddition handling). Observe-only.
 	mConflicts atomic.Int64
@@ -570,10 +574,31 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	}
 	defer closeParser()
 
+	// Key sets as they stood before the reload, so flush can tell a create from a resolve miss.
+	// The sweep already holds these slices; this is the same data as a set.
+	beforeSet := func(keys []string) map[string]struct{} {
+		m := make(map[string]struct{}, len(keys))
+		for _, k := range keys {
+			m[k] = struct{}{}
+		}
+		return m
+	}
 	rec := &reconciler{
 		jobs: s.target, users: s.users, jobsets: s.jobsets, clusters: s.clusters, header: s.header,
 		clusterprivate: s.clusterprivate,
 		seen:           seen, log: s.log, batches: map[*db.DB]*db.Txn{},
+		before: map[*db.DB]map[string]struct{}{
+			s.target:         beforeSet(beforeJobs),
+			s.users:          beforeSet(beforeUsers),
+			s.jobsets:        beforeSet(beforeJobsets),
+			s.clusters:       beforeSet(beforeClusters),
+			s.header:         beforeSet(beforeHeader),
+			s.clusterprivate: beforeSet(beforeClusterPrivate),
+		},
+		destroyed: map[*db.DB]map[string]struct{}{
+			s.target: {}, s.users: {}, s.jobsets: {},
+			s.clusters: {}, s.header: {}, s.clusterprivate: {},
+		},
 	}
 	for {
 		select {
@@ -625,7 +650,16 @@ func (s *JobSync) reconcileReload(ctx context.Context) (err error) {
 	// periodic behind that lines up with the schedd's compaction cadence.
 	s.log.Info("scheddsync: reconcile reload (source rotated/compacted)",
 		"seconds", nowFn().Sub(start).Seconds(),
-		"jobs_before", len(beforeJobs), "jobs_after", s.target.Len(), "writes", rec.n)
+		"jobs_before", len(beforeJobs), "jobs_after", s.target.Len(), "writes", rec.n,
+		"lookup_misses", rec.lookupMiss)
+	if rec.lookupMiss > 0 {
+		s.mReconcileLookupMiss.Add(rec.lookupMiss)
+		// Worth its own line: it means the store could not resolve keys it holds, which is a
+		// storage fault rather than a sync one, and the reconcile left those rows unchanged
+		// rather than overwriting them with a fragment.
+		s.log.Warn("scheddsync: reconcile could not resolve keys the table holds; left them unchanged",
+			"lookup_misses", rec.lookupMiss)
+	}
 	s.publishStatus(true)
 	return nil
 }
@@ -729,6 +763,17 @@ type reconciler struct {
 	batches map[*db.DB]*db.Txn // one buffered transaction per table touched this batch
 	n       int
 
+	// before is each table's key set as it stood BEFORE this reconcile, and destroyed is what this
+	// reconcile has deleted. Together they let flush tell the two reasons a LookupClassAd can miss
+	// apart: a key absent from the table (a create -- merge from empty is right) and a key the
+	// table HOLDS that failed to resolve (a storage miss -- merging from empty would replace the
+	// whole ad with one log run's attributes, fabricating exactly the identity-less rows this sync
+	// exists to avoid).
+	before    map[*db.DB]map[string]struct{}
+	destroyed map[*db.DB]map[string]struct{}
+	// lookupMiss counts the second case: rows protected from being overwritten by a fragment.
+	lookupMiss int64
+
 	curKey   string
 	curAd    *classad.ClassAd
 	curDels  []string // attributes DeleteAttribute'd in the current run (for a merge-flush)
@@ -781,6 +826,24 @@ func (r *reconciler) apply(e *classadlog.LogEntry) error {
 // attributes the log no longer sets are cleared); a LATER, non-contiguous run MERGES its sets and
 // deletes onto the already-written ad so the submission attributes survive. Writes go through the
 // per-table batch transaction, and an unchanged first run produces no write (hence no watch event).
+// heldBefore reports that the table held key before this reconcile started and this reconcile has
+// not destroyed it -- so a lookup miss for it cannot be explained by absence.
+func (r *reconciler) heldBefore(table *db.DB, key string) bool {
+	b := r.before[table]
+	if b == nil {
+		return false
+	}
+	if _, ok := b[key]; !ok {
+		return false
+	}
+	if d := r.destroyed[table]; d != nil {
+		if _, gone := d[key]; gone {
+			return false // destroyed within this reconcile: a later run legitimately re-creates it
+		}
+	}
+	return true
+}
+
 func (r *reconciler) flush() error {
 	key, ad, dels, table, destroy := r.curKey, r.curAd, r.curDels, r.curTable, r.destroy
 	r.curKey, r.curAd, r.curDels, r.curTable, r.destroy = "", nil, nil, nil, false
@@ -797,6 +860,11 @@ func (r *reconciler) flush() error {
 		// sweep does not treat it as live. (A key created and destroyed within the window that was
 		// never in the table is a no-op.)
 		delete(tableSeen, key)
+		if r.destroyed != nil {
+			if d := r.destroyed[table]; d != nil {
+				d[key] = struct{}{}
+			}
+		}
 		tx := r.batchTx(table)
 		if _, ok := tx.LookupClassAd(key); ok {
 			tx.DestroyClassAd(key)
@@ -821,6 +889,16 @@ func (r *reconciler) flush() error {
 	// attribute -- present on the row but set by no log run -- which the per-table key sweep does not
 	// address anyway.
 	base, hadRow := tx.LookupClassAd(key)
+	if !hadRow && r.heldBefore(table, key) {
+		// The table held this key before the reconcile and has not destroyed it since, so the miss
+		// is the store failing to resolve a key it has -- not a create. Merging from an empty ad
+		// here would write one log run's attributes AS the whole record: a row with no ClusterId,
+		// no JobStatus and no Key, which is the failure this reconcile is usually being run to
+		// repair. Leave the stored row alone; a later run for the key (or the next reconcile)
+		// applies the update once the key resolves again. A stale attribute beats a blanked ad.
+		r.lookupMiss++
+		return r.maybeCommit()
+	}
 	// Track whether the merge actually changes the stored row, so an unchanged row produces no
 	// spurious write/watch event -- without a second LookupClassAd copy just to compare against.
 	// A brand-new row is always a write; otherwise a change is a set to a new/different value, a
