@@ -56,7 +56,7 @@ func assertRouting(t *testing.T, reconcile bool) {
 	})
 	var err error
 	if reconcile {
-		err = s.reconcileReload(context.Background())
+		err = s.reconcileReload(context.Background(), "test")
 	} else {
 		err = s.Poll(context.Background())
 	}
