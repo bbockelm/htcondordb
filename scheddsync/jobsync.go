@@ -1030,6 +1030,21 @@ func (s *JobSync) restore(ctx context.Context) error {
 				if err := s.migrateJobsTable(); err != nil {
 					return err
 				}
+				// Re-register every existing proc under its cluster. s.children is what a cluster
+				// attribute fans out to, and it is IN-MEMORY, built as OpNewClassAd entries are
+				// applied -- so a proc created before this restart has no entry, and a cluster
+				// attribute logged after the restart never reaches it. Replaying from offset 0
+				// rebuilds it as a side effect; resuming in place does not, which is why the gap
+				// appears only after a restart.
+				//
+				// On an OSPool mirror this left ~2,800 proc rows missing exactly their cluster's
+				// attributes (ClusterId, JobStatus, Owner, QDate) while the cluster ad held them
+				// and sibling procs had them -- 1,470 of those ProcId 0, the proc most likely to
+				// exist before its cluster's attributes are logged.
+				//
+				// The parent is derived from the key, so this needs no new persisted state, and it
+				// rides the key scan migrateJobsTable already pays for on this path.
+				s.rebuildChildren()
 				s.parser.SetNextOffset(pos.Offset)
 				s.persistedOffset = pos.Offset // resume point; a later commit conflict rewinds here
 				s.curID, s.haveID = cur, true
@@ -1044,6 +1059,17 @@ func (s *JobSync) restore(ctx context.Context) error {
 		}
 	}
 	return s.reconcileReload(ctx)
+}
+
+// rebuildChildren re-registers each existing proc row under its cluster ad, restoring the
+// parent->children map that a resume would otherwise start empty. Idempotent, and a no-op for a
+// table with no proc rows.
+func (s *JobSync) rebuildChildren() {
+	for _, k := range s.target.Keys() {
+		if parent, ok := clusterKeyOf(k); ok {
+			s.addChild(parent, k)
+		}
+	}
 }
 
 // migrateJobsTable removes any key in the jobs table that does not belong there under the
