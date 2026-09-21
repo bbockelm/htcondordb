@@ -150,7 +150,12 @@ type JobSync struct {
 	// key but the lookup missed. Each one is a full ad that would otherwise have been replaced by
 	// a single log run's attributes. Nonzero means the store is failing to resolve keys it holds.
 	mReconcileLookupMiss atomic.Int64
-	mReconciles          atomic.Int64
+	// mUnapplied counts writes the store refused to compose (db.UnappliedError). Each one is an
+	// update that did not land; the row keeps its previous value rather than being replaced by a
+	// fragment. Nonzero means the store cannot read records it holds -- a storage fault, not a
+	// sync one -- and the keys are logged so it can be chased.
+	mUnapplied  atomic.Int64
+	mReconciles atomic.Int64
 	// mConflicts counts commit ConflictErrors recovered by the rewind-and-retry path (see Poll's
 	// ProbeAddition handling). Observe-only.
 	mConflicts atomic.Int64
@@ -455,12 +460,31 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	case classadlog.ProbeCompressed:
 		return s.reconcileReload(ctx, "prober reported the log was compacted")
 	case classadlog.ProbeAddition:
-		if aerr := s.readAndApply(ctx, false); aerr != nil {
+		aerr := s.readAndApply(ctx, false)
+		if applyErrorHook != nil {
+			aerr = applyErrorHook(aerr)
+		}
+		if aerr != nil {
 			var conflict *db.ConflictError
 			if errors.As(aerr, &conflict) {
 				return s.handleCommitConflict(ctx, conflict)
 			}
-			return aerr
+			var unapplied *db.UnappliedError
+			if !errors.As(aerr, &unapplied) {
+				return aerr
+			}
+			// A write that could not be composed at all. Retrying it cannot succeed -- the key is
+			// present but the record behind it will not come back -- so this must NOT rewind.
+			// Treating it as a conflict is what turned each one into three re-applies and then a
+			// full log replay: 1,239 of them produced 416 reconciles of a 923 MB log that wrote
+			// nothing, and the mirror never caught up. The rest of the batch committed and the
+			// offset advanced, so the pass made progress; record it and carry on.
+			s.mUnapplied.Add(int64(len(unapplied.Keys)))
+			s.log.Warn("scheddsync: writes could not be applied and will not be retried",
+				"keys", unapplied.Keys, "count", len(unapplied.Keys))
+			// readAndApply publishes status before it returns this error, so the snapshot an
+			// operator reads was taken with the counter at its old value. Republish.
+			s.publishStatus(true)
 		}
 		// A clean pass clears any prior conflict streak.
 		s.conflictOffset, s.conflictRuns = 0, 0
@@ -476,6 +500,12 @@ func (s *JobSync) Poll(ctx context.Context) error {
 		return errors.New("scheddsync: probe error on " + s.parser.GetFilename())
 	}
 }
+
+// applyErrorHook, when non-nil, replaces the error readAndApply returned. Test-only (nil in
+// production): an UnappliedError needs a stored record that will not read back, which is reachable
+// only through a classad-internal hook, and the routing it drives -- rewind for a conflict, carry on
+// for an unapplied write -- is the whole point of telling the two apart.
+var applyErrorHook func(error) error
 
 // maxConflictRetries bounds in-place commit-conflict re-applies at one offset before Poll escalates
 // to a full reconcileReload. Small: a transient conflict clears in a tick or two; a persistent one
