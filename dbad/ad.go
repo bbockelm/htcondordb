@@ -76,6 +76,26 @@ type DeltaStat struct {
 	// UnreadableReasons breaks UnreadableBase down by WHY, keyed by classad's reason names.
 	// The total says a refusal happened; only the reason says what to repair.
 	UnreadableReasons map[string]int64
+	// LastDecodeStage and LastDecodeError sample the most recent decode failure behind a
+	// refused chain merge. The counts say how often the bytes would not decode; only the
+	// decoder's own message says what it objected to, and a deployment refusing ~90 writes a
+	// minute cannot tell a truncated record from an unrecognised format without it.
+	LastDecodeStage string
+	LastDecodeError string
+}
+
+// maxDecodeErrorLen bounds the sampled decoder message on the ad. It is a diagnostic, not a
+// payload, and an unbounded string from a decoder reading damaged bytes does not belong in an
+// ad every collector in the pool stores.
+const maxDecodeErrorLen = 200
+
+// truncate bounds a diagnostic string, marking it when it had to cut, so a reader can tell a
+// short message from a clipped one.
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 // unreadableReasons are the reason names classad reports, paired with the ad attribute suffix
@@ -96,7 +116,8 @@ var unreadableReasons = []struct{ reason, suffix string }{
 	{"delta-reassemble", "ChainReassemble"},
 	{"delta-decompress", "ChainDecompress"},
 	{"delta-flag-mismatch", "FlagMismatch"},
-	{"delta-decode", "ChainDecode"},
+	{"delta-base-decode", "ChainBaseDecode"},
+	{"delta-patch-decode", "ChainPatchDecode"},
 }
 
 // ExporterStatus is one change-data exporter's health as the daemon's exporter manager sees it:
@@ -183,6 +204,9 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 	for _, r := range unreadableReasons {
 		ad.InsertAttr("DeltaUnreadable"+r.suffix, in.Delta.UnreadableReasons[r.reason])
 	}
+	// ... and the decoder's own last words, which is the one thing a count cannot give.
+	ad.InsertAttrString("DeltaLastDecodeStage", in.Delta.LastDecodeStage)
+	ad.InsertAttrString("DeltaLastDecodeError", truncate(in.Delta.LastDecodeError, maxDecodeErrorLen))
 	ad.InsertAttr("TotalAds", totalAds)
 	ad.InsertAttr("TotalLiveBytes", totalLive)
 	ad.InsertAttr("TotalDeadBytes", totalDead)

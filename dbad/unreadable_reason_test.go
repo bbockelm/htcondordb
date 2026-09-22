@@ -1,6 +1,7 @@
 package dbad
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -16,20 +17,23 @@ func TestUnreadableReasonsReachTheAd(t *testing.T) {
 	AddAttrs(ad, Input{Delta: DeltaStat{
 		UnreadableBase:    9,
 		UnreadableReasons: map[string]int64{"reassemble": 6, "delta-no-base": 2, "delta-flag-mismatch": 1},
+		LastDecodeStage:   "patch",
+		LastDecodeError:   "wire: bad tag 0x7f",
 	}})
 
 	for name, want := range map[string]int64{
-		"DeltaUnreadableBase":            9,
-		"DeltaUnreadableReassemble":      6,
-		"DeltaUnreadableNoBase":          2,
-		"DeltaUnreadableFlagMismatch":    1,
-		"DeltaUnreadableNotVisible":      0,
-		"DeltaUnreadableSegmentGone":     0,
-		"DeltaUnreadableDecode":          0,
-		"DeltaUnreadableNoVersions":      0,
-		"DeltaUnreadableChainReassemble": 0,
-		"DeltaUnreadableChainDecompress": 0,
-		"DeltaUnreadableChainDecode":     0,
+		"DeltaUnreadableBase":             9,
+		"DeltaUnreadableReassemble":       6,
+		"DeltaUnreadableNoBase":           2,
+		"DeltaUnreadableFlagMismatch":     1,
+		"DeltaUnreadableNotVisible":       0,
+		"DeltaUnreadableSegmentGone":      0,
+		"DeltaUnreadableDecode":           0,
+		"DeltaUnreadableNoVersions":       0,
+		"DeltaUnreadableChainReassemble":  0,
+		"DeltaUnreadableChainDecompress":  0,
+		"DeltaUnreadableChainBaseDecode":  0,
+		"DeltaUnreadableChainPatchDecode": 0,
 	} {
 		got, ok := ad.EvaluateAttrInt(name)
 		if !ok {
@@ -63,5 +67,32 @@ func TestReasonNamesMatchClassad(t *testing.T) {
 	}
 	if len(known) != len(names) {
 		t.Errorf("publishing %d reasons, classad has %d: %v vs %v", len(known), len(names), known, names)
+	}
+}
+
+// The sampled decoder message must reach the ad, and must be bounded there: it is a diagnostic
+// read off a live deployment, not a payload for every collector in the pool to store.
+func TestDecodeErrorSampleReachesTheAd(t *testing.T) {
+	ad := classad.New()
+	AddAttrs(ad, Input{Delta: DeltaStat{LastDecodeStage: "patch", LastDecodeError: "wire: bad tag 0x7f"}})
+	if got, ok := ad.EvaluateAttrString("DeltaLastDecodeStage"); !ok || got != "patch" {
+		t.Errorf("DeltaLastDecodeStage = %q (present %v), want patch", got, ok)
+	}
+	if got, ok := ad.EvaluateAttrString("DeltaLastDecodeError"); !ok || got != "wire: bad tag 0x7f" {
+		t.Errorf("DeltaLastDecodeError = %q (present %v)", got, ok)
+	}
+
+	long := strings.Repeat("x", maxDecodeErrorLen*3)
+	ad2 := classad.New()
+	AddAttrs(ad2, Input{Delta: DeltaStat{LastDecodeError: long}})
+	got, ok := ad2.EvaluateAttrString("DeltaLastDecodeError")
+	if !ok {
+		t.Fatal("DeltaLastDecodeError missing")
+	}
+	if len(got) > maxDecodeErrorLen+3 {
+		t.Errorf("sampled error is %d chars on the ad; it must be bounded", len(got))
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Error("a clipped message must be marked, or a reader cannot tell it from a short one")
 	}
 }
