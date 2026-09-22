@@ -501,6 +501,11 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	}
 }
 
+// reconcileApplyHook, when non-nil, replaces the error a reload's apply returned. Test-only, and
+// the only way to exercise the conflict path: a conflict needs a concurrent writer racing the
+// replay on the same key, which a test cannot arrange deterministically. See applyErrorHook.
+var reconcileApplyHook func(error) error
+
 // applyErrorHook, when non-nil, replaces the error readAndApply returned. Test-only (nil in
 // production): an UnappliedError needs a stored record that will not read back, which is reachable
 // only through a classad-internal hook, and the routing it drives -- rewind for a conflict, carry on
@@ -639,6 +644,8 @@ func (s *JobSync) reconcileReload(ctx context.Context, reason string) (err error
 			s.clusters: {}, s.header: {}, s.clusterprivate: {},
 		},
 	}
+	var nConflicted, nUnapplied int
+	var unappliedSample []string
 	for {
 		select {
 		case <-ctx.Done():
@@ -652,8 +659,37 @@ func (s *JobSync) reconcileReload(ctx context.Context, reason string) (err error
 		if rerr != nil {
 			return rerr
 		}
-		if aerr := rec.apply(entry); aerr != nil {
-			return aerr
+		aerr := rec.apply(entry)
+		if reconcileApplyHook != nil {
+			aerr = reconcileApplyHook(aerr)
+		}
+		if aerr != nil {
+			// A reload replays a LIVE log while the schedd keeps writing it, so a conflict
+			// means a newer value for that key already landed. A rebuild should keep that and
+			// step past, not abort: aborting made `.resync jobs` useless on a busy access
+			// point, where it gave up 3.5 seconds in on 131 conflicted keys having replayed a
+			// fraction of the log -- and said so only as a generic poll failure, with no
+			// completion line, so an operator could not tell a finished resync from a dead one.
+			//
+			// An unapplied write is not retryable and is dropped either way; it is counted and
+			// sampled here so a reload does not hide what the incremental path logs per key.
+			var conflict *db.ConflictError
+			var unapplied *db.UnappliedError
+			switch {
+			case errors.As(aerr, &conflict):
+				nConflicted += len(conflict.Keys)
+			case errors.As(aerr, &unapplied):
+				nUnapplied += len(unapplied.Keys)
+				s.mUnapplied.Add(int64(len(unapplied.Keys)))
+				for _, k := range unapplied.Keys {
+					if len(unappliedSample) >= reconcileUnappliedSample {
+						break
+					}
+					unappliedSample = append(unappliedSample, k)
+				}
+			default:
+				return aerr
+			}
 		}
 	}
 	closeParser() // finalize the offset before we checkpoint below
@@ -691,7 +727,14 @@ func (s *JobSync) reconcileReload(ctx context.Context, reason string) (err error
 		"reason", reason,
 		"seconds", nowFn().Sub(start).Seconds(),
 		"jobs_before", len(beforeJobs), "jobs_after", s.target.Len(), "writes", rec.n,
-		"lookup_misses", rec.lookupMiss)
+		"lookup_misses", rec.lookupMiss,
+		"conflicted", nConflicted, "unapplied", nUnapplied)
+	if nUnapplied > 0 {
+		// The incremental path names every dropped key; a reload must not be quieter than that
+		// just because it drops them in bulk. Sampled, since a reload can drop many.
+		s.log.Warn("scheddsync: reload could not apply some writes; they will not be retried",
+			"count", nUnapplied, "sample", unappliedSample)
+	}
 	if rec.lookupMiss > 0 {
 		s.mReconcileLookupMiss.Add(rec.lookupMiss)
 		// Worth its own line: it means the store could not resolve keys it holds, which is a
@@ -1529,6 +1572,10 @@ func isHeaderKey(key string) bool {
 	c, p, ok := parseJobKey(key)
 	return ok && c == 0 && p == 0
 }
+
+// reconcileUnappliedSample bounds how many dropped keys a reload names in its warning. The
+// point is to make the failure identifiable, not to reproduce the whole list in the log.
+const reconcileUnappliedSample = 20
 
 // clusterKeyOf returns the parent cluster ad key for a proc ad key of the form "C.P"
 // (ProcId >= 0), following HTCondor's job_queue.log convention where cluster C's ad is
