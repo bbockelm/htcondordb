@@ -54,6 +54,7 @@ func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []
 // table's.
 func CurrentDeltaStat() DeltaStat {
 	removal, bound, noBase, ineligible := db.FallbackReasons()
+	decodeStage, decodeErr := db.LastDeltaDecodeFailure()
 	return DeltaStat{
 		Removal:           removal,
 		Bound:             bound,
@@ -61,6 +62,8 @@ func CurrentDeltaStat() DeltaStat {
 		Ineligible:        ineligible,
 		UnreadableBase:    db.UnreadableBaseRefusals(),
 		UnreadableReasons: db.UnreadableBaseReasons(),
+		LastDecodeStage:   decodeStage,
+		LastDecodeError:   decodeErr,
 	}
 }
 
