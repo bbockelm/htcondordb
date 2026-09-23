@@ -92,6 +92,12 @@ type DeltaStat struct {
 	NoBaseVersions      int
 	NoBaseChainBroken   bool
 	NoBaseSealedSkipped int
+	// StrandedSealedDeltas counts live delta fragments found in SEALED segments at open. Zero on
+	// a healthy store: the seal-collapse invariant says a live fragment only ever sits in an
+	// active segment, and every collapse pass relies on it. Above zero means those keys are
+	// invisible to the collapse and will lose their base to the next compaction -- which is what
+	// DeltaUnreadableNoBase reports afterwards, once it is too late to tell which key it was.
+	StrandedSealedDeltas int64
 }
 
 // maxDecodeErrorLen bounds the sampled decoder message on the ad. It is a diagnostic, not a
@@ -226,6 +232,7 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 	ad.InsertAttr("DeltaLastNoBaseVersions", int64(in.Delta.NoBaseVersions))
 	ad.InsertAttrBool("DeltaLastNoBaseChainBroken", in.Delta.NoBaseChainBroken)
 	ad.InsertAttr("DeltaLastNoBaseSealedSkipped", int64(in.Delta.NoBaseSealedSkipped))
+	ad.InsertAttr("DeltaStrandedSealedDeltas", in.Delta.StrandedSealedDeltas)
 	ad.InsertAttr("TotalAds", totalAds)
 	ad.InsertAttr("TotalLiveBytes", totalLive)
 	ad.InsertAttr("TotalDeadBytes", totalDead)

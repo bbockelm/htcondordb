@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 
 	"github.com/bbockelm/htcondordb/scheddsync"
@@ -66,10 +67,11 @@ func CurrentDeltaStat() DeltaStat {
 		LastDecodeStage:   decodeStage,
 		LastDecodeError:   decodeErr,
 
-		SealedProbesSkipped: db.SealedProbesSkipped(),
-		NoBaseVersions:      nbVersions,
-		NoBaseChainBroken:   nbChainBroken,
-		NoBaseSealedSkipped: nbSealedSkipped,
+		SealedProbesSkipped:  db.SealedProbesSkipped(),
+		StrandedSealedDeltas: collections.StrandedSealedDeltas(),
+		NoBaseVersions:       nbVersions,
+		NoBaseChainBroken:    nbChainBroken,
+		NoBaseSealedSkipped:  nbSealedSkipped,
 	}
 }
 
