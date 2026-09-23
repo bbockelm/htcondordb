@@ -101,6 +101,20 @@ func run() error {
 				"keyAdopted", dg.KeyIndexAdopted, "attrAdopted", dg.AttrIndexAdopted,
 				"reasons", fmt.Sprint(dg.Reasons))
 		}
+		// A live delta in a SEALED segment breaks the seal-collapse invariant every collapse
+		// pass is built on: nothing will ever find it, so its base is never rewritten, the next
+		// compaction reclaims that base, and the key becomes permanently unreadable and
+		// unwritable. Warn with the keys, because this is the moment the damage is still
+		// identifiable -- afterwards it surfaces only as a refused write on a key nobody can
+		// tie back to a cause.
+		if dg.StrandedSealedDeltas > 0 {
+			keys := make([]string, 0, len(dg.StrandedSealedKeys))
+			for _, k := range dg.StrandedSealedKeys {
+				keys = append(keys, string(k))
+			}
+			log.Warn(logging.DestinationGeneral, "stranded delta fragments in sealed segments",
+				"dir", dg.Dir, "count", dg.StrandedSealedDeltas, "keys", fmt.Sprint(keys))
+		}
 		// Name the phase that dominated a slow open (classad #214). When every sidecar adopts
 		// cleanly the adoption line above stays silent, so a slow reopen would otherwise show only
 		// as one elapsed number; this breaks it into phases. Thresholded so a fast open is quiet.

@@ -132,3 +132,18 @@ func TestNoBaseDiagnosticsReachTheAd(t *testing.T) {
 		t.Errorf("DeltaLastNoBaseChainBroken = %v (present %v), want true", got, ok)
 	}
 }
+
+// The stranded-fragment count has to be queryable, not just logged at open. It is the one
+// number that catches the damage while the keys are still identifiable: afterwards it surfaces
+// as DeltaUnreadableNoBase on a key nobody can tie back to a cause.
+func TestStrandedSealedDeltasReachesTheAd(t *testing.T) {
+	ad := classad.New()
+	AddAttrs(ad, Input{Delta: DeltaStat{StrandedSealedDeltas: 12}})
+	got, ok := ad.EvaluateAttrInt("DeltaStrandedSealedDeltas")
+	if !ok {
+		t.Fatal("DeltaStrandedSealedDeltas is not on the ad: an operator querying it sees undefined")
+	}
+	if got != 12 {
+		t.Errorf("DeltaStrandedSealedDeltas = %d, want 12", got)
+	}
+}
