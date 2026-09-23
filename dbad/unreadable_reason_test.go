@@ -96,3 +96,39 @@ func TestDecodeErrorSampleReachesTheAd(t *testing.T) {
 		t.Error("a clipped message must be marked, or a reader cannot tell it from a short one")
 	}
 }
+
+// The no-base diagnostics have to reach the ad too: the reason names WHICH of three faults it
+// was, and these say how much of the chain the walk found, which is what separates "the base is
+// one link past a dead segment" from "there is nothing here". A counter collected but not
+// advertised reads exactly like one that is always zero.
+func TestNoBaseDiagnosticsReachTheAd(t *testing.T) {
+	ad := classad.New()
+	AddAttrs(ad, Input{Delta: DeltaStat{
+		UnreadableBase:      9,
+		UnreadableReasons:   map[string]int64{"delta-chain-broken": 5, "delta-index-pending": 4},
+		SealedProbesSkipped: 77,
+		NoBaseVersions:      3,
+		NoBaseChainBroken:   true,
+		NoBaseSealedSkipped: 2,
+	}})
+
+	for name, want := range map[string]int64{
+		"DeltaUnreadableChainBroken":   5,
+		"DeltaUnreadableIndexPending":  4,
+		"DeltaSealedProbesSkipped":     77,
+		"DeltaLastNoBaseVersions":      3,
+		"DeltaLastNoBaseSealedSkipped": 2,
+	} {
+		got, ok := ad.EvaluateAttrInt(name)
+		if !ok {
+			t.Errorf("%s is not on the ad", name)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s = %d, want %d", name, got, want)
+		}
+	}
+	if got, ok := ad.EvaluateAttrBool("DeltaLastNoBaseChainBroken"); !ok || !got {
+		t.Errorf("DeltaLastNoBaseChainBroken = %v (present %v), want true", got, ok)
+	}
+}

@@ -55,6 +55,7 @@ func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []
 func CurrentDeltaStat() DeltaStat {
 	removal, bound, noBase, ineligible := db.FallbackReasons()
 	decodeStage, decodeErr := db.LastDeltaDecodeFailure()
+	nbVersions, nbChainBroken, nbSealedSkipped := db.LastNoBaseDetail()
 	return DeltaStat{
 		Removal:           removal,
 		Bound:             bound,
@@ -64,6 +65,11 @@ func CurrentDeltaStat() DeltaStat {
 		UnreadableReasons: db.UnreadableBaseReasons(),
 		LastDecodeStage:   decodeStage,
 		LastDecodeError:   decodeErr,
+
+		SealedProbesSkipped: db.SealedProbesSkipped(),
+		NoBaseVersions:      nbVersions,
+		NoBaseChainBroken:   nbChainBroken,
+		NoBaseSealedSkipped: nbSealedSkipped,
 	}
 }
 
