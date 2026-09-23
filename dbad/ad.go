@@ -82,6 +82,16 @@ type DeltaStat struct {
 	// minute cannot tell a truncated record from an unrecognised format without it.
 	LastDecodeStage string
 	LastDecodeError string
+	// SealedProbesSkipped counts sealed-segment key probes skipped because the segment's key
+	// index is not built yet. It is the rate behind delta-index-pending: reads racing the
+	// reindex pass.
+	SealedProbesSkipped int64
+	// The shape of the most recent chain that had no whole record. The reason says which fault;
+	// these say how much of the chain the walk did find, which is what separates "the base is
+	// one link past a dead segment" from "there is nothing here".
+	NoBaseVersions      int
+	NoBaseChainBroken   bool
+	NoBaseSealedSkipped int
 }
 
 // maxDecodeErrorLen bounds the sampled decoder message on the ad. It is a diagnostic, not a
@@ -118,6 +128,11 @@ var unreadableReasons = []struct{ reason, suffix string }{
 	{"delta-flag-mismatch", "FlagMismatch"},
 	{"delta-base-decode", "ChainBaseDecode"},
 	{"delta-patch-decode", "ChainPatchDecode"},
+	// The three ways a chain ends up with no whole record. IndexPending is the one that is
+	// TRANSIENT -- a sealed segment's key index is built by a reindex pass, not at seal time --
+	// so a non-zero count there means writes are being dropped that a retry would have landed.
+	{"delta-chain-broken", "ChainBroken"},
+	{"delta-index-pending", "IndexPending"},
 }
 
 // ExporterStatus is one change-data exporter's health as the daemon's exporter manager sees it:
@@ -207,6 +222,10 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 	// ... and the decoder's own last words, which is the one thing a count cannot give.
 	ad.InsertAttrString("DeltaLastDecodeStage", in.Delta.LastDecodeStage)
 	ad.InsertAttrString("DeltaLastDecodeError", truncate(in.Delta.LastDecodeError, maxDecodeErrorLen))
+	ad.InsertAttr("DeltaSealedProbesSkipped", in.Delta.SealedProbesSkipped)
+	ad.InsertAttr("DeltaLastNoBaseVersions", int64(in.Delta.NoBaseVersions))
+	ad.InsertAttrBool("DeltaLastNoBaseChainBroken", in.Delta.NoBaseChainBroken)
+	ad.InsertAttr("DeltaLastNoBaseSealedSkipped", int64(in.Delta.NoBaseSealedSkipped))
 	ad.InsertAttr("TotalAds", totalAds)
 	ad.InsertAttr("TotalLiveBytes", totalLive)
 	ad.InsertAttr("TotalDeadBytes", totalDead)

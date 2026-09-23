@@ -16,6 +16,8 @@ github.com/PelicanPlatform/classad v0.30.5 h1:8wjzzsFAvkpOr5gqgIZqWYgGPKvelb+DR5
 github.com/PelicanPlatform/classad v0.30.5/go.mod h1:PEBQZp1N+KqUcAPMWhHqdCq+P5OSEYT2V14SeiXVM04=
 github.com/PelicanPlatform/classad v0.30.6 h1:4CzU/BjyWm1uE0Gauq01hMZ2sqCzMVq33/oZmoiix/g=
 github.com/PelicanPlatform/classad v0.30.6/go.mod h1:PEBQZp1N+KqUcAPMWhHqdCq+P5OSEYT2V14SeiXVM04=
+github.com/PelicanPlatform/classad v0.30.7 h1:UCQhE14fb+6vIZs9FSDcxTlS08qgHGnDmaNGkvgi4nY=
+github.com/PelicanPlatform/classad v0.30.7/go.mod h1:PEBQZp1N+KqUcAPMWhHqdCq+P5OSEYT2V14SeiXVM04=
 github.com/PelicanPlatform/classad/changefeed v0.29.14 h1:ZANH+/anZj7W4MufnRe8d/rOROdfko/2fCE9z7WAKlw=
 github.com/PelicanPlatform/classad/changefeed v0.29.14/go.mod h1:QEzzrTTu+ohtBy3XK2HBPV9fX8lZhWw4tn25cu7geHM=
 github.com/PelicanPlatform/classad/changefeed v0.30.0 h1:LHyOP4WO2xTm/yQXDGKj/GwGvWSiUP5dEWN9/YlGN80=
@@ -32,6 +34,8 @@ github.com/PelicanPlatform/classad/changefeed v0.30.5 h1:n1mtGnyagYBCjkiJ/P4+m/w
 github.com/PelicanPlatform/classad/changefeed v0.30.5/go.mod h1:QEzzrTTu+ohtBy3XK2HBPV9fX8lZhWw4tn25cu7geHM=
 github.com/PelicanPlatform/classad/changefeed v0.30.6 h1:AgFA49/ZSOzMRKo76RQFws31v0YjRbHpT9X4wvQyCQ4=
 github.com/PelicanPlatform/classad/changefeed v0.30.6/go.mod h1:QEzzrTTu+ohtBy3XK2HBPV9fX8lZhWw4tn25cu7geHM=
+github.com/PelicanPlatform/classad/changefeed v0.30.7 h1:P44OqGBS3T+cfwNCagurGatgLXxw9Dyk/D5DoszotIY=
+github.com/PelicanPlatform/classad/changefeed v0.30.7/go.mod h1:QEzzrTTu+ohtBy3XK2HBPV9fX8lZhWw4tn25cu7geHM=
 github.com/PelicanPlatform/classad/collections v0.29.14 h1:Jc4m7XltSAGodHqoSQppLjGMGNqFdBHOQbV71g2RO2I=
 github.com/PelicanPlatform/classad/collections v0.29.14/go.mod h1:bAY7t9hkTTYoLxLhQxvkzjcj+sxUV0D7WeeM+Zt1v4c=
 github.com/PelicanPlatform/classad/collections v0.30.0 h1:IPpR75SmNSsWyHGskkUSWo+x3KePGeYLNktpghPQnPc=
@@ -48,6 +52,8 @@ github.com/PelicanPlatform/classad/collections v0.30.5 h1:k/jFnfwFkJwNm7gOdotrFS
 github.com/PelicanPlatform/classad/collections v0.30.5/go.mod h1:bAY7t9hkTTYoLxLhQxvkzjcj+sxUV0D7WeeM+Zt1v4c=
 github.com/PelicanPlatform/classad/collections v0.30.6 h1:2O3qNBumKZ61kO/DctPRKJsAmkLLZPHwr4oBPmodwNw=
 github.com/PelicanPlatform/classad/collections v0.30.6/go.mod h1:bAY7t9hkTTYoLxLhQxvkzjcj+sxUV0D7WeeM+Zt1v4c=
+github.com/PelicanPlatform/classad/collections v0.30.7 h1:g4PmlFiyX2stXhH2PHlX7tMk1Ci5DwwuxkzxF0iXCzs=
+github.com/PelicanPlatform/classad/collections v0.30.7/go.mod h1:bAY7t9hkTTYoLxLhQxvkzjcj+sxUV0D7WeeM+Zt1v4c=
 github.com/PelicanPlatform/classad/db v0.29.14 h1:zoW89WaQ4b5VqWCUNsq0mpfnbVX+s4om+uKlGQlLFWI=
 github.com/PelicanPlatform/classad/db v0.29.14/go.mod h1:JPBsx3//8dluAq4S4q5GttjCLSfdQ8ZqbHfWAumk6Yw=
 github.com/PelicanPlatform/classad/db v0.30.0 h1:K+FnJxOtfpBbQXv4eEfHykFxsjVwDzbZB4G+287AKzM=
@@ -64,6 +70,8 @@ github.com/PelicanPlatform/classad/db v0.30.5 h1:3pzkRmIzBgHf3rgzKWLqlVIVMO4jrpe
 github.com/PelicanPlatform/classad/db v0.30.5/go.mod h1:JPBsx3//8dluAq4S4q5GttjCLSfdQ8ZqbHfWAumk6Yw=
 github.com/PelicanPlatform/classad/db v0.30.6 h1:xg9KnOR4y8PkIGbp4eRIUnQ68GLHRQtSKdDlpXBbrU4=
 github.com/PelicanPlatform/classad/db v0.30.6/go.mod h1:JPBsx3//8dluAq4S4q5GttjCLSfdQ8ZqbHfWAumk6Yw=
+github.com/PelicanPlatform/classad/db v0.30.7 h1:Y7ae6ogVr9Ri988ISeijBQewuxtatyxfvLYUDT6VXE8=
+github.com/PelicanPlatform/classad/db v0.30.7/go.mod h1:JPBsx3//8dluAq4S4q5GttjCLSfdQ8ZqbHfWAumk6Yw=
 github.com/PelicanPlatform/classad/dbrpc v0.29.14 h1:m0MU7qOWscimjJzvBAPqmdpWg1uQzGEA3GxjQHc4haA=
 github.com/PelicanPlatform/classad/dbrpc v0.29.14/go.mod h1:dp85Rc6x+n+d0IlqJksGMey1KxnNQDXRobEYo/oSm3k=
 github.com/PelicanPlatform/classad/dbrpc v0.30.0 h1:H8Zs7JjulAWpFjKKygVdP/ZjGPLHSbLQJFItyIiNKWE=
@@ -80,6 +88,8 @@ github.com/PelicanPlatform/classad/dbrpc v0.30.5 h1:hBc1z0PVP1UZDYOrICTIhai6Rn/I
 github.com/PelicanPlatform/classad/dbrpc v0.30.5/go.mod h1:dp85Rc6x+n+d0IlqJksGMey1KxnNQDXRobEYo/oSm3k=
 github.com/PelicanPlatform/classad/dbrpc v0.30.6 h1:UISKchrahrDAbRz1d3NY1TE5GhtmycjB6ydwAzQeWnE=
 github.com/PelicanPlatform/classad/dbrpc v0.30.6/go.mod h1:dp85Rc6x+n+d0IlqJksGMey1KxnNQDXRobEYo/oSm3k=
+github.com/PelicanPlatform/classad/dbrpc v0.30.7 h1:Jhk15wf/xa+pw/07HlKUlCZgq91hnNoEYT6yc1pyekY=
+github.com/PelicanPlatform/classad/dbrpc v0.30.7/go.mod h1:dp85Rc6x+n+d0IlqJksGMey1KxnNQDXRobEYo/oSm3k=
 github.com/RoaringBitmap/roaring/v2 v2.27.0 h1:rTzs+cuH9YBj6j4L9GF2DcK2NmOfdUvLI+ZFhyLy8g8=
 github.com/RoaringBitmap/roaring/v2 v2.27.0/go.mod h1:BZufmFbox589n3j5eOmyTaLSGXbRLc2LmQvjKjzSEGU=
 github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
