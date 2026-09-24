@@ -147,3 +147,30 @@ func TestStrandedSealedDeltasReachesTheAd(t *testing.T) {
 		t.Errorf("DeltaStrandedSealedDeltas = %d, want 12", got)
 	}
 }
+
+// DeltaCompactLiveDeltas is the one number that confirms, from production rather than from a
+// test, that a compaction met a live delta the pre-pass collapse should have removed -- the race
+// behind the stranded fragments. DeltaCompactDeferred is the fix working: a shard left alone
+// rather than sealed with a fragment in it.
+func TestCompactionAnomalyCountersReachTheAd(t *testing.T) {
+	ad := classad.New()
+	AddAttrs(ad, Input{Delta: DeltaStat{
+		CompactLiveDeltas:    4,
+		CompactDroppedDeltas: 9,
+		CompactDeferred:      2,
+	}})
+	for name, want := range map[string]int64{
+		"DeltaCompactLiveDeltas":    4,
+		"DeltaCompactDroppedDeltas": 9,
+		"DeltaCompactDeferred":      2,
+	} {
+		got, ok := ad.EvaluateAttrInt(name)
+		if !ok {
+			t.Errorf("%s is not on the ad: an operator querying it sees undefined", name)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s = %d, want %d", name, got, want)
+		}
+	}
+}

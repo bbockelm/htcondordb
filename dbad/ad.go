@@ -98,6 +98,18 @@ type DeltaStat struct {
 	// invisible to the collapse and will lose their base to the next compaction -- which is what
 	// DeltaUnreadableNoBase reports afterwards, once it is too late to tell which key it was.
 	StrandedSealedDeltas int64
+	// CompactLiveDeltas counts live delta records a compaction MET -- which the pre-pass collapse
+	// is supposed to leave none of. Non-zero means the collapse was overtaken by writers and the
+	// shard was sealed with a fragment still in it, which is how a key ends up unreadable. It is
+	// the direct confirmation that the race classad#272 fixes was firing here.
+	//
+	// CompactDeferred counts shards that compaction declined to touch because their active
+	// segment still held a live delta. That is the fix working: deferring costs a pass, sealing
+	// costs the row. A high rate means writers routinely overtake the pre-pass collapse, and the
+	// collapse should move inside the per-shard critical section rather than ahead of it.
+	CompactLiveDeltas    int64
+	CompactDroppedDeltas int64
+	CompactDeferred      int64
 }
 
 // maxDecodeErrorLen bounds the sampled decoder message on the ad. It is a diagnostic, not a
@@ -233,6 +245,9 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 	ad.InsertAttrBool("DeltaLastNoBaseChainBroken", in.Delta.NoBaseChainBroken)
 	ad.InsertAttr("DeltaLastNoBaseSealedSkipped", int64(in.Delta.NoBaseSealedSkipped))
 	ad.InsertAttr("DeltaStrandedSealedDeltas", in.Delta.StrandedSealedDeltas)
+	ad.InsertAttr("DeltaCompactLiveDeltas", in.Delta.CompactLiveDeltas)
+	ad.InsertAttr("DeltaCompactDroppedDeltas", in.Delta.CompactDroppedDeltas)
+	ad.InsertAttr("DeltaCompactDeferred", in.Delta.CompactDeferred)
 	ad.InsertAttr("TotalAds", totalAds)
 	ad.InsertAttr("TotalLiveBytes", totalLive)
 	ad.InsertAttr("TotalDeadBytes", totalDead)
