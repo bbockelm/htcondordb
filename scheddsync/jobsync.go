@@ -480,8 +480,13 @@ func (s *JobSync) Poll(ctx context.Context) error {
 			// nothing, and the mirror never caught up. The rest of the batch committed and the
 			// offset advanced, so the pass made progress; record it and carry on.
 			s.mUnapplied.Add(int64(len(unapplied.Keys)))
+			// With the reason per key. A list of dropped keys and nothing else tells an operator
+			// that something was lost but not what to do about it: a missing base, a chain broken
+			// at a dead link and bytes that will not decode are different faults with different
+			// responses, and correlating them by hand against the daemon ad's counters was the
+			// only way to tell.
 			s.log.Warn("scheddsync: writes could not be applied and will not be retried",
-				"keys", unapplied.Keys, "count", len(unapplied.Keys))
+				"keys", formatUnapplied(unapplied), "count", len(unapplied.Keys))
 			// readAndApply publishes status before it returns this error, so the snapshot an
 			// operator reads was taken with the counter at its old value. Republish.
 			s.publishStatus(true)
@@ -1571,6 +1576,19 @@ func isUserKey(key string) bool {
 func isHeaderKey(key string) bool {
 	c, p, ok := parseJobKey(key)
 	return ok && c == 0 && p == 0
+}
+
+// formatUnapplied renders the refused keys with the reason for each, falling back to the bare
+// keys if the reasons did not come through (an older classad, or a path that does not set them).
+func formatUnapplied(e *db.UnappliedError) []string {
+	if len(e.Reasons) != len(e.Keys) {
+		return e.Keys
+	}
+	out := make([]string, len(e.Keys))
+	for i, k := range e.Keys {
+		out[i] = k + " (" + e.Reasons[i] + ")"
+	}
+	return out
 }
 
 // reconcileUnappliedSample bounds how many dropped keys a reload names in its warning. The
