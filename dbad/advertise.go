@@ -57,6 +57,7 @@ func CurrentDeltaStat() DeltaStat {
 	removal, bound, noBase, ineligible := db.FallbackReasons()
 	decodeStage, decodeErr := db.LastDeltaDecodeFailure()
 	nbVersions, nbChainBroken, nbSealedSkipped := db.LastNoBaseDetail()
+	liveAtCompact, droppedFromHistory, _ := collections.DeltaAnomalies()
 	return DeltaStat{
 		Removal:           removal,
 		Bound:             bound,
@@ -69,6 +70,9 @@ func CurrentDeltaStat() DeltaStat {
 
 		SealedProbesSkipped:  db.SealedProbesSkipped(),
 		StrandedSealedDeltas: collections.StrandedSealedDeltas(),
+		CompactLiveDeltas:    liveAtCompact,
+		CompactDroppedDeltas: droppedFromHistory,
+		CompactDeferred:      collections.CompactDeferredLiveDelta(),
 		NoBaseVersions:       nbVersions,
 		NoBaseChainBroken:    nbChainBroken,
 		NoBaseSealedSkipped:  nbSealedSkipped,
