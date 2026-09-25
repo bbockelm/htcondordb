@@ -1,0 +1,104 @@
+package main
+
+import (
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/bbockelm/htcondordb/scheddsync"
+)
+
+// TestJobMetricsDefaults pins what an admin gets by doing nothing: sampling OFF (it adds a record
+// per running job per shadow update, which is a volume decision to make deliberately), and, when
+// turned on, a segment size a quarter of the archive default -- because a dashboard reads the
+// newest samples and the unsealed segment is rescanned in full on every query.
+func TestJobMetricsDefaults(t *testing.T) {
+	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
+	if s.metricsEnabled {
+		t.Error("job metrics should be off unless asked for")
+	}
+	if s.metricsSegSize != defaultJobMetricsSegmentSize {
+		t.Errorf("metricsSegSize = %d, want %d", s.metricsSegSize, defaultJobMetricsSegmentSize)
+	}
+	if s.metricsCatAttrs != "Owner" {
+		t.Errorf("metricsCatAttrs = %q, want Owner", s.metricsCatAttrs)
+	}
+	if s.metricsAttrs != "" {
+		t.Errorf("metricsAttrs = %q, want empty", s.metricsAttrs)
+	}
+	if s.metricsMinInterval != 0 {
+		t.Errorf("metricsMinInterval = %v, want 0 (no throttle)", s.metricsMinInterval)
+	}
+}
+
+// TestJobMetricsOverrides checks every knob is actually read, including the two that inherit from
+// the shared archive default.
+func TestJobMetricsOverrides(t *testing.T) {
+	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
+		"HTCONDORDB_ARCHIVE_MAX_BYTES = 10 GB\n"+
+		"HTCONDORDB_JOB_METRICS = true\n"+
+		"HTCONDORDB_JOB_METRICS_ATTRS = ProjectName, AccountingGroup\n"+
+		"HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS = Owner ProjectName\n"+
+		"HTCONDORDB_JOB_METRICS_MIN_INTERVAL = 120\n"+
+		"HTCONDORDB_JOB_METRICS_SEGMENT_SIZE = 4194304\n"+
+		"HTCONDORDB_JOB_METRICS_MAX_AGE = 2592000\n"))
+	if !s.metricsEnabled {
+		t.Fatal("metricsEnabled = false")
+	}
+	if got := splitAttrList(s.metricsAttrs); !slices.Equal(got, []string{"ProjectName", "AccountingGroup"}) {
+		t.Errorf("metricsAttrs = %v", got)
+	}
+	if got := splitAttrList(s.metricsCatAttrs); !slices.Equal(got, []string{"Owner", "ProjectName"}) {
+		t.Errorf("metricsCatAttrs = %v", got)
+	}
+	if s.metricsMinInterval != 120*time.Second {
+		t.Errorf("metricsMinInterval = %v, want 2m", s.metricsMinInterval)
+	}
+	if s.metricsSegSize != 4194304 {
+		t.Errorf("metricsSegSize = %d", s.metricsSegSize)
+	}
+	if s.metricsMaxAge != 2592000 {
+		t.Errorf("metricsMaxAge = %v, want 2592000", s.metricsMaxAge)
+	}
+	// Unset per-table size cap inherits the shared archive default, like history and epoch do.
+	if s.metricsMaxBytes != 10*1000*1000*1000 {
+		t.Errorf("metricsMaxBytes = %d, want the inherited 10 GB", s.metricsMaxBytes)
+	}
+}
+
+// TestJobMetricsMaxBytesOverridesDefault: an explicit 0 must uncap this table while the shared
+// default still caps the others -- the same "explicit wins, even when it is zero" rule the
+// history and epoch caps follow.
+func TestJobMetricsMaxBytesOverridesDefault(t *testing.T) {
+	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
+		"HTCONDORDB_ARCHIVE_MAX_BYTES = 10 GB\n"+
+		"HTCONDORDB_JOB_METRICS = true\n"+
+		"HTCONDORDB_JOB_METRICS_MAX_BYTES = 0\n"))
+	if s.metricsMaxBytes != 0 {
+		t.Errorf("metricsMaxBytes = %d, want 0 (explicitly uncapped)", s.metricsMaxBytes)
+	}
+	if s.historyMaxBytes != 10*1000*1000*1000 {
+		t.Errorf("historyMaxBytes = %d; the shared default must still cap the other tables", s.historyMaxBytes)
+	}
+}
+
+// TestJobMetricsSegmentSizeExplicitZero: an explicit 0 means "use the library default", which is
+// how an admin opts out of the small-segment choice. Unset must NOT mean that, or the default
+// would silently be 8 MiB.
+func TestJobMetricsSegmentSizeExplicitZero(t *testing.T) {
+	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
+		"HTCONDORDB_JOB_METRICS = true\nHTCONDORDB_JOB_METRICS_SEGMENT_SIZE = 0\n"))
+	if s.metricsSegSize != 0 {
+		t.Errorf("metricsSegSize = %d, want 0 (library default)", s.metricsSegSize)
+	}
+}
+
+// TestJobMetricsRetentionAttrIsZoned: age retention measures against a zone-mapped attribute (the
+// archive keeps a per-segment maximum of it), so the attribute the retention names and the one the
+// table is indexed on cannot drift apart.
+func TestJobMetricsRetentionAttrIsZoned(t *testing.T) {
+	if !slices.Contains(scheddsync.JobMetricsZoneAttrs, scheddsync.SampleTimeAttr) {
+		t.Fatalf("%s must be in JobMetricsZoneAttrs %v: age retention measures against it",
+			scheddsync.SampleTimeAttr, scheddsync.JobMetricsZoneAttrs)
+	}
+}

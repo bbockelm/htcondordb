@@ -203,6 +203,11 @@ type JobSync struct {
 	// log with reconcileReload. It heals a table corrupted by an older sync without truncating
 	// (reconcile writes only real deltas), so live consumers see the corrected rows, not a blink.
 	resyncReq atomic.Bool
+
+	// metrics samples running jobs' resource counters out of the same parsed stream, appending
+	// one record per committed transaction that moved a usage attribute. nil when unconfigured;
+	// every call site tolerates a nil receiver, so the feature costs nothing when off.
+	metrics *jobMetrics
 }
 
 // Resync requests that the next Poll rebuild the mirror from the current job_queue.log
@@ -247,6 +252,10 @@ type JobSyncConfig struct {
 	// progress, which the syncer re-applies idempotently on restart; rotation/compaction and a
 	// clean shutdown always checkpoint regardless.
 	SaveInterval time.Duration
+	// Metrics, when set, turns on per-job resource sampling into that archive table: one record
+	// per committed transaction that moved a usage attribute, with rates derived at ingest. See
+	// JobMetricsConfig; a zero Metrics.Archive leaves sampling off.
+	Metrics JobMetricsConfig
 }
 
 // NewJobSync creates a syncer that mirrors cfg.Filename into target (the jobs table) and routes
@@ -308,6 +317,10 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 		txs:            map[*db.DB]*db.Txn{},
 		store:          cfg.Store,
 	}
+	if cfg.Metrics.Logger == nil {
+		cfg.Metrics.Logger = logger
+	}
+	s.metrics = newJobMetrics(cfg.Metrics)
 	// Publish an initial status at construction (resume position, CaughtUp reflecting the current
 	// file) so the source is present in the VERY FIRST collector ad rather than only after the first
 	// poll completes -- dbad skips a source whose status is still zero (Kind ""), so without this the
@@ -1362,6 +1375,11 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 		}
 	case classadlog.OpDestroyClassAd:
 		tx.DestroyClassAd(e.Key)
+		if table == s.target {
+			// The job left the queue: drop its resource-sample predecessor, so that cache tracks
+			// running jobs rather than everything the tailer has ever seen.
+			s.metrics.forget(e.Key)
+		}
 		if parent, ok := clusterKeyOf(e.Key); ok {
 			if kids := s.children[parent]; kids != nil {
 				delete(kids, e.Key)
@@ -1397,6 +1415,11 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 				}
 			}
 		}
+		if table == s.target {
+			// Resource sampling rides along with the writes we are already doing: note that this
+			// job moved, and commitAll turns the noted set into one sample each.
+			s.metrics.note(e.Key, e.Name)
+		}
 	case classadlog.OpDeleteAttribute:
 		if !tx.Has(e.Key) {
 			s.mAbsentKey.Add(1) // observe-only (DeleteAttribute on an absent key is a no-op, but same signal)
@@ -1407,6 +1430,11 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 			for child := range kids {
 				jtx.DeleteAttribute(child, e.Name)
 			}
+		}
+		if table == s.target {
+			// A starter-sourced counter that an update omitted is DELETED from the job ad by
+			// HTCondor (CopyAttribute), so a delete is a real observation, not an absence of one.
+			s.metrics.note(e.Key, e.Name)
 		}
 	}
 	return nil
@@ -1665,12 +1693,26 @@ func (s *JobSync) ensureTx(table *db.DB) *db.Txn {
 // stall behind a commit is visible in the log at the moment it happens.
 func (s *JobSync) commitAll() error {
 	n := len(s.txs)
+	// Collect resource samples BEFORE committing: the open jobs transaction is where the merged,
+	// post-update row can be read, and reading it here rather than after the commit means a
+	// transaction that fails to commit leaves no sample for state that never landed.
+	var samples []*classad.ClassAd
+	if s.metrics != nil {
+		if jtx := s.txs[s.target]; jtx != nil {
+			samples = s.metrics.collect(jtx, s.curSeq)
+		} else {
+			s.metrics.discard()
+		}
+	}
 	start := nowFn()
 	var firstErr error
 	for _, tx := range s.txs {
 		if err := tx.Commit(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+	if firstErr == nil {
+		s.metrics.flush(samples)
 	}
 	s.txs = map[*db.DB]*db.Txn{}
 	s.explicit = false
@@ -1686,6 +1728,14 @@ func (s *JobSync) commitAll() error {
 }
 
 func (s *JobSync) abort() {
+	// Nothing was written, so nothing was observed: drop the noted set rather than carrying it
+	// into the next pass, where a key touched only by the abandoned pass would be sampled against
+	// a row that never changed.
+	//
+	// This is NOT what keeps a reconcile reload from emitting a duplicate sample per running job
+	// -- that falls out of structure: the reconciler writes through its own batched transactions
+	// and never calls commitAll, which is the only place samples are taken.
+	s.metrics.discard()
 	for _, tx := range s.txs {
 		tx.Abort()
 	}

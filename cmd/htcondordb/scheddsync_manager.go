@@ -98,6 +98,13 @@ func (m *scheddSyncManager) runGuardedTailer(ctx context.Context, name string, r
 // (the backfill decompresses every record once).
 const defaultArchiveCategoricalAttrs = "Owner"
 
+// defaultJobMetricsSegmentSize is deliberately a QUARTER of the archive default (8 MiB). A
+// dashboard reads the newest samples almost exclusively, and the active (unsealed) segment carries
+// no sidecar index, so it is rescanned in full on every query -- the measured dominant cost of an
+// archive read. Smaller segments seal sooner and shrink that window, which matters far more here
+// than for history, whose queries are not dominated by the last few minutes.
+const defaultJobMetricsSegmentSize = 2 << 20
+
 // scheddSyncSettings is the resolved, comparable configuration of the tailers. Every field
 // must stay comparable -- apply() reconciles by struct equality -- so attribute lists are
 // carried as their canonical config strings and split at the point of use.
@@ -138,6 +145,20 @@ type scheddSyncSettings struct {
 	// not persisted), so a puppet change takes effect on condor_reconfig.
 	historyMaxBytes int64
 	epochMaxBytes   int64
+
+	// Job resource-metrics sampling (the job_metrics archive). metricsEnabled turns the sampler
+	// on; the rest tune what it records and how much of it is kept. metricsAttrs names ADDITIONAL
+	// job attributes to copy into each sample -- an AccountingGroup, a ProjectName, or a metric
+	// the job publishes with condor_chirp, all of which already flow through job_queue.log.
+	metricsEnabled     bool
+	metricsAttrs       string
+	metricsCatAttrs    string
+	metricsSegSize     int
+	metricsMinInterval time.Duration
+	metricsMaxBytes    int64
+	// metricsMaxAge bounds the series by age (seconds against SampleTime) rather than by size.
+	// Both caps apply; whichever binds first drops the oldest whole segments.
+	metricsMaxAge float64
 }
 
 func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
@@ -196,7 +217,34 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		// default. Values accept a unit suffix ("10 GB", "500MiB") or plain bytes.
 		historyMaxBytes: configBytesOr(cfg, "HTCONDORDB_HISTORY_MAX_BYTES", defArchiveMaxBytes),
 		epochMaxBytes:   configBytesOr(cfg, "HTCONDORDB_EPOCH_HISTORY_MAX_BYTES", defArchiveMaxBytes),
+
+		// Off by default: sampling adds a record per running job per shadow update, which is a
+		// real volume decision an admin should make rather than inherit.
+		metricsEnabled:  configBool(cfg, "HTCONDORDB_JOB_METRICS"),
+		metricsAttrs:    canonicalAttrList(getStr(cfg, "HTCONDORDB_JOB_METRICS_ATTRS")),
+		metricsCatAttrs: canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS"), defaultArchiveCategoricalAttrs)),
+		metricsSegSize:  metricsSegmentSize(cfg),
+		// A throttle, not a filter: it only ever drops a sample carrying no transition (see
+		// jobMetrics.build). Seconds.
+		metricsMinInterval: time.Duration(configInt(cfg, "HTCONDORDB_JOB_METRICS_MIN_INTERVAL")) * time.Second,
+		metricsMaxBytes:    configBytesOr(cfg, "HTCONDORDB_JOB_METRICS_MAX_BYTES", defArchiveMaxBytes),
+		metricsMaxAge:      float64(configInt(cfg, "HTCONDORDB_JOB_METRICS_MAX_AGE")),
 	}
+}
+
+// metricsSegmentSize resolves the job_metrics segment size, defaulting to
+// defaultJobMetricsSegmentSize rather than to the library default. A negative value is treated as
+// unset; an explicit 0 means "use the library default", which is how an admin opts out of the
+// small-segment choice.
+func metricsSegmentSize(cfg *config.Config) int {
+	if _, set := cfg.Get("HTCONDORDB_JOB_METRICS_SEGMENT_SIZE"); !set {
+		return defaultJobMetricsSegmentSize
+	}
+	n := configInt(cfg, "HTCONDORDB_JOB_METRICS_SEGMENT_SIZE")
+	if n < 0 {
+		return defaultJobMetricsSegmentSize
+	}
+	return n
 }
 
 // configBytes reads a byte-size knob, accepting a unit suffix ("10 GB", "500MiB", "2t") or plain
@@ -320,6 +368,29 @@ func (m *scheddSyncManager) applyArchiveMaxBytes(t *db.ArchiveTable, name string
 	m.logger.Info("schedd-sync: archive size limit set", "archive", name,
 		"max_bytes", maxBytes, "was", was,
 		"note", "oldest whole segments are dropped past the cap on the archive-maintenance pass")
+}
+
+// applyArchiveMaxAge puts an age ceiling on an archive's retention, measured against SampleTime.
+// Like the size cap it is a runtime setting, so it is re-asserted on every start and reconfigure.
+// The attribute it measures against must be zone-mapped (the archive keeps a per-segment maximum
+// of it), which is why SampleTime is in JobMetricsZoneAttrs.
+func (m *scheddSyncManager) applyArchiveMaxAge(t *db.ArchiveTable, name string, maxAge float64) {
+	r := t.Retention()
+	if r.MaxAge == maxAge && (maxAge == 0 || r.MaxAgeAttr == scheddsync.SampleTimeAttr) {
+		return
+	}
+	was := r.MaxAge
+	r.MaxAge = maxAge
+	if maxAge > 0 {
+		r.MaxAgeAttr = scheddsync.SampleTimeAttr
+	}
+	if err := t.SetRetention(r); err != nil {
+		m.logger.Error("schedd-sync: setting archive age limit", "archive", name,
+			"max_age_seconds", maxAge, "err", err)
+		return
+	}
+	m.logger.Info("schedd-sync: archive age limit set", "archive", name,
+		"max_age_seconds", maxAge, "was", was, "attr", r.MaxAgeAttr)
 }
 
 // reconcileArchiveIndexes registers the backfill goroutine on wg so it is joined on
@@ -508,6 +579,37 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("schedd-sync: creating logmeta table: %w", err)
 		}
+		// Resource sampling rides on the same parsed stream, so it is configured here rather than
+		// as a tailer of its own: there is nothing extra to poll, and a second tailer would both
+		// double the parse cost and reintroduce an ordering problem between the queue state and
+		// the sample taken from it.
+		metricsCfg := scheddsync.JobMetricsConfig{
+			Attrs:       splitAttrList(s.metricsAttrs),
+			MinInterval: s.metricsMinInterval,
+			Logger:      m.logger,
+		}
+		if s.metricsEnabled {
+			jm, merr := m.svc.Catalog().CreateArchiveTable(scheddsync.DefaultJobMetricsTable, db.ArchiveConfig{
+				SegmentSize:      s.metricsSegSize,
+				RowGroupBytes:    s.archiveRowGroupBytes,
+				CategoricalAttrs: splitAttrList(s.metricsCatAttrs),
+				ValueAttrs:       scheddsync.JobMetricsValueAttrs,
+				// SampleTime carries the whole read pattern: every dashboard query filters on it,
+				// so zone-mapping it prunes whole segments instead of scanning, and age-based
+				// retention measures against a zone-mapped attribute.
+				ZoneAttrs: scheddsync.JobMetricsZoneAttrs,
+			})
+			if merr != nil {
+				return nil, nil, nil, fmt.Errorf("schedd-sync: creating job_metrics archive: %w", merr)
+			}
+			m.applyArchiveRowGroupBytes(jm, scheddsync.DefaultJobMetricsTable, s)
+			m.applyArchiveMaxBytes(jm, scheddsync.DefaultJobMetricsTable, s.metricsMaxBytes)
+			m.applyArchiveMaxAge(jm, scheddsync.DefaultJobMetricsTable, s.metricsMaxAge)
+			metricsCfg.Archive = jm
+			m.logger.Info("schedd-sync: sampling job resource usage",
+				"archive", scheddsync.DefaultJobMetricsTable, "extra_attrs", s.metricsAttrs,
+				"min_interval_seconds", s.metricsMinInterval.Seconds())
+		}
 		js := scheddsync.NewJobSync(jobs, scheddsync.JobSyncConfig{
 			Filename: s.jobLog, Logger: m.logger, Store: syncStore("jobs.pos"),
 			PollInterval: s.pollInterval, IdleMaxInterval: s.idleMaxInterval,
@@ -515,6 +617,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			Users:         users, Jobsets: jobsets, Clusters: clusters, Header: header,
 			ClusterPrivate: clusterprivate, LogMeta: logmeta,
 			SaveInterval: s.saveInterval,
+			Metrics:      metricsCfg,
 		})
 		wg.Add(1)
 		go func() { defer wg.Done(); m.runGuardedTailer(ctx, "jobs", js.Run) }()

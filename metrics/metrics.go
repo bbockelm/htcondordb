@@ -22,6 +22,7 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 
 	"github.com/bbockelm/htcondordb/dbad"
+	"github.com/bbockelm/htcondordb/scheddsync"
 )
 
 const namespace = "htcondordb"
@@ -274,6 +275,34 @@ func (c *viewCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
+// sampleOutcomes accumulates the job resource-sampler's counters across sync sources so they are
+// exported once per scrape rather than once per source (only the job source ever samples, and
+// duplicate label sets are a gather error).
+type sampleOutcomes scheddsync.MetricsStatus
+
+func (o sampleOutcomes) add(m scheddsync.MetricsStatus) sampleOutcomes {
+	o.Appended += m.Appended
+	o.Throttled += m.Throttled
+	o.Baseline += m.Baseline
+	o.Resets += m.Resets
+	o.InheritedCounters += m.InheritedCounters
+	o.Deduped += m.Deduped
+	o.AppendFailures += m.AppendFailures
+	return o
+}
+
+func (o sampleOutcomes) byOutcome() map[string]int64 {
+	return map[string]int64{
+		"appended":      o.Appended,
+		"throttled":     o.Throttled,
+		"baseline":      o.Baseline,
+		"reset":         o.Resets,
+		"inherited":     o.InheritedCounters,
+		"deduped":       o.Deduped,
+		"append_failed": o.AppendFailures,
+	}
+}
+
 // syncCollector emits schedd-sync tailer health (label: kind, source) and the daemon-managed
 // change-data exporter health (label: exporter, kind). Both are the "is anything falling behind"
 // signals an operator alerts on -- lag_bytes climbing or an exporter's last_beat going stale.
@@ -297,6 +326,7 @@ type syncCollector struct {
 	syncCommitSecs   *prometheus.Desc
 	syncPollSecs     *prometheus.Desc
 	syncReconcileSec *prometheus.Desc
+	jobSamples       *prometheus.Desc
 	expUp            *prometheus.Desc
 	expRestarts      *prometheus.Desc
 	expIndexed       *prometheus.Desc
@@ -337,6 +367,9 @@ func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dba
 		deltaFallback: prometheus.NewDesc(namespace+"_delta_fallback_total",
 			"Patch writes that did NOT store a delta record, by reason. \"removal\": the write deleted an attribute, which a delta cannot express. \"bound\": the key's chain reached DeltaMax. \"no_base\": no whole record to chain to (a create). \"ineligible\": delta records not in use for the write. \"unreadable_base\": REFUSED -- the key was present but its current record could not be read; before that refusal existed each of these stored the transaction's attributes as a whole record, producing an identity-less row (no ClusterId/JobStatus/Key). A climbing unreadable_base means the store is failing to resolve keys it holds.",
 			[]string{"reason"}, nil),
+		jobSamples: prometheus.NewDesc(namespace+"_job_metrics_samples_total",
+			"Job resource-usage observations by outcome. \"appended\": written to the job_metrics archive. \"throttled\": dropped by HTCONDORDB_JOB_METRICS_MIN_INTERVAL (never a state change or a run endpoint). \"baseline\": written with no derived rates because there was no usable predecessor -- a run's first sample or the first after a restart. \"reset\": a rate was suppressed because its counter went backwards, which means HTCondor reset a counter in a way the sampler does not model; a climbing value is a bug signal, not a workload signal. \"inherited\": a new run was still carrying the previous run's counters when first observed. \"deduped\": skipped as already present while replaying the log after a restart. \"append_failed\": the archive rejected the write.",
+			[]string{"outcome"}, nil),
 		syncReconciles: prometheus.NewDesc(namespace+"_sync_reconciles_total",
 			"Full reconcile-reload runs the schedd-sync tailer has performed (replay + sweep), by kind and source. Expected to be rare (about one per source-file compaction).", sync, nil),
 		syncCommitSecs: prometheus.NewDesc(namespace+"_sync_commit_seconds_total",
@@ -388,6 +421,7 @@ func (c *syncCollector) Collect(ch chan<- prometheus.Metric) {
 	} {
 		ch <- prometheus.MustNewConstMetric(c.deltaFallback, prometheus.CounterValue, float64(v), reason)
 	}
+	var samples sampleOutcomes
 	if c.sources != nil {
 		for _, s := range dbad.LiveStatuses(c.sources) {
 			g := func(d *prometheus.Desc, v float64) {
@@ -406,6 +440,14 @@ func (c *syncCollector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(c.syncCommitSecs, prometheus.CounterValue, s.CommitSeconds, s.Kind, s.Source)
 			ch <- prometheus.MustNewConstMetric(c.syncPollSecs, prometheus.CounterValue, s.PollSeconds, s.Kind, s.Source)
 			ch <- prometheus.MustNewConstMetric(c.syncReconcileSec, prometheus.CounterValue, s.ReconcileSeconds, s.Kind, s.Source)
+			// Sampler counters are labelled by OUTCOME only, not by (kind, source): only the job
+			// source samples, so a per-source series would carry no extra information -- and one
+			// per source would mean several series with identical label values, which the
+			// registry rejects at gather time. Summed here, emitted once below.
+			samples = samples.add(s.Metrics)
+		}
+		for outcome, v := range samples.byOutcome() {
+			ch <- prometheus.MustNewConstMetric(c.jobSamples, prometheus.CounterValue, float64(v), outcome)
 		}
 	}
 	if c.exporters != nil {

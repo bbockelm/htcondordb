@@ -45,6 +45,11 @@ type SyncStatus struct {
 	CommitSeconds    float64
 	PollSeconds      float64
 	ReconcileSeconds float64
+
+	// Metrics is the job resource-sampler's counters (zero when sampling is off, and on the
+	// history/epoch sources). Appended is the volume; Resets and InheritedCounters are the two
+	// "our model of HTCondor's counter semantics is wrong" signals and should stay near zero.
+	Metrics MetricsStatus
 }
 
 // Status exposes the latest published snapshot (zero value before the first read pass). Both
@@ -88,6 +93,7 @@ func (s *JobSync) publishStatus(progressed bool) {
 	st.CommitSeconds = float64(s.mCommitNanos.Load()) / 1e9
 	st.PollSeconds = float64(s.mPollNanos.Load()) / 1e9
 	st.ReconcileSeconds = float64(s.mReconcileNanos.Load()) / 1e9
+	st.Metrics = s.metrics.status()
 	if prev := s.status.Load(); prev != nil {
 		st.LastSync = prev.LastSync
 	}
