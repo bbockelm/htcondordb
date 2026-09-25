@@ -1,0 +1,319 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 0,
+  "schemaVersion": 39,
+  "tags": [
+    "htcondor",
+    "htcondordb",
+    "job-metrics"
+  ],
+  "title": "HTCondorDB Job Resource Usage",
+  "uid": "htcondordb-job-metrics",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "description": "Resource usage of running jobs, sampled from job_queue.log into the job_metrics archive (HTCONDORDB_JOB_METRICS). Requires schedd sync with job metrics enabled.",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "bbockelm-htcondordb-datasource",
+        "refresh": 1,
+        "hide": 0,
+        "current": {}
+      },
+      {
+        "name": "owner",
+        "label": "Owner",
+        "type": "query",
+        "datasource": {
+          "type": "bbockelm-htcondordb-datasource",
+          "uid": "${datasource}"
+        },
+        "query": "SELECT DISTINCT Owner FROM job_metrics",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "CPU cores used, by owner",
+      "type": "timeseries",
+      "datasource": {
+        "type": "bbockelm-htcondordb-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Average cores consumed per sampled job, from the change in RemoteUserCpu+RemoteSysCpu between consecutive observations. Gaps are real: a rate is undefined (never zero) when there is no usable predecessor -- a run's first samples, or an interval spanning a run boundary, where the counters restart.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "bbockelm-htcondordb-datasource",
+            "uid": "${datasource}"
+          },
+          "editorMode": "builder",
+          "table": "job_metrics",
+          "metrics": [
+            {
+              "func": "AVG",
+              "attr": "CpuUtil"
+            }
+          ],
+          "format": "timeseries",
+          "timeField": "SampleTime",
+          "groupBy": [
+            "Owner"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Memory high-water mark, by owner",
+      "type": "timeseries",
+      "datasource": {
+        "type": "bbockelm-htcondordb-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "PEAK memory ever used, not current usage: HTCondor's MemoryUsage only ratchets up. Filtered to RunInstanceID == 0 because the shadow SEEDS this from the previous run, so for a rerun it is the maximum over all of the job's runs wearing this run's timestamp. Read it as 'how much has this job ever needed', which is the right-sizing question.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decmbytes"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "bbockelm-htcondordb-datasource",
+            "uid": "${datasource}"
+          },
+          "editorMode": "builder",
+          "table": "job_metrics",
+          "metrics": [
+            {
+              "func": "MAX",
+              "attr": "MemoryUsage"
+            }
+          ],
+          "format": "timeseries",
+          "timeField": "SampleTime",
+          "groupBy": [
+            "Owner"
+          ],
+          "filters": [
+            {
+              "attr": "RunInstanceID",
+              "op": "==",
+              "value": "0"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Disk I/O rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "bbockelm-htcondordb-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Bytes/s read and written per sampled job, differentiated at ingest from the cumulative block counters. Only populated where the procd reports block I/O.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "bbockelm-htcondordb-datasource",
+            "uid": "${datasource}"
+          },
+          "editorMode": "builder",
+          "table": "job_metrics",
+          "metrics": [
+            {
+              "func": "AVG",
+              "attr": "BlockReadRate"
+            },
+            {
+              "func": "AVG",
+              "attr": "BlockWriteRate"
+            }
+          ],
+          "format": "timeseries",
+          "timeField": "SampleTime"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Memory actually used, as a fraction of what was requested",
+      "type": "barchart",
+      "datasource": {
+        "type": "bbockelm-htcondordb-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "The right-sizing panel, and the one that pays for this table: who asks for 64 GB and uses 4. MemUtil is MemoryUsage/RequestMemory, computed at ingest so the units are known to agree (both MiB). Restricted to first runs -- see the memory panel.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "bbockelm-htcondordb-datasource",
+            "uid": "${datasource}"
+          },
+          "editorMode": "builder",
+          "table": "job_metrics",
+          "metrics": [
+            {
+              "func": "AVG",
+              "attr": "MemUtil"
+            }
+          ],
+          "format": "table",
+          "timeField": "SampleTime",
+          "groupBy": [
+            "Owner"
+          ],
+          "orderBy": "AVG(MemUtil)",
+          "orderDesc": false,
+          "filters": [
+            {
+              "attr": "RunInstanceID",
+              "op": "==",
+              "value": "0"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Samples by trigger",
+      "type": "piechart",
+      "datasource": {
+        "type": "bbockelm-htcondordb-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "What caused each observation. Sampling is event-driven, so the 900s periodic timer is a floor: state changes, checkpoints and run endpoints add points on their own. A large 'chirp' share means jobs are publishing their own metrics frequently.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "bbockelm-htcondordb-datasource",
+            "uid": "${datasource}"
+          },
+          "editorMode": "builder",
+          "table": "job_metrics",
+          "metrics": [
+            {
+              "func": "COUNT",
+              "attr": "*"
+            }
+          ],
+          "format": "table",
+          "timeField": "SampleTime",
+          "groupBy": [
+            "SampleTrigger"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Jobs with the largest peak memory",
+      "type": "table",
+      "datasource": {
+        "type": "bbockelm-htcondordb-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "The jobs behind the right-sizing numbers, so an admin can go and look at one. $__timeFilter expands to the dashboard's range over SampleTime, which the archive zone-maps -- so the range prunes whole segments instead of scanning the table.",
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 8,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "bbockelm-htcondordb-datasource",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "rawSql": "SELECT ClusterId, ProcId, Owner, MAX(MemoryUsage) AS PeakMemoryMB, MAX(RequestMemory) AS RequestedMB, MAX(MemUtil) AS Fraction FROM job_metrics WHERE $__timeFilter(SampleTime) && RunInstanceID == 0 GROUP BY ClusterId, ProcId, Owner ORDER BY MAX(MemoryUsage) DESC LIMIT 25"
+        }
+      ]
+    }
+  ]
+}

@@ -3,21 +3,21 @@ module github.com/bbockelm/htcondordb/grafana
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.29.14
-	github.com/PelicanPlatform/classad/dbrpc v0.29.14
+	github.com/PelicanPlatform/classad v0.30.10
+	github.com/PelicanPlatform/classad/dbrpc v0.30.10
 	github.com/bbockelm/cedar v0.6.19
-	github.com/bbockelm/golang-htcondor v0.14.8
+	github.com/bbockelm/golang-htcondor v0.16.1
 	github.com/bbockelm/htcondordb v0.0.0
 	github.com/grafana/grafana-plugin-sdk-go v0.291.0
 )
 
 require (
 	github.com/BurntSushi/toml v1.5.0 // indirect
-	github.com/PelicanPlatform/classad/collections v0.29.14 // indirect
-	github.com/PelicanPlatform/classad/db v0.29.14 // indirect
+	github.com/PelicanPlatform/classad/collections v0.30.10 // indirect
+	github.com/PelicanPlatform/classad/db v0.30.10 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.27.0 // indirect
 	github.com/apache/arrow-go/v18 v18.5.2 // indirect
-	github.com/bbockelm/gosssd v0.0.2 // indirect
+	github.com/bbockelm/gosssd v0.0.3 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect

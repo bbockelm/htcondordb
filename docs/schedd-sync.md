@@ -213,6 +213,15 @@ chase resolution.
 Because the terminal commit carries the run's final counters, the **last sample of a run is
 its endpoint** — a resource plot needs no `epoch_history` lookup to find where a run finished.
 
+### The shipped dashboard
+
+The Grafana plugin bundles **HTCondorDB Job Resource Usage** (`htcondordb-job-metrics`), so the
+plots exist without writing any of the queries above: CPU cores used and memory high-water mark
+over time by owner, disk I/O rate, the requested-vs-used memory bar chart, a breakdown of what
+triggered each sample, and a table of the jobs with the largest peak memory. Import it from the
+datasource's dashboard list. The memory panels restrict themselves to `RunInstanceID == 0` for
+the reason in the next section.
+
 ### Reading the columns correctly
 
 Two properties of HTCondor's counters will mislead a dashboard built without them:
