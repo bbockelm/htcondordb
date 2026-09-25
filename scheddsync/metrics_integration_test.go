@@ -90,13 +90,21 @@ func TestJobMetricsIntegration(t *testing.T) {
 	})
 	es := NewJobEpochSync(epochArch, HistorySyncConfig{Filename: epochFile})
 
-	// A job that burns a little CPU and holds some memory for long enough to be sampled while
-	// running. Deliberately not /bin/sleep: a job that uses no CPU would make the counter
-	// assertions below pass on zeroes.
+	// A job that burns CPU IN ITS OWN PROCESS for long enough to be sampled while running.
+	//
+	// Both halves of that matter. Not /bin/sleep, because a job that uses no CPU would let the
+	// counter assertions pass on zeroes. And the loop is arithmetic in the shell itself rather
+	// than a time-bounded loop calling date(1), so the CPU is burned in the one process the
+	// procd is certainly tracking rather than in short-lived children it may only see on its
+	// snapshot interval.
+	//
+	// Even so, RemoteUserCpu comes through as 0 on a macOS harness for a job that demonstrably
+	// ran for eleven seconds. Whether that is Darwin process accounting, the procd's sampling, or
+	// something else is NOT established here -- which is exactly why the assertions below check
+	// that the endpoint carries real usage rather than naming CPU, and log what was found.
 	jobDir := t.TempDir()
 	submit := fmt.Sprintf("universe = vanilla\nexecutable = /bin/sh\n"+
-		"arguments = \"-c 'i=0; end=$(( $(date +%%s) + 12 )); while [ $(date +%%s) -lt $end ]; do "+
-		"i=$((i+1)); done; echo $i'\"\n"+
+		"arguments = \"-c 'i=0; while [ $i -lt 4000000 ]; do i=$((i+1)); done; echo $i'\"\n"+
 		"output = e.out\nerror = e.err\nlog = e.log\ntransfer_executable = false\n"+
 		"initialdir = %s\nqueue\n", jobDir)
 	clusterID, err := schedd.Submit(ctx, submit)
@@ -150,10 +158,11 @@ func TestJobMetricsIntegration(t *testing.T) {
 		t.Errorf("the LAST sample is %q, not the terminal one: the endpoint guarantee is that a "+
 			"run's final sample is its end, and ordering matters for a series", v)
 	}
-	// Which usage counters a platform actually populates varies -- macOS reports no CPU at all
-	// (RemoteUserCpu and CpusUsage both come through as 0), while Linux does. So the assertion is
-	// that the endpoint carries REAL usage, not that it carries one particular attribute, and the
-	// log says which ones were found so a platform gap is visible rather than silently tolerated.
+	// The assertion is that the endpoint carries REAL usage, not that it carries one particular
+	// attribute: which counters are populated depends on the platform and on how the EP tracks
+	// processes (see the note on the procd snapshot interval above, and CPU accounting needs the
+	// job's CPU to be visible to it at all). The log names what was found, so a gap stays visible
+	// rather than being tolerated silently.
 	usage := map[string]float64{}
 	for _, a := range []string{"RemoteUserCpu", "RemoteSysCpu", "MemoryUsage", "ResidentSetSize",
 		"DiskUsage", "CommittedTime", "BytesSent", "BytesRecvd"} {
