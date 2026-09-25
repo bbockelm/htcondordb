@@ -1,9 +1,12 @@
 package scheddsync
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -99,5 +102,68 @@ func TestUnappliedCounterReachesStatus(t *testing.T) {
 	s.publishStatus(true)
 	if got := s.Status().Unapplied; got != 7 {
 		t.Errorf("SyncStatus.Unapplied = %d, want 7", got)
+	}
+}
+
+// A dropped key logged without its reason tells an operator that something was lost but not what
+// to do about it -- a missing base, a chain broken at a dead link and bytes that will not decode
+// are different faults with different responses, and the only way to tell them apart was to
+// correlate by hand against the daemon ad's counters.
+func TestUnappliedIsFormattedWithItsReason(t *testing.T) {
+	got := formatUnapplied(&db.UnappliedError{
+		Keys:    []string{"15781354.0", "0.830"},
+		Reasons: []string{"delta-no-base", "delta-chain-broken"},
+	})
+	want := []string{"15781354.0 (delta-no-base)", "0.830 (delta-chain-broken)"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// An older classad, or a path that does not set them, must still log the keys rather than
+	// dropping the line or printing a misaligned pairing.
+	bare := formatUnapplied(&db.UnappliedError{Keys: []string{"1.0", "2.0"}})
+	if len(bare) != 2 || bare[0] != "1.0" || bare[1] != "2.0" {
+		t.Errorf("without reasons got %v, want the bare keys", bare)
+	}
+	// Mismatched lengths must not pair the wrong reason to a key.
+	mism := formatUnapplied(&db.UnappliedError{Keys: []string{"1.0", "2.0"}, Reasons: []string{"delta-no-base"}})
+	if len(mism) != 2 || mism[0] != "1.0" {
+		t.Errorf("with mismatched reasons got %v, want the bare keys", mism)
+	}
+}
+
+// And the WARN line must actually carry the reasons. The formatting test above passes with the
+// call site reverted to bare keys, so it proves the helper works, not that anything uses it --
+// and the operator-visible symptom was precisely a log line that named keys and nothing else.
+func TestTheUnappliedWarnLineCarriesTheReason(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	d := persistentDB(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, "107 1 CreationTimestamp 1000\n"+
+		"105 \n101 1.0 Job Machine\n103 1.0 ClusterId 1\n103 1.0 JobStatus 1\n106 \n")
+
+	s := NewJobSync(d, JobSyncConfig{Filename: logPath, Logger: logger})
+	applyErrorHook = func(error) error {
+		return &db.UnappliedError{Keys: []string{"1.0"}, Reasons: []string{"delta-no-base"}}
+	}
+	defer func() { applyErrorHook = nil }()
+
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll returned %v: an unapplied write must not be surfaced as a failure", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "could not be applied") {
+		t.Fatalf("no warning was logged at all; output: %s", out)
+	}
+	if !strings.Contains(out, "delta-no-base") {
+		t.Errorf("the warning does not name the reason, which is the whole point; output: %s", out)
 	}
 }
