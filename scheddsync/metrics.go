@@ -270,7 +270,10 @@ func triggerFor(name string) sampleTrigger {
 	switch strings.ToLower(name) {
 	case "exitcode", "exitbysignal", "exitsignal", "exitreason", "jobexitstatus",
 		"terminationpending", "removereason", "holdreason", "holdreasoncode",
-		"vacatereason", "lastvacatetime", "completiondate":
+		"vacatereason", "lastvacatetime":
+		// Deliberately NOT CompletionDate: the schedd writes it as 0 at SUBMIT, so it is a
+		// terminal signal only by its value, never by being set. JobStatus and ExitCode carry
+		// the real transition.
 		return triggerTerminal
 	case "jobcheckpointnumber", "lastcheckpointtime", "numckpts":
 		return triggerCheckpoint
@@ -534,13 +537,37 @@ func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd,
 	prev := m.prev[key]
 	status, _ := job.EvaluateAttrInt("JobStatus")
 
-	// Only jobs that are actually executing have resource usage to observe. A job with no
-	// NumShadowStarts has never run; one that is idle or held between runs still has its
-	// attributes rewritten by schedd bookkeeping, and sampling those would add points to a
-	// series at times the job was consuming nothing. The exception is the terminal commit, which
-	// is the run's endpoint and carries its final numbers -- that one is sampled whatever status
-	// it leaves the job in (completed, evicted back to idle, or held).
-	if !haveRun || (!isExecuting(status) && trig != triggerTerminal) {
+	// What counts as the end of a run, and why it is not "the commit that set ExitCode".
+	//
+	// The schedd spreads a completion across SEVERAL transactions, and the one carrying the
+	// terminal-looking attributes is NOT the one that changes the status. Observed against a real
+	// schedd, in order: a transaction setting ExitCode/ExitBySignal/MemoryUsage while JobStatus is
+	// still 2; then more transactions of transfer timings and committed time; then, separately,
+	// the one that sets JobStatus to 4. So no single commit is both terminal-looking and
+	// terminally-statused, and a rule requiring both emits no endpoint at all.
+	//
+	// The reliable signal is the TRANSITION: this tailer was sampling the run (it holds a
+	// predecessor for it), and the job is no longer executing. That is the run's last sample
+	// whatever attribute happened to trigger the commit, and by then the row has accumulated the
+	// final numbers the earlier transactions wrote.
+	wasSampling := prev != nil
+	switch {
+	case !haveRun:
+		return nil // never ran; nothing to observe
+	case isExecuting(status):
+		// An attribute name is a hint about a commit, not a verdict on the job: a vacate time
+		// from an earlier run, or a hold reason being cleared, can ride along with ordinary
+		// updates. Labelling that "terminal" would put an endpoint mid-run, which is worse than
+		// cosmetic -- a consumer filtering to terminal samples relies on there being one per run.
+		if trig == triggerTerminal {
+			trig = triggerStatus
+		}
+	case wasSampling || trig == triggerTerminal:
+		// The run ended (completed, evicted back to idle, or held).
+		trig = triggerTerminal
+	default:
+		// Not executing and not a run we were following: schedd bookkeeping on an idle or held
+		// job, which is not an observation of resource usage.
 		return nil
 	}
 

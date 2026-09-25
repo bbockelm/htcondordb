@@ -713,3 +713,61 @@ func TestJobMetricsDisabled(t *testing.T) {
 		t.Fatal("disabled sampler should report zero counters")
 	}
 }
+
+// TestJobMetricsTerminalRequiresTerminalStatus: an attribute name is a hint about a commit, not a
+// verdict on the job. A commit that touches a terminal-looking attribute while the job is still
+// running must not be labelled the run's endpoint -- a consumer filtering to terminal samples
+// would find one mid-run, and the guarantee that a run's LAST sample is its end would be false.
+//
+// Found by running against a real schedd, which wrote exactly this shape.
+func TestJobMetricsTerminalRequiresTerminalStatus(t *testing.T) {
+	pinClock(t, base-1)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, submitted)
+	s, arch := newSampledSync(t, logPath, JobMetricsConfig{})
+
+	appendFile(t, logPath, spawned(1))
+	// A terminal-looking attribute on a job that is still Running.
+	appendFile(t, logPath, fmt.Sprintf(`105
+103 1.0 StatsLastUpdateTimeStarter %d
+103 1.0 RemoteUserCpu 60.0
+103 1.0 LastVacateTime %d
+106
+`, base+60, base+60))
+	// And the real ending.
+	appendFile(t, logPath, fmt.Sprintf(`105
+103 1.0 StatsLastUpdateTimeStarter %d
+103 1.0 RemoteUserCpu 120.0
+103 1.0 JobStatus 4
+103 1.0 ExitCode 0
+106
+`, base+120))
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	got := samples(t, arch)
+	var kinds []string
+	for _, ad := range got {
+		kinds = append(kinds, trig(t, ad))
+	}
+	if n := len(got); n < 2 || kinds[n-1] != "terminal" {
+		t.Fatalf("triggers = %v; the LAST sample must be the terminal one", kinds)
+	}
+	for i, k := range kinds[:len(kinds)-1] {
+		if k == "terminal" {
+			t.Errorf("sample %d of %d is labelled terminal while the job was still running "+
+				"(all triggers: %v)", i, len(kinds), kinds)
+		}
+	}
+}
+
+// TestCompletionDateIsNotATerminalTrigger: the schedd writes CompletionDate = 0 at SUBMIT, so
+// treating the attribute's presence as a run ending misclassifies every submitted job.
+func TestCompletionDateIsNotATerminalTrigger(t *testing.T) {
+	if got := triggerFor("CompletionDate"); got == triggerTerminal {
+		t.Error("CompletionDate classified as terminal; it is written as 0 at submit, so only " +
+			"its VALUE is a signal and JobStatus/ExitCode carry the real transition")
+	}
+}

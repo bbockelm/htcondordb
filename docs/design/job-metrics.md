@@ -478,12 +478,38 @@ nothing, plus one useless record per job in a large submit. Two rules together:
 
 ### 4.3 End of run comes free — `epoch_history` is a cross-check, not a dependency
 
-Because `common_job_queue_attrs` is included in every update type (§2.2), the `U_TERMINATE` /
-`U_EVICT` / `U_HOLD` update carries the run's **final** usage numbers, in a transaction the
-tailer sees before the schedd destroys the ad. Streaming therefore gives us the endpoint for
-free: the last sample of a `RunInstanceID` *is* the end-of-run record, tagged
+Because `common_job_queue_attrs` is included in every update type (§2.2), the run's **final**
+usage numbers reach the queue before the schedd destroys the ad. Streaming therefore gives us the
+endpoint for free: the last sample of a `RunInstanceID` *is* the end-of-run record, tagged
 `SampleTrigger == "terminal"`, and a short job that never survived a full
 `SHADOW_QUEUE_UPDATE_INTERVAL` still gets at least one point.
+
+**How the endpoint is actually detected, which is not what this section first assumed.** The
+obvious rule — "the commit that sets `ExitCode` is the terminal one" — does not work, and the
+integration test against a real schedd is what established that. A completion is spread across
+several transactions, and the one carrying the terminal-looking attributes is *not* the one that
+changes the status. Observed, in order:
+
+| transaction | sets | `JobStatus` at that point |
+|---|---|---|
+| A | `ExitCode`, `ExitBySignal`, `MemoryUsage`, `CpusUsage` | still 2 (Running) |
+| B, C | transfer timings, `CommittedTime`, `TerminationPending` | still 2 |
+| D | `JobStatus 4`, `LastJobStatus 2`, `EnteredCurrentStatus` | 4 |
+| E | `LastRemoteWallClockTime`, then DELETES `RemoteHost`, `ClaimId`, … | 4 |
+| (loose) | `CurrentHosts 0`, `CompletionDate` | 4 |
+| F | `TotalCompletedJobs`, then `DestroyClassAd` | — |
+
+So no single commit is both terminal-looking and terminally-statused, and a rule requiring both
+emits no endpoint at all. The reliable signal is the **transition**: the sampler was following the
+run (it holds a predecessor for it) and the job is no longer executing. That is the run's last
+sample whatever attribute triggered the commit, and by then the row has accumulated the final
+numbers transactions A–C wrote. Two consequences worth stating:
+
+- `CompletionDate` is *not* a terminal signal. The schedd writes it as `0` at **submit**, so only
+  its value means anything, and treating its presence as an ending misclassifies every job.
+- A terminal-looking attribute on a still-executing job (a vacate time from an earlier run, a
+  hold reason being cleared) must **not** be labelled terminal, or a consumer filtering to
+  terminal samples finds one mid-run and the "one endpoint per run" guarantee is false.
 
 `epoch_history` remains the authoritative per-run record (it carries the disposition, exit
 code, and attributes outside the whitelist) and it is keyed by the same
@@ -674,7 +700,15 @@ Recorded because the reasons generalize, not for completeness:
    benchmark that shrinks the job count instead of the sample count puts a job's consecutive
    samples in the same segment, where they compress beautifully and the guard it calibrates is
    useless.
-6. **Three of the first tests passed for the wrong reason,** and mutation-checking each rule
+8. **The endpoint rule was wrong, and only a real schedd showed it** (§4.3). Two successive
+   versions were wrong in opposite directions: keying on the attribute name put a "terminal"
+   sample mid-run on a job that was still going, and then requiring the status to agree in the
+   *same commit* removed the endpoint entirely, because HTCondor sets `ExitCode` and `JobStatus`
+   in different transactions. No amount of synthetic `job_queue.log` content would have found
+   either, because the synthetic content encoded the same assumption the code did. The lesson is
+   narrow and reusable: when a rule depends on how another system batches its writes, the test
+   has to be that system.
+9. **Three of the first tests passed for the wrong reason,** and mutation-checking each rule
    against the test that claimed to cover it is what found them: the run-boundary test was really
    exercising the backwards-counter guard (a seam delta is normally negative — it needs the case
    where the new run's counter has already *exceeded* the old one), the context-attribute test was

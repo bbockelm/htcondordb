@@ -210,8 +210,10 @@ floor but multiplies the schedd's job-queue write traffic for *every* whiteliste
 so prefer `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` to bound volume rather than raising cadence to
 chase resolution.
 
-Because the terminal commit carries the run's final counters, the **last sample of a run is
-its endpoint** — a resource plot needs no `epoch_history` lookup to find where a run finished.
+The run's final counters reach the queue before the job leaves it, so the **last sample of a run
+is its endpoint** — a resource plot needs no `epoch_history` lookup to find where a run finished.
+(The endpoint is detected from the job leaving the executing states, not from any one attribute:
+the schedd sets `ExitCode` and `JobStatus 4` in *different* transactions.)
 
 ### The shipped dashboard
 
