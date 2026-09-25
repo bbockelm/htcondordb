@@ -20,8 +20,14 @@ import (
 // the REAL sampler rather than hand-writing them, and it reports rather than asserts wherever the
 // honest answer is "it depends on the workload".
 //
-// Default size runs in CI as a regression guard (a change that triples the record fails).
-// HTCONDORDB_SCALE=1 runs the full-size version and the segment-size A/B.
+// These three are SCALE-GATED (HTCONDORDB_SCALE=1) and do not run in CI. Not because they are
+// slow -- though under -race they are, 13x -- but because every number they produce depends on
+// having production's shape: enough records to fill many segments, and enough concurrently
+// running jobs that a segment holds one sample each from thousands of DIFFERENT ones. Shrink
+// either and the measurement stops describing any deployment, which is worse than not running
+// it. The structural guard that CAN run cheaply -- is the record still columnar, is anything
+// escaping to row form, did the rate columns make the schema -- lives in
+// metrics_composition_test.go and runs on every CI build.
 
 // scaleSize is the population. The JOB COUNT is the same at both sizes and the sample count is
 // what shrinks, which is deliberate: on a real AP every running job is sampled in the same round,
@@ -30,10 +36,11 @@ import (
 // the counters delta-compress -- measuring a locality production never has, and calibrating the
 // regression guard below against a number no deployment will see.
 func scaleSize(t *testing.T) (jobs, perJob int) {
+	t.Helper()
 	if os.Getenv("HTCONDORDB_SCALE") == "" {
-		return 20000, 4
+		t.Skip("set HTCONDORDB_SCALE=1: this measurement is only meaningful at production size " +
+			"(see metrics_composition_test.go for the guard that runs in CI)")
 	}
-	t.Log("HTCONDORDB_SCALE set: running the full-size measurement")
 	return 20000, 24
 }
 
@@ -343,9 +350,6 @@ func TestJobMetricsDashboardQuery(t *testing.T) {
 //
 // Skipped unless HTCONDORDB_SCALE is set: it builds the population four times.
 func TestJobMetricsSegmentSizeAB(t *testing.T) {
-	if os.Getenv("HTCONDORDB_SCALE") == "" {
-		t.Skip("set HTCONDORDB_SCALE=1: this builds the population once per arm")
-	}
 	jobs, perJob := scaleSize(t)
 	sizes := []int{2 << 20, 8 << 20, 32 << 20, 64 << 20}
 	best, bestSize := 0.0, 0

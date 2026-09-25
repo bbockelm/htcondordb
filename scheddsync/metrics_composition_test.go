@@ -61,7 +61,7 @@ func TestJobMetricsRecordComposition(t *testing.T) {
 	// This one needs enough samples PER JOB that the rate-less first samples are a small share --
 	// otherwise the derived rates never clear the schema's presence threshold and the assertion
 	// below is inert. Both regimes are real; each test uses the one its own claim depends on.
-	jobs, perJob := 4000, 24
+	jobs, perJob := 500, 24
 	if os.Getenv("HTCONDORDB_SCALE") != "" {
 		jobs, perJob = 20000, 24
 	}
@@ -97,14 +97,27 @@ func TestJobMetricsRecordComposition(t *testing.T) {
 	st := arch.Stats()
 	n := arch.Count()
 	perRec := float64(st.UsedBytes) / float64(n)
-	// The active segment is still row-form. Subtract its (estimated) share so the headline is the
-	// cost of COLUMNARIZED data, which is what a table in steady state is made of. Segments are
-	// equal-sized in row form, so the active one holds about n/segments records at the raw rate.
-	activeRecs := float64(n) / float64(st.Segments)
-	sealedPerRec := (float64(st.UsedBytes) - activeRecs*rawPerRec) / (float64(n) - activeRecs)
-	t.Logf("records=%d segments=%d (%d sealed, %d columnar) raw=%.0fB/rec whole-table=%.0fB/rec "+
-		"COLUMNARIZED=%.0fB/rec", n, st.Segments, info.SealedSegments, info.CoveredSegments,
-		rawPerRec, perRec, sealedPerRec)
+
+	// The active segment is never columnarized, so a whole-table average mixes two storage
+	// formats. Separating them from totals alone needs an assumption -- that every segment holds
+	// about n/segments records -- which is false for the PARTIALLY filled active one. With many
+	// segments the error is a rounding detail; with two it produced a negative "columnarized"
+	// figure, which is how this got caught. So the sealed-only number is reported only when
+	// there are enough segments to support it, and the guard below uses whichever is real.
+	const enoughSegments = 8
+	sealedPerRec, haveSealed := 0.0, st.Segments >= enoughSegments
+	if haveSealed {
+		activeRecs := float64(n) / float64(st.Segments)
+		sealedPerRec = (float64(st.UsedBytes) - activeRecs*rawPerRec) / (float64(n) - activeRecs)
+		t.Logf("records=%d segments=%d (%d sealed, %d columnar) raw=%.0fB/rec whole-table=%.0fB/rec "+
+			"COLUMNARIZED=%.0fB/rec", n, st.Segments, info.SealedSegments, info.CoveredSegments,
+			rawPerRec, perRec, sealedPerRec)
+	} else {
+		t.Logf("records=%d segments=%d (%d sealed, %d columnar) raw=%.0fB/rec whole-table=%.0fB/rec "+
+			"(too few segments to separate the row-form active one; run with HTCONDORDB_SCALE=1 "+
+			"for the columnarized-only figure)",
+			n, st.Segments, info.SealedSegments, info.CoveredSegments, rawPerRec, perRec)
+	}
 
 	// Fixed slot widths, by purpose. This is the UNCOMPRESSED columnar cost per record -- the
 	// upper bound the codec then works against, and the thing a projection change moves.
@@ -200,6 +213,21 @@ func TestJobMetricsRecordComposition(t *testing.T) {
 		"could fix", sampled, len(fits), len(bad))
 	if len(bad) > 0 {
 		t.Errorf("fields stored as rows despite being in the schema: %v", bad)
+	}
+
+	// A byte ceiling, riding along on a population this test already builds. It is NOT the
+	// production number, in two directions at once: with few enough jobs that a segment holds
+	// several samples of each, the strings dedupe and the counters delta-compress (pushing it
+	// down), while at CI size half the table is the row-form active segment (pushing it up).
+	// TestJobMetricsRecordSize measures the real thing, scale-gated. This is still the guard that
+	// matters day to day: a change that triples a sample fails here, on every build.
+	measured, ceiling := perRec, 500.0
+	if haveSealed {
+		measured, ceiling = sealedPerRec, 400.0
+	}
+	if measured > ceiling {
+		t.Errorf("%.0f bytes/record exceeds the %.0fB ceiling -- a sample got much more expensive",
+			measured, ceiling)
 	}
 }
 

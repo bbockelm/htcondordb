@@ -568,7 +568,14 @@ Two follow-ons, not blocking:
 
 ## 7. Phasing
 
-**Phase 0 — measure. ✅ DONE** (`scheddsync/metrics_scale_test.go`; `HTCONDORDB_SCALE=1` for the
+**Phase 0 — measure. ✅ DONE.** Note on where these live: the size, query-pruning and
+segment-size measurements are **scale-gated** (`HTCONDORDB_SCALE=1`) and do not run in CI. Not
+merely because they are slow — under `-race` they are 13x slower, and the first attempt at
+running them in CI blew the job's 15-minute timeout — but because every number they produce
+depends on production's shape, and a population small enough for CI stops describing any
+deployment. What CI runs instead is the *structural* guard, which is cheap and arguably stronger:
+is the record still columnar, is any field escaping to row form, did the rate columns make the
+schema, and is a sample still under a byte ceiling. (`scheddsync/metrics_scale_test.go`; `HTCONDORDB_SCALE=1` for the
 full size, a production-shaped subset in CI as a regression guard). It built its records through
 the real sampler rather than hand-writing them, and it overturned two things this document
 asserted: the per-record size (off by ~4x, §3.3) and the segment-size default (§3.5). The one
