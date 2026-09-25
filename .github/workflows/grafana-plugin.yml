@@ -3,13 +3,17 @@ name: Grafana plugin
 # Builds the htcondordb Grafana datasource plugin (grafana/): the Go backend as a
 # standalone module (GOWORK=off, i.e. how a consumer builds it), the TypeScript
 # frontend, and a combined plugin bundle. Path-filtered so it only runs on plugin
-# changes.
+# changes -- plus the ROOT module's go.mod/go.sum, because the plugin consumes the
+# root through a replace and pins the shared dependencies itself. Without the root
+# in the filter a dependency bump there never triggers this job, and the plugin's
+# own pins fall behind until it stops building entirely, which is exactly what
+# happened between classad v0.29.14 and v0.30.10.
 on:
   push:
     branches: [main]
-    paths: ['grafana/**', '.github/workflows/grafana-plugin.yml']
+    paths: ['grafana/**', 'go.mod', 'go.sum', '.github/workflows/grafana-plugin.yml']
   pull_request:
-    paths: ['grafana/**', '.github/workflows/grafana-plugin.yml']
+    paths: ['grafana/**', 'go.mod', 'go.sum', '.github/workflows/grafana-plugin.yml']
 
 permissions:
   contents: read
