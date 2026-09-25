@@ -109,7 +109,7 @@ inherits the condor config and drops to the condor user.
 | `HTCONDORDB_JOB_METRICS_ATTRS` | — | Additional job attributes to record on every sample (e.g. `ProjectName`, a chirp-published metric). |
 | `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | `Owner` | Which of them get a categorical index (an unindexed `GROUP BY` is a full scan). |
 | `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` | `0` | Seconds; throttles redundant samples per job. Never drops a state change or a run endpoint. |
-| `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | `2097152` | Segment size (create-time only); smaller than the archive default on purpose. |
+| `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default | Segment size (create-time only). Measured best as-is; see [Sizing](#sizing). |
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | inherits default | Per-table size cap for `job_metrics`. |
 | `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap in seconds, measured against `SampleTime`. |
 
@@ -156,6 +156,37 @@ GROUP BY time_bucket(SampleTime, '1h'), ProjectName;
 SELECT Owner AS label_owner, AVG(MemUtil) AS metric_mem_fraction
 FROM job_metrics WHERE RunInstanceID == 0 GROUP BY Owner;
 ```
+
+### Sizing
+
+Measured on a production-shaped population (20k concurrently running jobs, every job sampled in
+the same round, so a segment holds one sample each from thousands of different jobs):
+
+| | bytes/record |
+|---|---|
+| as appended | ~810 |
+| after the archive maintenance pass | **~250** |
+
+At 20k running jobs sampling at the 900s floor that is **~480 MiB/day, ~14 GiB for 30 days**,
+before whatever the event-driven triggers add on an eventful pool. Budget with
+`HTCONDORDB_JOB_METRICS_MAX_BYTES` / `_MAX_AGE`; the retention sweep drops the oldest whole
+segments once either binds.
+
+Three notes that follow from the table:
+
+- **Keep archive maintenance enabled.** The 3x comes from the per-segment columnar build, which
+  the maintenance pass does (`HTCONDORDB_ARCHIVE_ROTATE_INTERVAL`, hourly by default). With it
+  disabled, samples stay in row form and the table is roughly three times bigger.
+- **Do not tune the segment size without measuring.** Bytes per record is not monotone in it —
+  8 MiB measured best of 2/8/32/64 MiB, and 2 MiB cost 1.5x the storage for a 4% faster
+  recent-range query.
+- **Watch the baseline share.** If
+  `job_metrics_samples_total{outcome="baseline"} / {outcome="appended"}` exceeds ~10%, the
+  derived rate columns stop being stored columnar (a column needs to be present on 90% of
+  records to enter the segment schema, and a rate is absent on a run's first samples). A pool of
+  very short jobs -- sampled only two or three times each before they finish -- is the case that
+  trips it, and the cost is both size and the fast path for the columns dashboards aggregate.
+  Lowering `SHADOW_QUEUE_UPDATE_INTERVAL` so short jobs get more samples is the lever.
 
 ### When a sample is taken
 

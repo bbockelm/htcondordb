@@ -40,7 +40,7 @@ client in the tree resolves through `locate.Daemon`, and the daemon publishes to
 | `HTCONDORDB_JOB_METRICS_ATTRS` | — | Additional job attributes copied onto every sample — an `AccountingGroup`, a `ProjectName`, or a metric the job publishes with `condor_chirp` (all already flow through `job_queue.log`). |
 | `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | `Owner` | Categorical (string-equality) indexes on `job_metrics`. An unindexed `GROUP BY` is a full scan, and adding an index later costs a backfill. |
 | `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` | `0` | Seconds between samples for one job; a volume backstop. A state change, a new run and the run's endpoint are never throttled. |
-| `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | `2097152` | Sealed-segment size for `job_metrics` (create-time only). A quarter of the archive default: dashboards read the newest samples, and the unsealed segment is rescanned in full on every query. `0` = library default. |
+| `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default (8 MiB) | Sealed-segment size for `job_metrics` (create-time only). Leave it alone unless you have measured: bytes per record is **not** monotone in segment size, and 8 MiB measured best of 2/8/32/64 MiB (2 MiB cost 1.5x the storage for a 4% faster recent-range query). |
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for `job_metrics`; overrides the shared default (`0` uncaps this table). |
 | `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap in seconds, measured against `SampleTime`. Both caps apply; whichever binds first drops the oldest whole segments. |
 

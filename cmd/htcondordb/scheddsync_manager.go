@@ -98,13 +98,6 @@ func (m *scheddSyncManager) runGuardedTailer(ctx context.Context, name string, r
 // (the backfill decompresses every record once).
 const defaultArchiveCategoricalAttrs = "Owner"
 
-// defaultJobMetricsSegmentSize is deliberately a QUARTER of the archive default (8 MiB). A
-// dashboard reads the newest samples almost exclusively, and the active (unsealed) segment carries
-// no sidecar index, so it is rescanned in full on every query -- the measured dominant cost of an
-// archive read. Smaller segments seal sooner and shrink that window, which matters far more here
-// than for history, whose queries are not dominated by the last few minutes.
-const defaultJobMetricsSegmentSize = 2 << 20
-
 // scheddSyncSettings is the resolved, comparable configuration of the tailers. Every field
 // must stay comparable -- apply() reconciles by struct equality -- so attribute lists are
 // carried as their canonical config strings and split at the point of use.
@@ -232,17 +225,15 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 	}
 }
 
-// metricsSegmentSize resolves the job_metrics segment size, defaulting to
-// defaultJobMetricsSegmentSize rather than to the library default. A negative value is treated as
-// unset; an explicit 0 means "use the library default", which is how an admin opts out of the
-// small-segment choice.
+// metricsSegmentSize resolves the job_metrics segment size. Unset leaves the library default,
+// which is what the measurement says to use: bytes per record is NOT monotone in segment size,
+// and the 8 MiB default measured best of 2/8/32/64 MiB on a production-shaped population --
+// a 2 MiB segment cost 1.5x the storage for a 4% faster recent-range query. See
+// scheddsync.TestJobMetricsSegmentSizeAB, which fails if some other size ever wins.
 func metricsSegmentSize(cfg *config.Config) int {
-	if _, set := cfg.Get("HTCONDORDB_JOB_METRICS_SEGMENT_SIZE"); !set {
-		return defaultJobMetricsSegmentSize
-	}
 	n := configInt(cfg, "HTCONDORDB_JOB_METRICS_SEGMENT_SIZE")
 	if n < 0 {
-		return defaultJobMetricsSegmentSize
+		return 0
 	}
 	return n
 }

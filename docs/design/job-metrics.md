@@ -259,12 +259,64 @@ lists and **nested ClassAds** fall back to row form. So:
    job. This table should do dramatically better per record than history does — which is
    what makes 30 days of it affordable.
 
-**Estimate, to be measured before any retention number is written down** (§7 Phase 0 — we
-have retracted a scaling claim made from a too-small benchmark before): ~50 numeric columns
-at a guess of 40–80 compressed bytes/record. 20k running jobs at the 15-minute floor is 80k
-samples/hour ≈ 1.9M/day ≈ **80–150 MB/day**. Event-driven sampling adds to that in
-proportion to how eventful the workload is — a transfer-heavy or chirp-heavy pool could
-easily double it, which is what `_MIN_INTERVAL` (§5) is for.
+**MEASURED** (`scheddsync/metrics_scale_test.go`, `HTCONDORDB_SCALE=1`), and the estimate this
+paragraph used to carry — 40–80 bytes/record — was wrong by about 4x:
+
+| | bytes/record |
+|---|---|
+| as appended (row form) | **~810** |
+| whole table after maintenance | ~264 |
+| **columnarized data only** (the steady state) | **~252** |
+
+Measure the third row, not the second: the active (unsealed) segment is never columnarized, so a
+whole-table average is diluted by it — by ~5% at 47 segments and by ~25% at the eight a CI-sized
+run produces. The first version of this measurement reported the diluted number.
+
+20k running jobs at the 900s floor is 1.9M samples/day ≈ **480 MiB/day ≈ 14 GiB for 30 days**,
+before whatever event-driven sampling adds on an eventful pool. That is four to six times the old
+estimate, and it is the number the retention guidance in the user docs is written against.
+
+**Where the bytes go** (50 columnar fields, 210 B of uncompressed fixed slots per record):
+
+| group | fields | slot B/rec | share |
+|---|---|---|---|
+| derived rates | 10 | 80 | 38% |
+| raw counters | 13 | 71 | 34% |
+| context (including 6 strings) | 16 | 23 | 11% |
+| high-water marks | 4 | 14 | 7% |
+| sample metadata | 5 | 14 | 7% |
+| gauges | 1 | 8 | 4% |
+
+The derived rates are the single largest contributor, which is the honest price of §3.4: ten
+float64 columns of high-entropy values, bought because `rate(counter)` is not expressible as a
+query. The raw counters are next, and they are kept (§3.4) so a wrong derivation is fixable by
+recomputation. Nothing else is close, and no single attribute is a villain — removing all three
+identity strings was measured at roughly 10%, inside the noise of the segment-size effect below.
+
+Two caveats on the number itself:
+
+- **The generator's counters increment by uniform random amounts**, which is the least
+  compressible thing they could do. Real block-I/O and instruction counters are smoother, so
+  ~252 B/rec should be read as an upper bound.
+- **The rate columns only columnarize when the pool's jobs are sampled enough times.** A field
+  enters the schema at >=90% presence, and a rate is absent on a run's rate-less samples. A job
+  sampled 24 times carries rates on 96% of its records and the columns are taken; a pool whose
+  jobs are sampled 4 times sits at 75% and *every* rate column falls out — costing the storage
+  and, worse, the columnar fast path for exactly the columns a dashboard aggregates. The sampler
+  already exports the signal: `baseline / appended` IS that absence fraction, so an operator can
+  see it coming (§5). `TestJobMetricsRecordComposition` asserts the rule rather than a size.
+
+Two things the measurement changed about how to think of this table:
+
+- **The columnar build is not free and not automatic-on-write.** Records land in row form and
+  are rewritten by the maintenance pass (`ArchiveSchemaScanHotTopN`, on by default). The 2.7x is
+  only realized once that pass has run, so a deployment with archive maintenance disabled pays
+  ~780 bytes/record indefinitely.
+- **The population has no locality, by construction.** Every running job is sampled in the same
+  round, so a segment holds one sample each from thousands of DIFFERENT jobs — a job's
+  consecutive samples are tens of thousands of records apart. Dropping the identity strings
+  (`GlobalJobId`, `User`, `RemoteHost`) to fight that was measured and is worth ~10%, inside the
+  noise of the segment-size effect below. They stay.
 
 ### 3.4 Derive the rates at ingest, not at query time
 
@@ -340,13 +392,24 @@ db.ArchiveConfig{
   `historyMaxBytes`/`epochMaxBytes` are wired (`cmd/htcondordb/scheddsync_manager.go:190-199`).
 - **`SampleTime` must be a `ZoneAttr`** both for `MaxAge` (the doc comment requires it) and
   because it is what makes `WHERE SampleTime >= $__timeFrom()` prune whole segments.
-- **Use a smaller segment than history does.** The active segment carries no sidecar and is
-  scanned linearly, and the archive-scaling profile found rescanning it was ~87% of a
-  query's cost. Dashboards read the newest data almost exclusively, so here the tail *is*
-  the hot path. At the estimate above, an 8 MiB segment holds ~1.7 hours of samples — the
-  default "last 1h" panel would land almost entirely in the unsealed segment on every
-  refresh. 2 MiB quarters that exposure. This is the one place `job_metrics` should not
-  inherit `history`'s tuning.
+- **Do NOT override the segment size.** This shipped as 2 MiB, on the argument that the active
+  segment carries no sidecar and is rescanned in full, so a dashboard reading the newest data
+  wants that window short. Measurement killed both halves of the argument. The read cost is a
+  wash (last-hour panel: 686ms at 2 MiB, 718ms at 8 MiB, i.e. 4% in favour of the smaller
+  segment), and storage is **not monotone** in segment size, with 2 MiB on the wrong side of it:
+
+  | segment | bytes/record |
+  |---|---|
+  | 2 MiB | 425 |
+  | **8 MiB (library default)** | **281** |
+  | 32 MiB | 328 |
+  | 64 MiB | 424 |
+
+  So a 2 MiB segment bought a 4% faster query for a 1.5x storage bill. The override is gone.
+  The U-shape is recorded as a measurement, not explained: it is not the locality story it first
+  looked like, since the 64 MiB arm spans four sampling rounds and is as bad as the 2 MiB arm
+  that spans an eighth of one. `TestJobMetricsSegmentSizeAB` fails if some other size ever wins,
+  so the default gets revisited on evidence rather than drifting.
 
 ## 4. Where the sampler lives
 
@@ -505,11 +568,13 @@ Two follow-ons, not blocking:
 
 ## 7. Phasing
 
-**Phase 0 — measure.** Capture a few thousand real running-job ads from a busy AP, build the
-flat record, and measure compressed bytes/record and query latency over a realistic segment
-count. Also measure the *observed* trigger rate, which §2.2 says is workload-dependent and
-which no amount of reading the source will tell us. Everything downstream of a size default
-depends on these numbers.
+**Phase 0 — measure. ✅ DONE** (`scheddsync/metrics_scale_test.go`; `HTCONDORDB_SCALE=1` for the
+full size, a production-shaped subset in CI as a regression guard). It built its records through
+the real sampler rather than hand-writing them, and it overturned two things this document
+asserted: the per-record size (off by ~4x, §3.3) and the segment-size default (§3.5). The one
+thing still unmeasured is the *observed trigger rate* — how much event-driven sampling adds over
+the periodic floor — because that is a property of a real workload, not of a generator. It is
+visible in production from `htcondordb_job_metrics_samples_total` broken down by trigger.
 
 **Phase 1 — the table and the sampler. ✅ DONE.** `scheddsync/metrics.go` (the sampler),
 hooks in `jobsync.go` (`applyEntry` notes, `commitAll` collects and appends, `abort` discards),
@@ -585,7 +650,24 @@ Recorded because the reasons generalize, not for completeness:
 4. **`TransferRate` split into `BytesSentRate`/`BytesRecvdRate`.** A rate summed over two inputs
    needs *both* reported; a test that set only one showed the whole rate vanishing. Multi-input
    rates should be reserved for inputs HTCondor genuinely always writes together (CPU user+sys).
-5. **Three of the first tests passed for the wrong reason,** and mutation-checking each rule
+5. **The first measurement measured the wrong bytes.** It averaged over the whole table, which
+   mixes columnarized segments with the row-form active one — a 25% error at the size CI runs,
+   and the kind of mistake that is invisible because the number is merely somewhat too big rather
+   than obviously wrong. Reporting coverage (`46/46 sealed`) and per-field escape rates alongside
+   the total is what makes "is this actually columnar" answerable instead of assumed.
+6. **The two measurements need different populations, and saying so is part of the design.** The
+   size number is only meaningful at production locality (many jobs, few samples each, so a
+   segment holds one sample from thousands of different jobs). The schema/columnarization number
+   is only meaningful with enough samples per job for the rate columns to clear the presence
+   threshold. A single population would have made one of the two tests quietly vacuous.
+7. **The segment-size default was wrong, and so was the per-record estimate** (§3.5, §3.3). Both
+   were argued rather than measured in the original sketch, and both survived code review and CI
+   because nothing in either checks a number that only shows up at scale. The generalizable part
+   is that the measurement had to reproduce production's *locality* to be worth anything: a
+   benchmark that shrinks the job count instead of the sample count puts a job's consecutive
+   samples in the same segment, where they compress beautifully and the guard it calibrates is
+   useless.
+6. **Three of the first tests passed for the wrong reason,** and mutation-checking each rule
    against the test that claimed to cover it is what found them: the run-boundary test was really
    exercising the backwards-counter guard (a seam delta is normally negative — it needs the case
    where the new run's counter has already *exceeded* the old one), the context-attribute test was

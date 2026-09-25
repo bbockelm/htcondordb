@@ -9,16 +9,15 @@ import (
 )
 
 // TestJobMetricsDefaults pins what an admin gets by doing nothing: sampling OFF (it adds a record
-// per running job per shadow update, which is a volume decision to make deliberately), and, when
-// turned on, a segment size a quarter of the archive default -- because a dashboard reads the
-// newest samples and the unsealed segment is rescanned in full on every query.
+// per running job per shadow update, which is a volume decision to make deliberately) and the
+// library segment size, which the measurement picked -- see TestJobMetricsSegmentSizeAB.
 func TestJobMetricsDefaults(t *testing.T) {
 	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
 	if s.metricsEnabled {
 		t.Error("job metrics should be off unless asked for")
 	}
-	if s.metricsSegSize != defaultJobMetricsSegmentSize {
-		t.Errorf("metricsSegSize = %d, want %d", s.metricsSegSize, defaultJobMetricsSegmentSize)
+	if s.metricsSegSize != 0 {
+		t.Errorf("metricsSegSize = %d, want 0 (library default)", s.metricsSegSize)
 	}
 	if s.metricsCatAttrs != "Owner" {
 		t.Errorf("metricsCatAttrs = %q, want Owner", s.metricsCatAttrs)
@@ -82,12 +81,11 @@ func TestJobMetricsMaxBytesOverridesDefault(t *testing.T) {
 	}
 }
 
-// TestJobMetricsSegmentSizeExplicitZero: an explicit 0 means "use the library default", which is
-// how an admin opts out of the small-segment choice. Unset must NOT mean that, or the default
-// would silently be 8 MiB.
-func TestJobMetricsSegmentSizeExplicitZero(t *testing.T) {
+// TestJobMetricsSegmentSizeNegative: a nonsense value falls back to the library default rather
+// than being passed through to the archive, which would refuse to open.
+func TestJobMetricsSegmentSizeNegative(t *testing.T) {
 	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
-		"HTCONDORDB_JOB_METRICS = true\nHTCONDORDB_JOB_METRICS_SEGMENT_SIZE = 0\n"))
+		"HTCONDORDB_JOB_METRICS = true\nHTCONDORDB_JOB_METRICS_SEGMENT_SIZE = -1\n"))
 	if s.metricsSegSize != 0 {
 		t.Errorf("metricsSegSize = %d, want 0 (library default)", s.metricsSegSize)
 	}
