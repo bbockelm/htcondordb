@@ -228,7 +228,11 @@ the reason in the next section.
 
 Two properties of HTCondor's counters will mislead a dashboard built without them:
 
-- **The memory numbers are high-water marks, not gauges.** `MemoryUsage`, `ResidentSetSize`
+- **`CurrentResidentSetSize` / `CurrentMemUtil` are the exception** — a true memory gauge that
+  can go down, recorded whenever the pool publishes the attribute. HTCondor does not publish it
+  yet; until it does, these columns are simply absent and the high-water marks below are all
+  there is.
+- **The other memory numbers are high-water marks, not gauges.** `MemoryUsage`, `ResidentSetSize`
   and `ImageSize` only ratchet up, so a memory series is a staircase, not a working-set trace.
   Worse, the shadow **seeds them from the previous run**, so for `RunInstanceID > 0` they are
   a whole-*job* maximum wearing this run's timestamp — that run's real peak was never written

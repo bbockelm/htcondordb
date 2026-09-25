@@ -159,6 +159,14 @@ var sampleAttrs = map[string]attrClass{
 	"CumulativeTransferTime":   classCrossRunCounter,
 
 	// instantaneous, or already windowed by the starter
+	//
+	// CurrentResidentSetSize is the one number in this table that is a true memory GAUGE rather
+	// than a ratchet -- the RSS the starter measured, before the high-water maxes are applied.
+	// It does not exist in HTCondor yet (see the design doc's upstream asks); recording it here
+	// costs nothing on a pool that does not publish it, because an absent attribute is simply not
+	// written, and means a pool that gains it starts plotting real working-set curves with no
+	// change here.
+	"CurrentResidentSetSize":     classGauge,
 	"IOWait":                     classGauge,
 	"JobVMCpuUtilization":        classGauge,
 	"CpusUsage":                  classGauge,
@@ -202,15 +210,24 @@ var derivedRates = []derivedRate{
 }
 
 // derivedRatio is a fraction of a resource's usage to its request. No predecessor is needed, so
-// these are emitted on every sample including a baseline one. Num and Den must share units.
+// these are emitted on every sample including a baseline one.
+//
+// Scale converts the numerator into the denominator's units, and exists because the units in this
+// table are NOT uniform -- MemoryUsage is MiB while ResidentSetSize is KiB, against a RequestMemory
+// in MiB -- so a ratio built from the wrong pair is silently wrong by a factor of 1024 rather than
+// visibly broken. Doing the conversion once here, next to the declaration, is the point.
 type derivedRatio struct {
 	Out, Num, Den string
+	Scale         float64 // multiplies Num before dividing; 0 means 1
 }
 
 var derivedRatios = []derivedRatio{
 	// Both MiB. This is a HIGH-WATER-MARK ratio (see the package comment): for RunInstanceID > 0
 	// the numerator is the maximum over all of the job's runs, not this one's.
 	{Out: "MemUtil", Num: "MemoryUsage", Den: "RequestMemory"},
+	// KiB over MiB. The gauge counterpart of MemUtil, and the only one of the two that can go
+	// down -- so it is the one to plot against a memory request over time.
+	{Out: "CurrentMemUtil", Num: "CurrentResidentSetSize", Den: "RequestMemory", Scale: 1.0 / 1024},
 	// Both KiB.
 	{Out: "DiskUtil", Num: "DiskUsage", Den: "RequestDisk"},
 }
@@ -616,7 +633,11 @@ func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd,
 		num, ok1 := job.EvaluateAttrNumber(r.Num)
 		den, ok2 := job.EvaluateAttrNumber(r.Den)
 		if ok1 && ok2 && den > 0 {
-			_ = s.Set(r.Out, num/den)
+			scale := r.Scale
+			if scale == 0 {
+				scale = 1
+			}
+			_ = s.Set(r.Out, num*scale/den)
 		}
 	}
 

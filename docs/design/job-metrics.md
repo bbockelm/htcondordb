@@ -629,11 +629,20 @@ table to be useful.
 Each is small and self-contained; none blocks the table. The first two are now the
 high-value ones, because §2.4 showed the data loss is worse than the resolution loss.
 
-1. **Publish instantaneous RSS.** `ProcFamilyUsage.total_resident_set_size` is already
-   re-summed per sample and discarded by the max in `vanilla_proc.cpp:766` and again in
-   `remoteresource.cpp:1386-1391`. A new attribute carrying the un-maxed value turns the
-   memory plot from a ratchet into a real working-set trace.
-2. **Publish a per-run memory high-water mark.** Today the HWM is carried across runs
+1. **Publish instantaneous RSS. ✅ PATCH WRITTEN** (HTCondor branch `instantaneous-rss`, local,
+   unpushed — upstream filing is the maintainer's to do). `ProcFamilyUsage.total_resident_set_size`
+   is already re-summed per sample and discarded by the max in `vanilla_proc.cpp:766` and again in
+   `remoteresource.cpp:1386-1391`. The patch publishes it as **`CurrentResidentSetSize`** (KiB):
+   un-maxed in `VanillaProc::PublishUpdateAd`, forwarded as reported by the shadow, cleared per
+   run in `setJobAd` (the `DiskUsage` precedent, not the memory one — so it cannot go stale across
+   runs the way §2.4 note 1 describes), added to `common_job_queue_attrs`, and documented against
+   `ResidentSetSize` so a reader knows which answers which question.
+
+   The sampler already records it and derives `CurrentMemUtil` from it, so a pool that gains the
+   attribute starts plotting real working-set curves with no change here — and on a pool that
+   never does, an absent attribute is simply not written. That is the only memory column in the
+   table that can go *down*.
+2. **Publish a per-run memory high-water mark.** (Not written; §1 covers the more valuable half.) Today the HWM is carried across runs
    (`remoteresource.cpp:1179-1195`), so a rerun's real peak is unrecoverable (§2.4 note 1).
    A `<attr>ThisRun` companion — reset in `setJobAd` the way `DiskUsage` already is, twenty
    lines below — is additive and breaks no existing consumer.

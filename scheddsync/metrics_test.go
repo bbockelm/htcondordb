@@ -771,3 +771,50 @@ func TestCompletionDateIsNotATerminalTrigger(t *testing.T) {
 			"its VALUE is a signal and JobStatus/ExitCode carry the real transition")
 	}
 }
+
+// TestJobMetricsCurrentRSS covers the one true memory gauge in the table: HTCondor's
+// ResidentSetSize is a high-water mark, so a working-set curve needs the un-maxed value. The
+// attribute does not exist in HTCondor yet, which is precisely why this matters -- a pool that
+// gains it must start recording without any change here, and the KiB-over-MiB ratio must not be
+// wrong by a factor of 1024.
+func TestJobMetricsCurrentRSS(t *testing.T) {
+	pinClock(t, base-1)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, submitted) // RequestMemory = 2048 MiB
+	s, arch := newSampledSync(t, logPath, JobMetricsConfig{})
+
+	appendFile(t, logPath, spawned(1))
+	// 1 GiB resident (KiB), and a high-water mark that is already higher -- the shape a job has
+	// after it has freed memory, and the whole reason the gauge is worth recording.
+	appendFile(t, logPath, fmt.Sprintf(`105
+103 1.0 StatsLastUpdateTimeStarter %d
+103 1.0 CurrentResidentSetSize 1048576
+103 1.0 ResidentSetSize 2097152
+103 1.0 MemoryUsage 2048
+106
+`, base+300))
+	// Now it drops. ResidentSetSize cannot follow it down; the gauge must.
+	appendFile(t, logPath, fmt.Sprintf(`105
+103 1.0 StatsLastUpdateTimeStarter %d
+103 1.0 CurrentResidentSetSize 524288
+103 1.0 ResidentSetSize 2097152
+103 1.0 MemoryUsage 2048
+106
+`, base+600))
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	got := samples(t, arch)
+	last := got[len(got)-1]
+	closeTo(t, num(t, last, "CurrentResidentSetSize"), 524288, "CurrentResidentSetSize")
+	// 524288 KiB = 512 MiB against a 2048 MiB request = 0.25. Getting the scale wrong gives 256.
+	closeTo(t, num(t, last, "CurrentMemUtil"), 0.25, "CurrentMemUtil (KiB numerator, MiB request)")
+	// The high-water ratio stays pinned at 1.0, which is exactly the difference being recorded.
+	closeTo(t, num(t, last, "MemUtil"), 1.0, "MemUtil")
+	if prev := num(t, got[len(got)-2], "CurrentMemUtil"); prev <= num(t, last, "CurrentMemUtil") {
+		t.Errorf("CurrentMemUtil did not decrease (%v then %v); a gauge that cannot go down is "+
+			"just the high-water mark again", prev, num(t, last, "CurrentMemUtil"))
+	}
+}
