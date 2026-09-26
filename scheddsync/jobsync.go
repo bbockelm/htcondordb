@@ -530,6 +530,13 @@ var reconcileApplyHook func(error) error
 // for an unapplied write -- is the whole point of telling the two apart.
 var applyErrorHook func(error) error
 
+// commitErrorHook, when non-nil, replaces the error commitAll's commits returned. Test-only, and
+// the only way to exercise the two error shapes that differ for sampling: a ConflictError means
+// nothing landed (samples and cache updates are dropped and the pass rewinds), while an
+// UnappliedError means the transaction DID commit with a few keys not composed, so its samples
+// must still be written -- the offset advances past them either way.
+var commitErrorHook func(err error, samples int) error
+
 // maxConflictRetries bounds in-place commit-conflict re-applies at one offset before Poll escalates
 // to a full reconcileReload. Small: a transient conflict clears in a tick or two; a persistent one
 // (a stuck second writer) should heal via reconcile promptly, not spin.
@@ -829,6 +836,15 @@ func (s *JobSync) sweepKeys(table *db.DB, before []string, seen map[string]struc
 			batch = table.Begin()
 		}
 		batch.DestroyClassAd(k)
+		// The sampler's predecessor cache is keyed by job and only ever pruned on a
+		// DestroyClassAd from the incremental path -- which these keys never produce, because a
+		// reconcile is exactly the case where the job vanished from the log while we were not
+		// reading it. Without this the entries accumulate for the life of the daemon, one per job
+		// that finished during every compaction and every resync, and the cache's claim to be
+		// bounded by the RUNNING jobs is false. A reused key would then find a stale predecessor.
+		if table == s.target {
+			s.metrics.forget(k)
+		}
 		if n++; n >= reconcileBatch {
 			if err := commit(); err != nil {
 				return err
@@ -1204,6 +1220,7 @@ func (s *JobSync) migrateJobsTable() error {
 			batch = s.target.Begin()
 		}
 		batch.DestroyClassAd(k)
+		s.metrics.forget(k) // same reason as sweepKeys: these keys produce no DestroyClassAd
 		if (i+1)%reconcileBatch == 0 {
 			if err := commit(); err != nil {
 				return err
@@ -1697,9 +1714,10 @@ func (s *JobSync) commitAll() error {
 	// post-update row can be read, and reading it here rather than after the commit means a
 	// transaction that fails to commit leaves no sample for state that never landed.
 	var samples []*classad.ClassAd
+	var prevUpdates []prevUpdate
 	if s.metrics != nil {
 		if jtx := s.txs[s.target]; jtx != nil {
-			samples = s.metrics.collect(jtx, s.curSeq)
+			samples, prevUpdates = s.metrics.collect(jtx, s.curSeq)
 		} else {
 			s.metrics.discard()
 		}
@@ -1711,8 +1729,20 @@ func (s *JobSync) commitAll() error {
 			firstErr = err
 		}
 	}
-	if firstErr == nil {
+	// The samples follow the WRITES, not the error. db.UnappliedError means the transaction
+	// committed and a few keys could not be composed -- "a caller should record these and make
+	// progress rather than retry", which is exactly what Poll does: it advances and checkpoints
+	// past them. Treating it as a failed commit threw away every sample in a batch that had
+	// landed, for good, since the offset moved on; on one production mirror that path fired 1,239
+	// times. A ConflictError is the opposite -- nothing landed, the pass rewinds and re-reads --
+	// so its samples and cache updates are correctly dropped.
+	if commitErrorHook != nil {
+		firstErr = commitErrorHook(firstErr, len(samples))
+	}
+	var unapplied *db.UnappliedError
+	if firstErr == nil || errors.As(firstErr, &unapplied) {
 		s.metrics.flush(samples)
+		s.metrics.commitPending(prevUpdates)
 	}
 	s.txs = map[*db.DB]*db.Txn{}
 	s.explicit = false

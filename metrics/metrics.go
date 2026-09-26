@@ -288,6 +288,8 @@ func (o sampleOutcomes) add(m scheddsync.MetricsStatus) sampleOutcomes {
 	o.InheritedCounters += m.InheritedCounters
 	o.Deduped += m.Deduped
 	o.AppendFailures += m.AppendFailures
+	o.AfterEnd += m.AfterEnd
+	o.ClockMix += m.ClockMix
 	return o
 }
 
@@ -300,6 +302,8 @@ func (o sampleOutcomes) byOutcome() map[string]int64 {
 		"inherited":     o.InheritedCounters,
 		"deduped":       o.Deduped,
 		"append_failed": o.AppendFailures,
+		"after_end":     o.AfterEnd,
+		"clock_mix":     o.ClockMix,
 	}
 }
 

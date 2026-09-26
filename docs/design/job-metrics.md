@@ -337,9 +337,18 @@ GpuUtil        = (GPUsAverageUsage·t − GPUsAverageUsage_prev·t_prev) / Sampl
 
 The rules that keep these honest all come out of §2.4:
 
-- **Never differentiate across a `RunInstanceID` boundary**, except for the attributes §2.4
-  marks cumulative-across-runs (`CumulativeRemote*Cpu`, `BytesSent`/`BytesRecvd`,
-  `CommittedTime`). Everything else restarts, and a delta across the seam is meaningless.
+- **Never differentiate across a `RunInstanceID` boundary** — including the counters §2.4 marks
+  cumulative-across-runs (`CumulativeRemote*Cpu`, `BytesSent`/`BytesRecvd`, `CommittedTime`).
+  Those were originally exempted, on the reasoning that their inputs do not restart so the delta
+  is sound. The delta is; the *denominator* is not. The interval from a run's last sample to the
+  next run's first spans however long the job sat idle in between, so a job that transferred 1 MB
+  in 100s six hours after its previous run recorded 46 B/s — unmarked, and indistinguishable from
+  a genuinely slow transfer. A rate averaged over time the job was not running is not a rate.
+- **An interval may not span two different clocks.** `SampleTime` is the starter's when it reports
+  stats and the ingest clock otherwise, and the difference between them is AP/EP skew rather than
+  elapsed time: with the AP behind it can even go negative and silently drop every rate in the
+  window. `prevObservation` records which clock it came from and a mixed interval derives nothing
+  (counted as `clock_mix`).
 - **Anchor a run on its observed zero.** The shadow writes `RemoteUserCpu = 0` at run start
   and it reaches the queue (§2.4 note 2). Treat the first observation of a `RunInstanceID`
   carrying `RemoteUserCpu == 0` as that run's t0. An observation carrying a *new*
@@ -689,7 +698,8 @@ Recorded because the reasons generalize, not for completeness:
 3. **The strict missing-input rule** (§3.4). Writing the test forced the question of what an
    absent predecessor value means, and the answer — refuse, do not assume zero — costs one sample
    per run and prevents a fabricated spike.
-4. **`TransferRate` split into `BytesSentRate`/`BytesRecvdRate`.** A rate summed over two inputs
+4. **`TransferRate` split into `BytesSentRate`/`BytesRecvdRate`,** and later confined to a single
+   run like every other rate (§3.4). A rate summed over two inputs
    needs *both* reported; a test that set only one showed the whole rate vanishing. Multi-input
    rates should be reserved for inputs HTCondor genuinely always writes together (CPU user+sys).
 5. **The first measurement measured the wrong bytes.** It averaged over the whole table, which

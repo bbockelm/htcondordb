@@ -225,7 +225,10 @@ func buildPopulationStats(t *testing.T, arch *db.ArchiveTable, jobs, perJob int,
 		for _, j := range states {
 			ad := g.advance(j, at, float64(interval))
 			key := strconv.FormatInt(j.cluster, 10) + "." + strconv.FormatInt(j.proc, 10)
-			if rec := m.build(key, triggerPeriodic, ad, 1); rec != nil {
+			var upd []prevUpdate
+			rec := m.build(key, triggerPeriodic, ad, 1, &upd)
+			m.commitPending(upd)
+			if rec != nil {
 				if v, _ := rec.EvaluateAttrBool(SampleBaselineAttr); v {
 					baselines++
 				}

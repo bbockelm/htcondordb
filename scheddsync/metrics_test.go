@@ -211,9 +211,16 @@ func TestJobMetricsSeries(t *testing.T) {
 		t.Fatalf("sample 1 trigger = %q, want periodic", k)
 	}
 	closeTo(t, num(t, got[1], SampleTimeAttr), float64(base+300), "sample 1 SampleTime")
-	closeTo(t, num(t, got[1], SampleIntervalAttr), 301, "sample 1 SampleInterval")
 	closeTo(t, num(t, got[1], "MemUtil"), 1024.0/2048.0, "sample 1 MemUtil")
 	absent(t, got[1], "CpuUtil")
+	// No SampleInterval either, and for a second reason worth keeping separate from the missing
+	// counters: its predecessor is the spawn sample, whose SampleTime came from the INGEST clock
+	// (the starter had not reported yet) while this one comes from the starter's. The difference
+	// between those two is AP/EP skew, not elapsed time, so there is no interval to report.
+	absent(t, got[1], SampleIntervalAttr)
+	if n := s.metrics.status().ClockMix; n != 1 {
+		t.Errorf("ClockMix = %d, want 1 (the spawn sample's clock differs from the starter's)", n)
+	}
 	if v, _ := got[1].EvaluateAttrBool(SampleBaselineAttr); !v {
 		t.Fatalf("sample 1 should be a baseline (no counters in its predecessor): %s", got[1].String())
 	}
@@ -301,10 +308,14 @@ func TestJobMetricsRunBoundary(t *testing.T) {
 		t.Fatalf("Resets = %d, want 0: the delta here is POSITIVE, so if the run-boundary rule "+
 			"were removed the backwards-counter guard would not catch it", n)
 	}
-	// BytesSent did NOT restart, so its rate across the seam is real: 300 bytes over 300s.
-	closeTo(t, num(t, seam, "BytesSentRate"), 1.0, "seam BytesSentRate")
-	if v, _ := seam.EvaluateAttrBool(SampleBaselineAttr); v {
-		t.Fatal("a seam sample that derived a cross-run rate is not a baseline")
+	// And NO rate crosses the seam, not even for the counters that accumulate across runs.
+	// BytesSent does not restart, so its delta is sound -- but the DENOMINATOR is not: the
+	// interval from a run's last sample to the next run's first spans however long the job sat
+	// idle in between. Deriving one produced a plausible, unmarked, wrong number.
+	absent(t, seam, "BytesSentRate")
+	absent(t, seam, SampleIntervalAttr)
+	if v, _ := seam.EvaluateAttrBool(SampleBaselineAttr); !v {
+		t.Error("a seam sample derives nothing, so it is a baseline")
 	}
 }
 
@@ -816,5 +827,307 @@ func TestJobMetricsCurrentRSS(t *testing.T) {
 	if prev := num(t, got[len(got)-2], "CurrentMemUtil"); prev <= num(t, last, "CurrentMemUtil") {
 		t.Errorf("CurrentMemUtil did not decrease (%v then %v); a gauge that cannot go down is "+
 			"just the high-water mark again", prev, num(t, last, "CurrentMemUtil"))
+	}
+}
+
+// TestJobMetricsRunStartOrdering: HTCondor starts a run in TWO transactions and bumps
+// NumShadowStarts in the SECOND one. Scheduler::start_std calls mark_serial_job_running() --
+// its own transaction, which sets JobStatus=2 and does not touch NumShadowStarts -- before
+// add_shadow_rec(), which is where the counter moves. So on the JobStatus=2 commit the row still
+// reports the id of the run that just ENDED.
+//
+// Without a record of which runs have already ended, that commit produces an extra sample for the
+// finished run, AFTER its own endpoint, carrying the previous run's counters and clock. It also
+// resurrects the predecessor across the boundary, which is what let a later rate span the idle gap.
+func TestJobMetricsRunStartOrdering(t *testing.T) {
+	pinClock(t, base-1)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, submitted)
+	s, arch := newSampledSync(t, logPath, JobMetricsConfig{})
+
+	appendFile(t, logPath, spawned(1))
+	appendFile(t, logPath, starterUpdate(base+300, 300, 0, 1024, 4096))
+	// Evicted back to idle: the run's endpoint.
+	appendFile(t, logPath, fmt.Sprintf(`105
+103 1.0 JobStatus 1
+103 1.0 LastVacateTime %d
+106
+`, base+400))
+	// Re-run, in HTCondor's real order: JobStatus=2 FIRST, NumShadowStarts a transaction later.
+	appendFile(t, logPath, `105
+103 1.0 JobStatus 2
+106
+`)
+	appendFile(t, logPath, `105
+103 1.0 NumShadowStarts 2
+106
+`)
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	got := samples(t, arch)
+	var runs []int64
+	var kinds []string
+	for _, ad := range got {
+		r, _ := ad.EvaluateAttrInt(RunInstanceAttr)
+		runs = append(runs, r)
+		kinds = append(kinds, trig(t, ad))
+	}
+	// Exactly one endpoint for run 0, and nothing for run 0 after it.
+	lastRun0 := -1
+	for i, r := range runs {
+		if r == 0 {
+			lastRun0 = i
+		}
+	}
+	if lastRun0 < 0 || kinds[lastRun0] != "terminal" {
+		t.Fatalf("run 0's last sample is %v (all runs=%v kinds=%v), want its terminal one",
+			kinds[lastRun0], runs, kinds)
+	}
+	terminals := 0
+	for i, k := range kinds {
+		if k == "terminal" && runs[i] == 0 {
+			terminals++
+		}
+	}
+	if terminals != 1 {
+		t.Errorf("%d terminal samples for run 0, want exactly 1 (runs=%v kinds=%v)",
+			terminals, runs, kinds)
+	}
+	if n := s.metrics.status().AfterEnd; n == 0 {
+		t.Error("AfterEnd = 0: the pre-bump window should have been observed and suppressed")
+	}
+}
+
+// TestJobMetricsHeldWhileIdle: condor_hold and condor_rm set HoldReason/RemoveReason together
+// with JobStatus in ONE transaction, and they do it for idle jobs too. A job that ran earlier
+// still carries NumShadowStarts, so a terminal-looking attribute alone used to produce a SECOND
+// endpoint for a run that had already ended -- same SampleTime, same run id, old counters.
+func TestJobMetricsHeldWhileIdle(t *testing.T) {
+	pinClock(t, base-1)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, submitted)
+	s, arch := newSampledSync(t, logPath, JobMetricsConfig{})
+
+	appendFile(t, logPath, spawned(1))
+	appendFile(t, logPath, starterUpdate(base+300, 300, 0, 1024, 4096))
+	appendFile(t, logPath, fmt.Sprintf(`105
+103 1.0 JobStatus 1
+103 1.0 LastVacateTime %d
+106
+`, base+400))
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	before := len(samples(t, arch))
+
+	// Now held while idle, long after the run ended.
+	appendFile(t, logPath, `105
+103 1.0 JobStatus 5
+103 1.0 HoldReasonCode 3
+103 1.0 HoldReason "periodic hold"
+106
+`)
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll after hold: %v", err)
+	}
+	if got := len(samples(t, arch)); got != before {
+		t.Errorf("holding an idle job added %d samples, want 0: its run already had an endpoint",
+			got-before)
+	}
+}
+
+// TestJobMetricsCacheDeferredToCommit: the predecessor cache must not move for a transaction that
+// did not commit. The terminal case is the damaging one -- the update DELETES the predecessor, and
+// a re-applied pass then finds none, does not recognise the endpoint, and emits nothing for it.
+func TestJobMetricsCacheDeferredToCommit(t *testing.T) {
+	pinClock(t, base-1)
+	arch, cleanup := newMetricsArchive(t)
+	defer cleanup()
+	target, err := db.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	m := newJobMetrics(JobMetricsConfig{Archive: arch})
+
+	job := classad.New()
+	for k, v := range map[string]any{
+		"ClusterId": int64(1), "ProcId": int64(0), "Owner": "alice", "JobStatus": int64(2),
+		"NumShadowStarts": int64(1), "RequestMemory": int64(2048),
+		"RemoteUserCpu": 300.0, statsClockAttr: base + 300,
+	} {
+		_ = job.Set(k, v)
+	}
+	if err := target.Put("1.0", job); err != nil {
+		t.Fatal(err)
+	}
+
+	// A running sample, collected but NOT committed.
+	m.note("1.0", "RemoteUserCpu")
+	s1, upd1 := m.collect(target, 1)
+	if len(s1) != 1 || len(upd1) != 1 {
+		t.Fatalf("collect = %d samples %d updates, want 1/1", len(s1), len(upd1))
+	}
+	if _, ok := m.prev["1.0"]; ok {
+		t.Fatal("collect advanced the predecessor cache before the commit landed")
+	}
+	m.commitPending(upd1)
+	if _, ok := m.prev["1.0"]; !ok {
+		t.Fatal("commitPending did not advance the cache")
+	}
+
+	// Now the run ends. Collect the endpoint, then DISCARD it as a failed commit would.
+	_ = job.Set("JobStatus", int64(1))
+	_ = job.Set("LastVacateTime", base+400)
+	if err := target.Put("1.0", job); err != nil {
+		t.Fatal(err)
+	}
+	m.note("1.0", "LastVacateTime")
+	sTerm, _ := m.collect(target, 1)
+	if len(sTerm) != 1 || trig(t, sTerm[0]) != "terminal" {
+		t.Fatalf("expected one terminal sample, got %d", len(sTerm))
+	}
+	// Commit failed: apply nothing.
+	if _, ok := m.prev["1.0"]; !ok {
+		t.Fatal("the discarded terminal collect deleted the predecessor anyway -- a re-applied " +
+			"pass would find none and the run would lose its endpoint")
+	}
+	// Re-apply the identical entry, as the rewind does. The endpoint must come back.
+	m.note("1.0", "LastVacateTime")
+	sAgain, updAgain := m.collect(target, 1)
+	if len(sAgain) != 1 || trig(t, sAgain[0]) != "terminal" {
+		t.Fatalf("re-applying after a failed commit produced %d samples, want the endpoint back",
+			len(sAgain))
+	}
+	m.commitPending(updAgain)
+	if _, ok := m.prev["1.0"]; ok {
+		t.Error("the committed terminal update should have dropped the predecessor")
+	}
+}
+
+// TestJobMetricsPerInputResetGuard: guarding only the SUM of a multi-input rate lets one input's
+// reset hide inside another's progress. CpuUtil sums user+sys, so 100->160 with 50->0 sums to a
+// plausible +10 and was written as 0.1 cores against a true value of at least 0.6 -- neither
+// suppressed nor counted, which is exactly what the reset counter exists to surface.
+func TestJobMetricsPerInputResetGuard(t *testing.T) {
+	pinClock(t, base-1)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, submitted)
+	s, arch := newSampledSync(t, logPath, JobMetricsConfig{})
+
+	appendFile(t, logPath, spawned(1))
+	appendFile(t, logPath, starterUpdate(base+100, 100, 50, 1024, 4096))
+	appendFile(t, logPath, starterUpdate(base+200, 160, 0, 1024, 8192))
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	last := samples(t, arch)[len(samples(t, arch))-1]
+	absent(t, last, "CpuUtil")
+	if n := s.metrics.status().Resets; n != 1 {
+		t.Errorf("Resets = %d, want 1: one input went backwards and must be counted", n)
+	}
+	// The unaffected rate still derives -- the guard is per rate, not per sample.
+	closeTo(t, num(t, last, "BlockReadRate"), 4096.0/100.0, "BlockReadRate")
+}
+
+// TestJobMetricsSampleCarriesKey: ClusterId reaches a proc row only through cluster-ad chaining,
+// so an unchained row yields a sample with no ClusterId and no GlobalJobId. In an append-only
+// table that record is unattributable and unrepairable. The storage key is in hand when the
+// sample is built, so it goes on every one.
+func TestJobMetricsSampleCarriesKey(t *testing.T) {
+	pinClock(t, base-1)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, submitted)
+	s, arch := newSampledSync(t, logPath, JobMetricsConfig{})
+	appendFile(t, logPath, spawned(1))
+	appendFile(t, logPath, starterUpdate(base+300, 300, 0, 1024, 4096))
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	for i, ad := range samples(t, arch) {
+		k, ok := ad.EvaluateAttrString(KeyAttr)
+		if !ok || k != "1.0" {
+			t.Errorf("sample %d has %s=%q (present=%v), want \"1.0\"", i, KeyAttr, k, ok)
+		}
+	}
+}
+
+// TestJobMetricsUnappliedErrorStillSamples: db.UnappliedError means the transaction COMMITTED and
+// a few keys could not be composed -- Poll treats it as progress and checkpoints past it. Dropping
+// the batch's samples on that error lost them permanently, for writes that had landed.
+func TestJobMetricsUnappliedErrorStillSamples(t *testing.T) {
+	pinClock(t, base-1)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, submitted)
+	s, arch := newSampledSync(t, logPath, JobMetricsConfig{})
+	appendFile(t, logPath, spawned(1))
+	appendFile(t, logPath, starterUpdate(base+300, 300, 0, 1024, 4096))
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	before := len(samples(t, arch))
+	if before == 0 {
+		t.Fatal("no samples before the injection; the rest would be vacuous")
+	}
+
+	// Inject on the NEXT commit only. Injecting on every one aborts the pass at the submit
+	// transaction, before the job is even running.
+	appendFile(t, logPath, starterUpdate(base+600, 600, 0, 1024, 8192))
+	real := commitErrorHook
+	t.Cleanup(func() { commitErrorHook = real })
+	// Only on a commit that actually carries a sample: injecting on every one aborts the pass at
+	// an earlier, sample-less transaction and the interesting commit is never reached.
+	commitErrorHook = func(err error, samples int) error {
+		if samples == 0 {
+			return err
+		}
+		return &db.UnappliedError{Keys: []string{"99.0"}}
+	}
+	_ = s.Poll(context.Background()) // Poll surfaces the error; the commit still landed
+
+	if got := len(samples(t, arch)); got == before {
+		t.Error("an UnappliedError discarded the sample from a batch that committed; Poll " +
+			"treats that error as progress and checkpoints past it, so it is lost for good")
+	}
+}
+
+// TestJobMetricsTerminalNeedsPredecessorAfterRestart isolates the rule that a terminal-LOOKING
+// attribute is not by itself evidence a run ended here.
+//
+// Within one process the `ended` map also suppresses this, so the two gates cover for each other
+// and neither is tested alone. After a restart both the predecessor cache and `ended` are empty --
+// they are in-memory caches, rebuilt from the stream -- and only this rule is left. A job that ran
+// earlier still carries NumShadowStarts, and condor_hold sets HoldReason and JobStatus in one
+// transaction, so without it a fresh daemon writes a bogus endpoint for a run it never observed.
+func TestJobMetricsTerminalNeedsPredecessorAfterRestart(t *testing.T) {
+	pinClock(t, base-1)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	// The log as a restarted daemon reads it: a job that has already run, now idle, then held.
+	writeFile(t, logPath, submitted+`105
+103 1.0 NumShadowStarts 1
+103 1.0 JobStatus 1
+103 1.0 RemoteUserCpu 300.0
+106
+105
+103 1.0 JobStatus 5
+103 1.0 HoldReasonCode 3
+103 1.0 HoldReason "periodic hold"
+106
+`)
+	s, arch := newSampledSync(t, logPath, JobMetricsConfig{})
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if got := samples(t, arch); len(got) != 0 {
+		t.Errorf("a fresh sampler wrote %d samples for a run it never observed (first: %s)",
+			len(got), got[0].String())
 	}
 }

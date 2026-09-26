@@ -182,9 +182,8 @@ var sampleAttrs = map[string]attrClass{
 // interval. CrossRun marks the few whose inputs accumulate across runs (classCrossRunCounter), so
 // a delta spanning a run boundary is still correct; every other rate is suppressed at the seam.
 type derivedRate struct {
-	Out      string
-	In       []string
-	CrossRun bool
+	Out string
+	In  []string
 	// Doc is what the column means, kept next to the definition so the docs and the code cannot
 	// drift apart. Not emitted.
 	Doc string
@@ -203,9 +202,9 @@ var derivedRates = []derivedRate{
 	// Split rather than summed: a multi-input rate needs EVERY input reported (see sumDelta), so
 	// summing these would make the transfer rate vanish whenever only one direction was active.
 	// They also accumulate across runs, which is what makes them safe to differentiate at a seam.
-	{Out: "BytesSentRate", In: []string{"BytesSent"}, CrossRun: true,
+	{Out: "BytesSentRate", In: []string{"BytesSent"},
 		Doc: "bytes/s sent to the execute node (input transfer)"},
-	{Out: "BytesRecvdRate", In: []string{"BytesRecvd"}, CrossRun: true,
+	{Out: "BytesRecvdRate", In: []string{"BytesRecvd"},
 		Doc: "bytes/s received from the execute node (output transfer)"},
 }
 
@@ -360,6 +359,11 @@ type prevObservation struct {
 	gpuAvg     float64
 	hasGPU     bool
 	jobStatus  int64
+	// fromStarter records WHICH CLOCK sampleTime came from. Differentiating a starter-clock
+	// instant against an ingest-clock one measures the AP/EP skew as if it were elapsed time: with
+	// the AP behind, the interval can even go negative and silently drop every rate in the window.
+	// The two are not comparable, so an interval spanning both is refused.
+	fromStarter bool
 }
 
 // JobMetricsConfig configures the sampler.
@@ -397,6 +401,19 @@ type jobMetrics struct {
 	// prev is the per-job predecessor cache described on prevObservation.
 	prev map[string]*prevObservation
 
+	// ended records, per job, the last RunInstanceID whose endpoint sample was already emitted.
+	//
+	// It exists because HTCondor starts a run in TWO transactions and bumps NumShadowStarts in the
+	// SECOND one: Scheduler::start_std calls mark_serial_job_running() -- its own transaction,
+	// setting JobStatus=2 and nothing else of interest -- before add_shadow_rec(), which is where
+	// NumShadowStarts moves (schedd.cpp). So on the JobStatus=2 commit the row still reports the
+	// id of the run that just ENDED, and without this the sampler emits an extra sample for that
+	// finished run, after its own endpoint, carrying the previous run's counters.
+	//
+	// This is the same shape as the endpoint rule itself: a logical state change that HTCondor
+	// spreads over several commits cannot be read from any one of them.
+	ended map[string]int64
+
 	// dedup is on until the first sample is found NOT to be in the archive already. A restart
 	// re-applies the log from the last durable position, which re-produces samples that were
 	// already appended; appends are not idempotent, so the replayed prefix has to be skipped.
@@ -407,6 +424,8 @@ type jobMetrics struct {
 
 	mAppended    atomic.Int64
 	mThrottled   atomic.Int64
+	mAfterEnd    atomic.Int64
+	mClockMix    atomic.Int64
 	mBaseline    atomic.Int64
 	mResets      atomic.Int64
 	mInherited   atomic.Int64
@@ -432,6 +451,7 @@ func newJobMetrics(cfg JobMetricsConfig) *jobMetrics {
 		now:         nowFn,
 		pending:     map[string]sampleTrigger{},
 		prev:        map[string]*prevObservation{},
+		ended:       map[string]int64{},
 		dedup:       true,
 	}
 	m.extraFold = make(map[string]struct{}, len(m.extra))
@@ -500,6 +520,7 @@ func (m *jobMetrics) forget(key string) {
 	}
 	delete(m.prev, key)
 	delete(m.pending, key)
+	delete(m.ended, key)
 }
 
 // discard drops the pending set without sampling. Used when a transaction is aborted, and when a
@@ -516,28 +537,52 @@ func (m *jobMetrics) discard() {
 // collect builds the samples for the transaction about to be committed, reading each touched job
 // back through the open transaction -- so the row is the merged, post-update ad, carrying the
 // context attributes (Owner, RequestMemory, NumShadowStarts) that the transaction itself did not
-// mention. It is called BEFORE the commit and the result appended only if the commit succeeds, so
-// a failed commit leaves no sample for state that never landed.
+// mention.
 //
-// The predecessor cache is advanced here rather than at append time because the two must agree:
-// a sample that is built is the one the next delta is measured from.
-func (m *jobMetrics) collect(read rowReader, logSeq int64) []*classad.ClassAd {
+// It is called BEFORE the commit, and BOTH its results -- the samples and the predecessor-cache
+// updates -- are applied only once that commit has landed. Returning the cache updates rather
+// than applying them here is the whole point: a sample that gets discarded must not move the
+// cache it would have been measured from, and for a TERMINAL sample the update deletes the
+// predecessor -- after which a re-applied pass finds none, does not recognise the endpoint, and
+// emits nothing for it. The run would lose its endpoint permanently and silently.
+//
+// Each key appears at most once per transaction (pending is keyed by job), so no sample in a
+// batch depends on another's cache update.
+func (m *jobMetrics) collect(read rowReader, logSeq int64) ([]*classad.ClassAd, []prevUpdate) {
 	if m == nil || len(m.pending) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]*classad.ClassAd, 0, len(m.pending))
+	var updates []prevUpdate
 	for key, trig := range m.pending {
 		ad, ok := read.LookupClassAd(key)
 		if !ok || ad == nil {
 			// The row is gone (destroyed in this same transaction). Nothing to sample.
 			continue
 		}
-		if s := m.build(key, trig, ad, logSeq); s != nil {
+		if s := m.build(key, trig, ad, logSeq, &updates); s != nil {
 			out = append(out, s)
 		}
 	}
 	clear(m.pending)
-	return out
+	return out, updates
+}
+
+// commitPending applies the cache updates from a collect whose transaction actually committed.
+func (m *jobMetrics) commitPending(updates []prevUpdate) {
+	if m == nil {
+		return
+	}
+	for _, u := range updates {
+		if u.next == nil {
+			delete(m.prev, u.key)
+		} else {
+			m.prev[u.key] = u.next
+		}
+		if u.haveEnded {
+			m.ended[u.key] = u.endedRun
+		}
+	}
 }
 
 // rowReader is the read side of whatever holds the job rows -- a *db.Txn during a commit, a
@@ -548,7 +593,7 @@ type rowReader interface {
 
 // build turns one job row into a sample, advancing the predecessor cache. Returns nil when the
 // sample is throttled away.
-func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd, logSeq int64) *classad.ClassAd {
+func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd, logSeq int64, pending *[]prevUpdate) *classad.ClassAd {
 	run, haveRun := runInstanceOf(job)
 	sampleTime, fromStarter := m.sampleTimeOf(job)
 	prev := m.prev[key]
@@ -568,6 +613,13 @@ func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd,
 	// whatever attribute happened to trigger the commit, and by then the row has accumulated the
 	// final numbers the earlier transactions wrote.
 	wasSampling := prev != nil
+	if done, ok := m.ended[key]; ok && run <= done {
+		// This run's endpoint has already been emitted. Anything still arriving under its id is
+		// either the pre-bump window of the NEXT run (see the `ended` field) or late bookkeeping
+		// on a finished one; neither is an observation of it.
+		m.mAfterEnd.Add(1)
+		return nil
+	}
 	switch {
 	case !haveRun:
 		return nil // never ran; nothing to observe
@@ -579,8 +631,14 @@ func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd,
 		if trig == triggerTerminal {
 			trig = triggerStatus
 		}
-	case wasSampling || trig == triggerTerminal:
-		// The run ended (completed, evicted back to idle, or held).
+	case wasSampling:
+		// The run ended (completed, evicted back to idle, or held). Requires a predecessor
+		// DELIBERATELY: a terminal-looking attribute alone is not evidence a run ended here.
+		// condor_hold and condor_rm set HoldReason/RemoveReason together with JobStatus in one
+		// transaction, and they do that for IDLE jobs too -- a job that ran earlier still carries
+		// NumShadowStarts, so without this a held-while-idle job produced a second "terminal"
+		// record for a run that had already ended, at the same SampleTime, with the old run's
+		// counters. A run whose samples we never saw has no endpoint to record.
 		trig = triggerTerminal
 	default:
 		// Not executing and not a run we were following: schedd bookkeeping on an idle or held
@@ -616,6 +674,11 @@ func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd,
 		}
 	}
 
+	// The storage key, always. ClusterId reaches a proc row only through cluster-ad chaining, so a
+	// row that never got chained yields a sample with no ClusterId and no GlobalJobId -- with no
+	// way to tell whose it is, and no key to repair it by in an append-only table. It is in hand
+	// here for free.
+	_ = s.Set(KeyAttr, key)
 	_ = s.Set(SampleTimeAttr, sampleTime)
 	_ = s.Set(SampleTriggerAttr, trig.String())
 	_ = s.Set(SampleLogSeqAttr, logSeq)
@@ -641,7 +704,7 @@ func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd,
 		}
 	}
 
-	cur := m.observe(job, run, sampleTime)
+	cur := m.observe(job, run, sampleTime, fromStarter)
 	if m.deriveRates(s, prev, cur, run, haveRun) {
 		if prev != nil && prev.run != run {
 			// A new run whose counters did not restart: the sample carries values inherited from
@@ -657,17 +720,32 @@ func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd,
 		m.mBaseline.Add(1)
 	}
 
-	m.prev[key] = cur
+	// The caller applies this only if the transaction commits -- see collect. Advancing the cache
+	// here would survive a failed commit whose sample was discarded, and for a terminal sample it
+	// would DELETE the predecessor, after which the re-applied pass finds wasSampling false and
+	// emits no endpoint at all. The run would silently lose it.
+	upd := prevUpdate{key: key, next: cur}
 	if trig == triggerTerminal {
-		// The run ended: this sample is its endpoint, and the next run starts a fresh series.
-		delete(m.prev, key)
+		upd.next = nil // the run ended; the next one starts a fresh series
+		upd.endedRun, upd.haveEnded = run, true
 	}
+	*pending = append(*pending, upd)
 	return s
 }
 
+// prevUpdate is one deferred change to the predecessor cache, applied by commitPending once the
+// transaction the sample came from has actually committed.
+type prevUpdate struct {
+	key       string
+	next      *prevObservation // nil deletes the entry (the run ended)
+	endedRun  int64
+	haveEnded bool
+}
+
 // observe snapshots the counters this sample will be differentiated from next time.
-func (m *jobMetrics) observe(job *classad.ClassAd, run, sampleTime int64) *prevObservation {
-	o := &prevObservation{run: run, sampleTime: sampleTime, counters: map[string]float64{}}
+func (m *jobMetrics) observe(job *classad.ClassAd, run, sampleTime int64, fromStarter bool) *prevObservation {
+	o := &prevObservation{run: run, sampleTime: sampleTime, fromStarter: fromStarter,
+		counters: map[string]float64{}}
 	for name, class := range sampleAttrs {
 		if class != classRunCounter && class != classCrossRunCounter {
 			continue
@@ -692,6 +770,25 @@ func (m *jobMetrics) deriveRates(s *classad.ClassAd, prev, cur *prevObservation,
 	if prev == nil || !haveRun {
 		return true
 	}
+	// No rate spans a run boundary, including the counters that accumulate across runs.
+	//
+	// Those used to derive one, on the reasoning that their inputs do not restart so the delta is
+	// sound. The delta is -- but the DENOMINATOR is not: the interval between a run's last sample
+	// and the next run's first spans however long the job sat idle in between. A job that
+	// transferred 1 MB in 100s, six hours after its previous run ended, recorded 46 B/s and was
+	// not marked baseline, so nothing distinguished it from a genuinely slow transfer. A rate
+	// averaged over time the job was not running is not a rate.
+	if prev.run != run {
+		return true
+	}
+	// An interval may not span two different clocks. sampleTime is the starter's when it reports
+	// stats and the ingest clock otherwise, and the gap between them is AP/EP skew, not elapsed
+	// time. With the AP behind, the difference even goes negative and silently drops every rate
+	// in the window; ahead, every rate is understated by the skew with nothing on the record.
+	if prev.fromStarter != cur.fromStarter {
+		m.mClockMix.Add(1)
+		return true
+	}
 	// Elapsed wall time less the time the job spent suspended: a suspended interval advances the
 	// clock while the counters stand still, and dividing by the raw elapsed time would report a
 	// spuriously low rate rather than no rate.
@@ -701,22 +798,10 @@ func (m *jobMetrics) deriveRates(s *classad.ClassAd, prev, cur *prevObservation,
 	}
 	_ = s.Set(SampleIntervalAttr, interval)
 
-	sameRun := prev.run == run
 	wrote := false
 	for _, r := range derivedRates {
-		if !sameRun && !r.CrossRun {
-			// Every classRunCounter restarts at a run boundary; a delta across it is not a rate.
-			continue
-		}
-		delta, ok := sumDelta(prev, cur, r.In)
+		delta, ok := sumDelta(m, prev, cur, r.In)
 		if !ok {
-			continue
-		}
-		if delta < 0 {
-			// A counter went backwards: a reset we did not predict, or the starter stopped
-			// reporting and started again. Emit no rate rather than a negative one, and count it
-			// -- a climbing value means the reset table in this file is missing a case.
-			m.mResets.Add(1)
 			continue
 		}
 		_ = s.Set(r.Out, delta/interval)
@@ -725,7 +810,7 @@ func (m *jobMetrics) deriveRates(s *classad.ClassAd, prev, cur *prevObservation,
 	// GPU is a LIFETIME average, not a counter: GPUsAverageUsage is built by the startd as
 	// (Uptime - StartOfJobUptime)/(LastUpdate - FirstUpdate). Recovering the per-interval value
 	// means un-averaging it over the two elapsed times.
-	if sameRun && cur.hasGPU && prev.hasGPU && cur.elapsed > 0 && prev.elapsed > 0 {
+	if cur.hasGPU && prev.hasGPU && cur.elapsed > 0 && prev.elapsed > 0 {
 		used := cur.gpuAvg*cur.elapsed - prev.gpuAvg*prev.elapsed
 		if used >= 0 {
 			_ = s.Set("GpuUtil", used/interval)
@@ -753,7 +838,7 @@ func (m *jobMetrics) deriveRates(s *classad.ClassAd, prev, cur *prevObservation,
 //     mid-run, "absent" does not mean zero at all, and the invented baseline would show up as a
 //     spike. The cost of refusing is one rate-less sample per run; the cost of guessing is a
 //     fabricated number in a dashboard.
-func sumDelta(prev, cur *prevObservation, attrs []string) (float64, bool) {
+func sumDelta(m *jobMetrics, prev, cur *prevObservation, attrs []string) (float64, bool) {
 	var sum float64
 	for _, a := range attrs {
 		p, ok1 := prev.counters[a]
@@ -761,7 +846,20 @@ func sumDelta(prev, cur *prevObservation, attrs []string) (float64, bool) {
 		if !ok1 || !ok2 {
 			return 0, false
 		}
-		sum += c - p
+		// Each input is guarded SEPARATELY. Guarding only the sum lets one input's reset hide
+		// inside another's progress: RemoteUserCpu 100->160 with RemoteSysCpu 50->0 sums to +10,
+		// which is positive, so it was written as a rate of 0.1 cores against a true value of at
+		// least 0.6 -- neither suppressed nor counted, which is precisely what the reset counter
+		// exists to make visible.
+		d := c - p
+		if d < 0 {
+			// A counter went backwards: a reset we did not predict, or the starter stopped
+			// reporting and started again. Emit no rate rather than a wrong one, and count it --
+			// a climbing value means the reset table in this file is missing a case.
+			m.mResets.Add(1)
+			return 0, false
+		}
+		sum += d
 	}
 	return sum, true
 }
@@ -908,6 +1006,13 @@ type MetricsStatus struct {
 	InheritedCounters int64 // new run still carrying the previous run's counters
 	Deduped           int64 // samples skipped as already present (restart replay)
 	AppendFailures    int64
+	// AfterEnd counts commits arriving under a RunInstanceID whose endpoint was already emitted.
+	// A steady trickle is normal: HTCondor bumps NumShadowStarts one transaction AFTER it sets
+	// JobStatus=2, so every re-run has a brief window still reporting the previous run's id.
+	AfterEnd int64
+	// ClockMix counts rates suppressed because the interval would have spanned the starter's
+	// clock and the ingest clock. Nonzero means starter stats are intermittent on this pool.
+	ClockMix int64
 }
 
 func (m *jobMetrics) status() MetricsStatus {
@@ -922,6 +1027,8 @@ func (m *jobMetrics) status() MetricsStatus {
 		InheritedCounters: m.mInherited.Load(),
 		Deduped:           m.mDeduped.Load(),
 		AppendFailures:    m.mAppendFails.Load(),
+		AfterEnd:          m.mAfterEnd.Load(),
+		ClockMix:          m.mClockMix.Load(),
 	}
 }
 
