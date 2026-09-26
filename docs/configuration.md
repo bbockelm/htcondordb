@@ -36,6 +36,26 @@ client in the tree resolves through `locate.Daemon`, and the daemon publishes to
 | `HTCONDORDB_ARCHIVE_MAX_BYTES` | — | Default on-disk size cap applied to **both** schedd-sync archives (`history`, `epoch_history`). Oldest whole segments are dropped past the cap on the retention sweep. Accepts a unit suffix (`10 GB`, `500MiB`) or plain bytes; unset/`0` = no limit. |
 | `HTCONDORDB_HISTORY_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for the `history` archive; overrides the shared default (set to `0` to uncap this table while the default caps the other). |
 | `HTCONDORDB_EPOCH_HISTORY_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for the `epoch_history` archive; overrides the shared default. |
+| `HTCONDORDB_JOB_METRICS` | `false` | Sample running jobs' resource usage (memory/CPU/disk/IO/GPU) into the `job_metrics` archive, off the same `job_queue.log` stream. See [Schedd sync](schedd-sync.md#job-resource-metrics). |
+| `HTCONDORDB_JOB_METRICS_ATTRS` | — | Additional job attributes copied onto every sample — an `AccountingGroup`, a `ProjectName`, or a metric the job publishes with `condor_chirp` (all already flow through `job_queue.log`). |
+| `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | `Owner` | Categorical (string-equality) indexes on `job_metrics`. An unindexed `GROUP BY` is a full scan, and adding an index later costs a backfill. |
+| `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` | `0` | Minimum spacing between samples for one job; a volume backstop. A state change, a new run and the run's endpoint are never throttled. A bare number is seconds; a duration suffix (`5m`, `2h`, `1d`) is accepted. |
+| `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default (8 MiB) | Sealed-segment size for `job_metrics` (create-time only). Accepts a unit suffix (`8 MiB`); `0` means the library default. Values below 64 KiB or at/above 4 GiB are refused (logged, default used). Leave it alone unless you have measured: bytes per record is **not** monotone in segment size, and 8 MiB measured best of 2/8/32/64 MiB (2 MiB cost 1.5x the storage for a 4% faster recent-range query). |
+| `HTCONDORDB_JOB_METRICS_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for `job_metrics`; overrides the shared default (`0` uncaps this table). |
+| `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap measured against `SampleTime`. A bare number is seconds; a duration suffix (`30d`, `720h`) is accepted. Both caps apply; whichever binds first drops the oldest whole segments. |
+| `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Allow secondary (group) columnar schemas for attributes only *some* jobs carry — GPU metrics, a container universe's `NetworkIn`/`NetworkOut`. They sit below the 90% presence a field needs in the base schema, so without grouping they are stored as rows. Not free: measured at +60% bytes/record on a heterogeneous pool, in exchange for the columnar fast path on those attributes. A pool with no GPUs and no containers pays nothing either way. |
 
 Standard `SEC_*` and `ALLOW_`/`DENY_` knobs configure security and authorization
 — see [Authorization](authorization.md).
+
+### Unparseable values
+
+Every `HTCONDORDB_JOB_METRICS_*` knob above that takes a size or a duration reports a value it
+cannot parse, at `ERROR`, naming the knob — and falls back to the **safe** direction: no cap, no
+throttle, the library default. Nothing is guessed at.
+
+This is worth stating because the older integer parser did guess, and silently.
+`HTCONDORDB_JOB_METRICS_MAX_AGE = 30d` resolved to **30 seconds**, so the hourly retention sweep
+erased the table on every pass; `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE = 8 MiB` resolved to **8
+bytes**. If you are reading logs from a deployment older than this change, check for
+`max_age_seconds` and `SegmentSize` values far smaller than what the configuration says.

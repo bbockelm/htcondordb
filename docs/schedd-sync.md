@@ -15,6 +15,12 @@ Two independent tailers run, and **both** are active when their source is presen
   fast time-range queries). Retention is enforced by the periodic archive rotation
   (`HTCONDORDB_ARCHIVE_ROTATE_INTERVAL`, default hourly).
 
+- **Job resource usage** (optional, `HTCONDORDB_JOB_METRICS`) — samples running jobs'
+  resource counters out of the *same* parsed `job_queue.log` stream and appends them to
+  the **`job_metrics`** archive: one record per committed transaction that moved a usage
+  attribute, with per-interval rates derived at ingest. See
+  [Job resource metrics](#job-resource-metrics) below.
+
 At least one of the two sources must be configured; enable either or both. Paths
 default to HTCondor's standard `JOB_QUEUE_LOG` / `HISTORY` and can be overridden
 with `HTCONDORDB_JOB_QUEUE_LOG` / `HTCONDORDB_HISTORY`.
@@ -99,6 +105,14 @@ inherits the condor config and drops to the condor user.
 | `HTCONDORDB_ARCHIVE_MAX_BYTES` | — | On-disk size cap applied to both archives; oldest whole segments drop past the cap on the sweep. Accepts `10 GB` / `500MiB` / plain bytes; unset = no limit. |
 | `HTCONDORDB_HISTORY_MAX_BYTES` | inherits default | Per-table size cap for `history` (overrides the shared default; `0` uncaps). |
 | `HTCONDORDB_EPOCH_HISTORY_MAX_BYTES` | inherits default | Per-table size cap for `epoch_history`. |
+| `HTCONDORDB_JOB_METRICS` | `false` | Sample running jobs' resource usage into the `job_metrics` archive. |
+| `HTCONDORDB_JOB_METRICS_ATTRS` | — | Additional job attributes to record on every sample (e.g. `ProjectName`, a chirp-published metric). |
+| `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | `Owner` | Which of them get a categorical index (an unindexed `GROUP BY` is a full scan). |
+| `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` | `0` | Throttles redundant samples per job (bare number = seconds, or `5m`). Never drops a state change or a run endpoint. |
+| `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default | Segment size (create-time only), e.g. `8 MiB`. Measured best as-is; see [Sizing](#sizing). |
+| `HTCONDORDB_JOB_METRICS_MAX_BYTES` | inherits default | Per-table size cap for `job_metrics`. |
+| `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap against `SampleTime`, e.g. `30d`. |
+| `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). See [Sizing](#sizing). |
 
 ### Bounding disk usage
 
@@ -115,3 +129,149 @@ segments once a table exceeds its cap. The caps are applied on every start and `
 so a configuration-management change takes effect without recreating the database.
 
 See [Configuration](configuration.md) for the full knob list.
+
+## Job resource metrics
+
+`HTCONDORDB_JOB_METRICS = true` turns on a resource-usage time series for running jobs:
+memory, CPU, disk, block I/O, network, and GPU, plotted over time without standing up a
+metrics stack. It costs **no new polling** — the shadow already pushes these counters into
+the job queue, and the live-jobs tailer is already parsing every one of those commits.
+
+```conf
+HTCONDORDB_SYNC_SCHEDD    = true
+HTCONDORDB_JOB_METRICS    = true
+HTCONDORDB_JOB_METRICS_MAX_AGE = 30d           # keep 30 days
+HTCONDORDB_JOB_METRICS_ATTRS   = ProjectName   # extra grouping dimension
+```
+
+```sql
+-- CPU efficiency by project, hourly
+SELECT time_bucket(SampleTime, '1h') AS time,
+       ProjectName                   AS label_project,
+       AVG(CpuUtil / RequestCpus)    AS metric_cpu_efficiency
+FROM job_metrics
+WHERE SampleTime >= 1700000000
+GROUP BY time_bucket(SampleTime, '1h'), ProjectName;
+
+-- Right-sizing: how much of requested memory jobs actually used
+SELECT Owner AS label_owner, AVG(MemUtil) AS metric_mem_fraction
+FROM job_metrics WHERE RunInstanceID == 0 GROUP BY Owner;
+```
+
+### Sizing
+
+Measured on a production-shaped population (20k concurrently running jobs, every job sampled in
+the same round, so a segment holds one sample each from thousands of different jobs):
+
+| | bytes/record |
+|---|---|
+| as appended | ~810 |
+| after the archive maintenance pass | **~250** |
+
+At 20k running jobs sampling at the 900s floor that is **~480 MiB/day, ~14 GiB for 30 days**,
+before whatever the event-driven triggers add on an eventful pool. Budget with
+`HTCONDORDB_JOB_METRICS_MAX_BYTES` / `_MAX_AGE`; the retention sweep drops the oldest whole
+segments once either binds.
+
+Three notes that follow from the table:
+
+- **Keep archive maintenance enabled.** The 3x comes from the per-segment columnar build, which
+  the maintenance pass does (`HTCONDORDB_ARCHIVE_ROTATE_INTERVAL`, hourly by default). With it
+  disabled, samples stay in row form and the table is roughly three times bigger.
+- **Do not tune the segment size without measuring.** Bytes per record is not monotone in it —
+  8 MiB measured best of 2/8/32/64 MiB, and 2 MiB cost 1.5x the storage for a 4% faster
+  recent-range query.
+- **Grouping the heterogeneous tail is not free.** Attributes only *some* jobs carry — the GPU
+  metrics, a container universe's `NetworkIn`/`NetworkOut` — are below the 90% presence a field
+  needs to enter a segment's base schema, so they are captured by *secondary* (group) schemas
+  instead. Measured on a pool that is a fifth containers and a seventh GPUs, that cost **+60%
+  bytes per record** versus leaving the tail in row form, because it fragments into one small
+  group per exact co-occurrence pattern. What it buys is the columnar fast path on those
+  attributes, which row form does not give at all, and a pool with neither GPUs nor containers
+  pays nothing either way because the attributes are simply absent. Set
+  `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS = false` if you have measured your own mix and do not
+  need those panels.
+- **Watch the baseline share.** If
+  `job_metrics_samples_total{outcome="baseline"} / {outcome="appended"}` exceeds ~10%, the
+  derived rate columns stop being stored columnar (a column needs to be present on 90% of
+  records to enter the segment schema, and a rate is absent on a run's first samples). A pool of
+  very short jobs -- sampled only two or three times each before they finish -- is the case that
+  trips it, and the cost is both size and the fast path for the columns dashboards aggregate.
+  Lowering `SHADOW_QUEUE_UPDATE_INTERVAL` so short jobs get more samples is the lever.
+
+### When a sample is taken
+
+One per committed transaction that moved a usage attribute on a job that is **executing**
+(running, transferring output, or suspended) — plus the run's terminal commit whatever status
+it leaves the job in. HTCondor includes its queue-update attribute whitelist in *every* kind
+of shadow update, not just the periodic one, so samples arrive on:
+
+| Trigger (`SampleTrigger`) | When |
+|---|---|
+| `periodic` | the starter's stats clock advanced — `SHADOW_QUEUE_UPDATE_INTERVAL`, default 900s |
+| `status` | job state change: began executing, suspended, transfer start/finish, reconnect |
+| `checkpoint` | a checkpoint completed |
+| `terminal` | the run ended — completed, evicted, held or removed |
+| `update` | a usage attribute moved with no other signal |
+| `chirp` | only an admin-configured extra attribute moved |
+
+The periodic timer is therefore a **floor**, not a sampling window: an eventful job gets more
+points, exactly where a plot wants them. Lowering `SHADOW_QUEUE_UPDATE_INTERVAL` raises the
+floor but multiplies the schedd's job-queue write traffic for *every* whitelisted attribute,
+so prefer `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` to bound volume rather than raising cadence to
+chase resolution.
+
+The run's final counters reach the queue before the job leaves it, so the **last sample of a run
+is its endpoint** — a resource plot needs no `epoch_history` lookup to find where a run finished.
+(The endpoint is detected from the job leaving the executing states, not from any one attribute:
+the schedd sets `ExitCode` and `JobStatus 4` in *different* transactions.)
+
+### The shipped dashboard
+
+The Grafana plugin bundles **HTCondorDB Job Resource Usage** (`htcondordb-job-metrics`), so the
+plots exist without writing any of the queries above: CPU cores used and memory high-water mark
+over time by owner, disk I/O rate, the requested-vs-used memory bar chart, a breakdown of what
+triggered each sample, and a table of the jobs with the largest peak memory. Import it from the
+datasource's dashboard list. The memory panels restrict themselves to `RunInstanceID == 0` for
+the reason in the next section.
+
+### Reading the columns correctly
+
+Two properties of HTCondor's counters will mislead a dashboard built without them:
+
+- **`CurrentResidentSetSize` / `CurrentMemUtil` are the exception** — a true memory gauge that
+  can go down, recorded whenever the pool publishes the attribute. HTCondor does not publish it
+  yet; until it does, these columns are simply absent and the high-water marks below are all
+  there is.
+- **The other memory numbers are high-water marks, not gauges.** `MemoryUsage`, `ResidentSetSize`
+  and `ImageSize` only ratchet up, so a memory series is a staircase, not a working-set trace.
+  Worse, the shadow **seeds them from the previous run**, so for `RunInstanceID > 0` they are
+  a whole-*job* maximum wearing this run's timestamp — that run's real peak was never written
+  anywhere. **Filter to `RunInstanceID == 0` to ask a per-run memory question.**
+- **Rates are derived at ingest, not at query time.** `CpuUtil`, `BlockReadRate`,
+  `NetworkInRate`, `GpuUtil` and friends are computed from consecutive observations when the
+  sample is written, because the SQL surface has no window functions or `LAG`. They are
+  **undefined, never zero**, when there is no usable predecessor — a run's first sample, the
+  first after a daemon restart, or an interval spanning a run boundary (counters restart).
+  `SampleBaseline = true` marks those, and `time_bucket` drops undefined rows, so a series
+  shows a gap rather than a false zero.
+
+`SampleInterval` is elapsed time **net of suspension**, so a suspended interval reports the
+rate over the time the job was actually running.
+
+### Watching it
+
+`htcondordb_job_metrics_samples_total{outcome=...}` counts samples by outcome. Two of the
+outcomes are bug signals rather than workload signals and should stay at zero:
+
+- `reset` — a rate was suppressed because its counter went backwards, i.e. HTCondor reset a
+  counter in a way the sampler does not model.
+- `inherited` — a new run was still carrying the previous run's counters when first observed.
+
+`deduped` counts samples suppressed because their log position had already been flushed — a
+restart or a commit-conflict rewind re-reading a region. `baseline` is expected at a low rate (roughly one or two per run); `throttled` is whatever
+`HTCONDORDB_JOB_METRICS_MIN_INTERVAL` is dropping; `deduped` should be nonzero only just after
+a restart.
+
+See [the design sketch](design/job-metrics.md) for why each of these rules exists, with
+citations into the HTCondor source.

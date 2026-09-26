@@ -203,6 +203,11 @@ type JobSync struct {
 	// log with reconcileReload. It heals a table corrupted by an older sync without truncating
 	// (reconcile writes only real deltas), so live consumers see the corrected rows, not a blink.
 	resyncReq atomic.Bool
+
+	// metrics samples running jobs' resource counters out of the same parsed stream, appending
+	// one record per committed transaction that moved a usage attribute. nil when unconfigured;
+	// every call site tolerates a nil receiver, so the feature costs nothing when off.
+	metrics *jobMetrics
 }
 
 // Resync requests that the next Poll rebuild the mirror from the current job_queue.log
@@ -247,6 +252,10 @@ type JobSyncConfig struct {
 	// progress, which the syncer re-applies idempotently on restart; rotation/compaction and a
 	// clean shutdown always checkpoint regardless.
 	SaveInterval time.Duration
+	// Metrics, when set, turns on per-job resource sampling into that archive table: one record
+	// per committed transaction that moved a usage attribute, with rates derived at ingest. See
+	// JobMetricsConfig; a zero Metrics.Archive leaves sampling off.
+	Metrics JobMetricsConfig
 }
 
 // NewJobSync creates a syncer that mirrors cfg.Filename into target (the jobs table) and routes
@@ -308,6 +317,10 @@ func NewJobSync(target *db.DB, cfg JobSyncConfig) *JobSync {
 		txs:            map[*db.DB]*db.Txn{},
 		store:          cfg.Store,
 	}
+	if cfg.Metrics.Logger == nil {
+		cfg.Metrics.Logger = logger
+	}
+	s.metrics = newJobMetrics(cfg.Metrics)
 	// Publish an initial status at construction (resume position, CaughtUp reflecting the current
 	// file) so the source is present in the VERY FIRST collector ad rather than only after the first
 	// poll completes -- dbad skips a source whose status is still zero (Kind ""), so without this the
@@ -517,6 +530,13 @@ var reconcileApplyHook func(error) error
 // for an unapplied write -- is the whole point of telling the two apart.
 var applyErrorHook func(error) error
 
+// commitErrorHook, when non-nil, replaces the error commitAll's commits returned. Test-only, and
+// the only way to exercise the two error shapes that differ for sampling: a ConflictError means
+// nothing landed (samples and cache updates are dropped and the pass rewinds), while an
+// UnappliedError means the transaction DID commit with a few keys not composed, so its samples
+// must still be written -- the offset advances past them either way.
+var commitErrorHook func(err error, samples int) error
+
 // maxConflictRetries bounds in-place commit-conflict re-applies at one offset before Poll escalates
 // to a full reconcileReload. Small: a transient conflict clears in a tick or two; a persistent one
 // (a stuck second writer) should heal via reconcile promptly, not spin.
@@ -570,6 +590,11 @@ func (s *JobSync) handleCommitConflict(ctx context.Context, conflict *db.Conflic
 // checkpointed only after the sweep commits, so a crash mid-reload re-runs the idempotent
 // reconcile rather than resuming past an unfinished table.
 func (s *JobSync) reconcileReload(ctx context.Context, reason string) (err error) {
+	// The log this mark was measured against is being replaced or re-read from the head, and an
+	// offset in the new file means nothing against one from the old. Comparing them would
+	// SUPPRESS real samples rather than duplicates, which is the failure that does not announce
+	// itself. A reload emits no samples of its own, so there is nothing to lose by forgetting it.
+	s.metrics.resetMark()
 	start := nowFn()
 	// Logged on the WAY IN as well as out. A reconcile of a large log takes minutes, during which
 	// the tailer falls behind and says nothing, and the end line used to assert
@@ -816,6 +841,15 @@ func (s *JobSync) sweepKeys(table *db.DB, before []string, seen map[string]struc
 			batch = table.Begin()
 		}
 		batch.DestroyClassAd(k)
+		// The sampler's predecessor cache is keyed by job and only ever pruned on a
+		// DestroyClassAd from the incremental path -- which these keys never produce, because a
+		// reconcile is exactly the case where the job vanished from the log while we were not
+		// reading it. Without this the entries accumulate for the life of the daemon, one per job
+		// that finished during every compaction and every resync, and the cache's claim to be
+		// bounded by the RUNNING jobs is false. A reused key would then find a stale predecessor.
+		if table == s.target {
+			s.metrics.forget(k)
+		}
 		if n++; n >= reconcileBatch {
 			if err := commit(); err != nil {
 				return err
@@ -1191,6 +1225,7 @@ func (s *JobSync) migrateJobsTable() error {
 			batch = s.target.Begin()
 		}
 		batch.DestroyClassAd(k)
+		s.metrics.forget(k) // same reason as sweepKeys: these keys produce no DestroyClassAd
 		if (i+1)%reconcileBatch == 0 {
 			if err := commit(); err != nil {
 				return err
@@ -1362,6 +1397,11 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 		}
 	case classadlog.OpDestroyClassAd:
 		tx.DestroyClassAd(e.Key)
+		if table == s.target {
+			// The job left the queue: drop its resource-sample predecessor, so that cache tracks
+			// running jobs rather than everything the tailer has ever seen.
+			s.metrics.forget(e.Key)
+		}
 		if parent, ok := clusterKeyOf(e.Key); ok {
 			if kids := s.children[parent]; kids != nil {
 				delete(kids, e.Key)
@@ -1397,6 +1437,11 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 				}
 			}
 		}
+		if table == s.target {
+			// Resource sampling rides along with the writes we are already doing: note that this
+			// job moved, and commitAll turns the noted set into one sample each.
+			s.metrics.note(e.Key, e.Name)
+		}
 	case classadlog.OpDeleteAttribute:
 		if !tx.Has(e.Key) {
 			s.mAbsentKey.Add(1) // observe-only (DeleteAttribute on an absent key is a no-op, but same signal)
@@ -1407,6 +1452,11 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 			for child := range kids {
 				jtx.DeleteAttribute(child, e.Name)
 			}
+		}
+		if table == s.target {
+			// A starter-sourced counter that an update omitted is DELETED from the job ad by
+			// HTCondor (CopyAttribute), so a delete is a real observation, not an absence of one.
+			s.metrics.note(e.Key, e.Name)
 		}
 	}
 	return nil
@@ -1665,12 +1715,42 @@ func (s *JobSync) ensureTx(table *db.DB) *db.Txn {
 // stall behind a commit is visible in the log at the moment it happens.
 func (s *JobSync) commitAll() error {
 	n := len(s.txs)
+	// Collect resource samples BEFORE committing: the open jobs transaction is where the merged,
+	// post-update row can be read, and reading it here rather than after the commit means a
+	// transaction that fails to commit leaves no sample for state that never landed.
+	var samples []*classad.ClassAd
+	var prevUpdates []prevUpdate
+	if s.metrics != nil {
+		if jtx := s.txs[s.target]; jtx != nil {
+			samples, prevUpdates = s.metrics.collect(jtx, s.curSeq)
+		} else {
+			s.metrics.discard()
+		}
+	}
 	start := nowFn()
 	var firstErr error
 	for _, tx := range s.txs {
 		if err := tx.Commit(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+	// The samples follow the WRITES, not the error. db.UnappliedError means the transaction
+	// committed and a few keys could not be composed -- "a caller should record these and make
+	// progress rather than retry", which is exactly what Poll does: it advances and checkpoints
+	// past them. Treating it as a failed commit threw away every sample in a batch that had
+	// landed, for good, since the offset moved on; on one production mirror that path fired 1,239
+	// times. A ConflictError is the opposite -- nothing landed, the pass rewinds and re-reads --
+	// so its samples and cache updates are correctly dropped.
+	if commitErrorHook != nil {
+		firstErr = commitErrorHook(firstErr, len(samples))
+	}
+	var unapplied *db.UnappliedError
+	if firstErr == nil || errors.As(firstErr, &unapplied) {
+		// CurrentOffset, not GetNextOffset: the latter only folds in the bytes consumed at Close,
+		// so mid-pass it reports where the PASS began and every commit in it would share one
+		// position. This is the byte just past the entry that closed the transaction.
+		s.metrics.flush(samples, logPos{Seq: s.curSeq, Offset: s.parser.CurrentOffset()})
+		s.metrics.commitPending(prevUpdates)
 	}
 	s.txs = map[*db.DB]*db.Txn{}
 	s.explicit = false
@@ -1686,6 +1766,14 @@ func (s *JobSync) commitAll() error {
 }
 
 func (s *JobSync) abort() {
+	// Nothing was written, so nothing was observed: drop the noted set rather than carrying it
+	// into the next pass, where a key touched only by the abandoned pass would be sampled against
+	// a row that never changed.
+	//
+	// This is NOT what keeps a reconcile reload from emitting a duplicate sample per running job
+	// -- that falls out of structure: the reconciler writes through its own batched transactions
+	// and never calls commitAll, which is the only place samples are taken.
+	s.metrics.discard()
 	for _, tx := range s.txs {
 		tx.Abort()
 	}

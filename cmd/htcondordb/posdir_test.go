@@ -32,7 +32,7 @@ func TestResolveDBDir(t *testing.T) {
 // dir, not be silently disabled because HTCONDORDB_DIR is unset.
 func TestScheddSyncPosDirFollowsSpool(t *testing.T) {
 	cfg := mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nSPOOL = /var/spool/condor\nHTCONDORDB_HISTORY = /var/spool/condor/history\n")
-	s := resolveScheddSyncSettings(cfg)
+	s, _ := resolveScheddSyncSettings(cfg)
 	want := filepath.Join("/var/spool/condor", "htcondordb")
 	if s.posDir != want {
 		t.Errorf("posDir = %q, want %q (SPOOL-configured deployments must persist the sync position)", s.posDir, want)
