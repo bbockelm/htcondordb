@@ -16,7 +16,8 @@ import (
 // uncaps one table while the default caps the other), unit suffixes, and unset = 0 (no limit).
 func TestArchiveSizeLimitConfig(t *testing.T) {
 	resolve := func(extra string) scheddSyncSettings {
-		return resolveScheddSyncSettings(mkSyncCfg(t, syncOn+extra))
+		s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+extra))
+		return s
 	}
 
 	if s := resolve(""); s.historyMaxBytes != 0 || s.epochMaxBytes != 0 {

@@ -108,10 +108,10 @@ inherits the condor config and drops to the condor user.
 | `HTCONDORDB_JOB_METRICS` | `false` | Sample running jobs' resource usage into the `job_metrics` archive. |
 | `HTCONDORDB_JOB_METRICS_ATTRS` | — | Additional job attributes to record on every sample (e.g. `ProjectName`, a chirp-published metric). |
 | `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | `Owner` | Which of them get a categorical index (an unindexed `GROUP BY` is a full scan). |
-| `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` | `0` | Seconds; throttles redundant samples per job. Never drops a state change or a run endpoint. |
-| `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default | Segment size (create-time only). Measured best as-is; see [Sizing](#sizing). |
+| `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` | `0` | Throttles redundant samples per job (bare number = seconds, or `5m`). Never drops a state change or a run endpoint. |
+| `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default | Segment size (create-time only), e.g. `8 MiB`. Measured best as-is; see [Sizing](#sizing). |
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | inherits default | Per-table size cap for `job_metrics`. |
-| `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap in seconds, measured against `SampleTime`. |
+| `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap against `SampleTime`, e.g. `30d`. |
 | `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). See [Sizing](#sizing). |
 
 ### Bounding disk usage
@@ -140,7 +140,7 @@ the job queue, and the live-jobs tailer is already parsing every one of those co
 ```conf
 HTCONDORDB_SYNC_SCHEDD    = true
 HTCONDORDB_JOB_METRICS    = true
-HTCONDORDB_JOB_METRICS_MAX_AGE = 2592000       # keep 30 days
+HTCONDORDB_JOB_METRICS_MAX_AGE = 30d           # keep 30 days
 HTCONDORDB_JOB_METRICS_ATTRS   = ProjectName   # extra grouping dimension
 ```
 

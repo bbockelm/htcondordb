@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -168,10 +169,20 @@ type scheddSyncSettings struct {
 	metricsGroupSchemas bool
 }
 
-func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
+// resolveScheddSyncSettings reads the configuration, returning the settings plus the names of any
+// knobs whose value could not be parsed.
+//
+// Reporting them matters because silently substituting a value is how a typo becomes data loss.
+// HTCONDORDB_JOB_METRICS_MAX_AGE = 30d used to parse as 30 SECONDS -- fmt.Sscanf("%d") stops at
+// the first non-digit and reports no error -- so the hourly retention sweep erased job_metrics on
+// every pass, with one INFO line as the only trace. Every parse failure now resolves in the SAFE
+// direction (no cap, no throttle, the library default) and is named here so the caller logs it.
+func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string) {
 	if !configBool(cfg, "HTCONDORDB_SYNC_SCHEDD") {
-		return scheddSyncSettings{}
+		return scheddSyncSettings{}, nil
 	}
+	var bad []string
+	note := func(key string) { bad = append(bad, key+"="+strconv.Quote(getStr(cfg, key))) }
 	// Unset leaves SegmentSize zero, i.e. the library default (8 MiB). Deliberately not
 	// overridden: a small sealed segment is what keeps the tail of the archive queryable,
 	// since the active segment carries no sidecar index and is scanned linearly until it
@@ -192,6 +203,19 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 	}
 	// Shared default size cap for both archives; per-table knobs override it below.
 	defArchiveMaxBytes := configBytes(cfg, "HTCONDORDB_ARCHIVE_MAX_BYTES")
+
+	segSizeMetrics, okSeg := configSegmentBytes(cfg, "HTCONDORDB_JOB_METRICS_SEGMENT_SIZE")
+	if !okSeg {
+		note("HTCONDORDB_JOB_METRICS_SEGMENT_SIZE")
+	}
+	maxAgeMetrics, okAge := configSeconds(cfg, "HTCONDORDB_JOB_METRICS_MAX_AGE")
+	if !okAge {
+		note("HTCONDORDB_JOB_METRICS_MAX_AGE")
+	}
+	minIntervalMetrics, okMin := configSeconds(cfg, "HTCONDORDB_JOB_METRICS_MIN_INTERVAL")
+	if !okMin {
+		note("HTCONDORDB_JOB_METRICS_MIN_INTERVAL")
+	}
 	return scheddSyncSettings{
 		enabled:   true,
 		jobLog:    firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG")),
@@ -230,22 +254,75 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		metricsEnabled:  configBool(cfg, "HTCONDORDB_JOB_METRICS"),
 		metricsAttrs:    canonicalAttrList(getStr(cfg, "HTCONDORDB_JOB_METRICS_ATTRS")),
 		metricsCatAttrs: canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS"), defaultArchiveCategoricalAttrs)),
-		metricsSegSize:  metricsSegmentSize(cfg),
+		metricsSegSize:  segSizeMetrics,
 		// A throttle, not a filter: it only ever drops a sample carrying no transition (see
-		// jobMetrics.build). Seconds.
-		metricsMinInterval: time.Duration(configInt(cfg, "HTCONDORDB_JOB_METRICS_MIN_INTERVAL")) * time.Second,
+		// jobMetrics.build). A bare number is seconds; a duration suffix is accepted.
+		metricsMinInterval: time.Duration(minIntervalMetrics) * time.Second,
 		metricsMaxBytes:    configBytesOr(cfg, "HTCONDORDB_JOB_METRICS_MAX_BYTES", defArchiveMaxBytes),
-		metricsMaxAge:      float64(configInt(cfg, "HTCONDORDB_JOB_METRICS_MAX_AGE")),
+		metricsMaxAge:      float64(maxAgeMetrics),
 		// Unset means on, so the knob is an opt-OUT for a site that has measured its own mix.
 		metricsGroupSchemas: !configBoolDefaultTrueIsFalse(cfg, "HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS"),
-	}
+	}, bad
 }
 
-// metricsSegmentSize resolves the job_metrics segment size. Unset leaves the library default,
-// which is what the measurement says to use: bytes per record is NOT monotone in segment size,
-// and the 8 MiB default measured best of 2/8/32/64 MiB on a production-shaped population --
-// a 2 MiB segment cost 1.5x the storage for a 4% faster recent-range query. See
-// scheddsync.TestJobMetricsSegmentSizeAB, which fails if some other size ever wins.
+// configSeconds reads a knob naming a DURATION. A bare integer is seconds; a suffix is accepted
+// via time.ParseDuration, plus "d" for days, which Go does not handle.
+//
+// ok=false means the value was set and is unparseable, and the caller must treat it as unset
+// rather than guess. Contrast configInt, which is fmt.Sscanf("%d"): it stops at the first
+// non-digit and reports no error, so "30d" became 30 and "5m" became 5.
+func configSeconds(cfg *config.Config, key string) (int64, bool) {
+	s := strings.TrimSpace(getStr(cfg, key))
+	if s == "" {
+		return 0, true
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, true
+	}
+	if rest, found := strings.CutSuffix(s, "d"); found {
+		if n, err := strconv.ParseFloat(strings.TrimSpace(rest), 64); err == nil {
+			return int64(n * 86400), true
+		}
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return int64(d.Seconds()), true
+	}
+	return 0, false
+}
+
+// minSegmentSize is the floor a configured segment size must clear, and maxSegmentSize the
+// storage layer's structural ceiling (segment offsets are uint32 throughout the record and
+// sidecar formats).
+//
+// The floor exists because the storage layer has none: a segment size of 8 is accepted without
+// error and produces roughly two files per record. That is reachable by typo -- "8 MiB" through
+// the old integer parser was 8 -- so the floor is deliberately far below any sane setting. Its
+// job is to reject a unit-parse accident, not to second-guess tuning.
+const (
+	minSegmentSize = 64 << 10
+	maxSegmentSize = 1 << 32
+)
+
+// configSegmentBytes reads a segment size, accepting a unit suffix ("8 MiB"). Empty or an explicit
+// 0 means the library default; ok=false means the value was set and is not usable.
+func configSegmentBytes(cfg *config.Config, key string) (int, bool) {
+	s := strings.TrimSpace(getStr(cfg, key))
+	if s == "" {
+		return 0, true
+	}
+	n, err := humanize.ParseBytes(s)
+	if err != nil {
+		return 0, false
+	}
+	switch {
+	case n == 0:
+		return 0, true // explicitly "use the library default"
+	case n < minSegmentSize, n >= maxSegmentSize:
+		return 0, false
+	}
+	return int(n), true
+}
+
 // configBoolDefaultTrueIsFalse reports whether a knob that defaults to TRUE has been explicitly
 // turned off. Spelled this way because configBool defaults to false, and a knob whose absence
 // must mean "on" needs the set-ness checked rather than the value.
@@ -254,14 +331,6 @@ func configBoolDefaultTrueIsFalse(cfg *config.Config, key string) bool {
 		return false
 	}
 	return !configBool(cfg, key)
-}
-
-func metricsSegmentSize(cfg *config.Config) int {
-	n := configInt(cfg, "HTCONDORDB_JOB_METRICS_SEGMENT_SIZE")
-	if n < 0 {
-		return 0
-	}
-	return n
 }
 
 // configBytes reads a byte-size knob, accepting a unit suffix ("10 GB", "500MiB", "2t") or plain
@@ -492,7 +561,12 @@ func (m *scheddSyncManager) Sources() []dbad.StatusSource {
 // settings are unchanged, otherwise it stops the current tailers and (if still
 // enabled) starts fresh ones. Called once at startup and again on each reconfig.
 func (m *scheddSyncManager) apply(cfg *config.Config) error {
-	next := resolveScheddSyncSettings(cfg)
+	next, badKnobs := resolveScheddSyncSettings(cfg)
+	for _, k := range badKnobs {
+		// ERROR, not WARN: the value an operator wrote is NOT in effect, and the one that is came
+		// from this code rather than from them.
+		m.logger.Error("schedd-sync: unparseable configuration value, ignoring it", "knob", k)
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()

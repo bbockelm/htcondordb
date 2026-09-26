@@ -20,7 +20,7 @@ const syncOn = "HTCONDORDB_SYNC_SCHEDD = true\nSPOOL = /var/spool/condor\nHTCOND
 // is not: an archive with no categorical index cannot answer a GROUP BY from its indexes at
 // any segment size.
 func TestArchiveConfigDefaults(t *testing.T) {
-	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
+	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
 	if s.archiveSegSize != 0 {
 		t.Errorf("archiveSegSize = %d, want 0 (library default)", s.archiveSegSize)
 	}
@@ -34,7 +34,7 @@ func TestArchiveConfigDefaults(t *testing.T) {
 
 // TestArchiveConfigOverrides checks each knob is actually read.
 func TestArchiveConfigOverrides(t *testing.T) {
-	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
+	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
 		"HTCONDORDB_ARCHIVE_SEGMENT_SIZE = 268435456\n"+
 		"HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS = Owner, AccountingGroup\n"+
 		"HTCONDORDB_ARCHIVE_VALUE_ATTRS = ClusterId RequestMemory\n"))
@@ -60,7 +60,7 @@ func TestArchiveAttrListCanonical(t *testing.T) {
 	}
 	var first scheddSyncSettings
 	for i, body := range spellings {
-		s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+body))
+		s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+body))
 		if i == 0 {
 			first = s
 			continue
@@ -93,7 +93,7 @@ func TestReconcileArchiveIndexesAdds(t *testing.T) {
 	}
 
 	m := &scheddSyncManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
+	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
 	// The backfill runs in its own goroutine (so it cannot stall daemon startup) but is
 	// registered on wg, which the manager joins on stop; the test joins it the same way.
 	var wg sync.WaitGroup
@@ -126,7 +126,7 @@ func TestReconcileArchiveIndexesNeverDrops(t *testing.T) {
 
 	m := &scheddSyncManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	// Config names only Owner; AccountingGroup was added out of band.
-	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
+	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
 	var wg sync.WaitGroup
 	m.reconcileArchiveIndexes(context.Background(), hist, s, &wg)
 	wg.Wait() // join the backfill (adding the ClusterId value index) before asserting
@@ -161,7 +161,7 @@ func TestReconcileArchiveIndexesSurvivesRestart(t *testing.T) {
 		}
 	}
 	m := &scheddSyncManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
+	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
 	// Join the backfill via wg (as the manager does on stop): wg.Wait returns only after
 	// AddIndex has BOTH reindexed and persisted archiveconfig.json, so the reopen below sees the
 	// persisted index. Polling IndexedAttrs instead raced the persist step (IndexedAttrs flips
@@ -195,10 +195,10 @@ func TestReconcileArchiveIndexesSurvivesRestart(t *testing.T) {
 // TestArchiveRowGroupBytesRead checks the knob is read, and that leaving it out reports 0 rather
 // than a number -- 0 is what tells applyArchiveRowGroupBytes to leave a tuned archive alone.
 func TestArchiveRowGroupBytesRead(t *testing.T) {
-	if s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn)); s.archiveRowGroupBytes != 0 {
+	if s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn)); s.archiveRowGroupBytes != 0 {
 		t.Errorf("unset archiveRowGroupBytes = %d, want 0", s.archiveRowGroupBytes)
 	}
-	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_ARCHIVE_ROW_GROUP_BYTES = 131072\n"))
+	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_ARCHIVE_ROW_GROUP_BYTES = 131072\n"))
 	if s.archiveRowGroupBytes != 131072 {
 		t.Errorf("archiveRowGroupBytes = %d, want 131072", s.archiveRowGroupBytes)
 	}
@@ -232,7 +232,7 @@ func TestApplyArchiveRowGroupBytes(t *testing.T) {
 	}
 
 	m := &scheddSyncManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	s := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_ARCHIVE_ROW_GROUP_BYTES = 131072\n"))
+	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_ARCHIVE_ROW_GROUP_BYTES = 131072\n"))
 	m.applyArchiveRowGroupBytes(hist, "history", s)
 	if got := hist.RowGroupBytes(); got != 131072 {
 		t.Errorf("after apply RowGroupBytes = %d, want 131072", got)
@@ -242,7 +242,7 @@ func TestApplyArchiveRowGroupBytes(t *testing.T) {
 	}
 
 	// Unset must not reset a deliberately tuned archive.
-	m.applyArchiveRowGroupBytes(hist, "history", resolveScheddSyncSettings(mkSyncCfg(t, syncOn)))
+	m.applyArchiveRowGroupBytes(hist, "history", mustResolve(t, syncOn))
 	if got := hist.RowGroupBytes(); got != 131072 {
 		t.Errorf("removing the setting reset the archive to %d; unset means leave it alone", got)
 	}
