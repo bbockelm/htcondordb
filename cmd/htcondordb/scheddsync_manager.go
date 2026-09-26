@@ -167,6 +167,9 @@ type scheddSyncSettings struct {
 	// which row form does not give at all. A pool with no GPUs and no containers pays nothing
 	// either way, because the attributes are absent rather than rare.
 	metricsGroupSchemas bool
+	// metricsDerived is the configured computed columns, carried as a canonical string so the
+	// settings struct stays comparable for the reconcile-by-equality in apply().
+	metricsDerived string
 }
 
 // resolveScheddSyncSettings reads the configuration, returning the settings plus the names of any
@@ -216,6 +219,10 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 	if !okMin {
 		note("HTCONDORDB_JOB_METRICS_MIN_INTERVAL")
 	}
+	derivedCols, missingDerived := resolveDerivedColumns(cfg)
+	for _, name := range missingDerived {
+		bad = append(bad, "HTCONDORDB_JOB_METRICS_DERIVED_"+strings.ToUpper(name)+"=<unset>")
+	}
 	return scheddSyncSettings{
 		enabled:   true,
 		jobLog:    firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG")),
@@ -260,9 +267,79 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 		metricsMinInterval: time.Duration(minIntervalMetrics) * time.Second,
 		metricsMaxBytes:    configBytesOr(cfg, "HTCONDORDB_JOB_METRICS_MAX_BYTES", defArchiveMaxBytes),
 		metricsMaxAge:      float64(maxAgeMetrics),
+		metricsDerived:     canonicalDerived(derivedCols),
 		// Unset means on, so the knob is an opt-OUT for a site that has measured its own mix.
 		metricsGroupSchemas: !configBoolDefaultTrueIsFalse(cfg, "HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS"),
 	}, bad
+}
+
+// metricsConfigFor builds the sampler's configuration from the resolved settings. Split out so the
+// wiring is testable on its own: the defects this file has had were missing or mistyped CALLS, not
+// wrong logic inside them, and a test that constructs JobMetricsConfig itself cannot see those.
+func metricsConfigFor(s scheddSyncSettings, logger *slog.Logger, store scheddsync.PositionStore) scheddsync.JobMetricsConfig {
+	return scheddsync.JobMetricsConfig{
+		Attrs:       splitAttrList(s.metricsAttrs),
+		MinInterval: s.metricsMinInterval,
+		Derived:     parseDerived(s.metricsDerived),
+		Logger:      logger,
+		// Its own position file: the sampler's flush mark can run ahead of the tailer's resume
+		// offset (it advances per commit, the tailer's on a throttle), and the gap between them is
+		// exactly the window a restart re-reads and must not re-append.
+		Store: store,
+	}
+}
+
+// derivedListKnob names the computed columns; each one's expression lives in its own knob, the
+// same shape HTCONDORDB_HISTORY_IMPORT uses for its per-job settings. HTCondor config is flat, so
+// a list plus a knob per entry is how a map is spelled here.
+//
+//	HTCONDORDB_JOB_METRICS_DERIVED = CpuEff, MemHeadroom
+//	HTCONDORDB_JOB_METRICS_DERIVED_CPUEFF      = CpuUtil / RequestCpus
+//	HTCONDORDB_JOB_METRICS_DERIVED_MEMHEADROOM = RequestMemory - MemoryUsage
+const derivedListKnob = "HTCONDORDB_JOB_METRICS_DERIVED"
+
+// resolveDerivedColumns reads the computed-column configuration, returning the columns and the
+// names whose expression knob is missing. A named column with no expression is a typo worth
+// reporting rather than a column silently absent from every sample.
+func resolveDerivedColumns(cfg *config.Config) ([]scheddsync.DerivedColumn, []string) {
+	var out []scheddsync.DerivedColumn
+	var missing []string
+	for _, name := range splitAttrList(getStr(cfg, derivedListKnob)) {
+		expr := strings.TrimSpace(getStr(cfg, derivedListKnob+"_"+strings.ToUpper(name)))
+		if expr == "" {
+			missing = append(missing, name)
+			continue
+		}
+		out = append(out, scheddsync.DerivedColumn{Name: name, Expr: expr})
+	}
+	return out, missing
+}
+
+// canonicalDerived renders the columns as one comparable string. scheddSyncSettings is compared by
+// struct equality to decide whether a reconfigure restarts the tailers, so a slice cannot live
+// there -- and two spellings of the same configuration must not look like a change.
+func canonicalDerived(cols []scheddsync.DerivedColumn) string {
+	parts := make([]string, 0, len(cols))
+	for _, c := range cols {
+		parts = append(parts, c.Name+"="+c.Expr)
+	}
+	return strings.Join(parts, "\n")
+}
+
+// parseDerived turns the canonical string back into columns, for handing to the sampler.
+func parseDerived(canon string) []scheddsync.DerivedColumn {
+	if canon == "" {
+		return nil
+	}
+	var out []scheddsync.DerivedColumn
+	for _, line := range strings.Split(canon, "\n") {
+		name, expr, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		out = append(out, scheddsync.DerivedColumn{Name: name, Expr: expr})
+	}
+	return out
 }
 
 // configSeconds reads a knob naming a DURATION. A bare integer is seconds; a suffix is accepted
@@ -498,8 +575,8 @@ func (m *scheddSyncManager) applyArchiveMaxAge(t *db.ArchiveTable, name string, 
 // SIGKILL, which is crash-free (the OS reclaims the mapping; the backfill is idempotent and
 // retried next start). ctx is checked before the goroutine starts, so a stop before the backfill
 // begins skips it; once AddIndex is running only the join can end it cleanly.
-func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, hist *db.ArchiveTable, s scheddSyncSettings, wg *sync.WaitGroup) {
-	haveCat, haveVal := hist.IndexedAttrs()
+func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, arch *db.ArchiveTable, name string, wantCat, wantVal []string, wg *sync.WaitGroup) {
+	haveCat, haveVal := arch.IndexedAttrs()
 	missing := func(want []string, have []string) []string {
 		var out []string
 		for _, w := range want {
@@ -509,8 +586,8 @@ func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, hist *d
 		}
 		return out
 	}
-	addCat := missing(splitAttrList(s.archiveCatAttrs), haveCat)
-	addVal := missing(splitAttrList(s.archiveValAttrs), haveVal)
+	addCat := missing(wantCat, haveCat)
+	addVal := missing(wantVal, haveVal)
 	if len(addCat) == 0 && len(addVal) == 0 {
 		return
 	}
@@ -523,14 +600,14 @@ func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, hist *d
 		if archiveBackfillHook != nil {
 			archiveBackfillHook()
 		}
-		stale, sealed := hist.StaleIndexSegments()
-		m.logger.Info("schedd-sync: backfilling history archive indexes",
+		stale, sealed := arch.StaleIndexSegments()
+		m.logger.Info("schedd-sync: backfilling archive indexes", "archive", name,
 			"categorical", addCat, "value", addVal, "segments", sealed, "stale_before", stale)
-		if !hist.AddIndex(addCat, addVal) {
+		if !arch.AddIndex(addCat, addVal) {
 			return
 		}
-		stale, sealed = hist.StaleIndexSegments()
-		m.logger.Info("schedd-sync: history archive index backfill finished",
+		stale, sealed = arch.StaleIndexSegments()
+		m.logger.Info("schedd-sync: archive index backfill finished", "archive", name,
 			"categorical", addCat, "value", addVal, "segments", sealed, "stale_after", stale)
 	}()
 }
@@ -685,15 +762,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// as a tailer of its own: there is nothing extra to poll, and a second tailer would both
 		// double the parse cost and reintroduce an ordering problem between the queue state and
 		// the sample taken from it.
-		metricsCfg := scheddsync.JobMetricsConfig{
-			Attrs:       splitAttrList(s.metricsAttrs),
-			MinInterval: s.metricsMinInterval,
-			Logger:      m.logger,
-			// Its own position file: the sampler's flush mark can run ahead of the tailer's
-			// resume offset (it advances per commit, the tailer's on a throttle), and the gap
-			// between them is exactly the window a restart re-reads and must not re-append.
-			Store: syncStore("jobmetrics.pos"),
-		}
+		metricsCfg := metricsConfigFor(s, m.logger, syncStore("jobmetrics.pos"))
 		if s.metricsEnabled {
 			jm, merr := m.svc.Catalog().CreateArchiveTable(scheddsync.DefaultJobMetricsTable, db.ArchiveConfig{
 				SegmentSize:      s.metricsSegSize,
@@ -710,6 +779,13 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			if merr != nil {
 				return nil, nil, nil, fmt.Errorf("schedd-sync: creating job_metrics archive: %w", merr)
 			}
+			// archiveconfig.json is authoritative on reopen, so the index set above only takes
+			// effect when the table is CREATED. Without this an operator who adds a grouping
+			// dimension to HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS on an existing archive got a
+			// silent no-op -- and the docs told them it would cost a backfill, implying it worked.
+			// It now costs a backfill, in the background, exactly as for history.
+			m.reconcileArchiveIndexes(ctx, jm, scheddsync.DefaultJobMetricsTable,
+				splitAttrList(s.metricsCatAttrs), scheddsync.JobMetricsValueAttrs, &wg)
 			m.applyArchiveRowGroupBytes(jm, scheddsync.DefaultJobMetricsTable, s)
 			m.applyArchiveMaxBytes(jm, scheddsync.DefaultJobMetricsTable, s.metricsMaxBytes)
 			m.applyArchiveMaxAge(jm, scheddsync.DefaultJobMetricsTable, s.metricsMaxAge)
@@ -755,7 +831,8 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// and hours on a mature one, and must not hold up daemon startup. AddIndex is correct
 		// immediately (segments full-scan for the new attribute until their sidecars are
 		// rebuilt), so serving during the backfill is safe.
-		m.reconcileArchiveIndexes(ctx, hist, s, &wg)
+		m.reconcileArchiveIndexes(ctx, hist, "history",
+			splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
 		m.applyArchiveRowGroupBytes(hist, "history", s)
 		m.applyArchiveMaxBytes(hist, "history", s.historyMaxBytes)
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
@@ -790,7 +867,8 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("schedd-sync: creating epoch archive: %w", err)
 		}
-		m.reconcileArchiveIndexes(ctx, ep, s, &wg)
+		m.reconcileArchiveIndexes(ctx, ep, "epoch_history",
+			splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
 		m.applyArchiveRowGroupBytes(ep, "epoch_history", s)
 		m.applyArchiveMaxBytes(ep, "epoch_history", s.epochMaxBytes)
 		es := scheddsync.NewJobEpochSync(ep, scheddsync.HistorySyncConfig{

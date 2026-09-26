@@ -107,12 +107,12 @@ inherits the condor config and drops to the condor user.
 | `HTCONDORDB_EPOCH_HISTORY_MAX_BYTES` | inherits default | Per-table size cap for `epoch_history`. |
 | `HTCONDORDB_JOB_METRICS` | `false` | Sample running jobs' resource usage into the `job_metrics` archive. |
 | `HTCONDORDB_JOB_METRICS_ATTRS` | — | Additional job attributes to record on every sample (e.g. `ProjectName`, a chirp-published metric). |
-| `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | `Owner` | Which of them get a categorical index (an unindexed `GROUP BY` is a full scan). |
+| `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | `Owner` | Attributes to give a categorical index (an unindexed `GROUP BY` is a full scan). Applies to an existing archive: a newly-named one is backfilled in the background. |
 | `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` | `0` | Throttles redundant samples per job (bare number = seconds, or `5m`). Never drops a state change or a run endpoint. |
 | `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default | Segment size (create-time only), e.g. `8 MiB`. Measured best as-is; see [Sizing](#sizing). |
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | inherits default | Per-table size cap for `job_metrics`. |
 | `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap against `SampleTime`, e.g. `30d`. |
-| `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). See [Sizing](#sizing). |
+| `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). **Create-time only.** See [Sizing](#sizing). |
 
 ### Bounding disk usage
 
@@ -190,7 +190,9 @@ Three notes that follow from the table:
   attributes, which row form does not give at all, and a pool with neither GPUs nor containers
   pays nothing either way because the attributes are simply absent. Set
   `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS = false` if you have measured your own mix and do not
-  need those panels.
+  need those panels -- **before you first enable sampling**. Unlike the categorical indexes, this
+  one is read only when the archive is created and the storage layer exposes no runtime setter
+  for it, so on an existing archive the only way to change it is to drop the table.
 - **Watch the baseline share.** If
   `job_metrics_samples_total{outcome="baseline"} / {outcome="appended"}` exceeds ~10%, the
   derived rate columns stop being stored columnar (a column needs to be present on 90% of
@@ -198,6 +200,37 @@ Three notes that follow from the table:
   very short jobs -- sampled only two or three times each before they finish -- is the case that
   trips it, and the cost is both size and the fast path for the columns dashboards aggregate.
   Lowering `SHADOW_QUEUE_UPDATE_INTERVAL` so short jobs get more samples is the lever.
+
+### Computed columns
+
+An attribute you intend to `GROUP BY` should be a stored column, not an expression in the query.
+A computed group key is evaluated **client-side**, so every matching row is streamed to the
+client; a stored column groups server-side and can carry a categorical index.
+
+```conf
+HTCONDORDB_JOB_METRICS_DERIVED = CpuEff, SizeClass
+HTCONDORDB_JOB_METRICS_DERIVED_CPUEFF    = CpuUtil / RequestCpus
+HTCONDORDB_JOB_METRICS_DERIVED_SIZECLASS = ifThenElse(RequestMemory >= 4096, "large", "small")
+```
+
+Each expression is evaluated once per sample, against the finished sample — so it can reference
+the derived rates as well as the copied attributes. `AVG(CpuEff)` is then an ordinary query;
+`AVG(CpuUtil / RequestCpus)` is not expressible at all, because an aggregate's argument may not
+contain an expression and subqueries are unsupported.
+
+Three things worth knowing when writing one:
+
+- **Undefined results are not stored.** The usual reason an expression is undefined is that a rate
+  it references was suppressed — at a run boundary, across a clock change, after a counter reset —
+  and those are exactly the samples whose numbers should not be trusted.
+- **Prefer a total expression to a conditional one.** A column undefined on more than a tenth of
+  samples falls out of the segment schema and is stored as rows, losing the columnar fast path it
+  was created to get.
+- **Keep the cardinality low.** It wants to be a label, not an identifier.
+
+If the value can be computed by HTCondor instead — a submit-file `+Attr`, `SUBMIT_ATTRS`, or a
+`condor_chirp` write — naming it in `HTCONDORDB_JOB_METRICS_ATTRS` is cheaper still: the sampler
+evaluates an expression-valued job attribute and stores the resulting literal.
 
 ### When a sample is taken
 
