@@ -2,6 +2,7 @@ package scheddsync
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync/atomic"
@@ -376,6 +377,16 @@ type JobMetricsConfig struct {
 	// of turning it into a plottable series, because it is already flowing through
 	// job_queue.log; the sampler simply was not looking at it.
 	Attrs []string
+	// Derived names an extra column per entry, computed by evaluating a ClassAd expression
+	// against the finished sample. Unlike Attrs, which copies an attribute the job already has,
+	// this computes one that does not exist anywhere -- which is what a GROUP BY dimension needs,
+	// because a computed group key is evaluated CLIENT-side (every matching row crosses the wire)
+	// while a stored attribute groups server-side and can carry a categorical index.
+	//
+	// The expression sees the whole sample, including the rates derived above, so
+	// `CpuUtil / RequestCpus` works -- and that one cannot be written as a query at all, since an
+	// aggregate's argument may not contain an expression and subqueries are unsupported.
+	Derived []DerivedColumn
 	// MinInterval throttles redundant samples for one job: a periodic/update/chirp commit closer
 	// than this to the job's previous sample is dropped. It is a volume backstop, not a filter --
 	// a state change, a run change and a terminal sample are NEVER dropped, because the endpoint
@@ -387,6 +398,71 @@ type JobMetricsConfig struct {
 	Logger *slog.Logger
 }
 
+// DerivedColumn is one admin-configured computed column: a name and the ClassAd expression whose
+// value it takes, evaluated once per sample.
+type DerivedColumn struct {
+	Name string
+	Expr string
+}
+
+// compiledDerived is a DerivedColumn with its expression parsed once at construction rather than
+// per sample -- this runs on every commit for every running job.
+type compiledDerived struct {
+	name string
+	src  string
+	expr *classad.Expr
+}
+
+// compileDerived parses the configured expressions, returning the usable ones and a description of
+// each that failed. A bad expression is dropped rather than fataling the daemon: sampling is a
+// diagnostic, and one mistyped column is not a reason to stop mirroring a schedd. The caller logs
+// the failures, so it is not silent either.
+func compileDerived(cols []DerivedColumn) ([]compiledDerived, []string) {
+	var out []compiledDerived
+	var bad []string
+	for _, c := range cols {
+		name := strings.TrimSpace(c.Name)
+		src := strings.TrimSpace(c.Expr)
+		if name == "" || src == "" {
+			continue
+		}
+		// Refusing to shadow a built-in column: a derived MemUtil that disagreed with the one
+		// this file computes would be indistinguishable in the archive afterwards.
+		if _, taken := sampleAttrs[canonAttr(name)]; taken || isBuiltinDerived(name) {
+			bad = append(bad, fmt.Sprintf("%s (name is already a built-in column)", name))
+			continue
+		}
+		expr, err := classad.ParseExpr(src)
+		if err != nil {
+			bad = append(bad, fmt.Sprintf("%s = %q (%v)", name, src, err))
+			continue
+		}
+		out = append(out, compiledDerived{name: name, src: src, expr: expr})
+	}
+	return out, bad
+}
+
+// isBuiltinDerived reports whether name is one of the columns this file computes.
+func isBuiltinDerived(name string) bool {
+	for _, r := range derivedRates {
+		if strings.EqualFold(r.Out, name) {
+			return true
+		}
+	}
+	for _, r := range derivedRatios {
+		if strings.EqualFold(r.Out, name) {
+			return true
+		}
+	}
+	switch strings.ToLower(name) {
+	case "gpuutil", strings.ToLower(SampleTimeAttr), strings.ToLower(SampleIntervalAttr),
+		strings.ToLower(SampleTriggerAttr), strings.ToLower(SampleBaselineAttr),
+		strings.ToLower(SampleLogSeqAttr), strings.ToLower(RunInstanceAttr), strings.ToLower(KeyAttr):
+		return true
+	}
+	return false
+}
+
 // jobMetrics samples running jobs' resource counters out of the job_queue.log stream. It is owned
 // by a JobSync and is only ever touched from that syncer's goroutine, so it needs no locking of
 // its own; the atomic counters exist only because Status() reads them from another one.
@@ -395,6 +471,7 @@ type jobMetrics struct {
 	log         *slog.Logger
 	extra       []string
 	extraFold   map[string]struct{}
+	derived     []compiledDerived
 	minInterval int64 // seconds
 	now         func() time.Time
 
@@ -459,6 +536,11 @@ func newJobMetrics(cfg JobMetricsConfig) *jobMetrics {
 		store:       cfg.Store,
 	}
 	m.restoreMark()
+	derived, badDerived := compileDerived(cfg.Derived)
+	m.derived = derived
+	for _, b := range badDerived {
+		log.Error("job metrics: ignoring an unusable derived column", "column", b)
+	}
 	m.extraFold = make(map[string]struct{}, len(m.extra))
 	for _, a := range m.extra {
 		m.extraFold[strings.ToLower(a)] = struct{}{}
@@ -725,6 +807,10 @@ func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd,
 		m.mBaseline.Add(1)
 	}
 
+	// Admin-configured columns last, so an expression can see everything above it -- the copied
+	// attributes, the ratios and the derived rates.
+	m.applyDerived(s)
+
 	// The caller applies this only if the transaction commits -- see collect. Advancing the cache
 	// here would survive a failed commit whose sample was discarded, and for a terminal sample it
 	// would DELETE the predecessor, after which the re-applied pass finds wasSampling false and
@@ -745,6 +831,44 @@ type prevUpdate struct {
 	next      *prevObservation // nil deletes the entry (the run ended)
 	endedRun  int64
 	haveEnded bool
+}
+
+// applyDerived evaluates each configured expression against the finished sample and stores the
+// result as an ordinary column.
+//
+// Undefined and error results are NOT written, which is the same rule copyAttr follows: an absent
+// column is how a gap renders, and materializing one would turn "could not be computed" into data.
+// It matters more here than elsewhere, because the usual reason an expression is undefined is that
+// a rate it references was suppressed -- at a run boundary, across a clock change, after a counter
+// reset -- and those are exactly the samples whose numbers should not be trusted.
+//
+// A column that is undefined on more than a tenth of samples will also fall out of the segment
+// schema and be stored as rows, losing the columnar fast path it was created to get. That is worth
+// knowing when writing the expression: prefer one that is total over one that is conditional.
+func (m *jobMetrics) applyDerived(s *classad.ClassAd) {
+	for _, d := range m.derived {
+		v := s.EvaluateExprWithTarget(d.expr, nil)
+		switch {
+		case v.IsUndefined() || v.IsError():
+			continue
+		case v.IsInteger():
+			if n, err := v.IntValue(); err == nil {
+				_ = s.Set(d.name, n)
+			}
+		case v.IsNumber():
+			if f, err := v.NumberValue(); err == nil {
+				_ = s.Set(d.name, f)
+			}
+		case v.IsString():
+			if str, err := v.StringValue(); err == nil {
+				_ = s.Set(d.name, str)
+			}
+		default:
+			if b, err := v.BoolValue(); err == nil {
+				_ = s.Set(d.name, b)
+			}
+		}
+	}
 }
 
 // observe snapshots the counters this sample will be differentiated from next time.

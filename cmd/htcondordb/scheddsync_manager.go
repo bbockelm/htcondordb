@@ -167,6 +167,9 @@ type scheddSyncSettings struct {
 	// which row form does not give at all. A pool with no GPUs and no containers pays nothing
 	// either way, because the attributes are absent rather than rare.
 	metricsGroupSchemas bool
+	// metricsDerived is the configured computed columns, carried as a canonical string so the
+	// settings struct stays comparable for the reconcile-by-equality in apply().
+	metricsDerived string
 }
 
 // resolveScheddSyncSettings reads the configuration, returning the settings plus the names of any
@@ -216,6 +219,10 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 	if !okMin {
 		note("HTCONDORDB_JOB_METRICS_MIN_INTERVAL")
 	}
+	derivedCols, missingDerived := resolveDerivedColumns(cfg)
+	for _, name := range missingDerived {
+		bad = append(bad, "HTCONDORDB_JOB_METRICS_DERIVED_"+strings.ToUpper(name)+"=<unset>")
+	}
 	return scheddSyncSettings{
 		enabled:   true,
 		jobLog:    firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_QUEUE_LOG"), getStr(cfg, "JOB_QUEUE_LOG")),
@@ -260,9 +267,79 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 		metricsMinInterval: time.Duration(minIntervalMetrics) * time.Second,
 		metricsMaxBytes:    configBytesOr(cfg, "HTCONDORDB_JOB_METRICS_MAX_BYTES", defArchiveMaxBytes),
 		metricsMaxAge:      float64(maxAgeMetrics),
+		metricsDerived:     canonicalDerived(derivedCols),
 		// Unset means on, so the knob is an opt-OUT for a site that has measured its own mix.
 		metricsGroupSchemas: !configBoolDefaultTrueIsFalse(cfg, "HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS"),
 	}, bad
+}
+
+// metricsConfigFor builds the sampler's configuration from the resolved settings. Split out so the
+// wiring is testable on its own: the defects this file has had were missing or mistyped CALLS, not
+// wrong logic inside them, and a test that constructs JobMetricsConfig itself cannot see those.
+func metricsConfigFor(s scheddSyncSettings, logger *slog.Logger, store scheddsync.PositionStore) scheddsync.JobMetricsConfig {
+	return scheddsync.JobMetricsConfig{
+		Attrs:       splitAttrList(s.metricsAttrs),
+		MinInterval: s.metricsMinInterval,
+		Derived:     parseDerived(s.metricsDerived),
+		Logger:      logger,
+		// Its own position file: the sampler's flush mark can run ahead of the tailer's resume
+		// offset (it advances per commit, the tailer's on a throttle), and the gap between them is
+		// exactly the window a restart re-reads and must not re-append.
+		Store: store,
+	}
+}
+
+// derivedListKnob names the computed columns; each one's expression lives in its own knob, the
+// same shape HTCONDORDB_HISTORY_IMPORT uses for its per-job settings. HTCondor config is flat, so
+// a list plus a knob per entry is how a map is spelled here.
+//
+//	HTCONDORDB_JOB_METRICS_DERIVED = CpuEff, MemHeadroom
+//	HTCONDORDB_JOB_METRICS_DERIVED_CPUEFF      = CpuUtil / RequestCpus
+//	HTCONDORDB_JOB_METRICS_DERIVED_MEMHEADROOM = RequestMemory - MemoryUsage
+const derivedListKnob = "HTCONDORDB_JOB_METRICS_DERIVED"
+
+// resolveDerivedColumns reads the computed-column configuration, returning the columns and the
+// names whose expression knob is missing. A named column with no expression is a typo worth
+// reporting rather than a column silently absent from every sample.
+func resolveDerivedColumns(cfg *config.Config) ([]scheddsync.DerivedColumn, []string) {
+	var out []scheddsync.DerivedColumn
+	var missing []string
+	for _, name := range splitAttrList(getStr(cfg, derivedListKnob)) {
+		expr := strings.TrimSpace(getStr(cfg, derivedListKnob+"_"+strings.ToUpper(name)))
+		if expr == "" {
+			missing = append(missing, name)
+			continue
+		}
+		out = append(out, scheddsync.DerivedColumn{Name: name, Expr: expr})
+	}
+	return out, missing
+}
+
+// canonicalDerived renders the columns as one comparable string. scheddSyncSettings is compared by
+// struct equality to decide whether a reconfigure restarts the tailers, so a slice cannot live
+// there -- and two spellings of the same configuration must not look like a change.
+func canonicalDerived(cols []scheddsync.DerivedColumn) string {
+	parts := make([]string, 0, len(cols))
+	for _, c := range cols {
+		parts = append(parts, c.Name+"="+c.Expr)
+	}
+	return strings.Join(parts, "\n")
+}
+
+// parseDerived turns the canonical string back into columns, for handing to the sampler.
+func parseDerived(canon string) []scheddsync.DerivedColumn {
+	if canon == "" {
+		return nil
+	}
+	var out []scheddsync.DerivedColumn
+	for _, line := range strings.Split(canon, "\n") {
+		name, expr, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		out = append(out, scheddsync.DerivedColumn{Name: name, Expr: expr})
+	}
+	return out
 }
 
 // configSeconds reads a knob naming a DURATION. A bare integer is seconds; a suffix is accepted
@@ -685,15 +762,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// as a tailer of its own: there is nothing extra to poll, and a second tailer would both
 		// double the parse cost and reintroduce an ordering problem between the queue state and
 		// the sample taken from it.
-		metricsCfg := scheddsync.JobMetricsConfig{
-			Attrs:       splitAttrList(s.metricsAttrs),
-			MinInterval: s.metricsMinInterval,
-			Logger:      m.logger,
-			// Its own position file: the sampler's flush mark can run ahead of the tailer's
-			// resume offset (it advances per commit, the tailer's on a throttle), and the gap
-			// between them is exactly the window a restart re-reads and must not re-append.
-			Store: syncStore("jobmetrics.pos"),
-		}
+		metricsCfg := metricsConfigFor(s, m.logger, syncStore("jobmetrics.pos"))
 		if s.metricsEnabled {
 			jm, merr := m.svc.Catalog().CreateArchiveTable(scheddsync.DefaultJobMetricsTable, db.ArchiveConfig{
 				SegmentSize:      s.metricsSegSize,

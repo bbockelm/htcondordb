@@ -201,6 +201,37 @@ Three notes that follow from the table:
   trips it, and the cost is both size and the fast path for the columns dashboards aggregate.
   Lowering `SHADOW_QUEUE_UPDATE_INTERVAL` so short jobs get more samples is the lever.
 
+### Computed columns
+
+An attribute you intend to `GROUP BY` should be a stored column, not an expression in the query.
+A computed group key is evaluated **client-side**, so every matching row is streamed to the
+client; a stored column groups server-side and can carry a categorical index.
+
+```conf
+HTCONDORDB_JOB_METRICS_DERIVED = CpuEff, SizeClass
+HTCONDORDB_JOB_METRICS_DERIVED_CPUEFF    = CpuUtil / RequestCpus
+HTCONDORDB_JOB_METRICS_DERIVED_SIZECLASS = ifThenElse(RequestMemory >= 4096, "large", "small")
+```
+
+Each expression is evaluated once per sample, against the finished sample — so it can reference
+the derived rates as well as the copied attributes. `AVG(CpuEff)` is then an ordinary query;
+`AVG(CpuUtil / RequestCpus)` is not expressible at all, because an aggregate's argument may not
+contain an expression and subqueries are unsupported.
+
+Three things worth knowing when writing one:
+
+- **Undefined results are not stored.** The usual reason an expression is undefined is that a rate
+  it references was suppressed — at a run boundary, across a clock change, after a counter reset —
+  and those are exactly the samples whose numbers should not be trusted.
+- **Prefer a total expression to a conditional one.** A column undefined on more than a tenth of
+  samples falls out of the segment schema and is stored as rows, losing the columnar fast path it
+  was created to get.
+- **Keep the cardinality low.** It wants to be a label, not an identifier.
+
+If the value can be computed by HTCondor instead — a submit-file `+Attr`, `SUBMIT_ATTRS`, or a
+`condor_chirp` write — naming it in `HTCONDORDB_JOB_METRICS_ATTRS` is cheaper still: the sampler
+evaluates an expression-valued job attribute and stores the resulting literal.
+
 ### When a sample is taken
 
 One per committed transaction that moved a usage attribute on a job that is **executing**

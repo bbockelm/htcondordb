@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -281,5 +282,89 @@ func TestJobMetricsCategoricalAttrsReconcile(t *testing.T) {
 
 	if c, _ := arch.IndexedAttrs(); !slices.Contains(c, "ProjectName") {
 		t.Errorf("ProjectName was not backfilled on the existing archive; categorical = %v", c)
+	}
+}
+
+// TestJobMetricsDerivedConfig: the list-plus-a-knob-per-entry shape, and the two things that make
+// it safe to reconfigure -- a named column with no expression is reported rather than silently
+// absent, and the canonical form is stable so two spellings do not look like a config change and
+// needlessly restart the tailers.
+func TestJobMetricsDerivedConfig(t *testing.T) {
+	s, bad := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
+		"HTCONDORDB_JOB_METRICS = true\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED = CpuEff, SizeClass\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED_CPUEFF = CpuUtil / RequestCpus\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED_SIZECLASS = ifThenElse(RequestMemory >= 4096, \"large\", \"small\")\n"))
+	if len(bad) != 0 {
+		t.Fatalf("unexpected unparseable knobs: %v", bad)
+	}
+	cols := parseDerived(s.metricsDerived)
+	if len(cols) != 2 {
+		t.Fatalf("got %d columns, want 2: %+v", len(cols), cols)
+	}
+	if cols[0].Name != "CpuEff" || cols[0].Expr != "CpuUtil / RequestCpus" {
+		t.Errorf("column 0 = %+v", cols[0])
+	}
+	if cols[1].Name != "SizeClass" || !strings.Contains(cols[1].Expr, "ifThenElse") {
+		t.Errorf("column 1 = %+v", cols[1])
+	}
+
+	// A named column whose expression knob is missing is a typo, and reporting it is the only way
+	// an operator finds out -- the column would otherwise just never appear on any sample.
+	_, bad = resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
+		"HTCONDORDB_JOB_METRICS = true\nHTCONDORDB_JOB_METRICS_DERIVED = Ghost\n"))
+	if len(bad) != 1 || !strings.Contains(bad[0], "GHOST") {
+		t.Errorf("a column with no expression reported %v, want it named", bad)
+	}
+
+	// Separator spelling must not read as a configuration change: apply() reconciles by struct
+	// equality and would restart every tailer.
+	a, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_JOB_METRICS = true\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED = CpuEff,SizeClass\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED_CPUEFF = CpuUtil / RequestCpus\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED_SIZECLASS = 1\n"))
+	b, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_JOB_METRICS = true\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED = CpuEff   SizeClass\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED_CPUEFF = CpuUtil / RequestCpus\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED_SIZECLASS = 1\n"))
+	if a != b {
+		t.Errorf("two spellings of the same derived list differ:\n %q\n %q",
+			a.metricsDerived, b.metricsDerived)
+	}
+}
+
+// TestMetricsConfigForWiring: every setting that has to reach the sampler does.
+//
+// The defects in this file have all been missing or mistyped CALLS rather than wrong logic inside
+// them -- the categorical reconcile was simply never invoked for job_metrics -- and a test that
+// constructs JobMetricsConfig itself is blind to that whole class.
+func TestMetricsConfigForWiring(t *testing.T) {
+	s, bad := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
+		"HTCONDORDB_JOB_METRICS = true\n"+
+		"HTCONDORDB_JOB_METRICS_ATTRS = ProjectName\n"+
+		"HTCONDORDB_JOB_METRICS_MIN_INTERVAL = 90\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED = CpuEff\n"+
+		"HTCONDORDB_JOB_METRICS_DERIVED_CPUEFF = CpuUtil / RequestCpus\n"))
+	if len(bad) != 0 {
+		t.Fatalf("unexpected unparseable knobs: %v", bad)
+	}
+	store := &scheddsync.FileStore{Path: filepath.Join(t.TempDir(), "jobmetrics.pos")}
+	cfg := metricsConfigFor(s, slog.Default(), store)
+
+	if !slices.Equal(cfg.Attrs, []string{"ProjectName"}) {
+		t.Errorf("Attrs = %v", cfg.Attrs)
+	}
+	if cfg.MinInterval != 90*time.Second {
+		t.Errorf("MinInterval = %v, want 90s", cfg.MinInterval)
+	}
+	if len(cfg.Derived) != 1 || cfg.Derived[0].Name != "CpuEff" ||
+		cfg.Derived[0].Expr != "CpuUtil / RequestCpus" {
+		t.Errorf("Derived = %+v", cfg.Derived)
+	}
+	if cfg.Store == nil {
+		t.Error("Store is nil: a restart would re-append the window the tailer re-reads")
+	}
+	if cfg.Logger == nil {
+		t.Error("Logger is nil")
 	}
 }

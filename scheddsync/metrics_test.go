@@ -1230,3 +1230,71 @@ func TestLogPosAfter(t *testing.T) {
 		}
 	}
 }
+
+// TestJobMetricsDerivedColumns: an admin-configured expression becomes a real stored column.
+//
+// The point is GROUP BY. A computed group key is evaluated client-side, so every matching row
+// crosses the wire; a stored attribute groups server-side and can carry a categorical index. The
+// flagship case is CpuUtil / RequestCpus, which cannot be written as a query at all -- an
+// aggregate's argument may not contain an expression, and subqueries are unsupported -- so
+// AVG(CpuEff) is only reachable if CpuEff exists as a column.
+func TestJobMetricsDerivedColumns(t *testing.T) {
+	pinClock(t, base-1)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, submitted) // RequestCpus = 2, RequestMemory = 2048
+	s, arch := newSampledSync(t, logPath, JobMetricsConfig{Derived: []DerivedColumn{
+		// References a DERIVED rate, so it can only be computed after the built-ins.
+		{Name: "CpuEff", Expr: "CpuUtil / RequestCpus"},
+		// A string-valued grouping dimension over copied attributes.
+		{Name: "SizeClass", Expr: `ifThenElse(RequestMemory >= 4096, "large", "small")`},
+		{Name: "MemHeadroom", Expr: "RequestMemory - MemoryUsage"},
+	}})
+
+	appendFile(t, logPath, spawned(1))
+	appendFile(t, logPath, starterUpdate(base+300, 300, 0, 1024, 4096))
+	// 600 CPU-seconds over the 300s between starter reports = 2 cores on a 2-core request.
+	appendFile(t, logPath, starterUpdate(base+600, 900, 0, 1024, 8192))
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	got := samples(t, arch)
+	last := got[len(got)-1]
+	closeTo(t, num(t, last, "CpuUtil"), 2.0, "CpuUtil")
+	closeTo(t, num(t, last, "CpuEff"), 1.0, "CpuEff (CpuUtil/RequestCpus)")
+	closeTo(t, num(t, last, "MemHeadroom"), 1024, "MemHeadroom")
+	if v, _ := last.EvaluateAttrString("SizeClass"); v != "small" {
+		t.Errorf("SizeClass = %q, want small (RequestMemory is 2048)", v)
+	}
+
+	// A sample whose rate was suppressed must NOT carry a fabricated CpuEff: an expression over an
+	// undefined input is undefined, and writing it as zero would turn "not computed" into data.
+	first := got[0]
+	absent(t, first, "CpuUtil")
+	absent(t, first, "CpuEff")
+	// The ones that need no rate are still there, on every sample.
+	if v, _ := first.EvaluateAttrString("SizeClass"); v != "small" {
+		t.Errorf("SizeClass on a baseline sample = %q, want small", v)
+	}
+}
+
+// TestJobMetricsDerivedColumnsRejected: a column that cannot be used is dropped at construction
+// rather than failing per sample, and a name that would shadow a built-in is refused -- two
+// MemUtils disagreeing in the archive would be indistinguishable afterwards.
+func TestJobMetricsDerivedColumnsRejected(t *testing.T) {
+	cols := []DerivedColumn{
+		{Name: "Good", Expr: "RequestCpus * 2"},
+		{Name: "Broken", Expr: "RequestCpus *"},
+		{Name: "MemUtil", Expr: "1"},     // built-in derived column
+		{Name: "MemoryUsage", Expr: "1"}, // built-in copied column
+		{Name: "", Expr: "1"},            // ignored, not an error
+	}
+	out, bad := compileDerived(cols)
+	if len(out) != 1 || out[0].name != "Good" {
+		t.Fatalf("compiled %d columns, want just Good", len(out))
+	}
+	if len(bad) != 3 {
+		t.Errorf("reported %d unusable columns %v, want 3 (Broken, MemUtil, MemoryUsage)", len(bad), bad)
+	}
+}
