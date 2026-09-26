@@ -110,6 +110,12 @@ type DeltaStat struct {
 	CompactLiveDeltas    int64
 	CompactDroppedDeltas int64
 	CompactDeferred      int64
+	// SealedProbesSkipped counts sealed-segment key probes that found no index to look in, and
+	// ProvisionalIndexBuilds counts segments given one the moment they sealed. They are two ends
+	// of the same window: before it was closed this deployment skipped three million probes in
+	// six hours, and every write refused as delta-index-pending came from that blindness.
+	// Skipped should now stay flat while Builds climbs, one per sealed segment.
+	ProvisionalIndexBuilds int64
 }
 
 // maxDecodeErrorLen bounds the sampled decoder message on the ad. It is a diagnostic, not a
@@ -248,6 +254,7 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 	ad.InsertAttr("DeltaCompactLiveDeltas", in.Delta.CompactLiveDeltas)
 	ad.InsertAttr("DeltaCompactDroppedDeltas", in.Delta.CompactDroppedDeltas)
 	ad.InsertAttr("DeltaCompactDeferred", in.Delta.CompactDeferred)
+	ad.InsertAttr("DeltaProvisionalIndexBuilds", in.Delta.ProvisionalIndexBuilds)
 	ad.InsertAttr("TotalAds", totalAds)
 	ad.InsertAttr("TotalLiveBytes", totalLive)
 	ad.InsertAttr("TotalDeadBytes", totalDead)

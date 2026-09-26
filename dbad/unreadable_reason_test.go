@@ -174,3 +174,26 @@ func TestCompactionAnomalyCountersReachTheAd(t *testing.T) {
 		}
 	}
 }
+
+// The two ends of the post-seal window. Before it was closed this deployment skipped three
+// million sealed-segment probes in six hours, and every write refused as delta-index-pending
+// came from that blindness -- in batches of sixty to eighty keys, all procs of one cluster, so
+// each event lost a whole cluster's worth of updates at once. Builds climbing while Skipped
+// stays flat is what says the window is shut.
+func TestSealWindowCountersReachTheAd(t *testing.T) {
+	ad := classad.New()
+	AddAttrs(ad, Input{Delta: DeltaStat{ProvisionalIndexBuilds: 93, SealedProbesSkipped: 7}})
+	for name, want := range map[string]int64{
+		"DeltaProvisionalIndexBuilds": 93,
+		"DeltaSealedProbesSkipped":    7,
+	} {
+		got, ok := ad.EvaluateAttrInt(name)
+		if !ok {
+			t.Errorf("%s is not on the ad: an operator querying it sees undefined", name)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s = %d, want %d", name, got, want)
+		}
+	}
+}
