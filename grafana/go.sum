@@ -21,8 +21,11 @@ github.com/bbockelm/cedar v0.6.19 h1:kvdL3DxV3xLuytx9+1IUxxtcdT6+/cRSMnEVLmjgXUM
 github.com/bbockelm/cedar v0.6.19/go.mod h1:1SABFonyJbC729ODTx03voZhpMSBQqqy+Q+6TvpE08s=
 github.com/bbockelm/golang-htcondor v0.16.1 h1:Pfktb+ZeRnIOIjkPgmYL7w07zrEU9TJFBt9QRm/UPzg=
 github.com/bbockelm/golang-htcondor v0.16.1/go.mod h1:01XB7PPBGabuLyCJYh+dGU3oudc6FgBohhucNPhnxYE=
+github.com/bbockelm/golang-htcondor v0.16.4-0.20260926032345-41c11247a087 h1:GVSLPuKWo9l8/kggORc6rCrOKVvsMYvIStATznPMYOQ=
+github.com/bbockelm/golang-htcondor v0.16.4-0.20260926032345-41c11247a087/go.mod h1:qTvkXEjQY5dTxryEkjTXbE/T7mfHEe+46DMTR66Eou4=
 github.com/bbockelm/gosssd v0.0.3 h1:Rtp3c26AhmolQ+NVs8IRpIKyiPrZqnEuqrLV3yRoqLc=
 github.com/bbockelm/gosssd v0.0.3/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
+github.com/bbockelm/gosssd v0.0.4/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/bits-and-blooms/bitset v1.24.4 h1:95H15Og1clikBrKr/DuzMXkQzECs1M6hhoGXLwLQOZE=
