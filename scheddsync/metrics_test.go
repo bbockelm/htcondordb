@@ -581,6 +581,9 @@ func TestJobMetricsRestartDedup(t *testing.T) {
 	arch, cleanup := newMetricsArchive(t)
 	defer cleanup()
 
+	// Both syncers share one flush-position store, as a restart does: the position file outlives
+	// the process.
+	markStore := &FileStore{Path: filepath.Join(dir, "jobmetrics.pos")}
 	run := func() *JobSync {
 		target, err := db.Open("")
 		if err != nil {
@@ -589,7 +592,7 @@ func TestJobMetricsRestartDedup(t *testing.T) {
 		t.Cleanup(func() { target.Close() })
 		return NewJobSync(target, JobSyncConfig{
 			Filename: logPath,
-			Metrics:  JobMetricsConfig{Archive: arch},
+			Metrics:  JobMetricsConfig{Archive: arch, Store: markStore},
 		})
 	}
 
@@ -604,8 +607,8 @@ func TestJobMetricsRestartDedup(t *testing.T) {
 		t.Fatalf("first pass wrote %d samples, want 2", before)
 	}
 
-	// A second syncer with no persisted position replays the whole log from the start -- the
-	// worst case of what a crash-and-restart re-reads.
+	// A second syncer replays the whole log from the start -- the worst case of what a
+	// crash-and-restart re-reads -- sharing the flush position the first one persisted.
 	second := run()
 	appendFile(t, logPath, starterUpdate(base+600, 1200, 0, 1536, 8192))
 	if err := second.Poll(context.Background()); err != nil {
@@ -624,10 +627,6 @@ func TestJobMetricsRestartDedup(t *testing.T) {
 	}
 	if n := second.metrics.status().Deduped; n != 2 {
 		t.Fatalf("Deduped = %d, want 2", n)
-	}
-	// Once a sample is new, every later one is too, so the per-sample query stops.
-	if second.metrics.dedup {
-		t.Fatal("dedup should be off after the first new sample")
 	}
 }
 
@@ -1129,5 +1128,105 @@ func TestJobMetricsTerminalNeedsPredecessorAfterRestart(t *testing.T) {
 	if got := samples(t, arch); len(got) != 0 {
 		t.Errorf("a fresh sampler wrote %d samples for a run it never observed (first: %s)",
 			len(got), got[0].String())
+	}
+}
+
+// TestJobMetricsRestartDedupMovingClock is the test the previous design could not pass, and the
+// reason the suppression is keyed on a log position rather than on the record.
+//
+// The old check asked the archive for a sample with the same (job, run, SampleTime, trigger).
+// SampleTime falls back to the INGEST CLOCK whenever the job carries no starter stats -- which is
+// most samples, since a status commit carries none -- so on a restart the regenerated sample had a
+// different timestamp, matched nothing, and was appended a second time. The check then switched
+// itself off after that one miss, so every remaining replayed sample was duplicated too.
+//
+// TestJobMetricsRestartDedup, which pins the clock with pinClock, cannot see any of that: freezing
+// nowFn makes the ingest-clock sample reproduce byte-identically, which is precisely the condition
+// the bug needs to be absent. This test advances the clock instead, which is what a restart does.
+func TestJobMetricsRestartDedupMovingClock(t *testing.T) {
+	realNow := nowFn
+	t.Cleanup(func() { nowFn = realNow })
+	clock := base - 1
+	nowFn = func() time.Time { return time.Unix(clock, 0) }
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, submitted)
+	arch, cleanup := newMetricsArchive(t)
+	defer cleanup()
+	markStore := &FileStore{Path: filepath.Join(dir, "jobmetrics.pos")}
+	run := func() *JobSync {
+		target, err := db.Open("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { target.Close() })
+		return NewJobSync(target, JobSyncConfig{
+			Filename: logPath,
+			Metrics:  JobMetricsConfig{Archive: arch, Store: markStore},
+		})
+	}
+
+	// The spawn commit carries no starter stats, so its sample's SampleTime comes from the ingest
+	// clock -- the shape that defeated the old check.
+	appendFile(t, logPath, spawned(1))
+	appendFile(t, logPath, starterUpdate(base+300, 600, 0, 1024, 4096))
+	if err := run().Poll(context.Background()); err != nil {
+		t.Fatalf("first poll: %v", err)
+	}
+	before := len(samples(t, arch))
+	if before != 2 {
+		t.Fatalf("first pass wrote %d samples, want 2", before)
+	}
+
+	// Time passes across the restart, as it does.
+	clock = base + 1000
+	second := run()
+	appendFile(t, logPath, starterUpdate(base+600, 1200, 0, 1024, 8192))
+	if err := second.Poll(context.Background()); err != nil {
+		t.Fatalf("second poll: %v", err)
+	}
+
+	got := samples(t, arch)
+	if len(got) != 3 {
+		var desc []string
+		for _, ad := range got {
+			ts, _ := ad.EvaluateAttrInt(SampleTimeAttr)
+			desc = append(desc, fmt.Sprintf("%s@%d", trig(t, ad), ts-base))
+		}
+		t.Fatalf("after a restart with a moving clock: %d samples %v, want 3 -- the replayed "+
+			"window was appended again", len(got), desc)
+	}
+	if n := second.metrics.status().Deduped; n != 2 {
+		t.Errorf("Deduped = %d, want 2 (both replayed samples suppressed)", n)
+	}
+}
+
+// TestLogPosAfter pins the comparison the flush suppression rests on, including the case the
+// end-to-end tests cannot reach: a position from a DIFFERENT log generation.
+//
+// A compaction bumps the schedd's sequence number and restarts offsets from zero, so an offset in
+// the new file is not comparable with a mark from the old one. Comparing them anyway would make
+// the low new offsets look already-flushed and SUPPRESS real samples -- a silent gap, which is the
+// failure direction that does not announce itself. (A reconcile also resets the mark, so in
+// practice the two cover for each other; this tests the rule rather than the arrangement.)
+func TestLogPosAfter(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pos  logPos
+		mark logPos
+		want bool
+	}{
+		{"same generation, further on", logPos{Seq: 7, Offset: 200}, logPos{Seq: 7, Offset: 100}, true},
+		{"same generation, already flushed", logPos{Seq: 7, Offset: 100}, logPos{Seq: 7, Offset: 100}, false},
+		{"same generation, behind the mark", logPos{Seq: 7, Offset: 50}, logPos{Seq: 7, Offset: 100}, false},
+		// The compaction case: offsets restart, so a smaller one is still new.
+		{"newer generation, smaller offset", logPos{Seq: 8, Offset: 10}, logPos{Seq: 7, Offset: 9999}, true},
+		{"older generation", logPos{Seq: 6, Offset: 10}, logPos{Seq: 7, Offset: 5}, true},
+		{"no mark yet", logPos{Seq: 0, Offset: 1}, logPos{}, true},
+	} {
+		if got := tc.pos.after(tc.mark); got != tc.want {
+			t.Errorf("%s: logPos%+v.after(%+v) = %v, want %v", tc.name, tc.pos, tc.mark, got, tc.want)
+		}
 	}
 }

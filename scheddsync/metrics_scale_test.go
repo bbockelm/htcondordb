@@ -214,9 +214,6 @@ func buildPopulationStats(t *testing.T, arch *db.ArchiveTable, jobs, perJob int,
 		states[i] = g.newJob(i)
 	}
 	m := newJobMetrics(JobMetricsConfig{Archive: arch, Attrs: []string{"ProjectName"}})
-	// The sampler's recovery dedup would issue one archive query per record here. It exists for
-	// the log-replay path, not for a fresh archive; turn it off so the measurement times ingest.
-	m.dedup = false
 
 	start := time.Now()
 	baselines := 0

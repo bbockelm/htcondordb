@@ -268,7 +268,8 @@ outcomes are bug signals rather than workload signals and should stay at zero:
   counter in a way the sampler does not model.
 - `inherited` — a new run was still carrying the previous run's counters when first observed.
 
-`baseline` is expected at a low rate (roughly one or two per run); `throttled` is whatever
+`deduped` counts samples suppressed because their log position had already been flushed — a
+restart or a commit-conflict rewind re-reading a region. `baseline` is expected at a low rate (roughly one or two per run); `throttled` is whatever
 `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` is dropping; `deduped` should be nonzero only just after
 a restart.
 

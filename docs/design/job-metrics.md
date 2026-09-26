@@ -438,29 +438,35 @@ Reading back post-commit rather than assembling from the transaction is what mak
 sample complete without the sampler holding a second copy of the queue — the same design
 choice `JobSync` itself makes (`jobsync.go:7-9`).
 
-### 4.2 Idempotency: an identity constraint, not a synthesized key
+### 4.2 Idempotency: the log position, after all
 
-A restart re-applies the log from the last durable position, re-producing samples that were
-already appended. An archive record has no key to collide on, so the sampler asks the archive
-whether it already holds this observation, and stops asking once one turns out to be new — the
-self-limiting recovery dedup `HistorySync` uses (`scheddsync/historysync.go:40-45`). In steady
-state the check costs nothing.
+A restart resumes from the last durable offset and a commit conflict rewinds to it, so the log is
+re-read in both cases; appends are not idempotent, so a re-read has to be suppressed. Each batch of
+samples is stamped with the position of the commit it came from — the log generation (the schedd's
+op-107 sequence number) and the byte offset just past the entry that closed the transaction — and a
+batch at or before the last flushed position is dropped. The mark is persisted (`jobmetrics.pos`)
+*before* the append, so a crash in between loses samples rather than duplicating them: a gap
+renders as a gap, while a duplicate silently distorts an average.
 
-The identity is **(ClusterId, ProcId, RunInstanceID, SampleTime, SampleTrigger)**.
+**This replaces an identity constraint that did not work, and the way it failed is the lesson.**
+The first design recognised an already-written sample by querying the archive for one with the same
+`(ClusterId, ProcId, RunInstanceID, SampleTime, SampleTrigger)`. But `SampleTime` falls back to the
+**ingest clock** whenever the job carries no starter stats — which is most samples, since a status
+commit carries none; a real-schedd run produced 8 `status` samples out of 11 — so on a restart the
+regenerated sample had a different timestamp, matched nothing, and was appended again. The check
+then switched itself off after that single miss, so the entire replayed window was duplicated. An
+identity that includes a wall clock is not an identity.
 
-An earlier draft of this section proposed the exact log coordinate `(LogSeq, LogOffset)` instead,
-which is a better key in principle: unique per commit, and invariant under where a read pass
-happens to begin. It was dropped because `classadlog.Parser` exposes no per-entry offset —
-`GetNextOffset` only advances on `Close`, so mid-pass it reports the offset the pass *started*
-at, which shifts when a restart resumes from an earlier checkpoint. Making it exact means adding
-an accessor to `golang-htcondor` and a release-chain bump for a self-contained feature. If that
-accessor lands for another reason, switching is a small change and strictly better.
+It was chosen because `classadlog.Parser` exposed no per-entry offset: `GetNextOffset` only folds
+in the consumed bytes at `Close`, so mid-pass every commit in a pass shares one position. The note
+in §10 recorded that the exact coordinate would be "strictly better" and that the release-chain
+cost was why it was skipped. That cost was three lines
+([golang-htcondor#512](https://github.com/bbockelm/golang-htcondor/pull/512) adds
+`Parser.CurrentOffset`), and it was much smaller than the bug.
 
-The residual weakness of the constraint: two commits of the *same trigger kind* between two
-starter reports share an identity, so the second would be dropped on replay. That is bounded to
-the few seconds of log a crash re-reads, and dropping a sample is a better error than
-double-counting one. `LogSeq` is still recorded, as provenance — it says which log generation a
-sample came from — but it is not part of the identity.
+A different generation is never comparable — a compaction restarts offsets — so it counts as new,
+and a reconcile reload forgets the mark outright. Getting that backwards would suppress real
+samples rather than duplicates, which is the direction that does not announce itself.
 
 **A reconcile reload emits nothing.** After a compaction the tailer replays the whole log, which
 would otherwise produce a duplicate sample for every running job. That falls out of structure
@@ -468,9 +474,9 @@ rather than a guard: the reconciler writes through its own batched transactions 
 `commitAll`, which is the only place samples are taken.
 
 The sampler's steady-state memory is the previous observation per *running* job — bounded by
-concurrency, not queue size, dropped at a run's endpoint and when the job leaves the queue, and
-reconstructible from the stream. It is a cache, not a record: after a restart the first sample
-per job is simply a baseline.
+concurrency, not queue size, dropped at a run's endpoint, when the job leaves the queue, and when a
+reconcile sweeps it away. It is a cache, not a record: after a restart the first sample per job is
+simply a baseline.
 
 ### 4.2a Only executing jobs are sampled
 

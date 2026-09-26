@@ -1,7 +1,7 @@
 package scheddsync
 
 import (
-	"fmt"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"sync/atomic"
@@ -60,7 +60,8 @@ const (
 	SampleBaselineAttr = "SampleBaseline"
 	// SampleLogSeqAttr records the job_queue.log generation (the schedd's op-107
 	// LogHistoricalSequenceNumber, bumped on every compaction) the sample came from. Provenance
-	// only -- it is not the dedup key; see dedupConstraint.
+	// only -- what suppresses a re-read is the flush position, not the record's contents (see
+	// flush).
 	SampleLogSeqAttr = "LogSeq"
 )
 
@@ -380,7 +381,10 @@ type JobMetricsConfig struct {
 	// a state change, a run change and a terminal sample are NEVER dropped, because the endpoint
 	// and transition guarantees depend on them. 0 disables the throttle.
 	MinInterval time.Duration
-	Logger      *slog.Logger
+	// Store persists the position through which samples have been flushed, so a restart does not
+	// re-append the window the tailer re-reads. Nil keeps the sampler in-memory only.
+	Store  PositionStore
+	Logger *slog.Logger
 }
 
 // jobMetrics samples running jobs' resource counters out of the job_queue.log stream. It is owned
@@ -414,13 +418,13 @@ type jobMetrics struct {
 	// spreads over several commits cannot be read from any one of them.
 	ended map[string]int64
 
-	// dedup is on until the first sample is found NOT to be in the archive already. A restart
-	// re-applies the log from the last durable position, which re-produces samples that were
-	// already appended; appends are not idempotent, so the replayed prefix has to be skipped.
-	// Once one sample is new every later one is too (the stream is replayed in order), so the
-	// check -- one archive query each -- turns itself off. Same shape as HistorySync's recovery
-	// dedup.
-	dedup bool
+	// mark is the log position through which samples have been flushed, restored at startup from
+	// store. Everything at or before it has already been written; see flush.
+	mark  logPos
+	store PositionStore
+
+	lastAppendWarn time.Time
+	warnedSave     bool
 
 	mAppended    atomic.Int64
 	mThrottled   atomic.Int64
@@ -452,8 +456,9 @@ func newJobMetrics(cfg JobMetricsConfig) *jobMetrics {
 		pending:     map[string]sampleTrigger{},
 		prev:        map[string]*prevObservation{},
 		ended:       map[string]int64{},
-		dedup:       true,
+		store:       cfg.Store,
 	}
+	m.restoreMark()
 	m.extraFold = make(map[string]struct{}, len(m.extra))
 	for _, a := range m.extra {
 		m.extraFold[strings.ToLower(a)] = struct{}{}
@@ -929,70 +934,121 @@ func copyAttr(dst, src *classad.ClassAd, name string) {
 }
 
 // flush appends collected samples, skipping any the archive already holds while in recovery.
-func (m *jobMetrics) flush(samples []*classad.ClassAd) {
+// logPos is where in the job_queue.log stream a batch of samples came from: the log generation
+// (the schedd's op-107 sequence number, bumped on every compaction) and the byte offset just past
+// the entry that closed the transaction. Offsets are absolute within a generation, so the same
+// entry yields the same position however far back the pass began -- which is what lets a position
+// be compared against a durable mark.
+type logPos struct {
+	Seq    int64 `json:"seq"`
+	Offset int64 `json:"offset"`
+}
+
+// after reports whether p is strictly past mark, i.e. not already flushed. A different generation
+// is never comparable -- a compaction resets offsets -- so it counts as new.
+func (p logPos) after(mark logPos) bool {
+	if p.Seq != mark.Seq {
+		return true
+	}
+	return p.Offset > mark.Offset
+}
+
+// flush appends the samples from one committed transaction, unless that transaction's position has
+// already been flushed.
+//
+// WHY A POSITION AND NOT THE RECORD'S CONTENTS. Appends are not idempotent, and the log is re-read
+// in two ordinary situations: a commit conflict rewinds the pass to the last durable offset, and a
+// restart resumes from it. The first design recognised an already-written sample by querying the
+// archive for one with the same (job, run, SampleTime, trigger). That cannot work, because
+// SampleTime falls back to the INGEST CLOCK whenever the job carries no starter stats -- which is
+// most samples, since a status commit carries none -- so the replayed sample simply had a
+// different timestamp, matched nothing, and was appended again. Worse, the check switched itself
+// off after one miss, so that single unmatched sample disabled suppression for the whole replayed
+// window.
+//
+// The position has none of those properties: it is assigned by the log, not by us, and it
+// reproduces exactly.
+//
+// The mark is persisted BEFORE the append, so a crash in between loses samples rather than
+// duplicating them -- the same direction the rest of this table prefers, since a gap renders as a
+// gap while a duplicate silently distorts an average.
+func (m *jobMetrics) flush(samples []*classad.ClassAd, pos logPos) {
 	if m == nil || len(samples) == 0 {
 		return
 	}
+	if !pos.after(m.mark) {
+		// Already flushed: a rewind or a restart is re-reading this region.
+		m.mDeduped.Add(int64(len(samples)))
+		return
+	}
+	m.mark = pos
+	m.saveMark()
 	for _, s := range samples {
-		if m.dedup {
-			if m.alreadyHave(s) {
-				m.mDeduped.Add(1)
-				continue
-			}
-			// Past the replayed prefix: everything from here is new.
-			m.dedup = false
-		}
 		if err := m.archive.Append(s); err != nil {
 			m.mAppendFails.Add(1)
-			m.log.Warn("job metrics: append failed", "err", err.Error())
+			m.logAppendFailure(err)
 			continue
 		}
 		m.mAppended.Add(1)
 	}
 }
 
-// alreadyHave reports whether the archive already holds this observation. The constraint is the
-// same "identity as a query, not as a key" approach the epoch tailer uses: an archive record has
-// no key (collections.Archive appends with a nil key), so a record's identity is whatever set of
-// attributes distinguishes it.
-//
-// (job, run, instant, trigger) is unique for every sample a replay can reproduce EXCEPT two
-// commits of the same kind between two starter reports -- where the second would be dropped. That
-// is a bounded loss confined to the few seconds of log a crash re-reads, and dropping a sample is
-// a better error than double-counting one.
-func (m *jobMetrics) alreadyHave(s *classad.ClassAd) bool {
-	c, ok := dedupConstraint(s)
-	if !ok {
-		return false
+// saveMark persists the flush mark. A nil store leaves the sampler in-memory only, which is what
+// tests and an unconfigured deployment get; the cost of losing it is a replayed window's worth of
+// duplicates after a restart, not corruption.
+func (m *jobMetrics) saveMark() {
+	if m.store == nil {
+		return
 	}
-	seq, err := m.archive.QueryLimit(c, 1)
+	blob, err := json.Marshal(m.mark)
 	if err != nil {
-		// A malformed constraint must not stop sampling; treat it as "not present" (the failure
-		// mode is a duplicate, not a gap) and say so once per occurrence.
-		m.log.Warn("job metrics: dedup query failed", "err", err.Error())
-		return false
+		return
 	}
-	for range seq {
-		return true
+	if serr := m.store.Save(blob); serr != nil && !m.warnedSave {
+		m.warnedSave = true
+		m.log.Warn("job metrics: saving the flush position failed; a restart may duplicate "+
+			"samples for the replayed window", "err", serr.Error())
 	}
-	return false
 }
 
-func dedupConstraint(s *classad.ClassAd) (string, bool) {
-	cid, ok1 := s.EvaluateAttrInt("ClusterId")
-	pid, ok2 := s.EvaluateAttrInt("ProcId")
-	ts, ok3 := s.EvaluateAttrInt(SampleTimeAttr)
-	if !ok1 || !ok2 || !ok3 {
-		return "", false
+// restoreMark loads the persisted flush position. Absent or unreadable leaves it zero, which
+// treats everything as new -- the safe direction for a first run, and for a restart the cost is
+// bounded by how much log the tailer re-reads.
+func (m *jobMetrics) restoreMark() {
+	if m.store == nil {
+		return
 	}
-	trig, _ := s.EvaluateAttrString(SampleTriggerAttr)
-	run, haveRun := s.EvaluateAttrInt(RunInstanceAttr)
-	runTerm := fmt.Sprintf("%s is undefined", RunInstanceAttr)
-	if haveRun {
-		runTerm = fmt.Sprintf("%s == %d", RunInstanceAttr, run)
+	blob, ok, err := m.store.Load()
+	if err != nil || !ok {
+		return
 	}
-	return fmt.Sprintf("ClusterId == %d && ProcId == %d && %s && %s == %d && %s == %s",
-		cid, pid, runTerm, SampleTimeAttr, ts, SampleTriggerAttr, classadStringLit(trig)), true
+	var mark logPos
+	if json.Unmarshal(blob, &mark) == nil {
+		m.mark = mark
+	}
+}
+
+// resetMark forgets the flush position. Called when the log is replaced under us (a compaction
+// the sequence number did not distinguish), since offsets in the new file mean nothing against a
+// mark from the old one -- and comparing them would suppress real samples rather than duplicates.
+func (m *jobMetrics) resetMark() {
+	if m == nil {
+		return
+	}
+	m.mark = logPos{}
+	m.saveMark()
+}
+
+// logAppendFailure rate-limits the append warning. A persistently failing archive (a full disk)
+// otherwise produces one line per sample per poll, which makes a disk problem worse.
+func (m *jobMetrics) logAppendFailure(err error) {
+	now := m.now()
+	if now.Sub(m.lastAppendWarn) < time.Minute {
+		return
+	}
+	m.lastAppendWarn = now
+	m.log.Warn("job metrics: append failed", "err", err.Error(),
+		"failures_total", m.mAppendFails.Load())
 }
 
 // MetricsStatus is the sampler's counters, surfaced through the job syncer's SyncStatus so an

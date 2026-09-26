@@ -689,6 +689,10 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			Attrs:       splitAttrList(s.metricsAttrs),
 			MinInterval: s.metricsMinInterval,
 			Logger:      m.logger,
+			// Its own position file: the sampler's flush mark can run ahead of the tailer's
+			// resume offset (it advances per commit, the tailer's on a throttle), and the gap
+			// between them is exactly the window a restart re-reads and must not re-append.
+			Store: syncStore("jobmetrics.pos"),
 		}
 		if s.metricsEnabled {
 			jm, merr := m.svc.Catalog().CreateArchiveTable(scheddsync.DefaultJobMetricsTable, db.ArchiveConfig{

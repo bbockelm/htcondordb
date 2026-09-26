@@ -590,6 +590,11 @@ func (s *JobSync) handleCommitConflict(ctx context.Context, conflict *db.Conflic
 // checkpointed only after the sweep commits, so a crash mid-reload re-runs the idempotent
 // reconcile rather than resuming past an unfinished table.
 func (s *JobSync) reconcileReload(ctx context.Context, reason string) (err error) {
+	// The log this mark was measured against is being replaced or re-read from the head, and an
+	// offset in the new file means nothing against one from the old. Comparing them would
+	// SUPPRESS real samples rather than duplicates, which is the failure that does not announce
+	// itself. A reload emits no samples of its own, so there is nothing to lose by forgetting it.
+	s.metrics.resetMark()
 	start := nowFn()
 	// Logged on the WAY IN as well as out. A reconcile of a large log takes minutes, during which
 	// the tailer falls behind and says nothing, and the end line used to assert
@@ -1741,7 +1746,10 @@ func (s *JobSync) commitAll() error {
 	}
 	var unapplied *db.UnappliedError
 	if firstErr == nil || errors.As(firstErr, &unapplied) {
-		s.metrics.flush(samples)
+		// CurrentOffset, not GetNextOffset: the latter only folds in the bytes consumed at Close,
+		// so mid-pass it reports where the PASS began and every commit in it would share one
+		// position. This is the byte just past the entry that closed the transaction.
+		s.metrics.flush(samples, logPos{Seq: s.curSeq, Offset: s.parser.CurrentOffset()})
 		s.metrics.commitPending(prevUpdates)
 	}
 	s.txs = map[*db.DB]*db.Txn{}
