@@ -107,12 +107,12 @@ inherits the condor config and drops to the condor user.
 | `HTCONDORDB_EPOCH_HISTORY_MAX_BYTES` | inherits default | Per-table size cap for `epoch_history`. |
 | `HTCONDORDB_JOB_METRICS` | `false` | Sample running jobs' resource usage into the `job_metrics` archive. |
 | `HTCONDORDB_JOB_METRICS_ATTRS` | — | Additional job attributes to record on every sample (e.g. `ProjectName`, a chirp-published metric). |
-| `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | `Owner` | Which of them get a categorical index (an unindexed `GROUP BY` is a full scan). |
+| `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | `Owner` | Attributes to give a categorical index (an unindexed `GROUP BY` is a full scan). Applies to an existing archive: a newly-named one is backfilled in the background. |
 | `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` | `0` | Throttles redundant samples per job (bare number = seconds, or `5m`). Never drops a state change or a run endpoint. |
 | `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default | Segment size (create-time only), e.g. `8 MiB`. Measured best as-is; see [Sizing](#sizing). |
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | inherits default | Per-table size cap for `job_metrics`. |
 | `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap against `SampleTime`, e.g. `30d`. |
-| `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). See [Sizing](#sizing). |
+| `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). **Create-time only.** See [Sizing](#sizing). |
 
 ### Bounding disk usage
 
@@ -190,7 +190,9 @@ Three notes that follow from the table:
   attributes, which row form does not give at all, and a pool with neither GPUs nor containers
   pays nothing either way because the attributes are simply absent. Set
   `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS = false` if you have measured your own mix and do not
-  need those panels.
+  need those panels -- **before you first enable sampling**. Unlike the categorical indexes, this
+  one is read only when the archive is created and the storage layer exposes no runtime setter
+  for it, so on an existing archive the only way to change it is to drop the table.
 - **Watch the baseline share.** If
   `job_metrics_samples_total{outcome="baseline"} / {outcome="appended"}` exceeds ~10%, the
   derived rate columns stop being stored columnar (a column needs to be present on 90% of

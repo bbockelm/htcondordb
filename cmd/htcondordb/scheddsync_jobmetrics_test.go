@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/bbockelm/htcondordb/scheddsync"
+	"github.com/bbockelm/htcondordb/server"
 )
 
 // TestJobMetricsDefaults pins what an admin gets by doing nothing: sampling OFF (it adds a record
@@ -212,5 +218,68 @@ func TestJobMetricsSegmentSizeKnob(t *testing.T) {
 			t.Errorf("_SEGMENT_SIZE = %q -> reported=%v, want reported=%v (bad=%v)",
 				tc.value, reported, !tc.ok, bad)
 		}
+	}
+}
+
+// TestJobMetricsCategoricalAttrsReconcile: a grouping dimension added to
+// HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS must take effect on an archive that ALREADY EXISTS.
+//
+// archiveconfig.json is authoritative on reopen, so the ArchiveConfig passed at creation is
+// discarded from then on. history compensates with a background index backfill; job_metrics did
+// not, so the knob was a silent no-op on every deployment past its first start -- while the docs
+// said adding an index later "costs a backfill", which reads as "works, and costs a backfill".
+//
+// Driven through the manager's launch path rather than the reconciler directly, because the defect
+// was the missing CALL, not the reconciler.
+func TestJobMetricsCategoricalAttrsReconcile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("schedd-sync refuses to run as root")
+	}
+	dir := t.TempDir()
+	svc, err := server.New(server.Config{Dir: dir, Authorize: func(_, _, _ string) bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = svc.Close() }()
+
+	logDir := t.TempDir()
+	jobLog := filepath.Join(logDir, "job_queue.log")
+	if err := os.WriteFile(jobLog, []byte("101 1.0 Job Machine\n103 1.0 ProcId 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := "HTCONDORDB_SYNC_SCHEDD = true\nHTCONDORDB_DIR = " + dir +
+		"\nHISTORY =\nHTCONDORDB_JOB_QUEUE_LOG = " + jobLog + "\nHTCONDORDB_JOB_METRICS = true\n"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &scheddSyncManager{parent: ctx, svc: svc, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	// First start: the archive is created with the default categorical set.
+	if err := m.apply(mkSyncCfg(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	arch, ok := svc.Catalog().ArchiveTable(scheddsync.DefaultJobMetricsTable)
+	if !ok {
+		t.Fatal("job_metrics archive was not created")
+	}
+	if c, _ := arch.IndexedAttrs(); slices.Contains(c, "ProjectName") {
+		t.Fatal("ProjectName indexed before it was configured; the rest would be vacuous")
+	}
+	// Some content, so the backfill has segments to walk.
+	for i := 0; i < 20; i++ {
+		if err := arch.AppendOld("ClusterId = 1\nOwner = \"alice\"\nProjectName = \"cms\""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Now the operator adds a grouping dimension and reconfigures.
+	if err := m.apply(mkSyncCfg(t, base+
+		"HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS = Owner, ProjectName\n")); err != nil {
+		t.Fatal(err)
+	}
+	m.Stop() // joins the backfill goroutine, as a daemon shutdown or reconfigure does
+
+	if c, _ := arch.IndexedAttrs(); !slices.Contains(c, "ProjectName") {
+		t.Errorf("ProjectName was not backfilled on the existing archive; categorical = %v", c)
 	}
 }

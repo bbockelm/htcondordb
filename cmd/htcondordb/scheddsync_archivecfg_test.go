@@ -97,7 +97,8 @@ func TestReconcileArchiveIndexesAdds(t *testing.T) {
 	// The backfill runs in its own goroutine (so it cannot stall daemon startup) but is
 	// registered on wg, which the manager joins on stop; the test joins it the same way.
 	var wg sync.WaitGroup
-	m.reconcileArchiveIndexes(context.Background(), hist, s, &wg)
+	m.reconcileArchiveIndexes(context.Background(), hist, "history",
+		splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
 	wg.Wait()
 
 	if c, _ := hist.IndexedAttrs(); !slices.Contains(c, "Owner") {
@@ -128,7 +129,8 @@ func TestReconcileArchiveIndexesNeverDrops(t *testing.T) {
 	// Config names only Owner; AccountingGroup was added out of band.
 	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
 	var wg sync.WaitGroup
-	m.reconcileArchiveIndexes(context.Background(), hist, s, &wg)
+	m.reconcileArchiveIndexes(context.Background(), hist, "history",
+		splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
 	wg.Wait() // join the backfill (adding the ClusterId value index) before asserting
 
 	c, _ := hist.IndexedAttrs()
@@ -167,7 +169,8 @@ func TestReconcileArchiveIndexesSurvivesRestart(t *testing.T) {
 	// persisted index. Polling IndexedAttrs instead raced the persist step (IndexedAttrs flips
 	// after the reindex, before saveIndexConfig) and flaked.
 	var wg sync.WaitGroup
-	m.reconcileArchiveIndexes(context.Background(), hist, s, &wg)
+	m.reconcileArchiveIndexes(context.Background(), hist, "history",
+		splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
 	wg.Wait()
 	if c, _ := hist.IndexedAttrs(); !slices.Contains(c, "Owner") {
 		t.Fatalf("Owner was not backfilled; categorical = %v", c)
