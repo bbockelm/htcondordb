@@ -68,14 +68,15 @@ func CurrentDeltaStat() DeltaStat {
 		LastDecodeStage:   decodeStage,
 		LastDecodeError:   decodeErr,
 
-		SealedProbesSkipped:  db.SealedProbesSkipped(),
-		StrandedSealedDeltas: collections.StrandedSealedDeltas(),
-		CompactLiveDeltas:    liveAtCompact,
-		CompactDroppedDeltas: droppedFromHistory,
-		CompactDeferred:      collections.CompactDeferredLiveDelta(),
-		NoBaseVersions:       nbVersions,
-		NoBaseChainBroken:    nbChainBroken,
-		NoBaseSealedSkipped:  nbSealedSkipped,
+		SealedProbesSkipped:    db.SealedProbesSkipped(),
+		StrandedSealedDeltas:   collections.StrandedSealedDeltas(),
+		CompactLiveDeltas:      liveAtCompact,
+		CompactDroppedDeltas:   droppedFromHistory,
+		CompactDeferred:        collections.CompactDeferredLiveDelta(),
+		ProvisionalIndexBuilds: collections.ProvisionalIndexBuilds(),
+		NoBaseVersions:         nbVersions,
+		NoBaseChainBroken:      nbChainBroken,
+		NoBaseSealedSkipped:    nbSealedSkipped,
 	}
 }
 
