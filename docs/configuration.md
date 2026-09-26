@@ -43,6 +43,7 @@ client in the tree resolves through `locate.Daemon`, and the daemon publishes to
 | `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default (8 MiB) | Sealed-segment size for `job_metrics` (create-time only). Leave it alone unless you have measured: bytes per record is **not** monotone in segment size, and 8 MiB measured best of 2/8/32/64 MiB (2 MiB cost 1.5x the storage for a 4% faster recent-range query). |
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for `job_metrics`; overrides the shared default (`0` uncaps this table). |
 | `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap in seconds, measured against `SampleTime`. Both caps apply; whichever binds first drops the oldest whole segments. |
+| `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Allow secondary (group) columnar schemas for attributes only *some* jobs carry — GPU metrics, a container universe's `NetworkIn`/`NetworkOut`. They sit below the 90% presence a field needs in the base schema, so without grouping they are stored as rows. Not free: measured at +60% bytes/record on a heterogeneous pool, in exchange for the columnar fast path on those attributes. A pool with no GPUs and no containers pays nothing either way. |
 
 Standard `SEC_*` and `ALLOW_`/`DENY_` knobs configure security and authorization
 — see [Authorization](authorization.md).

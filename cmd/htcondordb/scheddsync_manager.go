@@ -152,6 +152,20 @@ type scheddSyncSettings struct {
 	// metricsMaxAge bounds the series by age (seconds against SampleTime) rather than by size.
 	// Both caps apply; whichever binds first drops the oldest whole segments.
 	metricsMaxAge float64
+	// metricsGroupSchemas allows the secondary (group) columnar schemas that capture attributes
+	// the base schema cannot carry -- the ones only SOME jobs have, such as the GPU metrics or a
+	// container universe's NetworkIn/NetworkOut, which sit far below the 90% presence a field
+	// needs to enter the base schema and otherwise fall to row form.
+	//
+	// Default ON, matching the library, but exposed because it is NOT free: measured on a
+	// heterogeneous population (a fifth in containers, a seventh on GPUs) it cost 60% more per
+	// record than leaving that tail in row form. The tail fragments into one small group per
+	// exact co-occurrence pattern -- and our own derived rates split it further, since a rate is
+	// absent on a run's rate-less samples and so has a different presence pattern from the
+	// counter it comes from. What the cost buys is the columnar fast path on those attributes,
+	// which row form does not give at all. A pool with no GPUs and no containers pays nothing
+	// either way, because the attributes are absent rather than rare.
+	metricsGroupSchemas bool
 }
 
 func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
@@ -222,6 +236,8 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 		metricsMinInterval: time.Duration(configInt(cfg, "HTCONDORDB_JOB_METRICS_MIN_INTERVAL")) * time.Second,
 		metricsMaxBytes:    configBytesOr(cfg, "HTCONDORDB_JOB_METRICS_MAX_BYTES", defArchiveMaxBytes),
 		metricsMaxAge:      float64(configInt(cfg, "HTCONDORDB_JOB_METRICS_MAX_AGE")),
+		// Unset means on, so the knob is an opt-OUT for a site that has measured its own mix.
+		metricsGroupSchemas: !configBoolDefaultTrueIsFalse(cfg, "HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS"),
 	}
 }
 
@@ -230,6 +246,16 @@ func resolveScheddSyncSettings(cfg *config.Config) scheddSyncSettings {
 // and the 8 MiB default measured best of 2/8/32/64 MiB on a production-shaped population --
 // a 2 MiB segment cost 1.5x the storage for a 4% faster recent-range query. See
 // scheddsync.TestJobMetricsSegmentSizeAB, which fails if some other size ever wins.
+// configBoolDefaultTrueIsFalse reports whether a knob that defaults to TRUE has been explicitly
+// turned off. Spelled this way because configBool defaults to false, and a knob whose absence
+// must mean "on" needs the set-ness checked rather than the value.
+func configBoolDefaultTrueIsFalse(cfg *config.Config, key string) bool {
+	if _, set := cfg.Get(key); !set {
+		return false
+	}
+	return !configBool(cfg, key)
+}
+
 func metricsSegmentSize(cfg *config.Config) int {
 	n := configInt(cfg, "HTCONDORDB_JOB_METRICS_SEGMENT_SIZE")
 	if n < 0 {
@@ -359,6 +385,17 @@ func (m *scheddSyncManager) applyArchiveMaxBytes(t *db.ArchiveTable, name string
 	m.logger.Info("schedd-sync: archive size limit set", "archive", name,
 		"max_bytes", maxBytes, "was", was,
 		"note", "oldest whole segments are dropped past the cap on the archive-maintenance pass")
+}
+
+// groupSchemaCount maps the boolean knob onto the library's tri-state: 0 is "use the default"
+// and a negative value is "build none". There is no "count" to configure here on purpose -- an
+// admin deciding how many secondary schemas to derive is a tuning exercise that wants the
+// measurement in scheddsync.TestJobMetricsGroupSchemas, not a number in a config file.
+func groupSchemaCount(enabled bool) int {
+	if enabled {
+		return 0
+	}
+	return -1
 }
 
 // applyArchiveMaxAge puts an age ceiling on an archive's retention, measured against SampleTime.
@@ -589,6 +626,8 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 				// so zone-mapping it prunes whole segments instead of scanning, and age-based
 				// retention measures against a zone-mapped attribute.
 				ZoneAttrs: scheddsync.JobMetricsZoneAttrs,
+				// Negative builds none; 0 takes the library default.
+				GroupSchemaCount: groupSchemaCount(s.metricsGroupSchemas),
 			})
 			if merr != nil {
 				return nil, nil, nil, fmt.Errorf("schedd-sync: creating job_metrics archive: %w", merr)

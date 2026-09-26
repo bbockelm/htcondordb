@@ -112,6 +112,7 @@ inherits the condor config and drops to the condor user.
 | `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default | Segment size (create-time only). Measured best as-is; see [Sizing](#sizing). |
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | inherits default | Per-table size cap for `job_metrics`. |
 | `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap in seconds, measured against `SampleTime`. |
+| `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). See [Sizing](#sizing). |
 
 ### Bounding disk usage
 
@@ -180,6 +181,16 @@ Three notes that follow from the table:
 - **Do not tune the segment size without measuring.** Bytes per record is not monotone in it —
   8 MiB measured best of 2/8/32/64 MiB, and 2 MiB cost 1.5x the storage for a 4% faster
   recent-range query.
+- **Grouping the heterogeneous tail is not free.** Attributes only *some* jobs carry — the GPU
+  metrics, a container universe's `NetworkIn`/`NetworkOut` — are below the 90% presence a field
+  needs to enter a segment's base schema, so they are captured by *secondary* (group) schemas
+  instead. Measured on a pool that is a fifth containers and a seventh GPUs, that cost **+60%
+  bytes per record** versus leaving the tail in row form, because it fragments into one small
+  group per exact co-occurrence pattern. What it buys is the columnar fast path on those
+  attributes, which row form does not give at all, and a pool with neither GPUs nor containers
+  pays nothing either way because the attributes are simply absent. Set
+  `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS = false` if you have measured your own mix and do not
+  need those panels.
 - **Watch the baseline share.** If
   `job_metrics_samples_total{outcome="baseline"} / {outcome="appended"}` exceeds ~10%, the
   derived rate columns stop being stored columnar (a column needs to be present on 90% of

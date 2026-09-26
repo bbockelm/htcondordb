@@ -76,6 +76,16 @@ type jobState struct {
 	cores         float64
 	startedAt     int64
 
+	// container and gpu mark the job shapes that carry attributes MOST jobs do not: NetworkIn/Out
+	// are only populated for container universes, and the GPU metrics only where the pool runs a
+	// GPU monitor. They are what makes a real pool's population heterogeneous, and the reason a
+	// single flat schema is the wrong model for it.
+	container bool
+	gpu       bool
+
+	netIn, netOut float64
+	gpuAvg        float64
+
 	userCPU, sysCPU float64
 	memMB           int64
 	rssKB           int64
@@ -90,6 +100,11 @@ type jobState struct {
 func (g *jobGen) newJob(i int) *jobState {
 	reqCPU := int64(1 + g.rnd.Intn(8))
 	return &jobState{
+		// A fifth of the pool in containers, a seventh on GPUs -- both plausible, and both well
+		// under the 90% presence a field needs to enter the BASE schema, so these attributes
+		// cannot be carried there however common they feel.
+		container: i%5 == 0,
+		gpu:       i%7 == 0,
 		cluster:   int64(100000 + i/10),
 		proc:      int64(i % 10),
 		owner:     g.owners[g.rnd.Intn(len(g.owners))],
@@ -158,6 +173,20 @@ func (g *jobGen) advance(j *jobState, at int64, dt float64) *classad.ClassAd {
 	set("CumulativeSuspensionTime", int64(0))
 	set("TotalSuspensions", int64(0))
 	set("CommittedTime", at-j.startedAt)
+
+	// The heterogeneous tail. Each shape's attributes always appear TOGETHER and only on its own
+	// jobs, which is exactly the co-occurrence a secondary (group) schema exists to capture.
+	if j.container {
+		j.netIn += g.rnd.Float64() * 8
+		j.netOut += g.rnd.Float64() * 2
+		set("NetworkIn", j.netIn)
+		set("NetworkOut", j.netOut)
+	}
+	if j.gpu {
+		j.gpuAvg = 0.4 + g.rnd.Float64()*0.6
+		set("GPUsAverageUsage", j.gpuAvg)
+		set("GPUsMemoryUsage", int64(4096+g.rnd.Intn(8192)))
+	}
 	return ad
 }
 

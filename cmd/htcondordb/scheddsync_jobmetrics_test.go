@@ -100,3 +100,31 @@ func TestJobMetricsRetentionAttrIsZoned(t *testing.T) {
 			scheddsync.SampleTimeAttr, scheddsync.JobMetricsZoneAttrs)
 	}
 }
+
+// TestJobMetricsGroupSchemasKnob: grouping defaults ON (matching the library) and the knob is an
+// opt-OUT. That asymmetry is the whole reason it needs a test -- configBool defaults to false, so
+// a knob whose absence must mean "on" is easy to wire up backwards, and getting it wrong would
+// silently disable the columnar path for GPU and container attributes on every deployment.
+func TestJobMetricsGroupSchemasKnob(t *testing.T) {
+	on := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_JOB_METRICS = true\n"))
+	if !on.metricsGroupSchemas {
+		t.Error("group schemas should default to on")
+	}
+	if got := groupSchemaCount(on.metricsGroupSchemas); got != 0 {
+		t.Errorf("groupSchemaCount(on) = %d, want 0 (library default)", got)
+	}
+	off := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
+		"HTCONDORDB_JOB_METRICS = true\nHTCONDORDB_JOB_METRICS_GROUP_SCHEMAS = false\n"))
+	if off.metricsGroupSchemas {
+		t.Error("HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS = false must turn them off")
+	}
+	if got := groupSchemaCount(off.metricsGroupSchemas); got != -1 {
+		t.Errorf("groupSchemaCount(off) = %d, want -1 (build none)", got)
+	}
+	// Explicitly true is on, which is the case a set-ness check gets wrong if it ignores the value.
+	explicit := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
+		"HTCONDORDB_JOB_METRICS = true\nHTCONDORDB_JOB_METRICS_GROUP_SCHEMAS = true\n"))
+	if !explicit.metricsGroupSchemas {
+		t.Error("an explicit true must be on")
+	}
+}
