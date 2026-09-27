@@ -85,8 +85,9 @@ daemons refuse it after an hour. The daemon returns an opaque `AUTH_PW_ERROR`,
 so the client can only say "server rejected token (no reason returned by
 daemon)".
 
-For a demo, either re-fetch the token right before you start, or set a large
-value on the server (a *positive* one -- see below):
+`./refresh-token.sh <ap-hostname>` re-fetches the token and restarts the stack,
+which is the quickest way through this. Otherwise, set a large value on the
+server (a *positive* one -- see below):
 
     SEC_TOKEN_MAX_AGE = 31536000
 
