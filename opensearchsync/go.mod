@@ -6,7 +6,7 @@ require (
 	github.com/PelicanPlatform/classad v0.29.12
 	github.com/PelicanPlatform/classad/db v0.29.12
 	github.com/PelicanPlatform/classad/dbrpc v0.29.12
-	github.com/bbockelm/cedar v0.6.16
+	github.com/bbockelm/cedar v0.7.2
 	github.com/bbockelm/golang-htcondor v0.13.0
 	github.com/opensearch-project/opensearch-go/v4 v4.7.2
 )
