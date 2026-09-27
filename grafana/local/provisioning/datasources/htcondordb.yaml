@@ -1,0 +1,21 @@
+# Provisions the htcondordb datasource from the environment, so the address and
+# the IDTOKEN live in .env rather than in a file that could get committed.
+apiVersion: 1
+datasources:
+  - name: htcondordb
+    uid: htcondordb-local
+    type: bbockelm-htcondordb-datasource
+    access: proxy
+    isDefault: true
+    editable: true
+    jsonData:
+      # An HTCondor sinful string or host:port. Behind shared port the sinful
+      # string carries ?sock=htcondordb_<pid>_<hash>, which CHANGES whenever the
+      # daemon restarts -- re-run the discovery command and update .env if the
+      # health check starts failing.
+      address: ${HTCONDORDB_ADDR}
+      connectTimeoutSeconds: 30
+    secureJsonData:
+      # HTCondor IDTOKEN. Leave empty for an anonymous read-only session (which
+      # only works if the server permits anonymous READ).
+      token: ${HTCONDORDB_TOKEN}
