@@ -17,41 +17,31 @@ Grafana ──gRPC──> plugin backend ──CEDAR──> htcondordb ──> j
 ## Requirements
 
 - **Grafana 10.4 or newer** (`grafanaDependency` in `plugin.json`).
-- **Linux or macOS** for the Grafana host. The backend uses Unix-specific syscalls
-  and has no Windows build.
+- **Linux or macOS** for the Grafana host, amd64 or arm64. The backend uses
+  Unix-specific syscalls and has no Windows build.
 - Network reach from the Grafana host to the htcondordb daemon, which normally
   means **TCP 9618** (HTCondor's shared port) on the access point.
 - An **HTCondor IDTOKEN** for the pool. See [Authentication](#authentication).
 
-## 1. Get the plugin
+## 1. Install the plugin
 
-There is no signed release on the Grafana catalog yet, so build from source:
+Each htcondordb release attaches a prebuilt, ready-to-install plugin:
+`bbockelm-htcondordb-datasource_<version>.zip`. It bundles the backend for Linux
+and macOS on both amd64 and arm64, so there is nothing to select and nothing to
+compile.
 
 ```sh
-git clone https://github.com/bbockelm/htcondordb
-cd htcondordb/grafana
-
-npm ci && npm run build            # -> dist/module.js, plugin.json, img/
-
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -o dist/gpx_htcondordb_linux_amd64 ./pkg
+VER=v0.20.0
+gh release download "$VER" --repo bbockelm/htcondordb \
+    -p 'bbockelm-htcondordb-datasource_*.zip' -p SHA256SUMS.txt
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
 ```
 
-Set `GOARCH=arm64` for ARM hosts. Build one binary per architecture you serve;
-Grafana picks the matching one at load time. `dist/` is then the complete plugin.
-
-CI builds exactly this for every platform and uploads the bundle as an artifact
-(`.github/workflows/grafana-plugin.yml`), so you can take it from there instead of
-building locally.
-
-## 2. Install it
-
-Copy `dist/` into Grafana's plugin directory under the **plugin id**, which must be
-the directory name:
+The archive unpacks to a directory already named for the plugin id, which is what
+Grafana matches on, so unzip it straight into the plugin path:
 
 ```sh
-install -d /var/lib/grafana/plugins/bbockelm-htcondordb-datasource
-cp -r dist/* /var/lib/grafana/plugins/bbockelm-htcondordb-datasource/
+unzip -d /var/lib/grafana/plugins "bbockelm-htcondordb-datasource_${VER}.zip"
 chown -R grafana:grafana /var/lib/grafana/plugins/bbockelm-htcondordb-datasource
 ```
 
@@ -80,7 +70,10 @@ level=info msg="Plugin registered" pluginId=bbockelm-htcondordb-datasource
 The two warnings are expected. If only the first appears, the
 `allow_loading_unsigned_plugins` setting did not take effect.
 
-## 3. Find the daemon's address
+Building from source is only needed for a platform the release does not cover; see
+[`README.md`](README.md).
+
+## 2. Find the daemon's address
 
 htcondordb advertises itself to the pool collector with `MyType == "HTCondorDB"`:
 
@@ -106,7 +99,7 @@ Two things to plan around:
 Append `?alias=<hostname>` if the daemon's host certificate is valid and you want
 TLS to verify it; a bare IP address has no matching SAN.
 
-## 4. Add the datasource
+## 3. Add the datasource
 
 Either through the UI (*Connections -> Data sources -> Add -> HTCondorDB*), filling
 in the address and token, or by provisioning
@@ -151,38 +144,12 @@ need to hand Grafana an administrator's token. Leaving the token blank yields an
 anonymous, read-only session, which works only if the server permits anonymous
 `READ`.
 
-Two ways this fails that do not look like authentication failures:
-
-**Wrong trust domain.** The token's issuer must match the server's `TRUST_DOMAIN`
-(`condor_config_val TRUST_DOMAIN` on the AP) -- which is often *not* the hostname.
-A token from another issuer is filtered out client-side and never offered, so the
-error reads "all authentication methods failed" with TOKEN absent from the list,
-rather than "bad token".
-
-**Token age.** See below -- this one has bitten us in production.
-
-### `SEC_TOKEN_MAX_AGE`
-
-HTCondor can reject a token based on how long ago it was *issued* (`iat`),
-independently of when it expires (`exp`). HTCondor's C++ default is `-1`, meaning
-the check is off.
-
-Go daemons built against **cedar older than v0.7.2** defaulted it to 3600 and
-enforced it, so an IDTOKEN stopped working one hour after issuance no matter what
-`-lifetime` you asked for, while C++ daemons in the same pool kept accepting it.
-The daemon returns an opaque `AUTH_PW_ERROR`, so the only symptom is
-`server rejected token (no reason returned by daemon)`.
-
-If you are running such a build, set a positive value on the htcondordb host:
-
-```
-SEC_TOKEN_MAX_AGE = 31536000
-```
-
-Setting it to `-1` or `0` does not work on those builds: the config is read, but
-the "disabled" case falls back to the 3600 default. Only a *positive* value has an
-effect. From cedar v0.7.2 the knob behaves as HTCondor documents and can be left
-unset.
+One failure mode is worth knowing in advance: the token's issuer must match the
+server's `TRUST_DOMAIN` (`condor_config_val TRUST_DOMAIN` on the AP), which is
+often *not* the hostname. A token from another issuer is filtered out client-side
+and never offered, so the error reads "all authentication methods failed" with
+TOKEN absent from the list, rather than "bad token". An expired token looks the
+same. Both are easy to mistake for "no token configured".
 
 ## Verify
 
@@ -207,17 +174,18 @@ FROM jobs WHERE $__timeFilter(QDate)
 GROUP BY time_bucket(QDate, '1h') ORDER BY time
 ```
 
-The plugin ships an **HTCondorDB Overview** dashboard; import it from the plugin's
-Dashboards tab once a datasource exists.
+The plugin ships two dashboards, **HTCondorDB Overview** and **HTCondorDB Job
+Resource Usage**; import them from the plugin's Dashboards tab once a datasource
+exists.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 | --- | --- |
 | Plugin absent from the datasource list | Directory not named `bbockelm-htcondordb-datasource`, or `allow_loading_unsigned_plugins` not set |
-| `Plugin unavailable` / backend won't start | No `gpx_htcondordb_<os>_<arch>` matching the host; check it is executable |
+| `Plugin unavailable` / backend won't start | Unpacked without the execute bit on `gpx_htcondordb_*`, or an unsupported platform |
 | `all authentication methods failed`, TOKEN not listed | No token configured, wrong trust domain, or the token expired -- all three look identical |
-| `server rejected token (no reason returned by daemon)` | Token age (see `SEC_TOKEN_MAX_AGE`), or a signing key the daemon does not have |
+| `server rejected token (no reason returned by daemon)` | The daemon declined the token; its own log has the reason, the wire does not carry one |
 | Worked yesterday, fails today | htcondordb restarted; `sock=` in the address is stale. Re-run the `condor_status` lookup |
 | `Data is missing a time field` | The panel is a Time series visualization but the query has no time column. Switch to Table, or alias a bucketed epoch column `AS time` |
 

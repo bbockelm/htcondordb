@@ -72,28 +72,13 @@ Note that the plugin takes the token *inline*; it does not read
 `~/.condor/tokens.d`. The Grafana container has no HTCondor config, so there is
 no `SEC_TOKEN_DIRECTORY` for it to search.
 
-### The one-hour trap
+### If the token stops working after an hour
 
-A token stops working **one hour after it was issued**, regardless of the
-`-lifetime` you asked for. `-lifetime` sets `exp`; what bites is `iat`.
-
-golang-cedar's server-side check defaults `SEC_TOKEN_MAX_AGE` to **3600 s and
-enforces it**, while HTCondor's C++ defaults it to **-1, meaning no check at
-all** (`condor_auth_passwd.cpp`, `param_integer("SEC_TOKEN_MAX_AGE", -1)`). ap40
-does not set the knob, so its C++ daemons accept a day-old token and its Go
-daemons refuse it after an hour. The daemon returns an opaque `AUTH_PW_ERROR`,
-so the client can only say "server rejected token (no reason returned by
-daemon)".
-
-`./refresh-token.sh <ap-hostname>` re-fetches the token and restarts the stack,
-which is the quickest way through this. Otherwise, set a large value on the
-server (a *positive* one -- see below):
-
-    SEC_TOKEN_MAX_AGE = 31536000
-
-Setting it to `-1` or `0` -- HTCondor's way of disabling the check -- does **not**
-work against a Go daemon: the config is read, but the `TokenMaxAge > 0` guard
-cannot express "disabled", so it silently falls back to the 3600 default.
+Daemons running cedar older than v0.7.2 reject a token an hour after it was
+issued, whatever `-lifetime` you asked for. Run
+`./refresh-token.sh <ap-hostname>` to re-fetch and restart, or set
+`SEC_TOKEN_MAX_AGE = 31536000` on the server to stop it happening. Fixed from
+cedar v0.7.2.
 
 ## 4. Run it
 
