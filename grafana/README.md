@@ -5,6 +5,11 @@ stored in [htcondordb](../README.md) using its SQL engine. It is a separate Go
 module (`github.com/bbockelm/htcondordb/grafana`) living inside the htcondordb
 repo so it can reuse the repl SQL parser/executor and the dbrpc client directly.
 
+Two guides sit alongside this one, which is the developer reference:
+
+- [`INSTALL.md`](INSTALL.md) -- installing the datasource into a shared or production Grafana.
+- [`local/README.md`](local/README.md) -- a laptop Docker stack pointed at a remote htcondordb, for demos.
+
 ## How it works
 
 ```
