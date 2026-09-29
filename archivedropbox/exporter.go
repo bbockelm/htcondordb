@@ -34,7 +34,7 @@ const (
 // so tests can substitute a fake; the production implementation is dropboxWriter.
 type Writer interface {
 	WriteTarball(seq uint64, recs []record) (string, error)
-	WriteLossReport(adText string, detectedUnix int64) (string, error)
+	WriteLossReport(body string, detectedUnix int64, ext string) (string, error)
 	DirSize() (int64, error)
 }
 
@@ -228,7 +228,13 @@ func (r *Runner) session(ctx context.Context, st *State) error {
 					}
 					lossPending = false
 				}
-				pending = append(pending, record{name: entryName(len(pending), ev.Key, ad), adText: ad.MarshalOld(), modUnix: rt})
+				body, merr := marshalRecord(ad, r.cfg.Format)
+				if merr != nil {
+					skipped++
+					r.log.Warn("archivedropbox: skipping unrenderable ad", "exporter", r.name, "key", ev.Key, "err", merr)
+					continue
+				}
+				pending = append(pending, record{name: entryName(len(pending), ev.Key, ad, r.cfg.Format), body: body, modUnix: rt})
 				if len(pending) >= r.cfg.RollJobs {
 					if err := flush(ev.Cursor); err != nil {
 						return err
@@ -275,7 +281,11 @@ func (r *Runner) emitLoss(start, end int64) error {
 		return nil // no real gap
 	}
 	now := time.Now().Unix()
-	path, err := r.w.WriteLossReport(buildLossReport(r.name, r.cfg.Table, start, end, now), now)
+	body, err := buildLossReport(r.name, r.cfg.Table, start, end, now, r.cfg.Format)
+	if err != nil {
+		return err
+	}
+	path, err := r.w.WriteLossReport(body, now, r.cfg.Format.lossExt())
 	if err != nil {
 		return err
 	}

@@ -175,25 +175,36 @@ func keys(m map[string]string) []string {
 	return out
 }
 
-// fakeWriter drives the backpressure test: DirSize is scripted, and writes are recorded.
+// fakeWriter drives the backpressure and format tests: DirSize is scripted, and writes are
+// recorded (including the records themselves, so a test can assert what was serialized).
 type fakeWriter struct {
 	mu       sync.Mutex
 	size     int64
 	tarballs int
 	loss     int
+	written  []record
+	lossBody string
+	lossExt  string
 }
 
 func (f *fakeWriter) WriteTarball(seq uint64, recs []record) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tarballs++
+	f.written = append(f.written, recs...)
 	return "fake", nil
 }
-func (f *fakeWriter) WriteLossReport(adText string, detectedUnix int64) (string, error) {
+func (f *fakeWriter) WriteLossReport(body string, detectedUnix int64, ext string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.loss++
+	f.lossBody, f.lossExt = body, ext
 	return "fake-loss", nil
+}
+func (f *fakeWriter) records() []record {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]record(nil), f.written...)
 }
 func (f *fakeWriter) DirSize() (int64, error) {
 	f.mu.Lock()

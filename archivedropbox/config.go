@@ -5,7 +5,8 @@
 //
 // It targets an append-only ARCHIVE (e.g. the history archive). Records are batched and written
 // as a .tar.gz once every RollJobs records OR every RollInterval, whichever comes first, one
-// ClassAd file per job. Each tarball is written to a temp file, fsync'd, atomically renamed into
+// file per job -- old-ClassAd text by default, or JSON (condor_history -json's rendering) when
+// the exporter is configured with format "json". Each tarball is written to a temp file, fsync'd, atomically renamed into
 // place, and the containing directory fsync'd; only then does the resume cursor advance -- so a
 // crash never advances past data that is not durably on disk (at-least-once).
 //
@@ -52,6 +53,40 @@ type Config struct {
 	// CompressionLevel is the gzip level (gzip.BestSpeed=1 .. gzip.BestCompression=9). Default 6
 	// (gzip.DefaultCompression).
 	CompressionLevel int `json:"compressionLevel,omitempty"`
+
+	// Format is how each record is serialized inside the tarball: FormatClassAd (the default,
+	// old-ClassAd text, one .classad entry per record) or FormatJSON (one .json entry per record).
+	Format RecordFormat `json:"format,omitempty"`
+}
+
+// RecordFormat selects the on-disk serialization of a record inside the tarball.
+type RecordFormat string
+
+const (
+	// FormatClassAd writes each record as old-ClassAd text ("Attr = value" lines), the format
+	// condor_history prints and classad.Parse reads. Entries are named "<n>-<id>.classad".
+	FormatClassAd RecordFormat = "classad"
+	// FormatJSON writes each record as a JSON object, matching `condor_history -json`: ClassAd
+	// expressions that are not literals are rendered as the string "/Expr(<expr>)/". Entries are
+	// named "<n>-<id>.json".
+	FormatJSON RecordFormat = "json"
+)
+
+// entryExt is the tar entry extension for a format.
+func (f RecordFormat) entryExt() string {
+	if f == FormatJSON {
+		return ".json"
+	}
+	return ".classad"
+}
+
+// lossExt is the extension for a loss report dropped beside the tarballs. The ClassAd form keeps
+// the historical ".ad" so an existing consumer's glob still matches.
+func (f RecordFormat) lossExt() string {
+	if f == FormatJSON {
+		return ".json"
+	}
+	return ".ad"
 }
 
 // Defaults, exported so the cmd help and tests can reference them.
@@ -60,6 +95,7 @@ const (
 	DefaultRollInterval     = 10 * time.Minute
 	DefaultMaxDropboxBytes  = ByteSize(2 * 1024 * 1024 * 1024) // 2 GiB
 	DefaultCompressionLevel = 6                                // gzip.DefaultCompression
+	DefaultFormat           = FormatClassAd
 )
 
 // Validate fills defaults and checks required fields.
@@ -86,6 +122,14 @@ func (c *Config) Validate() error {
 	// default above, so only guard the out-of-range case.
 	if c.CompressionLevel < -1 || c.CompressionLevel > 9 {
 		return fmt.Errorf("archivedropbox: compressionLevel %d out of range (-1..9)", c.CompressionLevel)
+	}
+	if c.Format == "" {
+		c.Format = DefaultFormat
+	}
+	switch c.Format {
+	case FormatClassAd, FormatJSON:
+	default:
+		return fmt.Errorf("archivedropbox: format %q is invalid (want %q or %q)", c.Format, FormatClassAd, FormatJSON)
 	}
 	return nil
 }

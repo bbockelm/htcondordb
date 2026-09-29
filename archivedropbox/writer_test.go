@@ -54,8 +54,8 @@ func readTarball(t *testing.T, path string) map[string]string {
 func TestWriteTarballAtomicAndComplete(t *testing.T) {
 	w, dir := newTestWriter(t)
 	recs := []record{
-		{name: "000000-ap40_12.0.classad", adText: "GlobalJobId = \"ap40#12.0\"\nJobStatus = 4\n", modUnix: 1_700_000_100},
-		{name: "000001-ap40_13.0.classad", adText: "GlobalJobId = \"ap40#13.0\"\nJobStatus = 4\n", modUnix: 1_700_000_200},
+		{name: "000000-ap40_12.0.classad", body: "GlobalJobId = \"ap40#12.0\"\nJobStatus = 4\n", modUnix: 1_700_000_100},
+		{name: "000001-ap40_13.0.classad", body: "GlobalJobId = \"ap40#13.0\"\nJobStatus = 4\n", modUnix: 1_700_000_200},
 	}
 	path, err := w.WriteTarball(1, recs)
 	if err != nil {
@@ -100,7 +100,7 @@ func TestWriteTarballEmptyIsNoop(t *testing.T) {
 func TestDirSizeExcludesTempFiles(t *testing.T) {
 	w, dir := newTestWriter(t)
 	// A finished tarball counts.
-	if _, err := w.WriteTarball(1, []record{{name: "a.classad", adText: strings.Repeat("x", 500), modUnix: 1}}); err != nil {
+	if _, err := w.WriteTarball(1, []record{{name: "a.classad", body: strings.Repeat("x", 500), modUnix: 1}}); err != nil {
 		t.Fatal(err)
 	}
 	// A dangling temp file (a crash mid-write) must NOT count toward backpressure.
@@ -118,12 +118,15 @@ func TestDirSizeExcludesTempFiles(t *testing.T) {
 
 func TestWriteLossReport(t *testing.T) {
 	w, dir := newTestWriter(t)
-	ad := buildLossReport("hist-dropbox", "history", 1_700_000_000, 1_700_050_000, 1_700_060_000)
-	path, err := w.WriteLossReport(ad, 1_700_060_000)
+	ad, err := buildLossReport("hist-dropbox", "history", 1_700_000_000, 1_700_050_000, 1_700_060_000, FormatClassAd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Dir(path) != dir || !strings.HasPrefix(filepath.Base(path), "loss-") {
+	path, err := w.WriteLossReport(ad, 1_700_060_000, FormatClassAd.lossExt())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(path) != dir || filepath.Base(path) != "loss-1700060000.ad" {
 		t.Fatalf("loss report path wrong: %s", path)
 	}
 	body, err := os.ReadFile(path)
