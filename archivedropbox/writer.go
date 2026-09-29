@@ -12,13 +12,13 @@ import (
 
 // tmpPrefix marks a file the exporter is still writing (or a loss report being staged). A consumer
 // MUST ignore dot-prefixed files -- only fully-renamed tarballs (batch-*.tar.gz) and loss reports
-// (loss-*.ad) are complete.
+// (loss-*.ad / loss-*.json) are complete.
 const tmpPrefix = "."
 
 // record is one job queued for the next tarball.
 type record struct {
 	name    string // in-tarball entry name (unique within the batch, ordered)
-	adText  string // the ClassAd, old (bracketless) text form
+	body    string // the serialized record (old-ClassAd text or JSON, per Config.Format)
 	modUnix int64  // record-time, used as the entry's mod time (0 -> now)
 }
 
@@ -65,7 +65,7 @@ func (w *dropboxWriter) WriteTarball(seq uint64, recs []record) (string, error) 
 	}
 	tw := tar.NewWriter(gz)
 	for _, r := range recs {
-		body := []byte(r.adText)
+		body := []byte(r.body)
 		mod := time.Unix(r.modUnix, 0)
 		if r.modUnix <= 0 {
 			mod = time.Unix(0, 0)
@@ -114,16 +114,17 @@ func (w *dropboxWriter) WriteTarball(seq uint64, recs []record) (string, error) 
 	return final, nil
 }
 
-// WriteLossReport durably drops a small ClassAd describing an estimated data-loss window, using
-// the same stage-fsync-rename-fsyncdir dance so a consumer never sees a partial report.
-func (w *dropboxWriter) WriteLossReport(adText string, detectedUnix int64) (string, error) {
-	final := filepath.Join(w.dir, fmt.Sprintf("loss-%d.ad", detectedUnix))
+// WriteLossReport durably drops a small record describing an estimated data-loss window, using
+// the same stage-fsync-rename-fsyncdir dance so a consumer never sees a partial report. ext is the
+// exporter format's extension, so a JSON dropbox holds only JSON.
+func (w *dropboxWriter) WriteLossReport(body string, detectedUnix int64, ext string) (string, error) {
+	final := filepath.Join(w.dir, fmt.Sprintf("loss-%d%s", detectedUnix, ext))
 	f, err := os.CreateTemp(w.dir, tmpPrefix+"loss-*.tmp")
 	if err != nil {
 		return "", err
 	}
 	tmp := f.Name()
-	if _, err := f.WriteString(adText); err != nil {
+	if _, err := f.WriteString(body); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return "", err

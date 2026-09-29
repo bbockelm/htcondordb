@@ -6,7 +6,7 @@
 //
 // Usage:
 //
-//	archivedropbox create -name N -table T -dir /path/to/dropbox [options]
+//	archivedropbox create -name N -table T -dir /path/to/dropbox [-format classad|json] [options]
 //	archivedropbox list
 //	archivedropbox drop -name N
 //	archivedropbox run  -name N
@@ -70,7 +70,7 @@ func run() error {
 func usage() error {
 	fmt.Fprint(os.Stderr, `archivedropbox -- manage and run htcondordb archive-dropbox exporters
 
-  archivedropbox create -name N -table T -dir /path/to/dropbox [options]
+  archivedropbox create -name N -table T -dir /path/to/dropbox [-format classad|json] [options]
   archivedropbox list
   archivedropbox drop -name N
   archivedropbox run  -name N
@@ -166,6 +166,7 @@ func cmdCreate(args []string) error {
 	rollInterval := fs.Duration("roll-interval", 0, "roll a partial tarball at least this often (0=default 10m)")
 	maxBytes := fs.String("max-bytes", "", "backpressure ceiling, e.g. 2GiB (0=default 2GiB)")
 	level := fs.Int("compression-level", 0, "gzip level -1..9 (0=default 6)")
+	format := fs.String("format", "", "record format inside the tarball: classad (default) or json")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -178,6 +179,7 @@ func cmdCreate(args []string) error {
 		RollJobs:         *rollJobs,
 		RollInterval:     archivedropbox.Duration(*rollInterval),
 		CompressionLevel: *level,
+		Format:           archivedropbox.RecordFormat(strings.ToLower(strings.TrimSpace(*format))),
 	}
 	if *maxBytes != "" {
 		bs, err := archivedropbox.ParseByteSize(*maxBytes)
@@ -203,7 +205,7 @@ func cmdCreate(args []string) error {
 	if err := c.CreateExporter(ctx, db.ExporterDef{Name: *name, Kind: archivedropbox.Kind, Config: raw}); err != nil {
 		return err
 	}
-	fmt.Printf("created dropbox exporter %q (archive %q -> %q)\n", *name, *table, cfg.Directory)
+	fmt.Printf("created dropbox exporter %q (archive %q -> %q, format %s)\n", *name, *table, cfg.Directory, cfg.Format)
 	return nil
 }
 

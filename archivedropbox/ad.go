@@ -26,13 +26,28 @@ func recordTime(ad *classad.ClassAd) int64 {
 
 // entryName builds a stable, unique, path-safe tar entry name for a record: a zero-padded index
 // (guaranteeing uniqueness and preserving order within the tarball) followed by the sanitized
-// GlobalJobId (or the watch key when absent).
-func entryName(index int, key string, ad *classad.ClassAd) string {
+// GlobalJobId (or the watch key when absent) and the format's extension.
+func entryName(index int, key string, ad *classad.ClassAd, format RecordFormat) string {
 	id := key
 	if gjid, ok := ad.EvaluateAttrString("GlobalJobId"); ok && gjid != "" {
 		id = gjid
 	}
-	return fmt.Sprintf("%06d-%s.classad", index, sanitizeName(id))
+	return fmt.Sprintf("%06d-%s%s", index, sanitizeName(id), format.entryExt())
+}
+
+// marshalRecord serializes one record for the tarball. Both forms drop private (secret)
+// attributes, so switching format changes the rendering and not which attributes are exported.
+func marshalRecord(ad *classad.ClassAd, format RecordFormat) (string, error) {
+	if format == FormatJSON {
+		b, err := ad.MarshalJSON()
+		if err != nil {
+			return "", fmt.Errorf("archivedropbox: rendering record as JSON: %w", err)
+		}
+		// One JSON object per line: a tarball of .json entries is then also concatenable into
+		// NDJSON by a consumer that would rather stream them.
+		return string(b) + "\n", nil
+	}
+	return ad.MarshalOld(), nil
 }
 
 // sanitizeName makes an identifier safe as a single tar path component: path separators and any
@@ -56,12 +71,12 @@ func sanitizeName(s string) string {
 	return out
 }
 
-// buildLossReport renders the data-loss ClassAd dropped into the dropbox. start is the record-time
-// of the last record successfully exported before the gap; end is the record-time of the oldest
-// record still retained (the first record of the re-sync), i.e. the first record AFTER the gap.
-// The exact number of lost records is unknowable (they were pruned before we saw them), so it is
-// deliberately not reported.
-func buildLossReport(exporter, table string, start, end, detected int64) string {
+// buildLossReport renders the data-loss record dropped into the dropbox, in the exporter's own
+// format. start is the record-time of the last record successfully exported before the gap; end is
+// the record-time of the oldest record still retained (the first record of the re-sync), i.e. the
+// first record AFTER the gap. The exact number of lost records is unknowable (they were pruned
+// before we saw them), so it is deliberately not reported.
+func buildLossReport(exporter, table string, start, end, detected int64, format RecordFormat) (string, error) {
 	ad := classad.New()
 	ad.InsertAttrString("MyType", "ArchiveDropboxDataLoss")
 	ad.InsertAttrString("Exporter", exporter)
@@ -76,5 +91,5 @@ func buildLossReport(exporter, table string, start, end, detected int64) string 
 		"the watch resume cursor fell out of the archive's retention window; records between the "+
 			"last exported record and the oldest still-retained record were pruned before export. "+
 			"Export resumed from the oldest retained record.")
-	return ad.MarshalOld()
+	return marshalRecord(ad, format)
 }
