@@ -1,8 +1,13 @@
 name: sync-integration
 
-# Runs the schedd-sync integration tests against a real mini-HTCondor: submit jobs to a
-# real schedd and verify the syncers mirror the actual job_queue.log / history file. Runs
-# unprivileged (the sync must never read schedd files as root).
+# Runs the integration tests that need a real mini-HTCondor, unprivileged (the sync must
+# never read schedd files as root):
+#
+#   ./scheddsync/     -- submit jobs to a real schedd and verify the syncers mirror the
+#                        actual job_queue.log / history file.
+#   ./historyimport/  -- discover real daemons through a real collector and pull their
+#                        history over the wire. These tests self-skip without condor, so
+#                        this job is the only place they run at all.
 
 on:
   push:
@@ -10,7 +15,7 @@ on:
 
 jobs:
   integration:
-    name: Schedd-sync integration
+    name: Sync + history-import integration
     runs-on: ubuntu-latest
     steps:
       - name: Checkout htcondordb
@@ -37,11 +42,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y condor
 
-      - name: Run schedd-sync integration tests
+      - name: Run sync and history-import integration tests
         working-directory: htcondordb
         env:
           GOFLAGS: -mod=mod
           GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
         # -count=1 defeats the test cache so the real HTCondor is always exercised; a long
         # timeout accommodates the match+execute pipeline for the history test.
-        run: go test -run Integration -v -count=1 -timeout 20m ./scheddsync/
+        run: go test -run Integration -v -count=1 -timeout 20m ./scheddsync/ ./historyimport/
