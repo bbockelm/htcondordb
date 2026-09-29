@@ -65,16 +65,7 @@ func (s ScheddHistorySource) History(ctx context.Context, sd ScheddRef, constrai
 		source = htcondor.HistorySourceJobHistory
 	}
 	sc := htcondor.NewSchedd(sd.Name, sd.Address)
-	opts := &htcondor.HistoryQueryOptions{
-		Source: source,
-		// The archive must hold the FULL record, not condor_history's narrow default
-		// projection -- "*" returns every attribute (including the epoch-only
-		// EpochWriteDate / RunInstanceID the importer keys on).
-		Projection: []string{"*"},
-		Backwards:  true, // newest first, so `since` and recovery dedup can stop early
-		Since:      since,
-		Limit:      limit, // 0 = unlimited
-	}
+	opts := historyOptions(source, since, limit)
 	streamOpts := &htcondor.StreamOptions{BufferSize: s.BufferSize, WriteTimeout: s.WriteTimeout}
 
 	ch, err := sc.QueryHistoryStream(ctx, constraint, opts, streamOpts)
@@ -93,6 +84,32 @@ func (s ScheddHistorySource) History(ctx context.Context, sd ScheddRef, constrai
 		}
 	}
 	return nil
+}
+
+// historyOptions is the query the importer makes: the whole record, newest first,
+// stopping at the cursor, and uncapped unless the job set MAX_RECORDS_PER_CYCLE.
+//
+// "No cap" must be spelled -1, not 0: the history client reads a zero Limit as
+// "unset" and substitutes its interactive default of 50, and a zero ScanLimit as
+// 10000. That is not merely a slow import. The scan is newest-first and the cursor
+// advances to the newest record seen, so a cycle truncated at 50 leaves the records
+// below the cut unimported and then skips past them for good -- the next cycle's
+// `since` stops the schedd's backward scan at the new cursor.
+func historyOptions(source htcondor.HistoryRecordSource, since string, limit int) *htcondor.HistoryQueryOptions {
+	if limit <= 0 {
+		limit = -1
+	}
+	return &htcondor.HistoryQueryOptions{
+		Source: source,
+		// The archive must hold the FULL record, not condor_history's narrow default
+		// projection -- "*" returns every attribute (including the epoch-only
+		// EpochWriteDate / RunInstanceID the importer keys on).
+		Projection: []string{"*"},
+		Backwards:  true, // newest first, so `since` and recovery dedup can stop early
+		Since:      since,
+		Limit:      limit,
+		ScanLimit:  -1, // scan as far back as the cursor needs; `since` is what stops it
+	}
 }
 
 // ArchiveWriter implements Writer against a live db.Catalog, appending to (and
