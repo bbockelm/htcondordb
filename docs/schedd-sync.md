@@ -135,6 +135,8 @@ Repairing the mirror goes through the sync itself (DAEMON-authorized, over
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | inherits default | Per-table size cap for `job_metrics`. |
 | `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap against `SampleTime`, e.g. `30d`. |
 | `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). **Create-time only.** See [Sizing](#sizing). |
+| `HTCONDORDB_MIRRORED_SCHEDD_NAME` | the schedd's own rule | Which schedd this mirror claims (`MirroredScheddName`). See [Naming the mirrored schedd](#naming-the-mirrored-schedd). |
+| `HTCONDORDB_SYNCSTATUS_INTERVAL` | `5` | Seconds between `syncstatus` heartbeat rows. |
 
 ### Bounding disk usage
 
@@ -151,6 +153,36 @@ segments once a table exceeds its cap. The caps are applied on every start and `
 so a configuration-management change takes effect without recreating the database.
 
 See [Configuration](configuration.md) for the full knob list.
+
+### Naming the mirrored schedd
+
+While schedd sync runs, the collector ad and the `DBSyncStatus` reply carry
+`MirroredScheddName` -- the schedd whose files this daemon reads -- and, when the schedd's
+address file (`SCHEDD_ADDRESS_FILE`) is readable, `MirroredScheddAddress`. A consumer pairs a
+mirror with its schedd by this name instead of guessing from the host. With schedd sync off
+neither attribute is published.
+
+The name follows the schedd's own rule (`build_valid_daemon_name` / `default_daemon_name` in
+HTCondor): `SCHEDD.SCHEDD_NAME` or `SCHEDD_NAME` verbatim when it contains `@`; the full hostname
+when it names this host; otherwise `name@$(FULL_HOSTNAME)`. With no `SCHEDD_NAME` it is
+`$(FULL_HOSTNAME)` when this daemon runs as root or the condor user (as it does under
+`condor_master`), else `user@$(FULL_HOSTNAME)` (a personal condor). HTCondor resolves a configured
+name through DNS to decide "names this host"; htcondordb compares it with `FULL_HOSTNAME` and
+`HOSTNAME` instead, so a DNS alias of this host needs `HTCONDORDB_MIRRORED_SCHEDD_NAME`. The chosen
+name, the rule that produced it, and whether the address file was found are logged when sync
+starts.
+
+### The syncstatus heartbeat
+
+Schedd sync also keeps a one-row mutable table, `syncstatus` (key `status`), rewritten every
+`HTCONDORDB_SYNCSTATUS_INTERVAL` seconds. It carries `MirroredScheddName`, `HeartbeatSeq`
+(continues across restarts), `HeartbeatTime` (this host's clock, informational),
+`HeartbeatIntervalSeconds`, and for each source the collector ad's health fields --
+`JobQueueCaughtUp`/`LagBytes`, `HistoryCaughtUp`/`LagBytes`/`GapDetected`, the `Epoch`
+equivalents -- plus `<Source>LagSeconds`, the self-measured lag (the same quantity as the ad's
+`<Source>SecondsSinceSync`, taken when the row is written). `SpokeLagSeconds` is the largest of
+them and is absent until every source has completed a read pass. A federation hub replicates the
+row and computes freshness from it; see [Federation](federation.md).
 
 ## Job resource metrics
 

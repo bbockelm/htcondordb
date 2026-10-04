@@ -458,7 +458,8 @@ func run() error {
 	syncSources := func() []dbad.StatusSource {
 		return append(syncMgr.Sources(), mirrorMgr.Sources()...)
 	}
-	dbAugment := dbad.Augment(svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, advertisedAddr(d, ln))
+	dbAugment := dbad.Augment(svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, advertisedAddr(d, ln),
+		dbad.WithMirrored(syncMgr.Mirrored))
 	startCollectorAdvertise(ctx, d, cfg, syncSources, dbAugment)
 
 	// Point-to-point sync health (DBSyncStatus): answer the same ad over the command port. A

@@ -21,6 +21,7 @@ import (
 	"github.com/bbockelm/htcondordb/dbad"
 	"github.com/bbockelm/htcondordb/scheddsync"
 	"github.com/bbockelm/htcondordb/server"
+	"github.com/bbockelm/htcondordb/syncstatus"
 )
 
 // scheddSyncManager owns the schedd-sync tailers so their configuration
@@ -210,6 +211,11 @@ type scheddSyncSettings struct {
 	historyMaxBytes int64
 	epochMaxBytes   int64
 
+	// mirrored names the schedd these files belong to, for the collector ad and the heartbeat row.
+	mirrored mirroredSchedd
+	// syncStatusInterval is the heartbeat row's cadence (HTCONDORDB_SYNCSTATUS_INTERVAL).
+	syncStatusInterval time.Duration
+
 	// Job resource-metrics sampling (the job_metrics archive). metricsEnabled turns the sampler
 	// on; the rest tune what it records and how much of it is kept. metricsAttrs names ADDITIONAL
 	// job attributes to copy into each sample -- an AccountingGroup, a ProjectName, or a metric
@@ -289,6 +295,15 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 	if !okMin {
 		note("HTCONDORDB_JOB_METRICS_MIN_INTERVAL")
 	}
+	syncStatusSecs, okHB := configSeconds(cfg, "HTCONDORDB_SYNCSTATUS_INTERVAL")
+	if !okHB || syncStatusSecs < 0 {
+		note("HTCONDORDB_SYNCSTATUS_INTERVAL")
+		syncStatusSecs = 0
+	}
+	syncStatusInterval := time.Duration(syncStatusSecs) * time.Second
+	if syncStatusInterval <= 0 {
+		syncStatusInterval = syncstatus.DefaultInterval
+	}
 	derivedCols, missingDerived := resolveDerivedColumns(cfg)
 	for _, name := range missingDerived {
 		bad = append(bad, "HTCONDORDB_JOB_METRICS_DERIVED_"+strings.ToUpper(name)+"=<unset>")
@@ -325,6 +340,9 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 		// default. Values accept a unit suffix ("10 GB", "500MiB") or plain bytes.
 		historyMaxBytes: configBytesOr(cfg, "HTCONDORDB_HISTORY_MAX_BYTES", defArchiveMaxBytes),
 		epochMaxBytes:   configBytesOr(cfg, "HTCONDORDB_EPOCH_HISTORY_MAX_BYTES", defArchiveMaxBytes),
+
+		mirrored:           resolveMirroredSchedd(cfg),
+		syncStatusInterval: syncStatusInterval,
 
 		// Off by default: sampling adds a record per running job per shadow update, which is a
 		// real volume decision an admin should make rather than inherit.
@@ -704,6 +722,18 @@ func (m *scheddSyncManager) Sources() []dbad.StatusSource {
 	return m.sources
 }
 
+// Mirrored returns the schedd this daemon mirrors, for the collector ad, or nil while schedd-sync is
+// off. The address is read from the schedd's address file on each call.
+func (m *scheddSyncManager) Mirrored() *dbad.Mirrored {
+	m.mu.Lock()
+	cur := m.current
+	m.mu.Unlock()
+	if !cur.enabled || cur.mirrored.name == "" {
+		return nil
+	}
+	return &dbad.Mirrored{Name: cur.mirrored.name, Address: cur.mirrored.address()}
+}
+
 // apply reconciles the running tailers with cfg: a no-op when the resolved
 // settings are unchanged, otherwise it stops the current tailers and (if still
 // enabled) starts fresh ones. Called once at startup and again on each reconfig.
@@ -751,6 +781,12 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 	if !next.enabled {
 		return nil
 	}
+
+	// Say which schedd this daemon claims to mirror and why: a hub pairs on this name, and a wrong
+	// one is a wrong pairing rather than an error anywhere.
+	addr := next.mirrored.address()
+	m.logger.Info("schedd-sync: mirrored schedd", "name", next.mirrored.name, "rule", next.mirrored.rule,
+		"address", addr, "address_file", next.mirrored.addrFile, "address_found", addr != "")
 
 	ctx, cancel := context.WithCancel(m.parent)
 	sources, resyncers, histSyncs, done, err := m.launch(ctx, next)
@@ -804,6 +840,12 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	resyncers := map[string]resyncer{}
 	histSyncs := map[string]*scheddsync.HistorySync{}
 	var wg sync.WaitGroup
+
+	// Created before any tailer starts, so a failure here leaves nothing running.
+	hb, err := m.svc.Catalog().CreateTable(syncstatus.Table)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating %s table: %w", syncstatus.Table, err)
+	}
 
 	if s.jobLog != "" {
 		// job_queue.log flattens into five tables by key namespace: proc ads -> jobs, cluster ads
@@ -972,6 +1014,19 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		histSyncs["epoch_history"] = es
 		m.logger.Info("schedd-sync: tailing epoch history file", "file", s.epochFile, "archive", "epoch_history")
 	}
+
+	// The heartbeat row a federation hub reads freshness from. Written by this process only, from
+	// the same live status the collector ad reports.
+	statusSources := append([]dbad.StatusSource(nil), sources...)
+	w := &syncstatus.Writer{
+		Table:    hb,
+		Sources:  func() []dbad.StatusSource { return statusSources },
+		Mirrored: func() (string, string) { return s.mirrored.name, s.mirrored.address() },
+		Interval: s.syncStatusInterval,
+		Logger:   m.logger,
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); w.Run(ctx) }()
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()

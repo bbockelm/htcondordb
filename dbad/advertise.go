@@ -27,7 +27,11 @@ type StatusSource interface {
 // myAddress is the daemon's authoritative reachable command address (covering the non-shared-port
 // fallback that PublishAd cannot know). sources is queried each cycle so a set that changes at
 // runtime (schedd-sync tailers restarted on reconfigure) is always current.
-func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []ExporterStatus, importers func() []ImporterStatus, myAddress string) func(*classad.ClassAd) {
+func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []ExporterStatus, importers func() []ImporterStatus, myAddress string, opts ...AugmentOption) func(*classad.ClassAd) {
+	var o augmentOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	return func(ad *classad.ClassAd) {
 		var exp []ExporterStatus
 		if exporters != nil {
@@ -45,9 +49,38 @@ func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []
 			Exporters:    exp,
 			Importers:    imp,
 			Delta:        CurrentDeltaStat(),
+			Mirrored:     callOrNil(o.mirrored),
+			Federation:   callOrNil(o.federation),
 			Now:          time.Now(),
 		})
 	}
+}
+
+// AugmentOption adds an optional attribute source to Augment.
+type AugmentOption func(*augmentOptions)
+
+type augmentOptions struct {
+	mirrored   func() *Mirrored
+	federation func() *Federation
+}
+
+// WithMirrored makes the ad name the schedd this daemon mirrors. f is called on every
+// advertisement and returns nil while schedd-sync is off, which omits the attributes.
+func WithMirrored(f func() *Mirrored) AugmentOption {
+	return func(o *augmentOptions) { o.mirrored = f }
+}
+
+// WithFederation adds a federation hub's source summary. f returns nil when the daemon is not
+// running as a hub.
+func WithFederation(f func() *Federation) AugmentOption {
+	return func(o *augmentOptions) { o.federation = f }
+}
+
+func callOrNil[T any](f func() *T) *T {
+	if f == nil {
+		return nil
+	}
+	return f()
 }
 
 // CurrentDeltaStat reads the process-wide delta write counters out of classad. They are package
