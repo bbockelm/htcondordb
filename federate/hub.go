@@ -1,0 +1,752 @@
+package federate
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/db/replicate"
+
+	"github.com/bbockelm/htcondordb/cedarsync"
+	"github.com/bbockelm/htcondordb/dbad"
+	"github.com/bbockelm/htcondordb/syncstatus"
+)
+
+// Defaults for Config's durations.
+const (
+	DefaultDiscoverInterval = 60 * time.Second
+	DefaultStateInterval    = 5 * time.Second
+	DefaultFreshThreshold   = 60 * time.Second
+	DefaultRetireAfter      = 7 * 24 * time.Hour
+)
+
+// Source states, as federation_sources reports them.
+const (
+	StateFresh     = "fresh"
+	StateStale     = "stale"
+	StateAbsent    = "absent"
+	StateUntrusted = "untrusted"
+	StateRetiring  = "retiring"
+)
+
+// Config configures a Hub.
+type Config struct {
+	// Catalog is the hub's local catalog. The hub writes its federated tables in process.
+	Catalog *db.Catalog
+	// Tables are the spoke tables to federate (DefaultTables when empty). syncstatus is needed for
+	// freshness: without it every source reads stale.
+	Tables []string
+	// Archive tunes the hub's archives.
+	Archive ArchiveOptions
+	// Discovery finds the AP set's spokes.
+	Discovery Discoverer
+	// Dial returns a cedarsync.Dial for a spoke address (a fresh authenticated DBSession per call).
+	Dial func(address string) cedarsync.Dial
+	// CursorDir holds the per-(source, table) resume cursors. Empty keeps them in memory only, so
+	// a hub restart replays every source (correct -- the sinks reconcile and deduplicate -- but
+	// expensive).
+	CursorDir string
+
+	DiscoverInterval time.Duration // DefaultDiscoverInterval when <= 0
+	StateInterval    time.Duration // how often states and federation_sources are refreshed
+	FlushInterval    time.Duration // cedarsync.DefaultFlushInterval when <= 0
+	FreshThreshold   time.Duration // staleness at or under this is fresh
+	RetireAfter      time.Duration // unseen (or unmatched) this long => rows deleted
+
+	Metrics *Metrics     // nil makes a private set
+	Logger  *slog.Logger // nil discards
+	Now     func() time.Time
+}
+
+// Hub fans the spokes of an AP set into one catalog. See the package documentation.
+type Hub struct {
+	cfg     Config
+	log     *slog.Logger
+	metrics *Metrics
+	now     func() time.Time
+	tables  []string
+
+	ht *hubTables
+
+	// Everything below is owned by the Run goroutine, except where noted.
+	sources       map[string]*source
+	discoveryDone bool // a discovery pass with a known match set has completed
+	runCtx        context.Context
+	retireReq     chan retireReq
+	discoverNow   chan struct{}
+
+	summary atomic.Pointer[dbad.Federation]
+
+	resetMu    sync.Mutex
+	resetTimes map[string]time.Time // schedd -> last Reset received (written by runner goroutines)
+}
+
+// source is the hub's state for one schedd.
+type source struct {
+	schedd            string
+	spokeAddress      string
+	spokeName         string
+	static            bool
+	inSet             bool // matched by the last discovery with a known match set
+	untrusted         string
+	declined          string
+	lastCollectorSeen time.Time
+	lastContact       time.Time
+	lastReset         time.Time
+	retiringSince     time.Time
+	rows              map[string]int64
+	runners           map[string]*runnerHandle
+	lastRow           *classad.ClassAd
+}
+
+type runnerHandle struct {
+	runner  *cedarsync.Runner
+	address string
+	cancel  context.CancelFunc
+	done    chan struct{}
+}
+
+type retireReq struct {
+	schedd string
+	resp   chan error
+}
+
+// New validates cfg and builds a Hub. Run creates the tables and starts replicating.
+func New(cfg Config) (*Hub, error) {
+	if cfg.Catalog == nil || cfg.Discovery == nil || cfg.Dial == nil {
+		return nil, errors.New("federate: Catalog, Discovery and Dial are required")
+	}
+	tables := cfg.Tables
+	if len(tables) == 0 {
+		tables = DefaultTables
+	}
+	for _, t := range tables {
+		switch t {
+		case TableJobs, TableHistory, TableEpochHistory, TableSyncStatus:
+		default:
+			return nil, fmt.Errorf("federate: cannot federate table %q (want jobs, history, epoch_history, syncstatus)", t)
+		}
+	}
+	h := &Hub{
+		cfg: cfg, log: cfg.Logger, metrics: cfg.Metrics, now: cfg.Now, tables: tables,
+		sources: map[string]*source{}, retireReq: make(chan retireReq), discoverNow: make(chan struct{}, 1),
+		resetTimes: map[string]time.Time{},
+	}
+	if h.log == nil {
+		h.log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if h.metrics == nil {
+		h.metrics = NewMetrics()
+	}
+	if h.now == nil {
+		h.now = time.Now
+	}
+	if !containsTable(tables, TableSyncStatus) {
+		h.log.Warn("federate: syncstatus is not federated; no source can be measured fresh", "tables", tables)
+	}
+	return h, nil
+}
+
+func containsTable(tables []string, t string) bool {
+	for _, x := range tables {
+		if x == t {
+			return true
+		}
+	}
+	return false
+}
+
+func orDur(v, def time.Duration) time.Duration {
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+// Summary returns the latest source summary for the hub's collector ad (nil before the first
+// state pass).
+func (h *Hub) Summary() *dbad.Federation { return h.summary.Load() }
+
+// Metrics returns the hub's metric set.
+func (h *Hub) Metrics() *Metrics { return h.metrics }
+
+// Retire deletes schedd's rows from the hub's mutable tables (jobs, syncstatus,
+// federation_sources) and forgets its cursors. Archives are append-only and are left to age out.
+// If the schedd is still in the AP set and its spoke still advertises, the next discovery adds it
+// back and replays it from scratch.
+func (h *Hub) Retire(ctx context.Context, schedd string) error {
+	req := retireReq{schedd: schedd, resp: make(chan error, 1)}
+	select {
+	case h.retireReq <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-req.resp:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Rediscover asks Run to run a discovery pass now instead of at the next interval.
+func (h *Hub) Rediscover() {
+	select {
+	case h.discoverNow <- struct{}{}:
+	default:
+	}
+}
+
+// Run replicates until ctx is cancelled. It returns only after every runner and background index
+// backfill has stopped, so the caller may close the catalog afterwards.
+func (h *Hub) Run(ctx context.Context) error {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	ht, err := ensureTables(h.cfg.Catalog, h.tables, h.cfg.Archive, h.log, &wg)
+	if err != nil {
+		return err
+	}
+	h.ht = ht
+	h.runCtx = ctx
+	defer h.stopAll()
+
+	h.loadSources()
+	for _, s := range h.sources {
+		if s.retiringSince.IsZero() && s.spokeAddress != "" {
+			h.startRunners(s)
+		}
+	}
+	h.refreshState()
+
+	discover := time.NewTicker(orDur(h.cfg.DiscoverInterval, DefaultDiscoverInterval))
+	defer discover.Stop()
+	state := time.NewTicker(orDur(h.cfg.StateInterval, DefaultStateInterval))
+	defer state.Stop()
+
+	h.discover(ctx)
+	h.refreshState()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-discover.C:
+			h.discover(ctx)
+			h.refreshState()
+		case <-h.discoverNow:
+			h.discover(ctx)
+			h.refreshState()
+		case <-state.C:
+			h.refreshState()
+		case req := <-h.retireReq:
+			req.resp <- h.retire(req.schedd, "admin request")
+			h.refreshState()
+		}
+	}
+}
+
+// discover runs one discovery pass and applies it to the source set.
+func (h *Hub) discover(ctx context.Context) {
+	dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	snap, err := h.cfg.Discovery.Discover(dctx)
+	if err != nil {
+		h.log.Warn("federate: discovery failed; keeping the current source set", "err", err.Error())
+		return
+	}
+	now := h.now()
+	for _, r := range snap.Rejected {
+		h.metrics.RejectedSpokes.WithLabelValues(r.Reason).Inc()
+		h.log.Warn("federate: spoke rejected", "schedd", r.Schedd, "spoke", r.SpokeName,
+			"address", r.SpokeAddress, "reason", r.Reason, "detail", r.Detail)
+	}
+
+	// Schedds in the AP set.
+	if snap.MatchKnown {
+		for schedd := range snap.Matched {
+			s := h.source(schedd)
+			s.inSet = true
+			s.lastCollectorSeen = now
+			if !s.retiringSince.IsZero() {
+				h.log.Info("federate: source matches again; no longer retiring", "schedd", schedd)
+				s.retiringSince = time.Time{}
+			}
+			s.untrusted, s.declined = snap.Untrusted[schedd], snap.Declined[schedd]
+			if sp, ok := snap.Spokes[schedd]; ok {
+				s.static, s.spokeName = sp.Static, sp.SpokeName
+				if sp.Address != s.spokeAddress {
+					if s.spokeAddress != "" {
+						h.log.Info("federate: spoke address changed; restarting runners", "schedd", schedd,
+							"from", s.spokeAddress, "to", sp.Address)
+					}
+					h.stopRunners(s)
+					s.spokeAddress = sp.Address
+				}
+			}
+			// A schedd whose spoke ad is missing, untrusted or declined keeps streaming from the
+			// last validated address, if it has one: membership is sticky.
+			if s.spokeAddress != "" {
+				h.startRunners(s)
+			}
+		}
+		h.discoveryDone = true
+	}
+
+	// Members not in the AP set this pass.
+	for schedd, s := range h.sources {
+		if !snap.MatchKnown || snap.Matched[schedd] {
+			continue
+		}
+		s.inSet = false
+		leaving := s.static || (snap.PresentKnown && snap.Present[schedd])
+		if leaving && s.retiringSince.IsZero() {
+			why := "the schedd no longer matches the constraint"
+			if s.static {
+				why = "the static spoke was removed from HTCONDORDB_FEDERATE_SPOKES"
+			}
+			h.log.Warn("federate: source leaving the AP set; retiring", "schedd", schedd, "reason", why,
+				"deleted_after", orDur(h.cfg.RetireAfter, DefaultRetireAfter).String())
+			s.retiringSince = now
+			h.stopRunners(s)
+		}
+	}
+	h.countRows()
+}
+
+// source returns (creating if needed) schedd's state.
+func (h *Hub) source(schedd string) *source {
+	s, ok := h.sources[schedd]
+	if !ok {
+		s = &source{schedd: schedd, runners: map[string]*runnerHandle{}, rows: map[string]int64{}}
+		h.sources[schedd] = s
+		h.log.Info("federate: new source", "schedd", schedd)
+	}
+	return s
+}
+
+// startRunners starts any missing runner for s, one per federated table.
+func (h *Hub) startRunners(s *source) {
+	for _, table := range h.tables {
+		if rh, ok := s.runners[table]; ok && rh.address == s.spokeAddress {
+			continue
+		}
+		if err := h.startRunner(s, table); err != nil {
+			h.log.Error("federate: cannot start runner", "schedd", s.schedd, "table", table, "err", err.Error())
+		}
+	}
+}
+
+func (h *Hub) startRunner(s *source, table string) error {
+	store, err := h.cursorStore(s.schedd, table)
+	if err != nil {
+		return err
+	}
+	schedd := s.schedd
+	onReset := func() {
+		h.resetMu.Lock()
+		h.resetTimes[schedd] = h.now()
+		h.resetMu.Unlock()
+	}
+	var sink replicate.Sink
+	if isArchiveTable(table) {
+		sink, err = newArchiveSink(h.ht.archives[table], table, schedd, store, h.metrics, h.log, onReset)
+	} else {
+		sink, err = newTableSink(h.ht.mutable[table], table, schedd, store, h.metrics, h.now, onReset)
+	}
+	if err != nil {
+		return err
+	}
+	r, err := cedarsync.NewRunner(h.cfg.Dial(s.spokeAddress), cedarsync.Config{
+		Source: table, Src: schedd, FlushInterval: h.cfg.FlushInterval,
+	}, sink, h.log)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(h.runCtx)
+	rh := &runnerHandle{runner: r, address: s.spokeAddress, cancel: cancel, done: make(chan struct{})}
+	s.runners[table] = rh
+	go func() {
+		defer close(rh.done)
+		_ = r.Run(ctx)
+	}()
+	h.log.Info("federate: replicating", "schedd", schedd, "table", table, "spoke", s.spokeAddress)
+	return nil
+}
+
+func (h *Hub) stopRunners(s *source) {
+	for table, rh := range s.runners {
+		rh.cancel()
+		<-rh.done
+		delete(s.runners, table)
+	}
+}
+
+func (h *Hub) stopAll() {
+	for _, s := range h.sources {
+		h.stopRunners(s)
+	}
+}
+
+// cursorDir is the per-schedd cursor directory: a readable prefix of the name plus a hash, so any
+// schedd name maps to one safe, distinct directory.
+func (h *Hub) cursorDir(schedd string) string {
+	if h.cfg.CursorDir == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(schedd))
+	var b strings.Builder
+	for _, r := range schedd {
+		if b.Len() >= 48 {
+			break
+		}
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return filepath.Join(h.cfg.CursorDir, b.String()+"-"+hex.EncodeToString(sum[:6]))
+}
+
+func (h *Hub) cursorStore(schedd, table string) (replicate.CursorStore, error) {
+	dir := h.cursorDir(schedd)
+	if dir == "" {
+		return &replicate.MemCursorStore{}, nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	return replicate.FileCursorStore{Path: filepath.Join(dir, table+".cursor")}, nil
+}
+
+// retire deletes schedd's rows from the mutable tables and forgets it.
+func (h *Hub) retire(schedd, why string) error {
+	s, known := h.sources[schedd]
+	if known {
+		h.stopRunners(s)
+	}
+	_, hasRow := h.ht.sources.LookupClassAd(schedd)
+	if !known && !hasRow {
+		return fmt.Errorf("no federated source named %q", schedd)
+	}
+	deleted := map[string]int{}
+	for table, d := range h.ht.mutable {
+		n, err := d.DeleteWhere(scheddConstraint(schedd))
+		if err != nil {
+			return fmt.Errorf("federate: retiring %s: deleting its %s rows: %w", schedd, table, err)
+		}
+		deleted[table] = n
+	}
+	if hasRow {
+		tx := h.ht.sources.Begin()
+		tx.DestroyClassAd(schedd)
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("federate: retiring %s: %w", schedd, err)
+		}
+	}
+	if dir := h.cursorDir(schedd); dir != "" {
+		if err := os.RemoveAll(dir); err != nil {
+			h.log.Warn("federate: could not remove retired source's cursors", "schedd", schedd, "dir", dir, "err", err.Error())
+		}
+	}
+	delete(h.sources, schedd)
+	h.resetMu.Lock()
+	delete(h.resetTimes, schedd)
+	h.resetMu.Unlock()
+	h.metrics.Retired.Inc()
+	h.log.Warn("federate: source retired", "schedd", schedd, "reason", why, "deleted_rows", fmt.Sprint(deleted),
+		"note", "archive rows are kept and age out with retention")
+	return nil
+}
+
+// staleness computes the upper bound on how far the hub's copy of an AP is behind its schedd,
+// from the hub's syncstatus row for it, using only the hub's clock:
+//
+//	(hub_now - HubReceivedTime) + SpokeLagSeconds + HeartbeatIntervalSeconds
+//
+// ok is false with no heartbeat yet, or a heartbeat whose lag the spoke could not measure: unknown
+// is never fresh.
+func staleness(row *classad.ClassAd, now time.Time) (int64, bool) {
+	if row == nil {
+		return 0, false
+	}
+	recv, ok1 := row.EvaluateAttrInt(HubReceivedTimeAttr)
+	lag, ok2 := row.EvaluateAttrInt(syncstatus.AttrSpokeLagSeconds)
+	if !ok1 || !ok2 {
+		return 0, false
+	}
+	iv, ok := row.EvaluateAttrInt(syncstatus.AttrHeartbeatInterval)
+	if !ok || iv <= 0 {
+		iv = int64(syncstatus.DefaultInterval / time.Second)
+	}
+	since := now.Unix() - recv
+	if since < 0 {
+		since = 0
+	}
+	return since + lag + iv, true
+}
+
+// refreshState recomputes every source's state, persists changed federation_sources rows, retires
+// what is due, and publishes the summary and metrics.
+func (h *Hub) refreshState() {
+	now := h.now()
+	retireAfter := orDur(h.cfg.RetireAfter, DefaultRetireAfter)
+	fresh := int64(orDur(h.cfg.FreshThreshold, DefaultFreshThreshold) / time.Second)
+
+	// Retirement first, so a retired source is not written back.
+	for schedd, s := range h.sources {
+		switch {
+		case !s.retiringSince.IsZero() && now.Sub(s.retiringSince) >= retireAfter:
+			_ = h.logRetire(schedd, fmt.Sprintf("retiring since %s", s.retiringSince.UTC().Format(time.RFC3339)))
+		case h.discoveryDone && !s.inSet && s.retiringSince.IsZero() && now.Sub(lastSeen(s)) >= retireAfter:
+			_ = h.logRetire(schedd, fmt.Sprintf("unseen since %s", lastSeen(s).UTC().Format(time.RFC3339)))
+		}
+	}
+
+	sum := &dbad.Federation{Constraint: h.cfg.Discovery.Constraint()}
+	byState := map[string]float64{StateFresh: 0, StateStale: 0, StateAbsent: 0, StateUntrusted: 0, StateRetiring: 0}
+	known := map[string]float64{}
+	var hb *classadLookup
+	if d, ok := h.ht.mutable[TableSyncStatus]; ok {
+		hb = &classadLookup{d.LookupClassAd}
+	}
+	h.resetMu.Lock()
+	resets := make(map[string]time.Time, len(h.resetTimes))
+	for k, v := range h.resetTimes {
+		resets[k] = v
+	}
+	h.resetMu.Unlock()
+
+	for schedd, s := range h.sources {
+		if t, ok := resets[schedd]; ok && t.After(s.lastReset) {
+			s.lastReset = t
+		}
+		connected := false
+		for _, rh := range s.runners {
+			if rh.runner.Status().Connected {
+				connected = true
+			}
+		}
+		if connected {
+			s.lastContact = now
+		}
+		var stale int64
+		staleKnown := false
+		if hb != nil {
+			if row, ok := hb.lookup(HubKey(schedd, syncstatus.Key)); ok {
+				stale, staleKnown = staleness(row, now)
+			}
+		}
+		state, reason := h.stateOf(s, stale, staleKnown, fresh)
+		byState[state]++
+		sum.Total++
+		switch state {
+		case StateFresh:
+			sum.Fresh++
+		case StateStale:
+			sum.Stale++
+		case StateAbsent:
+			sum.Absent++
+		case StateUntrusted:
+			sum.Untrusted++
+		case StateRetiring:
+			sum.Retiring++
+		}
+		if staleKnown && state != StateRetiring {
+			known[schedd] = float64(stale)
+			if !sum.MaxStalenessKnown || stale > sum.MaxStaleness {
+				sum.MaxStaleness, sum.MaxStalenessKnown = stale, true
+			}
+		}
+		h.writeSourceRow(s, state, reason, stale, staleKnown)
+	}
+	for st, n := range byState {
+		h.metrics.SourcesByState.WithLabelValues(st).Set(n)
+	}
+	h.metrics.setStaleness(known)
+	h.summary.Store(sum)
+}
+
+func (h *Hub) logRetire(schedd, why string) error {
+	if err := h.retire(schedd, why); err != nil {
+		h.log.Error("federate: retirement failed", "schedd", schedd, "err", err.Error())
+		return err
+	}
+	return nil
+}
+
+type classadLookup struct {
+	lookup func(string) (*classad.ClassAd, bool)
+}
+
+func lastSeen(s *source) time.Time {
+	if s.lastContact.After(s.lastCollectorSeen) {
+		return s.lastContact
+	}
+	return s.lastCollectorSeen
+}
+
+// stateOf decides a source's state. Precedence: retiring, then absent (not in the AP set, or in
+// it with no spoke ever paired), then untrusted, then fresh/stale by measured staleness.
+func (h *Hub) stateOf(s *source, stale int64, staleKnown bool, fresh int64) (string, string) {
+	switch {
+	case !s.retiringSince.IsZero():
+		return StateRetiring, "left the AP set; rows are deleted when the retirement delay passes"
+	case h.discoveryDone && !s.inSet:
+		return StateAbsent, "not in the AP set at the last discovery; rows kept"
+	case s.spokeAddress == "" && s.untrusted != "":
+		return StateUntrusted, s.untrusted
+	case s.spokeAddress == "" && s.declined != "":
+		return StateAbsent, s.declined
+	case s.spokeAddress == "":
+		return StateAbsent, "no spoke advertises MirroredScheddName for this schedd"
+	case !staleKnown:
+		return StateStale, "no heartbeat with a measured lag received yet"
+	case stale <= fresh:
+		return StateFresh, ""
+	default:
+		return StateStale, fmt.Sprintf("staleness %ds exceeds %ds", stale, fresh)
+	}
+}
+
+// Table attribute prefixes in federation_sources.
+func tablePrefix(table string) string {
+	switch table {
+	case TableJobs:
+		return "Jobs"
+	case TableHistory:
+		return "History"
+	case TableEpochHistory:
+		return "EpochHistory"
+	case TableSyncStatus:
+		return "SyncStatus"
+	}
+	return table
+}
+
+// writeSourceRow persists s's federation_sources row when it changed.
+func (h *Hub) writeSourceRow(s *source, state, reason string, stale int64, staleKnown bool) {
+	ad := classad.New()
+	ad.InsertAttrString(ScheddNameAttr, s.schedd)
+	ad.InsertAttrString("State", state)
+	if reason != "" {
+		ad.InsertAttrString("Reason", reason)
+	}
+	if staleKnown {
+		ad.InsertAttr("StalenessSeconds", stale)
+	}
+	putTime := func(name string, t time.Time) {
+		if !t.IsZero() {
+			ad.InsertAttr(name, t.Unix())
+		}
+	}
+	putTime("LastSeen", lastSeen(s))
+	putTime("LastCollectorSeen", s.lastCollectorSeen)
+	putTime("LastContact", s.lastContact)
+	putTime("LastReset", s.lastReset)
+	putTime("RetiringSince", s.retiringSince)
+	if s.spokeAddress != "" {
+		ad.InsertAttrString("SpokeAddress", s.spokeAddress)
+	}
+	if s.spokeName != "" {
+		ad.InsertAttrString("SpokeName", s.spokeName)
+	}
+	ad.InsertAttrBool("Static", s.static)
+	tables := append([]string(nil), h.tables...)
+	sort.Strings(tables)
+	for _, t := range tables {
+		p := tablePrefix(t)
+		rh, ok := s.runners[t]
+		var st cedarsync.Status
+		if ok {
+			st = rh.runner.Status()
+		}
+		ad.InsertAttrBool(p+"Connected", st.Connected)
+		if st.LastError != "" {
+			ad.InsertAttrString(p+"LastError", st.LastError)
+			putTime(p+"LastErrorTime", st.LastErrorTime)
+		}
+		if n, ok := s.rows[t]; ok {
+			ad.InsertAttr(p+"Rows", n)
+		}
+	}
+	if s.lastRow != nil && s.lastRow.Equal(ad) {
+		return
+	}
+	tx := h.ht.sources.Begin()
+	tx.NewClassAd(s.schedd, ad)
+	if err := tx.Commit(); err != nil {
+		h.log.Warn("federate: writing federation_sources row failed", "schedd", s.schedd, "err", err.Error())
+		return
+	}
+	s.lastRow = ad
+}
+
+// loadSources restores the persisted source set, so a hub restarting while the collector is empty
+// still knows every member, its last validated spoke address and when it was last seen.
+func (h *Hub) loadSources() {
+	h.ht.sources.ForEach(func(ad *classad.ClassAd) bool {
+		name, _ := ad.EvaluateAttrString(ScheddNameAttr)
+		if name == "" {
+			return true
+		}
+		s := &source{schedd: name, runners: map[string]*runnerHandle{}, rows: map[string]int64{}}
+		s.spokeAddress, _ = ad.EvaluateAttrString("SpokeAddress")
+		s.spokeName, _ = ad.EvaluateAttrString("SpokeName")
+		s.static, _ = ad.EvaluateAttrBool("Static")
+		getTime := func(n string) time.Time {
+			if v, ok := ad.EvaluateAttrInt(n); ok && v > 0 {
+				return time.Unix(v, 0)
+			}
+			return time.Time{}
+		}
+		s.lastCollectorSeen = getTime("LastCollectorSeen")
+		s.lastContact = getTime("LastContact")
+		s.lastReset = getTime("LastReset")
+		s.retiringSince = getTime("RetiringSince")
+		if seen := getTime("LastSeen"); seen.After(lastSeen(s)) {
+			s.lastCollectorSeen = seen
+		}
+		for _, t := range h.tables {
+			if n, ok := ad.EvaluateAttrInt(tablePrefix(t) + "Rows"); ok {
+				s.rows[t] = n
+			}
+		}
+		h.sources[name] = s
+		return true
+	})
+	if len(h.sources) > 0 {
+		h.log.Info("federate: restored persisted sources", "count", len(h.sources))
+	}
+}
+
+// countRows refreshes per-source row counts where an index can answer them cheaply. A count the
+// index cannot answer is left out rather than computed by a scan.
+func (h *Hub) countRows() {
+	for schedd, s := range h.sources {
+		c := scheddConstraint(schedd)
+		for table, d := range h.ht.mutable {
+			if n, ok := d.CountConstraint(c); ok {
+				s.rows[table] = int64(n)
+			}
+		}
+		for table, a := range h.ht.archives {
+			if n, ok := a.CountConstraint(c); ok {
+				s.rows[table] = int64(n)
+			}
+		}
+	}
+}
