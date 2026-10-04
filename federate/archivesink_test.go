@@ -85,7 +85,7 @@ func TestArchiveRedeliveryAfterCrash(t *testing.T) {
 
 	cat := openCatalog(t, dir)
 	hist := hubArchive(t, cat, TableHistory)
-	s := newHistSink(t, hist, "ap1.example.org", replicate.FileCursorStore{Path: cursorPath}, m)
+	s := newHistSink(t, hist, "ap1.example.org", fileCursorStore{path: cursorPath}, m)
 	s.BeginSession()
 	apply(t, s, reset(), upsert("r1", histRecord(t, "ap1.example.org", 1)), synced("after-1"))
 	for i := 2; i <= 4; i++ {
@@ -102,7 +102,7 @@ func TestArchiveRedeliveryAfterCrash(t *testing.T) {
 	if n := countArchive(t, hist, `true`); n != 4 {
 		t.Fatalf("precondition: %d records survived the crash, want 4", n)
 	}
-	s = newHistSink(t, hist, "ap1.example.org", replicate.FileCursorStore{Path: cursorPath}, m)
+	s = newHistSink(t, hist, "ap1.example.org", fileCursorStore{path: cursorPath}, m)
 	if got := string(s.Cursor()); got != "after-1" {
 		t.Fatalf("resume cursor = %q, want after-1 (the last committed)", got)
 	}

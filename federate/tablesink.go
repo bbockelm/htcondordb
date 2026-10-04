@@ -39,6 +39,10 @@ type tableSink struct {
 	metrics *Metrics
 	now     func() time.Time
 	onReset func()
+	// commit makes a batch durable: (*db.Txn).Commit, which returns only after the store's
+	// durability sync (msync) -- never CommitNondurable, since the cursor that follows must not
+	// cover writes a crash could lose. A seam for the ordering test.
+	commit func(*db.Txn) error
 
 	tx      *db.Txn
 	pending int
@@ -57,7 +61,8 @@ func newTableSink(tbl *db.DB, table, schedd string, store replicate.CursorStore,
 	if err != nil {
 		return nil, err
 	}
-	return &tableSink{tbl: tbl, table: table, schedd: schedd, store: store, metrics: m, now: now, onReset: onReset, cur: cur, catchup: true}, nil
+	return &tableSink{tbl: tbl, table: table, schedd: schedd, store: store, metrics: m, now: now, onReset: onReset,
+		commit: (*db.Txn).Commit, cur: cur, catchup: true}, nil
 }
 
 func (s *tableSink) BeginSession() { s.catchup = true }
@@ -182,7 +187,7 @@ func (s *tableSink) sweep() error {
 		for _, k := range stale[i:min(i+maxBatch, len(stale))] {
 			tx.DestroyClassAd(k)
 		}
-		if err := tx.Commit(); err != nil {
+		if err := s.commit(tx); err != nil {
 			return fmt.Errorf("federate: sweeping %s rows of %s: %w", s.table, s.schedd, err)
 		}
 	}
@@ -203,13 +208,15 @@ func (s *tableSink) commitTxn() error {
 	}
 	tx := s.tx
 	s.tx, s.pending = nil, 0
-	if err := tx.Commit(); err != nil {
+	if err := s.commit(tx); err != nil {
 		return fmt.Errorf("federate: committing %s batch from %s: %w", s.table, s.schedd, err)
 	}
 	return nil
 }
 
-// Flush commits the pending batch and then the cursor of its last change.
+// Flush commits the pending batch durably and only then the cursor of its last change, so a
+// committed cursor never covers a write a crash could lose. A failed commit leaves the cursor
+// where it was: the next session re-delivers the batch.
 func (s *tableSink) Flush() error {
 	if err := s.commitTxn(); err != nil {
 		return err

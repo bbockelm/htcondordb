@@ -1,6 +1,7 @@
 package federate
 
 import (
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -39,8 +40,13 @@ type archiveSink struct {
 
 	catchup bool
 	nextCur []byte
-	probes  int                   // exact probes made this catch-up
-	idset   map[[16]byte]struct{} // this schedd's identities, once a catch-up outgrows probing
+	// appended is set by an append since the last flush.
+	appended bool
+	// syncData makes every append so far durable; Flush calls it once, before committing the
+	// cursor. See archiveSync. A seam for the ordering test.
+	syncData func() error
+	probes   int                   // exact probes made this catch-up
+	idset    map[[16]byte]struct{} // this schedd's identities, once a catch-up outgrows probing
 
 	mu  sync.Mutex
 	cur []byte
@@ -51,7 +57,23 @@ func newArchiveSink(arch *db.ArchiveTable, table, schedd string, store replicate
 	if err != nil {
 		return nil, err
 	}
-	return &archiveSink{arch: arch, table: table, schedd: schedd, store: store, metrics: m, log: log, onReset: onReset, cur: cur, catchup: true}, nil
+	return &archiveSink{arch: arch, table: table, schedd: schedd, store: store, metrics: m, log: log, onReset: onReset,
+		syncData: archiveSync(arch), cur: cur, catchup: true}, nil
+}
+
+// archiveSync returns the durability step Flush runs before it commits a cursor.
+//
+// In classad v0.30.11 there is nothing to call: db.ArchiveTable.Append is already durable when it
+// returns -- collections.Archive.Append -> Collection.Put -> shard.applyOne/applyBatch, which run
+// shard.syncFor (an msync of the pages written) before returning -- and db.ArchiveTable exposes
+// neither a Sync/Flush nor a non-durable append (collections.Archive.Flush is a no-op). So the
+// ordering "data durable, then cursor" holds, at the price of one msync per appended record.
+//
+// TODO(classad): add db.ArchiveTable.AppendNondurable and db.ArchiveTable.Sync() (msync every
+// shard's dirty pages); then append nondurably and return arch.Sync here, so a catch-up pays one
+// msync per flush instead of one per record.
+func archiveSync(_ *db.ArchiveTable) func() error {
+	return func() error { return nil }
 }
 
 // probeBudget is how many records of a catch-up are checked by exact query before the sink loads
@@ -89,6 +111,7 @@ func (s *archiveSink) Apply(c replicate.Change) error {
 		if err := s.arch.Append(c.Ad); err != nil {
 			return err
 		}
+		s.appended = true
 		if hasID && s.idset != nil {
 			s.idset[id.digest()] = struct{}{}
 		}
@@ -160,9 +183,16 @@ func (s *archiveSink) loadIdentities() error {
 	return nil
 }
 
-// Flush commits the cursor of the last applied change. The appends it covers are already in the
-// archive.
+// Flush makes the appends since the last flush durable (once, not per record) and only then
+// commits the cursor of the last applied change, so a committed cursor never covers an append a
+// crash could lose. A failed sync leaves the cursor where it was.
 func (s *archiveSink) Flush() error {
+	if s.appended {
+		if err := s.syncData(); err != nil {
+			return fmt.Errorf("federate: syncing %s appends from %s: %w", s.table, s.schedd, err)
+		}
+		s.appended = false
+	}
 	if len(s.nextCur) == 0 {
 		return nil
 	}

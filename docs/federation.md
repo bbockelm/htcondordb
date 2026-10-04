@@ -121,9 +121,11 @@ attribute is carried through unchanged and is unique only within its AP.
   record by record; a long one loads the AP's identities once and checks in memory. Live records
   are appended without a check. A record with no `GlobalJobId` (or, for epochs, no
   `RunInstanceID`) is appended unchecked and counted in `missing_identity_total`.
-- **Bounded replay after a hub restart.** Writes are batched into one transaction per flush (about
-  a second) and the resume cursor is committed only after that transaction. A hub crash re-applies
-  at most the last flush window, idempotently.
+- **Bounded replay after a hub restart, no gap after a crash.** Writes are batched into one
+  durable transaction per flush (about a second); archive appends are durable when they return.
+  The resume cursor is written (and fsynced) only after the data it covers is durable, so neither a
+  process nor an OS crash can leave a committed cursor covering lost data. A crash re-applies at
+  most the last flush window, idempotently.
 
 ## Freshness
 
@@ -185,8 +187,8 @@ staleness). Per-source detail is in `federation_sources`, which a consumer can w
 - **Replays are correct, not cheap.** Every spoke restart replays its tables (spoke watch epochs are
   per process). The hub writes almost nothing for an unchanged spoke, but it still streams and
   checks the spoke's whole retained history.
-- **An OS crash on the hub** can lose archive appends that a committed cursor already covers
-  (appends are not fsynced with the cursor); a process crash cannot.
+- **Archive ingest pays one msync per record.** classad's archive has no non-durable append and no
+  batch sync, so the hub cannot defer durability to the once-per-flush point it uses for tables.
 - **Absent sources keep their last state.** `absent` says the collector does not list the AP; the
   rows are as fresh as `StalenessSeconds` says, no fresher.
 - **Freshness needs `syncstatus`.** A spoke too old to heartbeat is always `stale`.

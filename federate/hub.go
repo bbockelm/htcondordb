@@ -429,7 +429,7 @@ func (h *Hub) cursorStore(schedd, table string) (replicate.CursorStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return replicate.FileCursorStore{Path: filepath.Join(dir, table+".cursor")}, nil
+	return fileCursorStore{path: filepath.Join(dir, table+".cursor")}, nil
 }
 
 // retire deletes schedd's rows from the mutable tables and forgets it.
