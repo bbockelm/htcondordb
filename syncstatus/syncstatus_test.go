@@ -64,6 +64,19 @@ func TestBuildAdLag(t *testing.T) {
 	if _, ok := unknown.EvaluateAttrInt("HistoryLagSeconds"); ok {
 		t.Errorf("HistoryLagSeconds present before the first pass: %s", unknown)
 	}
+
+	// A source whose file does not exist has nothing to lag on: it does not hold the spoke's lag
+	// unknown forever (an epoch history the schedd never wrote would otherwise keep the AP stale).
+	missing := BuildAd(Row{Now: now, Interval: time.Second, Missing: map[int]bool{1: true}, Sources: []scheddsync.SyncStatus{
+		{Kind: "job_queue.log", LastSync: now.Add(-3 * time.Second)},
+		{Kind: "job_epoch"},
+	}})
+	if v, ok := missing.EvaluateAttrInt(AttrSpokeLagSeconds); !ok || v != 3 {
+		t.Errorf("SpokeLagSeconds with a missing epoch file = %d (present %v), want 3", v, ok)
+	}
+	if v, ok := missing.EvaluateAttrBool("EpochFilePresent"); !ok || v {
+		t.Errorf("EpochFilePresent = %v (present %v), want false", v, ok)
+	}
 }
 
 // fakeTicker hands the writer a channel the test fires by hand, so cadence is asserted by count

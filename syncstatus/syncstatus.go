@@ -15,7 +15,10 @@ package syncstatus
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -48,8 +51,10 @@ const (
 	// AttrHeartbeatInterval is the cadence in seconds, so a hub can bound how old a received
 	// heartbeat may be without knowing the spoke's configuration.
 	AttrHeartbeatInterval = "HeartbeatIntervalSeconds"
-	// AttrSpokeLagSeconds is the largest per-source lag below. Absent when any source has not
-	// completed a read pass yet: an unknown lag must not read as zero.
+	// AttrSpokeLagSeconds is the largest per-source lag below. Absent when any source whose file
+	// exists has not completed a read pass yet: an unknown lag must not read as zero. A source whose
+	// file does not exist (an epoch history on a schedd that has written none) has nothing to be
+	// behind on and does not hold it back; it is reported with <Prefix>FilePresent = false.
 	AttrSpokeLagSeconds = "SpokeLagSeconds"
 
 	SuffixCaughtUp    = "CaughtUp"
@@ -57,6 +62,7 @@ const (
 	SuffixLagSeconds  = "LagSeconds"
 	SuffixLastSync    = "LastSyncTime"
 	SuffixGapDetected = "GapDetected"
+	SuffixFilePresent = "FilePresent"
 )
 
 // Prefix maps a scheddsync source kind to its attribute prefix ("" for an unknown kind). It is
@@ -97,6 +103,8 @@ type Row struct {
 	Now           time.Time
 	Interval      time.Duration
 	Sources       []scheddsync.SyncStatus
+	// Missing marks, by index into Sources, a source whose file does not exist.
+	Missing map[int]bool
 }
 
 // BuildAd renders a heartbeat row. Pure, for testing.
@@ -114,9 +122,13 @@ func BuildAd(r Row) *classad.ClassAd {
 
 	var maxLag int64
 	lagKnown := len(r.Sources) > 0
-	for _, st := range r.Sources {
+	for i, st := range r.Sources {
 		p := Prefix(st.Kind)
 		if p == "" {
+			continue
+		}
+		if r.Missing[i] && st.LastSync.IsZero() {
+			ad.InsertAttrBool(p+SuffixFilePresent, false)
 			continue
 		}
 		ad.InsertAttrBool(p+SuffixCaughtUp, st.CaughtUp)
@@ -223,9 +235,18 @@ func (w *Writer) WriteOnce() error {
 	if w.Mirrored != nil {
 		name, addr = w.Mirrored()
 	}
+	sources := dbad.LiveStatuses(w.Sources)
+	missing := map[int]bool{}
+	for i, st := range sources {
+		if st.Source != "" {
+			if _, err := os.Stat(st.Source); errors.Is(err, fs.ErrNotExist) {
+				missing[i] = true
+			}
+		}
+	}
 	ad := BuildAd(Row{
 		ScheddName: name, ScheddAddress: addr, Seq: w.seq, Now: w.now(),
-		Interval: w.interval(), Sources: dbad.LiveStatuses(w.Sources),
+		Interval: w.interval(), Sources: sources, Missing: missing,
 	})
 	tx := w.Table.Begin()
 	tx.NewClassAd(Key, ad)
