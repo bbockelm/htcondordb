@@ -57,6 +57,11 @@ type ExecConfig struct {
 	// dbrpc session refuses with dbrpc.ErrTableReadOnly, are re-sent here, and "owner" explains a
 	// refused write. The CLI wires it to a DBSyncControl dial (DAEMON-authorized).
 	SyncControl func(action, target string, args []string) (string, error)
+
+	// Retire, if set, backs the `.retire <schedd>` command on a federation hub: it deletes the
+	// named source's rows from the hub's mutable tables. When nil, `.retire` falls back to
+	// SyncControl, and reports it is unavailable when both are nil.
+	Retire func(schedd string) error
 }
 
 // WriteKind identifies a mutation in a write batch.
@@ -87,6 +92,7 @@ type Executor struct {
 	applyBatch func([]WriteOp) error
 	resync     func(target string) error
 	syncCtl    func(action, target string, args []string) (string, error)
+	retire     func(schedd string) error
 
 	// wireRowsOff forces reads onto the old-ClassAd text path even where the wire-form
 	// relay would serve them. It exists so a test can run the same query over both
@@ -186,7 +192,7 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire}
 }
 
 // SyncControl sends one DBSyncControl request to the daemon (see ExecConfig.SyncControl).
@@ -211,6 +217,19 @@ func (e *Executor) Resync(target string) error {
 		return fmt.Errorf("resync is not available in this session")
 	}
 	return e.resync(target)
+}
+
+// Retire asks a federation hub to retire the named source. Returns an error if no transport is
+// configured.
+func (e *Executor) Retire(schedd string) error {
+	if e.retire == nil {
+		if e.syncCtl != nil {
+			_, err := e.syncCtl("retire", schedd, nil)
+			return err
+		}
+		return fmt.Errorf("retire is not available in this session")
+	}
+	return e.retire(schedd)
 }
 
 // commit applies a batch of write ops to table. Inside an explicit transaction (BEGIN)

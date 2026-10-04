@@ -91,6 +91,8 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.showExporter(console, arg)
 	case ".resync":
 		s.resync(console, arg)
+	case ".retire":
+		s.retire(console, arg)
 	default:
 		return false
 	}
@@ -113,6 +115,22 @@ func (s *session) resync(console io.Writer, arg string) {
 		return
 	}
 	fmt.Fprintf(console, "resync requested for %q\n", target)
+}
+
+// retire asks a federation hub to retire a source now: delete its rows from the hub's mutable
+// tables (jobs, syncstatus, federation_sources) and forget its cursors. Archive rows are kept and
+// age out with retention. DAEMON-authorized; delivered over the DBSyncControl command.
+func (s *session) retire(console io.Writer, arg string) {
+	schedd := strings.TrimSpace(arg)
+	if schedd == "" {
+		fmt.Fprintln(console, "usage: .retire <schedd-name>   (federation hub: delete that AP's rows from the mutable tables now)")
+		return
+	}
+	if err := s.exec.Retire(schedd); err != nil {
+		fmt.Fprintln(console, "error:", err.Error())
+		return
+	}
+	fmt.Fprintf(console, "retired %q\n", schedd)
 }
 
 // timeTravel handles ".timetravel on <window> [checkpoint] | off" for the current

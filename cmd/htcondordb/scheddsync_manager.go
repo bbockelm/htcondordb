@@ -751,6 +751,12 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 		return nil // nothing changed
 	}
 	if next.enabled {
+		// A federation hub writes the same tables (see checkFederationExclusive).
+		if fs, _, ferr := resolveFederationSettings(cfg); ferr == nil {
+			if err := checkFederationExclusive(cfg, fs); err != nil {
+				return err
+			}
+		}
 		// Never read a schedd's job_queue.log/history as root (symlink risk).
 		if err := scheddSyncGuardEUID(os.Geteuid()); err != nil {
 			return err

@@ -30,6 +30,7 @@ type syncController struct {
 	imp    *importerManager
 	owners *server.TableOwners
 	cat    *db.Catalog
+	fed    *federationManager
 }
 
 // ownerTruncateTimeout bounds how long a truncate waits for the owning tailer to take it. The
@@ -42,6 +43,9 @@ const ownerTruncateTimeout = 20 * time.Second
 //	Action = "truncate" | "rotate"           Target = <owned table>
 //	Action = "retention.set"                 Target = <owned archive>, Args = "<maxSegments> <maxBytes> [attr ageSeconds]"
 //	Action = "owner"                         Target = <table>   (who owns it, and what to run instead)
+//
+//	Action = "retire"   (federation hub)
+//	Target = "<schedd-name>"
 //
 // Response: Ok (bool); on failure Error (string); on success Note (string).
 func (sc *syncController) handle(ctx context.Context, reqAd *classad.ClassAd) *classad.ClassAd {
@@ -59,6 +63,8 @@ func (sc *syncController) handle(ctx context.Context, reqAd *classad.ClassAd) *c
 		if err = sc.resync(target); err == nil {
 			note = fmt.Sprintf("resync requested for %q", target)
 		}
+	case "retire":
+		note, err = sc.retire(target)
 	case "truncate":
 		note, err = sc.truncate(ctx, target)
 	case "rotate":
@@ -68,7 +74,7 @@ func (sc *syncController) handle(ctx context.Context, reqAd *classad.ClassAd) *c
 	case "owner":
 		note, err = sc.ownerNote(target), nil
 	default:
-		err = fmt.Errorf("unknown sync action %q (want resync, truncate, rotate, retention.set, or owner)", action)
+		err = fmt.Errorf("unknown sync action %q (want resync, truncate, rotate, retention.set, owner, or retire)", action)
 	}
 	if err != nil {
 		return fail(resp, err.Error())
@@ -82,6 +88,23 @@ func fail(resp *classad.ClassAd, msg string) *classad.ClassAd {
 	resp.InsertAttrBool("Ok", false)
 	resp.InsertAttrString("Error", msg)
 	return resp
+}
+
+// retire has a federation hub retire a source now: its rows leave the hub's mutable tables.
+func (sc *syncController) retire(target string) (string, error) {
+	if target == "" {
+		return "", fmt.Errorf("retire requires a target (a federated schedd name)")
+	}
+	if sc.fed == nil {
+		return "", fmt.Errorf("this daemon is not a federation hub")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := sc.fed.Retire(ctx, target); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("retired %q: its jobs/syncstatus/federation_sources rows are deleted; "+
+		"archive rows age out with retention. If it is still in the AP set it returns at the next discovery, replayed from scratch", target), nil
 }
 
 // resync routes a target to its owning manager. "jobs"/"history"/"epoch" are the schedd-sync

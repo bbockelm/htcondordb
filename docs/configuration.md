@@ -34,6 +34,15 @@ client in the tree resolves through `locate.Daemon`, and the daemon publishes to
 | `HTCONDORDB_HISTORY` | `$(HISTORY)` | Schedd history file to tail (`history` archive). |
 | `HTCONDORDB_MIRRORED_SCHEDD_NAME` | the schedd's own rule | The schedd this spoke mirrors, advertised as `MirroredScheddName` (collector ad, `DBSyncStatus`, `syncstatus` row) when schedd sync runs. Unset follows the schedd's naming: `SCHEDD.SCHEDD_NAME`/`SCHEDD_NAME` used as is when it contains `@`, the full hostname when it names this host, else `name@$(FULL_HOSTNAME)`; with no `SCHEDD_NAME`, `$(FULL_HOSTNAME)` (or `user@$(FULL_HOSTNAME)` for a non-condor user). Set it when the schedd is started with `-name` or a local name. The chosen name and the rule are logged at startup. `MirroredScheddAddress` is the first line of `SCHEDD_ADDRESS_FILE`, omitted when unreadable. |
 | `HTCONDORDB_SYNCSTATUS_INTERVAL` | `5` | Seconds between rewrites of the `syncstatus` heartbeat row (key `status`) while schedd sync runs. A federation hub reads per-AP freshness from it. A duration suffix (`5s`, `1m`) is accepted. See [Federation](federation.md#spoke-side). |
+| `HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT` | — | Run as a [federation hub](federation.md) over the schedds matching this ScheddAd constraint (needs `COLLECTOR_HOST`). Refused together with `HTCONDORDB_SYNC_SCHEDD`. |
+| `HTCONDORDB_FEDERATE_SPOKES` | — | Static hub spokes, by name; each needs `HTCONDORDB_FEDERATE_SPOKE_<NAME>_ADDRESS` and may set `HTCONDORDB_FEDERATE_SPOKE_<NAME>_SCHEDD` (default `<NAME>`). Static spokes skip host validation. Also enables hub mode. |
+| `HTCONDORDB_FEDERATE_SPOKE_<NAME>_ADDRESS` | — | A static spoke's command address. |
+| `HTCONDORDB_FEDERATE_SPOKE_<NAME>_SCHEDD` | `<NAME>` | The schedd a static spoke mirrors; its rows carry this `ScheddName`. |
+| `HTCONDORDB_FEDERATE_TABLES` | `jobs history syncstatus` | Spoke tables a hub fans in (`epoch_history` also supported). |
+| `HTCONDORDB_FEDERATE_RETIRE_AFTER` | `7d` | A hub deletes an AP's mutable rows once it has been unseen, or unmatched after a constraint change, this long. Seconds or a suffix (`36h`, `7d`). Archive rows are never deleted by retirement. |
+| `HTCONDORDB_FEDERATE_FRESH_SECONDS` | `60` | A hub source at or under this staleness is `fresh`. |
+| `HTCONDORDB_FEDERATE_DISCOVER_INTERVAL` | `60` | Seconds between a hub's collector discovery passes. |
+| `HTCONDORDB_FEDERATE_STATE_INTERVAL` | `5` | Seconds between a hub's source-state refreshes (`federation_sources`, ad summary, metrics). |
 | `HTCONDORDB_ARCHIVE_ROTATE_INTERVAL` | `3600` | Archive-table retention sweep interval (seconds; `0` disables). |
 | `HTCONDORDB_ARCHIVE_MAX_BYTES` | — | Default on-disk size cap applied to **both** schedd-sync archives (`history`, `epoch_history`). Oldest whole segments are dropped past the cap on the retention sweep. Accepts a unit suffix (`10 GB`, `500MiB`) or plain bytes; unset/`0` = no limit. |
 | `HTCONDORDB_HISTORY_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for the `history` archive; overrides the shared default (set to `0` to uncap this table while the default caps the other). |

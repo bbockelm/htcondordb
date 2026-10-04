@@ -375,6 +375,9 @@ CompletionDate); with none, the current table:
   .resync <jobs|history|epoch|exporter>        re-read/re-export a sync source from the start
                                                (needs DAEMON, non-destructive: heals a mirror
                                                or re-exports without wiping the target)
+  .retire <schedd>                             federation hub: delete that AP's rows from
+                                               jobs/syncstatus/federation_sources now (needs
+                                               DAEMON; archives age out with retention)
   .memory [table]                              drop a table's on-disk backing, keeping
                                                its data in RAM only (needs DAEMON)
   .timetravel on <window> [checkpoint] | off   enable/disable point-in-time queries on

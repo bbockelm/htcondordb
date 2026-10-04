@@ -420,6 +420,21 @@ func run() error {
 		}
 	})
 
+	// Federation hub (federate): fan the spokes of an AP set -- schedds matching
+	// HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT and/or static HTCONDORDB_FEDERATE_SPOKES -- into this
+	// catalog. Reapplied on reconfigure. Off unless one of those is set; refused alongside schedd sync.
+	fedMgr := newFederationManager(ctx, svc.Catalog(), d.Slog())
+	// An in-process writer like syncMgr: stop-and-wait before svc.Close munmaps.
+	defer fedMgr.Stop()
+	if ferr := fedMgr.apply(cfg); ferr != nil {
+		return ferr
+	}
+	d.OnReconfig(func(newCfg *config.Config) {
+		if ferr := fedMgr.apply(newCfg); ferr != nil {
+			log.Error(logging.DestinationGeneral, "reconfigure: federation hub not reapplied", "err", ferr.Error())
+		}
+	})
+
 	// History importers (historyimport): pull completed-job history from every schedd of a pool
 	// (remote condor_history) into an archive table, one supervised subprocess per configured job,
 	// running as a service account with pool credentials. Reapplied on reconfigure. Off unless
@@ -445,7 +460,7 @@ func run() error {
 	// It is also the operator's path to the data-removing admin actions on a table an in-process
 	// writer owns (truncate/rotate/retention), which the dbrpc session refuses on every connection.
 	registerSyncControl(srv, &syncController{
-		sched: syncMgr, exp: expMgr, ced: cedarMgr, imp: impMgr,
+		sched: syncMgr, exp: expMgr, ced: cedarMgr, imp: impMgr, fed: fedMgr,
 		owners: svc.Owners(), cat: svc.Catalog(),
 	})
 
@@ -459,7 +474,7 @@ func run() error {
 		return append(syncMgr.Sources(), mirrorMgr.Sources()...)
 	}
 	dbAugment := dbad.Augment(svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, advertisedAddr(d, ln),
-		dbad.WithMirrored(syncMgr.Mirrored))
+		dbad.WithMirrored(syncMgr.Mirrored), dbad.WithFederation(fedMgr.Summary))
 	startCollectorAdvertise(ctx, d, cfg, syncSources, dbAugment)
 
 	// Point-to-point sync health (DBSyncStatus): answer the same ad over the command port. A
@@ -482,7 +497,7 @@ func run() error {
 	// but bind it to a trusted interface.
 	if addr := getStr(cfg, "HTCONDORDB_METRICS_ADDRESS"); addr != "" {
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", metrics.Handler(ctx, svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses))
+		mux.Handle("/metrics", metrics.Handler(ctx, svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, fedMgr.Metrics()))
 		// pprof (opt-in via HTCONDORDB_ENABLE_PPROF): profiling endpoints on the same
 		// trusted listener, so a memory/CPU anomaly in a live daemon is one
 		// `go tool pprof http://.../debug/pprof/heap` away instead of a blind restart.
