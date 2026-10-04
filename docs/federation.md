@@ -135,9 +135,11 @@ the hub's clock only, so clock skew between hosts never becomes staleness:
 staleness = (hub_now - HubReceivedTime) + SpokeLagSeconds + HeartbeatIntervalSeconds
 ```
 
-An idle AP keeps heartbeating and stays fresh; a stopped heartbeat is staleness that grows. No
-heartbeat yet, or a spoke that cannot measure its own lag, is `stale` with no
-`StalenessSeconds` -- never fresh.
+`SpokeLagSeconds` grows while the spoke is behind its schedd (it counts from the last time the
+spoke was caught up, not from its last read pass), so a spoke replaying a large backlog is stale
+however promptly it heartbeats. An idle AP keeps heartbeating and stays fresh; a stopped heartbeat
+is staleness that grows. No heartbeat yet, or a spoke that cannot state its lag (one that restarted
+behind and has not caught up), is `stale` with no `StalenessSeconds` -- never fresh.
 
 ## Membership is sticky
 

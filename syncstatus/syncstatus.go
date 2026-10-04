@@ -51,8 +51,9 @@ const (
 	// AttrHeartbeatInterval is the cadence in seconds, so a hub can bound how old a received
 	// heartbeat may be without knowing the spoke's configuration.
 	AttrHeartbeatInterval = "HeartbeatIntervalSeconds"
-	// AttrSpokeLagSeconds is the largest per-source lag below. Absent when any source whose file
-	// exists has not completed a read pass yet: an unknown lag must not read as zero. A source whose
+	// AttrSpokeLagSeconds is the largest per-source lag below (see LagSeconds). Absent when any
+	// source whose file exists has no known lag -- not yet seen caught up by this process: an
+	// unknown lag must not read as zero. A source whose
 	// file does not exist (an epoch history on a schedd that has written none) has nothing to be
 	// behind on and does not hold it back; it is reported with <Prefix>FilePresent = false.
 	AttrSpokeLagSeconds = "SpokeLagSeconds"
@@ -80,15 +81,29 @@ func Prefix(kind string) string {
 	}
 }
 
-// LagSeconds is how far a source was behind its file at now, in whole seconds: now minus the last
-// read pass that verified the mirror against the file. It is the quantity the collector ad's
-// *SecondsSinceSync attributes carry, computed at the moment the row is written, which is when it
-// is true. ok is false before the first such pass.
-func LagSeconds(st scheddsync.SyncStatus, now time.Time) (int64, bool) {
-	if st.LastSync.IsZero() {
+// LagSeconds is an upper bound, in whole seconds at now, on how old the newest state the mirror
+// is guaranteed to hold for a source is.
+//
+//   - Caught up (the collector ad's CaughtUp: no unconsumed tail, or a small one with a fresh
+//     sync): now minus the last read pass that verified the mirror against its file -- the
+//     collector ad's *SecondsSinceSync quantity, taken when the row is written.
+//   - Behind: now minus caughtUpAt, the last time this process saw the source caught up. It grows
+//     for as long as the source stays behind.
+//
+// now - LastSync alone is wrong while behind: a tailer catching up on a large backlog applies
+// records on every pass and refreshes LastSync each time, so a mirror gigabytes behind would read
+// a lag of one poll interval. ok is false before the source has been seen caught up since this
+// process started (and before its first pass): a spoke that restarts behind is unknown, hence
+// stale at a hub, until it catches up.
+func LagSeconds(st scheddsync.SyncStatus, caughtUpAt, now time.Time) (int64, bool) {
+	ref := caughtUpAt
+	if st.CaughtUp && !st.LastSync.IsZero() {
+		ref = st.LastSync
+	}
+	if ref.IsZero() {
 		return 0, false
 	}
-	secs := int64(now.Sub(st.LastSync).Seconds())
+	secs := int64(now.Sub(ref).Seconds())
 	if secs < 0 {
 		secs = 0
 	}
@@ -105,6 +120,9 @@ type Row struct {
 	Sources       []scheddsync.SyncStatus
 	// Missing marks, by index into Sources, a source whose file does not exist.
 	Missing map[int]bool
+	// CaughtUpAt is, by index into Sources, the last time the source was seen caught up (its
+	// LastSync at that observation); zero or absent means not since this process started.
+	CaughtUpAt map[int]time.Time
 }
 
 // BuildAd renders a heartbeat row. Pure, for testing.
@@ -136,7 +154,7 @@ func BuildAd(r Row) *classad.ClassAd {
 		if !st.LastSync.IsZero() {
 			ad.InsertAttr(p+SuffixLastSync, st.LastSync.Unix())
 		}
-		if secs, ok := LagSeconds(st, r.Now); ok {
+		if secs, ok := LagSeconds(st, r.CaughtUpAt[i], r.Now); ok {
 			ad.InsertAttr(p+SuffixLagSeconds, secs)
 			maxLag = max(maxLag, secs)
 		} else {
@@ -173,6 +191,9 @@ type Writer struct {
 
 	seq     int64
 	started bool
+	// caughtUpAt is, per source kind, the LastSync of the latest heartbeat that found the source
+	// caught up. In memory only: after a restart the lag is unknown until the source catches up.
+	caughtUpAt map[string]time.Time
 }
 
 func (w *Writer) interval() time.Duration {
@@ -235,18 +256,28 @@ func (w *Writer) WriteOnce() error {
 	if w.Mirrored != nil {
 		name, addr = w.Mirrored()
 	}
+	// LiveStatuses applies the collector ad's CaughtUp definition (no tail, or a small tail with a
+	// fresh sync) against the live file size, so "caught up" here means what it means there.
 	sources := dbad.LiveStatuses(w.Sources)
+	if w.caughtUpAt == nil {
+		w.caughtUpAt = map[string]time.Time{}
+	}
 	missing := map[int]bool{}
+	caughtUpAt := map[int]time.Time{}
 	for i, st := range sources {
 		if st.Source != "" {
 			if _, err := os.Stat(st.Source); errors.Is(err, fs.ErrNotExist) {
 				missing[i] = true
 			}
 		}
+		if st.CaughtUp && !st.LastSync.IsZero() && st.LastSync.After(w.caughtUpAt[st.Kind]) {
+			w.caughtUpAt[st.Kind] = st.LastSync
+		}
+		caughtUpAt[i] = w.caughtUpAt[st.Kind]
 	}
 	ad := BuildAd(Row{
 		ScheddName: name, ScheddAddress: addr, Seq: w.seq, Now: w.now(),
-		Interval: w.interval(), Sources: sources, Missing: missing,
+		Interval: w.interval(), Sources: sources, Missing: missing, CaughtUpAt: caughtUpAt,
 	})
 	tx := w.Table.Begin()
 	tx.NewClassAd(Key, ad)

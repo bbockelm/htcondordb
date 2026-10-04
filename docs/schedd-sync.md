@@ -179,10 +179,16 @@ Schedd sync also keeps a one-row mutable table, `syncstatus` (key `status`), rew
 (continues across restarts), `HeartbeatTime` (this host's clock, informational),
 `HeartbeatIntervalSeconds`, and for each source the collector ad's health fields --
 `JobQueueCaughtUp`/`LagBytes`, `HistoryCaughtUp`/`LagBytes`/`GapDetected`, the `Epoch`
-equivalents -- plus `<Source>LagSeconds`, the self-measured lag (the same quantity as the ad's
-`<Source>SecondsSinceSync`, taken when the row is written). `SpokeLagSeconds` is the largest of
-them and is absent until every source has completed a read pass. A federation hub replicates the
-row and computes freshness from it; see [Federation](federation.md).
+equivalents -- plus `<Source>LagSeconds`, an upper bound on how old the newest state the mirror
+is guaranteed to hold is. While the source is caught up (the ad's `CaughtUp` definition) that is
+the ad's `<Source>SecondsSinceSync`, taken when the row is written; while it is behind it is the
+time since it was last caught up, and keeps growing -- a tailer working through a backlog applies
+records on every pass, so time since the last pass would read a mirror gigabytes behind as fresh.
+`SpokeLagSeconds` is the largest of them. It is absent while any source's lag is unknown: before
+the source is first seen caught up by this process, so a daemon that restarts behind reports no
+lag until it catches up. A source whose file does not exist is reported as
+`<Source>FilePresent = false` and does not hold it back. A federation hub replicates the row and
+computes freshness from it; see [Federation](federation.md).
 
 ## Job resource metrics
 

@@ -13,6 +13,8 @@ import (
 	"github.com/PelicanPlatform/classad/dbrpc"
 
 	"github.com/bbockelm/htcondordb/cedarsync"
+	"github.com/bbockelm/htcondordb/scheddsync"
+	"github.com/bbockelm/htcondordb/syncstatus"
 )
 
 // fakeDiscovery returns whatever snapshot the test last set.
@@ -401,4 +403,49 @@ func TestStalenessThroughHeartbeats(t *testing.T) {
 	if s := hub.hub.Summary(); s == nil || s.Stale != 1 || !s.MaxStalenessKnown || s.MaxStaleness != first+60 {
 		t.Errorf("summary = %+v", s)
 	}
+}
+
+// TestCatchingUpSpokeIsStale: a spoke replaying a large backlog heartbeats on time and its tailer
+// applies records on every pass, so a now-minus-LastSync lag would read one poll interval and the
+// hub would call it fresh. The heartbeat the spoke actually writes (syncstatus.BuildAd) lags from
+// the last time it was caught up, and the hub must classify the AP stale while it is behind.
+func TestCatchingUpSpokeIsStale(t *testing.T) {
+	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
+	disc := &fakeDiscovery{}
+	disc.set(members("ap1"))
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	ss := mustTable(t, cat, TableSyncStatus)
+	hub := startHub(t, Config{Catalog: cat, Discovery: disc, Dial: unreachable, Now: clock.now, FreshThreshold: 60 * time.Second})
+	defer hub.stop(t)
+
+	sink, err := newTableSink(ss, TableSyncStatus, "ap1", &replicate.MemCursorStore{}, NewMetrics(), clock.now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply(t, sink, reset(), synced("c"))
+	caughtUpAt := clock.now()
+	for seq := 1; seq <= 60; seq++ { // five minutes of heartbeats while 10 GB behind
+		now := clock.now()
+		row := syncstatus.BuildAd(syncstatus.Row{
+			ScheddName: "ap1", Seq: int64(seq), Now: now, Interval: 5 * time.Second,
+			Sources:    []scheddsync.SyncStatus{{Kind: "job_queue.log", LagBytes: 10 << 30, LastSync: now}},
+			CaughtUpAt: map[int]time.Time{0: caughtUpAt},
+		})
+		apply(t, sink, upsert("status", row))
+		if err := sink.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		clock.advance(5 * time.Second)
+	}
+	waitFor(t, "a catching-up spoke classified stale", func() bool {
+		row, ok := sourceRow(cat, "ap1")
+		if !ok {
+			return false
+		}
+		st, _ := row.EvaluateAttrString("State")
+		secs, _ := row.EvaluateAttrInt("StalenessSeconds")
+		// 295s behind at the last heartbeat, 5s since it arrived, plus the 5s interval.
+		return st == StateStale && secs == 295+5+5
+	})
 }

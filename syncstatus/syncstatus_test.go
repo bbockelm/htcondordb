@@ -2,6 +2,8 @@ package syncstatus
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -30,17 +32,20 @@ func memTable(t *testing.T) *db.DB {
 	return tbl
 }
 
-// TestBuildAdLag: the per-source lag is the collector ad's SecondsSinceSync quantity measured at
-// the row's own time, and SpokeLagSeconds is the worst of them -- absent, not zero, while any
-// source has never completed a pass.
+// TestBuildAdLag: a caught-up source's lag is the collector ad's SecondsSinceSync quantity measured
+// at the row's own time; a source behind lags from the last time it was caught up, however
+// recently it last applied records; SpokeLagSeconds is the worst of them -- absent, not zero,
+// while any source's lag is unknown.
 func TestBuildAdLag(t *testing.T) {
 	now := time.Unix(1_700_000_100, 0)
 	ad := BuildAd(Row{
 		ScheddName: "ap1.example.org", Seq: 7, Now: now, Interval: 5 * time.Second,
 		Sources: []scheddsync.SyncStatus{
 			{Kind: "job_queue.log", CaughtUp: true, LastSync: now.Add(-2 * time.Second)},
-			{Kind: "history", LagBytes: 300, LastSync: now.Add(-9 * time.Second), Resyncs: 1},
+			// Behind, applying records (LastSync 1s ago), last caught up 9s ago.
+			{Kind: "history", LagBytes: 300, LastSync: now.Add(-1 * time.Second), Resyncs: 1},
 		},
+		CaughtUpAt: map[int]time.Time{1: now.Add(-9 * time.Second)},
 	})
 	i := func(k string) int64 { v, _ := ad.EvaluateAttrInt(k); return v }
 	b := func(k string) bool { v, _ := ad.EvaluateAttrBool(k); return v }
@@ -55,7 +60,7 @@ func TestBuildAdLag(t *testing.T) {
 	}
 
 	unknown := BuildAd(Row{Now: now, Interval: time.Second, Sources: []scheddsync.SyncStatus{
-		{Kind: "job_queue.log", LastSync: now},
+		{Kind: "job_queue.log", CaughtUp: true, LastSync: now},
 		{Kind: "history"}, // never synced
 	}})
 	if _, ok := unknown.EvaluateAttrInt(AttrSpokeLagSeconds); ok {
@@ -68,7 +73,7 @@ func TestBuildAdLag(t *testing.T) {
 	// A source whose file does not exist has nothing to lag on: it does not hold the spoke's lag
 	// unknown forever (an epoch history the schedd never wrote would otherwise keep the AP stale).
 	missing := BuildAd(Row{Now: now, Interval: time.Second, Missing: map[int]bool{1: true}, Sources: []scheddsync.SyncStatus{
-		{Kind: "job_queue.log", LastSync: now.Add(-3 * time.Second)},
+		{Kind: "job_queue.log", CaughtUp: true, LastSync: now.Add(-3 * time.Second)},
 		{Kind: "job_epoch"},
 	}})
 	if v, ok := missing.EvaluateAttrInt(AttrSpokeLagSeconds); !ok || v != 3 {
@@ -157,4 +162,90 @@ func TestWriterCadence(t *testing.T) {
 	if n, _ := row.EvaluateAttrInt(AttrHeartbeatSeq); n != 5 {
 		t.Errorf("restarted writer seq = %d, want 5", n)
 	}
+}
+
+// liveSource is a StatusSource whose status the test changes between heartbeats.
+type liveSource struct {
+	mu sync.Mutex
+	st scheddsync.SyncStatus
+}
+
+func (l *liveSource) Status() scheddsync.SyncStatus { l.mu.Lock(); defer l.mu.Unlock(); return l.st }
+func (l *liveSource) set(f func(*scheddsync.SyncStatus)) {
+	l.mu.Lock()
+	f(&l.st)
+	l.mu.Unlock()
+}
+
+// TestCatchingUpLagGrows: a tailer working through a large backlog applies records on every pass,
+// so its LastSync is always fresh -- yet the mirror is gigabytes behind. Its heartbeat lag must grow
+// from the last time it was caught up (here, as judged by the collector ad's CaughtUp against the
+// live file), not read as one poll interval. A process that has never seen it caught up reports no
+// lag at all.
+func TestCatchingUpLagGrows(t *testing.T) {
+	tbl := memTable(t)
+	path := filepath.Join(t.TempDir(), "job_queue.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(1 << 20); err != nil { // 1 MiB, sparse
+		t.Fatal(err)
+	}
+	clock := time.Now() // LiveStatuses judges sync freshness on the real clock
+	src := &liveSource{st: scheddsync.SyncStatus{Kind: "job_queue.log", Source: path, Offset: 1 << 20, LastSync: clock}}
+	w := &Writer{Table: tbl, Now: func() time.Time { return clock },
+		Sources: func() []dbad.StatusSource { return []dbad.StatusSource{src} }}
+	lag := func() (int64, bool) {
+		t.Helper()
+		if err := w.WriteOnce(); err != nil {
+			t.Fatal(err)
+		}
+		row, _ := tbl.LookupClassAd(Key)
+		return row.EvaluateAttrInt(AttrSpokeLagSeconds)
+	}
+	if v, ok := lag(); !ok || v != 0 {
+		t.Fatalf("caught-up lag = %d (known %v), want 0", v, ok)
+	}
+
+	// The schedd writes 64 MiB the tailer has not read; the tailer keeps applying records, so
+	// LastSync is refreshed on every pass.
+	if err := f.Truncate(65 << 20); err != nil {
+		t.Fatal(err)
+	}
+	caughtAt := clock
+	for step := 1; step <= 3; step++ {
+		clock = clock.Add(30 * time.Second)
+		src.set(func(st *scheddsync.SyncStatus) { st.Offset += 4 << 20; st.LastSync = clock })
+		v, ok := lag()
+		if want := int64(clock.Sub(caughtAt).Seconds()); !ok || v != want {
+			t.Fatalf("step %d: lag = %d (known %v), want %d -- a backlog read as fresh", step, v, ok, want)
+		}
+	}
+	if row, _ := tbl.LookupClassAd(Key); row != nil {
+		if up, _ := row.EvaluateAttrBool("JobQueueCaughtUp"); up {
+			t.Error("JobQueueCaughtUp true with a 60 MiB tail")
+		}
+	}
+
+	// Caught up again: back to the SecondsSinceSync quantity.
+	src.set(func(st *scheddsync.SyncStatus) { st.Offset = 65 << 20; st.LastSync = clock })
+	if v, ok := lag(); !ok || v != 0 {
+		t.Fatalf("lag after catching up = %d (known %v), want 0", v, ok)
+	}
+
+	// A fresh process (a spoke restart) that finds the source behind has no lag to report.
+	w2 := &Writer{Table: tbl, Now: func() time.Time { return clock },
+		Sources: func() []dbad.StatusSource { return []dbad.StatusSource{src} }}
+	if err := f.Truncate(129 << 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.WriteOnce(); err != nil {
+		t.Fatal(err)
+	}
+	row, _ := tbl.LookupClassAd(Key)
+	if v, ok := row.EvaluateAttrInt(AttrSpokeLagSeconds); ok {
+		t.Fatalf("restarted writer reported lag %d for a source it never saw caught up", v)
+	}
+	_ = f.Close()
 }
