@@ -408,7 +408,7 @@ func run() error {
 	// Native-CEDAR fan-in replicators (cedarsync): mirror configured source htcondordbs'
 	// tables/archives into local targets, selectively and Src-stamped, over a normal DBSession.
 	// Reapplied on reconfigure. Off unless HTCONDORDB_REPLICATE_SOURCES is set.
-	cedarMgr := &cedarSyncManager{parent: ctx, cat: svc.Catalog(), logger: d.Slog()}
+	cedarMgr := &cedarSyncManager{parent: ctx, cat: svc.Catalog(), logger: d.Slog(), owners: svc.Owners()}
 	// Like syncMgr, an in-process writer: stop-and-wait before svc.Close munmaps.
 	defer cedarMgr.Stop()
 	if cerr := cedarMgr.apply(cfg); cerr != nil {
@@ -424,7 +424,7 @@ func run() error {
 	// (remote condor_history) into an archive table, one supervised subprocess per configured job,
 	// running as a service account with pool credentials. Reapplied on reconfigure. Off unless
 	// HTCONDORDB_HISTORY_IMPORT names jobs.
-	impMgr := newImporterManager(ctx, d.Slog(), advertisedAddr(d, ln))
+	impMgr := newImporterManager(ctx, d.Slog(), advertisedAddr(d, ln), svc.Owners())
 	if ierr := impMgr.apply(cfg); ierr != nil {
 		return ierr
 	}
@@ -442,7 +442,12 @@ func run() error {
 	// (jobs/history) or a managed exporter without a restart -- e.g. `.resync jobs` to heal a
 	// mirror from the current log, or `.resync <exporter>` to re-export from the start. Registered
 	// in every mode (unlike the HA-only DBControl).
-	registerSyncControl(srv, syncMgr, expMgr)
+	// It is also the operator's path to the data-removing admin actions on a table an in-process
+	// writer owns (truncate/rotate/retention), which the dbrpc session refuses on every connection.
+	registerSyncControl(srv, &syncController{
+		sched: syncMgr, exp: expMgr, ced: cedarMgr, imp: impMgr,
+		owners: svc.Owners(), cat: svc.Catalog(),
+	})
 
 	// Advertise a discovery/monitoring ClassAd to the collector: agents (and the htcondor-api
 	// MCP) discover this database and its command address here, and the ad doubles as a metrics

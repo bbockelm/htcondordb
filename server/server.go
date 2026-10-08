@@ -176,6 +176,10 @@ type Service struct {
 	log          *slog.Logger
 	stopReaper   func() // stops the idle-transaction reaper; set in New
 
+	// owners holds the tables an in-process writer owns; every client connection's
+	// TableWritable consults it, so those tables are read-only to remote peers.
+	owners *TableOwners
+
 	// Archive dictionary retrain scheduling (see maybeRetrainArchive). retrainMu guards
 	// lastArchiveRetrain; the interval and seed are written once before the maintenance loop starts.
 	retrainMu           sync.Mutex
@@ -242,6 +246,7 @@ func New(cfg Config) (*Service, error) {
 		forceReadOn:  cfg.ForceReadOnly,
 		logQueries:   cfg.LogQueries,
 		log:          log,
+		owners:       NewTableOwners(),
 	}
 	step("rpc-server")
 	// Background self-tuning (index auto-tune + hot-set refresh + dictionary retrain),
@@ -297,6 +302,10 @@ func (s *Service) DB() *db.DB {
 	return d
 }
 
+// Owners returns the registry of tables owned by in-process writers. Managers register the
+// tables their writers maintain; the server refuses remote writes to them.
+func (s *Service) Owners() *TableOwners { return s.owners }
+
 // RPC returns the underlying dbrpc server (for HA layers that serve replica
 // connections). Its lifetime is owned by Service.
 func (s *Service) RPC() *dbrpc.Server { return s.rpc }
@@ -312,10 +321,7 @@ func (s *Service) RegisterOn(srv *cedarserver.Server) {
 // scoped to the connection's effective authorization level.
 func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error {
 	level := s.effectiveLevel(c)
-	opts := serveOptionsFor(level)
-	if s.forceReadOn {
-		opts.ReadOnly = true
-	}
+	opts := s.ServeOptions(level, peerSession(c))
 	if hook := s.queryLogHook(peerUser(c), c.RemoteAddr); hook != nil {
 		opts.QueryLog = hook
 	}
@@ -372,6 +378,24 @@ func (s *Service) queryLogHook(user, remote string) func(dbrpc.QueryLog) {
 	}
 }
 
+// ServeOptions builds the dbrpc options for one client connection: its access level, the
+// daemon-wide read-only override, and the per-table write gate. sessionID is the CEDAR session the
+// connection runs on; it only matters for a session granted to an out-of-process owner
+// (TableOwners.GrantSession).
+//
+// The gate applies at every level, DAEMON included: a table an in-process writer owns (a schedd
+// mirror, a replica, an importer's archive) changes only through that writer. Operator actions on
+// such a table (truncate, rotate, retention) go through the owner instead, over DBSyncControl.
+func (s *Service) ServeOptions(level Level, sessionID string) dbrpc.ServeOptions {
+	opts := serveOptionsFor(level)
+	if s.forceReadOn {
+		opts.ReadOnly = true
+	}
+	owners := s.owners
+	opts.TableWritable = func(table string) bool { return owners.Writable(table, sessionID) }
+	return opts
+}
+
 // serveOptionsFor maps an access level to the dbrpc serving options.
 func serveOptionsFor(level Level) dbrpc.ServeOptions {
 	switch level {
@@ -419,6 +443,14 @@ func (s *Service) Close() error {
 func peerUser(c *cedarserver.Conn) string {
 	if c.Negotiation != nil {
 		return c.Negotiation.User
+	}
+	return ""
+}
+
+// peerSession is the CEDAR session id the connection runs on ("" for a raw command).
+func peerSession(c *cedarserver.Conn) string {
+	if c.Negotiation != nil {
+		return c.Negotiation.SessionId
 	}
 	return ""
 }

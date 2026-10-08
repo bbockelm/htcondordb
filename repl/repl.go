@@ -3,10 +3,14 @@ package repl
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
+
+	"github.com/PelicanPlatform/classad/dbrpc"
 )
 
 // session holds the mutable REPL state the meta-commands change: the current
@@ -89,6 +93,7 @@ func Run(ctx context.Context, e *Executor, readLine ReadLine, console io.Writer)
 			if h := HintFor(execErr); h != "" {
 				fmt.Fprintf(console, "  hint: %s\n", h)
 			}
+			s.explainOwner(console, execErr)
 			continue
 		}
 		FormatResult(s.out, res, s.format)
@@ -99,10 +104,48 @@ func isMeta(line string) bool {
 	return strings.HasPrefix(line, ".") || strings.HasPrefix(line, "\\")
 }
 
+// ReadOnlyTable returns the table a dbrpc.ErrTableReadOnly refusal names, or "" when err is not
+// one (or does not carry the name).
+func ReadOnlyTable(err error) string {
+	var se *dbrpc.ServerError
+	if !errors.Is(err, dbrpc.ErrTableReadOnly) || !errors.As(err, &se) {
+		return ""
+	}
+	rest, ok := strings.CutPrefix(se.Msg, "read-only table ")
+	if !ok {
+		return ""
+	}
+	q, qerr := strconv.QuotedPrefix(rest)
+	if qerr != nil {
+		return ""
+	}
+	t, _ := strconv.Unquote(q)
+	return t
+}
+
+// explainOwner follows a dbrpc.ErrTableReadOnly refusal with which writer owns the table and what
+// to run instead, asked of the daemon (DBSyncControl "owner"). Silent when err is another error,
+// or the session cannot ask (no transport, or not DAEMON-authorized) -- the generic hint stands.
+func (s *session) explainOwner(console io.Writer, err error) {
+	table := ReadOnlyTable(err)
+	if table == "" || !s.exec.HasSyncControl() {
+		return
+	}
+	if note, cerr := s.exec.SyncControl("owner", table); cerr == nil && note != "" {
+		fmt.Fprintf(console, "  owner: %s\n", note)
+	}
+}
+
 // HintFor returns an actionable hint for common, confusing errors, or "".
 func HintFor(err error) string {
 	if err == nil {
 		return ""
+	}
+	if errors.Is(err, dbrpc.ErrTableReadOnly) {
+		return "the table is maintained by a writer inside the daemon (schedd sync, replication, or a managed " +
+			"history importer), so every client -- DAEMON included -- may read and watch it but not modify it. " +
+			"Write to another table. Operators: `.truncate`, `.rotate` and `.retention` on it are routed through its " +
+			"owner, and `.resync` rebuilds a schedd-sync table from the schedd's files."
 	}
 	if strings.Contains(err.Error(), "read-only connection") {
 		return "the daemon authorized this connection READ-only, so writes are refused. " +
@@ -327,7 +370,8 @@ CompletionDate); with none, the current table:
                                                show/set an archive's retention bounds
                                                (maxBytes takes a KiB/MiB/GiB suffix; 0=none)
   .truncate <table>                            empty a table (needs DAEMON, destructive);
-                                               a history archive re-syncs from the start
+                                               a schedd-sync history archive is wiped and
+                                               re-read from the history file by the sync
   .resync <jobs|history|epoch|exporter>        re-read/re-export a sync source from the start
                                                (needs DAEMON, non-destructive: heals a mirror
                                                or re-exports without wiping the target)

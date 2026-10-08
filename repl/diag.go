@@ -3,6 +3,7 @@ package repl
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -817,16 +818,43 @@ func (s *session) convertToMemory(console io.Writer, arg string) {
 }
 
 // adminTable runs a management action on a named table and prints the result.
+//
+// The data-removing actions (truncate, rotate, retention.set) on a table a writer inside the
+// daemon owns are refused on every dbrpc session (dbrpc.ErrTableReadOnly); for those the request
+// is re-sent to the daemon's sync control, which carries it out through the owner -- e.g. a
+// schedd-sync history truncate wipes the archive and re-reads the history file in one step -- or
+// refuses it saying why and what to run instead. The admin path is tried first so an unowned
+// table needs no second connection and a non-DAEMON session keeps its authorization error.
 func (s *session) adminTable(console io.Writer, table, action string, args ...string) {
 	msg, err := s.exec.Admin(table, action, args...)
+	if err != nil && errors.Is(err, dbrpc.ErrTableReadOnly) && ownerRoutedAction(action) && s.exec.HasSyncControl() {
+		note, cerr := s.exec.SyncControl(action, table, args...)
+		if cerr != nil {
+			fmt.Fprintf(console, "error: %v\n", cerr)
+			return
+		}
+		fmt.Fprintln(console, note)
+		return
+	}
 	if err != nil {
 		fmt.Fprintf(console, "error: %v\n", err)
 		if h := HintFor(err); h != "" {
 			fmt.Fprintf(console, "  hint: %s\n", h)
 		}
+		s.explainOwner(console, err)
 		return
 	}
 	fmt.Fprintln(console, msg)
+}
+
+// ownerRoutedAction reports whether an admin action refused on an owned table is carried out
+// through the owner (DBSyncControl) rather than reported as refused.
+func ownerRoutedAction(action string) bool {
+	switch action {
+	case "truncate", "rotate", "retention.set":
+		return true
+	}
+	return false
 }
 
 // maintenance runs a maintenance action on a table, or on every table when the argument
@@ -864,9 +892,10 @@ func (s *session) maintenance(console io.Writer, arg, action string) {
 // truncate empties a table: `.truncate <table>`. It is destructive and DAEMON-authorized
 // (the server refuses it on an unprivileged connection). A table name is required -- unlike
 // the read-only diagnostics, truncate never defaults to the current table, so a stray
-// `.truncate` can't wipe data by accident. For a history archive this drops every record and
-// the live schedd-sync tailer re-reads the history file from the start, rebuilding it (a
-// from-scratch re-sync without stopping the daemon).
+// `.truncate` can't wipe data by accident. A table a writer inside the daemon owns refuses the
+// direct truncate; adminTable then routes it to the owner. For the schedd-sync history archive
+// that means the history tailer itself wipes the archive and re-reads the history file from the
+// start (a from-scratch re-sync without stopping the daemon).
 func (s *session) truncate(console io.Writer, arg string) {
 	fields := strings.Fields(arg)
 	if len(fields) == 0 {

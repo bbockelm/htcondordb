@@ -85,7 +85,7 @@ func TestSyncControllerRoutesEpochToSchedd(t *testing.T) {
 	// Empty exporter manager: had epoch wrongly routed here, it would error instead of succeeding.
 	sc := &syncController{sched: sched, exp: &exporterManager{}}
 
-	resp := sc.handle(mkReq("resync", "epoch"))
+	resp := sc.handle(context.Background(), mkReq("resync", "epoch"))
 	if ok, _ := resp.EvaluateAttrBool("Ok"); !ok {
 		e, _ := resp.EvaluateAttrString("Error")
 		t.Fatalf("resync epoch should succeed via the schedd manager; got error %q", e)
@@ -110,25 +110,25 @@ func TestSyncControllerDispatch(t *testing.T) {
 	okOf := func(ad *classad.ClassAd) bool { v, _ := ad.EvaluateAttrBool("Ok"); return v }
 
 	// Empty target -> error.
-	if okOf(sc.handle(mkReq("resync", ""))) {
+	if okOf(sc.handle(context.Background(), mkReq("resync", ""))) {
 		t.Error("empty target should fail")
 	}
 	// Unknown action -> error.
-	if okOf(sc.handle(mkReq("frobnicate", "jobs"))) {
+	if okOf(sc.handle(context.Background(), mkReq("frobnicate", "jobs"))) {
 		t.Error("unknown action should fail")
 	}
 	// jobs/history route to the schedd-sync manager (which has no running tailers here -> error,
 	// but the routing is exercised).
-	if okOf(sc.handle(mkReq("resync", "jobs"))) {
+	if okOf(sc.handle(context.Background(), mkReq("resync", "jobs"))) {
 		t.Error("resync jobs with no tailers running should fail")
 	}
 	// An unknown name routes to the exporter manager (no such managed exporter -> error).
-	if okOf(sc.handle(mkReq("resync", "some-exporter"))) {
+	if okOf(sc.handle(context.Background(), mkReq("resync", "some-exporter"))) {
 		t.Error("resync of an unknown exporter should fail")
 	}
 	// A missing Action defaults to resync (still fails here for lack of a live target, but Ok is
 	// a bool and the Error is populated).
-	resp := sc.handle(mkReq("", "jobs"))
+	resp := sc.handle(context.Background(), mkReq("", "jobs"))
 	if okOf(resp) {
 		t.Error("default action on a dead target should fail")
 	}

@@ -66,7 +66,9 @@ class ProgrammingError(DatabaseError):
     A SQL parse error, a bad table name, or a wrong parameter count. A write refused
     because the daemon authorized the connection READ-only is also reported here: the
     remedy is in the caller's hands (authenticate, or get WRITE authorization), and the
-    daemon's own hint explaining what to check is carried in the message.
+    daemon's own hint explaining what to check is carried in the message. So is a write
+    to a table a writer inside the daemon owns (a schedd mirror, a replica, an import
+    target): it is read-only to every client, and retrying cannot succeed.
     """
 
 

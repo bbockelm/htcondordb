@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -21,6 +23,7 @@ import (
 	"github.com/bbockelm/htcondordb/command"
 	"github.com/bbockelm/htcondordb/dbad"
 	"github.com/bbockelm/htcondordb/historyimport"
+	"github.com/bbockelm/htcondordb/server"
 )
 
 // importerManager launches and supervises the out-of-process history-import
@@ -33,7 +36,8 @@ import (
 type importerManager struct {
 	parent     context.Context
 	logger     *slog.Logger
-	daemonAddr string // the address children dial back on
+	daemonAddr string              // the address children dial back on
+	owners     *server.TableOwners // the import targets are registered here; nil owns nothing
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
@@ -59,6 +63,7 @@ type importerSettings struct {
 	binOverride     string
 	logDir          string
 	jobs            []string
+	targets         []string // "job=table", sorted: which archive each job imports into
 	livenessTimeout time.Duration
 	gracefulTimeout time.Duration
 }
@@ -66,11 +71,47 @@ type importerSettings struct {
 func (s importerSettings) equal(o importerSettings) bool {
 	return s.enabled == o.enabled && s.user == o.user && s.binOverride == o.binOverride &&
 		s.logDir == o.logDir && s.livenessTimeout == o.livenessTimeout &&
-		s.gracefulTimeout == o.gracefulTimeout && slices.Equal(s.jobs, o.jobs)
+		s.gracefulTimeout == o.gracefulTimeout && slices.Equal(s.jobs, o.jobs) &&
+		slices.Equal(s.targets, o.targets)
 }
 
-func newImporterManager(ctx context.Context, logger *slog.Logger, daemonAddr string) *importerManager {
-	return &importerManager{parent: ctx, logger: logger, daemonAddr: daemonAddr}
+// tables lists the archives the configured jobs import into (deduplicated: jobs may share one).
+func (s importerSettings) tables() []string {
+	var out []string
+	for _, jt := range s.targets {
+		_, t, _ := strings.Cut(jt, "=")
+		if !slices.Contains(out, t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// JobsFor names the managed import jobs writing into table, for operator messages.
+func (m *importerManager) JobsFor(table string) []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, jt := range m.current.targets {
+		if j, t, _ := strings.Cut(jt, "="); strings.EqualFold(t, table) {
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
+// exitTableReadOnly is history-import's exit status when the daemon refused a write because the
+// target table belongs to another writer (dbrpc.ErrTableReadOnly). Restarting cannot fix that --
+// only a configuration change can -- so the supervisor stops relaunching the job until its
+// configuration changes (or the daemon restarts) instead of retrying it forever. Keep in sync
+// with cmd/history-import.
+const exitTableReadOnly = 3
+
+func newImporterManager(ctx context.Context, logger *slog.Logger, daemonAddr string, owners *server.TableOwners) *importerManager {
+	return &importerManager{parent: ctx, logger: logger, daemonAddr: daemonAddr, owners: owners}
 }
 
 func resolveImporterSettings(cfg *config.Config) importerSettings {
@@ -88,10 +129,13 @@ func resolveImporterSettings(cfg *config.Config) importerSettings {
 		return importerSettings{}
 	}
 	names := make([]string, len(jobs))
+	targets := make([]string, len(jobs))
 	for i, j := range jobs {
 		names[i] = j.Name
+		targets[i] = j.Name + "=" + j.Table
 	}
 	slices.Sort(names)
+	slices.Sort(targets)
 
 	user := getStr(cfg, "HTCONDORDB_HISTORY_IMPORT_USER")
 	if user == "" {
@@ -115,6 +159,7 @@ func resolveImporterSettings(cfg *config.Config) importerSettings {
 		binOverride:     getStr(cfg, "HISTORY_IMPORT"),
 		logDir:          logDir,
 		jobs:            names,
+		targets:         targets,
 		livenessTimeout: live,
 		gracefulTimeout: grace,
 	}
@@ -142,16 +187,22 @@ func (m *importerManager) apply(cfg *config.Config) error {
 	}
 	m.current = importerSettings{}
 	if !next.enabled {
+		m.owners.Set(ownerHistoryImport, nil)
 		m.logger.Info("importer manager: disabled")
 		return nil
 	}
 
 	bin := resolveBinary(next.binOverride, "history-import")
 	if bin == "" {
+		// An external runner writes over an ordinary session, so its tables must stay writable.
+		m.owners.Set(ownerHistoryImport, nil)
 		m.logger.Warn("importer manager: history-import binary not found; leaving import jobs to an external runner",
 			"jobs", next.jobs)
 		return nil
 	}
+	// The import targets belong to the managed runners, which write them over sessions minted
+	// for them (runOnce grants each one); every other peer may only read them.
+	m.owners.Set(ownerHistoryImport, next.tables())
 
 	// Drop runtime status for jobs no longer configured, so the ad stops
 	// advertising them.
@@ -203,6 +254,11 @@ func (m *importerManager) supervise(ctx context.Context, s importerSettings, nam
 		if time.Since(start) >= maxBackoff {
 			backoff = time.Second // a run that stayed up a while resets the backoff
 		}
+		if exitCode(err) == exitTableReadOnly {
+			m.logger.Error("importer manager: import job's target table is owned by another writer; not restarting it until its configuration changes",
+				"name", name, "err", err)
+			return
+		}
 		if err != nil {
 			m.logger.Warn("importer manager: import job exited; restarting", "name", name, "err", err, "backoff", backoff)
 		} else {
@@ -230,6 +286,10 @@ func (m *importerManager) runOnce(ctx context.Context, s importerSettings, name,
 		return fmt.Errorf("minting session: %w", err)
 	}
 	defer security.GetSessionCache().Invalidate(sid)
+	// Connections resumed from this session may write the import targets; the grant dies with
+	// the child, like the session.
+	m.owners.GrantSession(sid, ownerHistoryImport)
+	defer m.owners.RevokeSession(sid)
 
 	childCtx, cancelChild := context.WithCancel(ctx)
 	defer cancelChild()
@@ -390,6 +450,15 @@ func (m *importerManager) Statuses() []dbad.ImporterStatus {
 		})
 	}
 	return out
+}
+
+// exitCode is the exit status of a finished child (-1 when err is not an exit).
+func exitCode(err error) int {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
 }
 
 // forwardChildLog relays a child's output stream into the daemon log, one line per

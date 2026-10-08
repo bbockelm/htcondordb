@@ -43,6 +43,12 @@ type CoordinatorConfig struct {
 	// Peers" (or single-node if Peers is empty).
 	ClusterSize int
 
+	// TableWritable, if set, is consulted for every table a client write batch (the DBControl
+	// "apply" request) touches; a false answer refuses the whole batch. It is the consistent-mode
+	// counterpart of dbrpc.ServeOptions.TableWritable: a table a writer inside the daemon owns
+	// must not change through this path either. Must be safe for concurrent use.
+	TableWritable func(table string) bool
+
 	// Timeout bounds raft Apply / membership operations (default 10s).
 	Timeout time.Duration
 	// Logger receives coordinator diagnostics (raft's own logs go to hclog).
