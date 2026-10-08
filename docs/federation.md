@@ -91,7 +91,7 @@ matching the constraint, for all ScheddAds (to tell "no longer matches" from "go
 |---|---|---|---|---|
 | `jobs` | mutable | spoke `jobs` | (schedd, spoke key) | categorical `ScheddName`, `User`; value `JobStatus` |
 | `syncstatus` | mutable | spoke `syncstatus` | schedd | -- |
-| `history` | archive | spoke `history` | `GlobalJobId` | categorical `ScheddName`, `Owner`, `GlobalJobId`; value `ClusterId`; zones `CompletionDate`, `EnteredHistoryTime` |
+| `history` | archive | spoke `history` | `GlobalJobId` | categorical `ScheddName`, `Owner`, `User`, `GlobalJobId`; value `ClusterId`; zones `CompletionDate`, `EnteredHistoryTime` |
 | `epoch_history` | archive | spoke `epoch_history` | `GlobalJobId` + `RunInstanceID` + `EpochAdType` | as history; zones `EpochWriteDate`, `EnteredHistoryTime` |
 | `federation_sources` | mutable | computed | schedd name (the key) | -- |
 

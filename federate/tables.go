@@ -16,7 +16,7 @@ import (
 var (
 	jobsCategorical    = []string{ScheddNameAttr, "User"}
 	jobsValue          = []string{"JobStatus"}
-	archiveCategorical = []string{ScheddNameAttr, "Owner", "GlobalJobId"}
+	archiveCategorical = []string{ScheddNameAttr, "Owner", "User", "GlobalJobId"}
 	archiveValue       = []string{"ClusterId"}
 	historyZones       = []string{"CompletionDate", "EnteredHistoryTime"}
 	epochZones         = []string{"EpochWriteDate", "EnteredHistoryTime"}
