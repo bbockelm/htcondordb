@@ -50,7 +50,10 @@ export const FILTER_OPS = ['==', '!=', '>', '>=', '<', '<=', '=~', '!~'];
 
 // Non-secret datasource config (JSONData).
 export interface HtcondordbDataSourceOptions extends DataSourceJsonData {
+  // Either address, or pool (+ optional name) to locate the daemon through a collector.
   address?: string;
+  pool?: string;
+  name?: string;
   connectTimeoutSeconds?: number;
 }
 

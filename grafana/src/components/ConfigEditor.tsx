@@ -17,6 +17,14 @@ export function ConfigEditor(props: Props) {
     onOptionsChange({ ...options, jsonData: { ...jsonData, address: e.target.value } });
   };
 
+  const onPoolChange = (e: ChangeEvent<HTMLInputElement>) => {
+    onOptionsChange({ ...options, jsonData: { ...jsonData, pool: e.target.value } });
+  };
+
+  const onNameChange = (e: ChangeEvent<HTMLInputElement>) => {
+    onOptionsChange({ ...options, jsonData: { ...jsonData, name: e.target.value } });
+  };
+
   const onTimeoutChange = (e: ChangeEvent<HTMLInputElement>) => {
     const n = parseInt(e.target.value, 10);
     onOptionsChange({
@@ -40,9 +48,37 @@ export function ConfigEditor(props: Props) {
   return (
     <>
       <InlineField
+        label="Pool"
+        labelWidth={LABEL_WIDTH}
+        tooltip="Collector to find the database through, as condor_status -pool takes it. Preferred over a fixed address: the daemon is looked up on every connection, so it is still found after a restart."
+      >
+        <Input
+          width={40}
+          data-testid="htcondordb-config-pool"
+          value={jsonData.pool ?? ''}
+          placeholder="cm-1.example.edu"
+          onChange={onPoolChange}
+        />
+      </InlineField>
+
+      <InlineField
+        label="Database name"
+        labelWidth={LABEL_WIDTH}
+        tooltip="Which database in that pool, as condor_status -name takes it. Leave blank if the pool has only one; with several, the connection fails and lists them rather than picking one."
+      >
+        <Input
+          width={40}
+          data-testid="htcondordb-config-name"
+          value={jsonData.name ?? ''}
+          placeholder="htcondordb@ap40.example.edu"
+          onChange={onNameChange}
+        />
+      </InlineField>
+
+      <InlineField
         label="Address"
         labelWidth={LABEL_WIDTH}
-        tooltip="htcondordb server address: an HTCondor sinful string or host:port."
+        tooltip="Alternative to Pool: the server's address directly, as an HTCondor sinful string or host:port. Set this or Pool, not both."
       >
         <Input
           width={40}

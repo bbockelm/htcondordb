@@ -14,6 +14,8 @@ import (
 
 	"github.com/PelicanPlatform/classad/dbrpc"
 
+	"github.com/bbockelm/golang-htcondor/config"
+
 	"github.com/bbockelm/htcondordb/repl"
 )
 
@@ -29,7 +31,15 @@ var (
 // datasourceSettings is the non-secret JSONData saved by the ConfigEditor.
 type datasourceSettings struct {
 	// Address is the htcondordb server (HTCondor sinful string or host:port).
+	// Either this or Pool names the daemon.
 	Address string `json:"address"`
+	// Pool is the collector to locate the daemon through, as condor_status -pool
+	// takes it. Empty falls back to COLLECTOR_HOST, if the host has HTCondor
+	// configuration at all.
+	Pool string `json:"pool"`
+	// Name is the daemon to ask for in that pool, as condor_status -name takes it.
+	// Empty means the pool's only htcondordb.
+	Name string `json:"name"`
 	// ConnectTimeoutSeconds bounds dialing + the CEDAR handshake (0 = default).
 	ConnectTimeoutSeconds int `json:"connectTimeoutSeconds"`
 }
@@ -56,12 +66,33 @@ func NewDatasource(_ context.Context, s backend.DataSourceInstanceSettings) (ins
 	if addr == "" {
 		addr = strings.TrimSpace(s.URL) // fall back to the standard URL field
 	}
-	if addr == "" {
-		return nil, errors.New("htcondordb address is not configured")
+	pool, name := strings.TrimSpace(js.Pool), strings.TrimSpace(js.Name)
+
+	// Both name a daemon, and they can name different ones. Refuse rather than
+	// silently honoring one: queries would run somewhere nobody asked for.
+	// htcondordb-cli refuses the same combination of -addr with -pool/-name.
+	if addr != "" && (pool != "" || name != "") {
+		return nil, errors.New("configure either an address or a pool/name, not both")
 	}
+	if addr == "" && pool == "" && name == "" {
+		return nil, errors.New("htcondordb address is not configured: set an address, or a pool to locate the daemon through")
+	}
+
 	cfg := connConfig{
 		Address: addr,
+		Pool:    pool,
+		Name:    name,
 		Token:   s.DecryptedSecureJSONData["token"], // empty -> anonymous read-only
+	}
+	if addr == "" {
+		// Only the collector lookup reads HTCondor configuration, and only for
+		// COLLECTOR_HOST. A Grafana host normally has none; that is not an error
+		// here, it just means an unset Pool has nothing to fall back to.
+		htcfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "TOOL"})
+		if err != nil {
+			return nil, fmt.Errorf("reading HTCondor configuration for the collector lookup: %w", err)
+		}
+		cfg.HTCfg = htcfg
 	}
 	if js.ConnectTimeoutSeconds > 0 {
 		cfg.ConnectTimeout = time.Duration(js.ConnectTimeoutSeconds) * time.Second
