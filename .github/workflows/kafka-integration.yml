@@ -24,8 +24,11 @@ jobs:
         with: { go-version: '1.27' }
 
       - name: Install Redpanda (native; test prefers it over docker)
+        # dl.redpanda.com shut down on 2026-09-28; packages moved to linux.pkg.redpanda.com.
+        # pipefail: a failed setup download must fail here, not as "Unable to locate package".
         run: |
-          curl -1sLf 'https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.deb.sh' | sudo -E bash
+          set -o pipefail
+          curl -fsSL --tlsv1.2 'https://linux.pkg.redpanda.com/setup-redpanda.deb.sh' | sudo -E bash
           sudo apt-get install -y redpanda
           redpanda --version
 
