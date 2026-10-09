@@ -21,11 +21,13 @@ import (
 //     held k records of an identity, the first k replayed records of it are dropped and the rest
 //     appended. Records this catch-up appends never count as already held. The count of an
 //     identity is read when the catch-up first meets it -- before it can have appended any -- by
-//     an exact query; a catch-up that runs past probeBudget queries is a full replay, and the sink
-//     then loads every identity count this schedd has in the hub archive once (one projected scan
-//     of the schedd's rows) and checks the rest in memory. A query per record costs about a
-//     millisecond -- the archive's active segment is scanned, not indexed -- which is fine for a
-//     resume's overlap and hours for a replay of a million records;
+//     an exact query. A Reset replay that runs past probeBudget queries then loads every identity
+//     count this schedd has in the hub archive once (one projected scan of the schedd's rows) and
+//     checks the rest in memory. A query per record costs about a millisecond -- the archive's
+//     active segment is scanned, not indexed -- which is fine for a resume's overlap and hours for
+//     a replay of a million records. A resume's catch-up is always probed: it re-delivers only the
+//     overlap since the committed cursor (after a WatchResync, up to the spoke's watch buffer), and
+//     loading the AP's whole history for that would cost more than the probes;
 //   - live-tail records are new by construction and are appended without a probe;
 //   - a record with no identity is appended and counted (it cannot be deduplicated).
 //
@@ -52,7 +54,8 @@ type archiveSink struct {
 	// syncData makes every append so far durable; Flush calls it once, before committing the
 	// cursor. See archiveSync. A seam for the ordering test.
 	syncData func() error
-	probes   int // exact probes made this catch-up
+	full     bool // this catch-up is a Reset replay of everything the spoke retains
+	probes   int  // exact probes made this catch-up
 	// remaining maps an identity digest to how many records of it the hub held before this
 	// catch-up that the catch-up has not yet matched. An identity absent from it has not been
 	// looked up yet -- unless setLoaded, when it was loaded and the hub held none.
@@ -87,8 +90,8 @@ func archiveSync(_ *db.ArchiveTable) func() error {
 	return func() error { return nil }
 }
 
-// probeBudget is how many records of a catch-up are checked by exact query before the sink loads
-// the identity set instead.
+// probeBudget is how many records of a Reset replay are checked by exact query before the sink
+// loads the identity set instead.
 const probeBudget = 256
 
 // BeginSession starts from the committed cursor: a cursor a failed session left uncommitted is
@@ -111,11 +114,11 @@ func (s *archiveSink) fail(err error) error {
 }
 
 func (s *archiveSink) startCatchup() {
-	s.catchup, s.probes, s.remaining, s.setLoaded = true, 0, map[[16]byte]int{}, false
+	s.catchup, s.full, s.probes, s.remaining, s.setLoaded = true, false, 0, map[[16]byte]int{}, false
 }
 
 func (s *archiveSink) endCatchup() {
-	s.catchup, s.probes, s.remaining, s.setLoaded = false, 0, nil, false
+	s.catchup, s.full, s.probes, s.remaining, s.setLoaded = false, false, 0, nil, false
 }
 
 func (s *archiveSink) Apply(c replicate.Change) error {
@@ -152,6 +155,7 @@ func (s *archiveSink) apply(c replicate.Change) error {
 		s.metrics.EventsApplied.WithLabelValues(s.table, "upsert").Inc()
 	case replicate.KindReset:
 		s.startCatchup() // a replay of everything retained: all of it may already be here
+		s.full = true
 		s.metrics.Resets.WithLabelValues(s.table).Inc()
 		if s.onReset != nil {
 			s.onReset()
@@ -183,7 +187,7 @@ func (s *archiveSink) held(c replicate.Change) (bool, error) {
 	d := id.digest()
 	n, known := s.remaining[d]
 	if !known && !s.setLoaded {
-		if s.probes >= probeBudget {
+		if s.full && s.probes >= probeBudget {
 			if err := s.loadIdentities(); err != nil {
 				return false, err
 			}

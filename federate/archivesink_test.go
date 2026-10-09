@@ -347,3 +347,65 @@ func TestHistoryReplayCountsIdentity(t *testing.T) {
 		t.Errorf("job 2.0: %d records, want 1", n)
 	}
 }
+
+// TestResumeCatchupProbesWithoutLoadingSet: a resume's catch-up re-delivers at most the overlap
+// since the committed cursor (after a WatchResync, up to the spoke's watch buffer of ~1024 events),
+// so it is probed record by record however long it runs -- loading the AP's whole identity set is
+// for a Reset's full replay only. It still dedups exactly, repeated identities included.
+func TestResumeCatchupProbesWithoutLoadingSet(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	ep := hubArchive(t, cat, TableEpochHistory)
+	m := NewMetrics()
+	s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, m, discard, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := func(i int) replicate.Change {
+		return upsert("e", parseAd(t, fmt.Sprintf(`GlobalJobId = "ap1#%d.0#1"; RunInstanceID = 0; EpochAdType = "EPOCH"`, i)))
+	}
+	// Live: records 1..n and one CHECKPOINT; none committed a cursor past "s0".
+	n := probeBudget + 44
+	s.BeginSession()
+	apply(t, s, reset(), synced("s0"))
+	for i := 1; i <= n; i++ {
+		apply(t, s, rec(i))
+	}
+	apply(t, s, checkpointRec(t, 1))
+	s.EndSession()
+
+	// Resume from s0: the overlap re-delivers all of it, then two more CHECKPOINTs and one new
+	// record.
+	s.BeginSession()
+	for i := 1; i <= n; i++ {
+		apply(t, s, rec(i))
+	}
+	apply(t, s, checkpointRec(t, 1), checkpointRec(t, 2), checkpointRec(t, 3), rec(n+1))
+	if s.setLoaded {
+		t.Error("a resume catch-up loaded the identity set")
+	}
+	apply(t, s, synced("s1"))
+	s.EndSession()
+	if got := countArchive(t, ep, `true`); got != n+4 {
+		t.Fatalf("hub holds %d records, want %d", got, n+4)
+	}
+	if v := val(m.DedupHits.WithLabelValues(TableEpochHistory)); v != float64(n+1) {
+		t.Errorf("dedup_hits = %v, want %d", v, n+1)
+	}
+}
+
+// TestResetReplayLoadsSet: a Reset replay past the probe budget does load the set.
+func TestResetReplayLoadsSet(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, NewMetrics())
+	s.BeginSession()
+	apply(t, s, reset())
+	for i := 1; i <= probeBudget+1; i++ {
+		apply(t, s, upsert("r", histRecord(t, "ap1", i)))
+	}
+	if !s.setLoaded {
+		t.Error("a Reset replay past the probe budget did not load the identity set")
+	}
+}
