@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -54,15 +53,15 @@ func TestDiscoveryPairsByName(t *testing.T) {
 			scheddAd(t, "ap2.example.org", "<10.0.0.2:9618>"),
 		},
 		dbs: []*classad.ClassAd{
-			// alias matches the claimed host
+			// the claimed host resolves to the spoke's primary address
 			spokeAd(t, "db1", "<10.0.0.1:9620?alias=ap1.example.org>", "ap1.example.org", true, true),
-			// no alias, but shares the schedd's IP
 			spokeAd(t, "db2", "<10.0.0.2:9620>", "ap2.example.org", true, true),
 			// claims a schedd outside the AP set: ignored, not rejected
 			spokeAd(t, "db9", "<10.0.0.9:9620>", "ap9.example.org", true, true),
 		},
 	}
-	d := &Discovery{Collector: fc, ScheddConstraint: `true`, Resolve: noResolve}
+	d := &Discovery{Collector: fc, ScheddConstraint: `true`,
+		Resolve: resolveMap(map[string][]string{"ap1.example.org": {"10.0.0.1"}, "ap2.example.org": {"10.0.0.2"}})}
 	snap, err := d.Discover(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +118,8 @@ func TestDiscoveryRejectsHostMismatch(t *testing.T) {
 func TestDiscoveryHATie(t *testing.T) {
 	sd := []*classad.ClassAd{scheddAd(t, "ap1.example.org", "<10.0.0.1:9618>")}
 	run := func(a, b *classad.ClassAd) Snapshot {
-		d := &Discovery{Collector: &fakeCollector{schedds: sd, dbs: []*classad.ClassAd{a, b}}, ScheddConstraint: `true`, Resolve: noResolve}
+		d := &Discovery{Collector: &fakeCollector{schedds: sd, dbs: []*classad.ClassAd{a, b}}, ScheddConstraint: `true`,
+			Resolve: resolveMap(map[string][]string{"ap1.example.org": {"10.0.0.1"}})}
 		snap, err := d.Discover(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -187,15 +187,15 @@ func TestDiscoveryConstraintAndStatic(t *testing.T) {
 	}
 }
 
-func TestSinfulHosts(t *testing.T) {
-	got := sinfulHosts("<10.0.0.1:9618?addrs=10.0.0.1-9618+[2001:db8::1]-9618&alias=AP1.example.org&sock=schedd_1>")
-	var keys []string
-	for k := range got {
-		keys = append(keys, k)
-	}
-	for _, want := range []string{"10.0.0.1", "2001:db8::1", "ap1.example.org"} {
-		if !got[want] {
-			t.Errorf("missing %s in %s", want, strings.Join(keys, ","))
+func TestPrimaryHost(t *testing.T) {
+	for in, want := range map[string]string{
+		"<10.0.0.1:9618?addrs=10.0.0.9-9618&alias=AP9.example.org&sock=schedd_1>": "10.0.0.1",
+		"<[2001:db8::1]:9618>":   "2001:db8::1",
+		"<AP1.Example.org:9618>": "ap1.example.org",
+		"":                       "",
+	} {
+		if got := primaryHost(in); got != want {
+			t.Errorf("primaryHost(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

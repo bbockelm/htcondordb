@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/url"
 	"sort"
 	"strings"
 
@@ -222,12 +221,12 @@ func spokeInfos(ads []*classad.ClassAd) []spokeInfo {
 
 // pair validates each spoke's claim and picks one spoke per matched schedd.
 //
-// A claim is accepted only when the host in MirroredScheddName (the part after '@', or the whole
-// name) is where the spoke itself runs -- its address's host or alias, or an address that host
-// name resolves to -- or when the spoke shares a host with the schedd's own advertised address.
-// Without that check a misconfigured or hostile spoke could publish rows under another AP's name.
-// Two valid claimants for one schedd (an HA pair) are resolved by preferring the one that is
-// syncing and caught up; on a tie the schedd is declined rather than guessed.
+// A claim is accepted only when the spoke's primary address is the claimed schedd's host (see
+// hostValid). This is a guard against misconfiguration -- a spoke on one host claiming another's
+// schedd would publish rows under that AP's name -- not authentication: every input comes from
+// collector ads, which their advertisers write. Two valid claimants for one schedd (an HA pair) are
+// resolved by preferring the one that is syncing and caught up; on a tie the schedd is declined
+// rather than guessed.
 func pair(ctx context.Context, schedds map[string]scheddInfo, spokes []spokeInfo, resolve func(context.Context, string) ([]string, error)) (accepted map[string]Spoke, rejected []Rejection, untrusted, declined map[string]string) {
 	accepted, untrusted, declined = map[string]Spoke{}, map[string]string{}, map[string]string{}
 	valid := map[string][]spokeInfo{}
@@ -276,34 +275,37 @@ func pair(ctx context.Context, schedds map[string]scheddInfo, spokes []spokeInfo
 	return accepted, rejected, untrusted, declined
 }
 
-// hostValid checks a spoke's claim to mirror schedd sd. It returns a description of the mismatch
-// when the claim fails.
+// hostValid checks a spoke's claim to mirror schedd sd: the host of the spoke's PRIMARY address
+// (the host:port of its sinful string) must be the schedd's host -- the host part of its Name -- by
+// name, or be an address the hub's resolver returns for that name. It returns a description of the
+// mismatch when the claim fails.
+//
+// Nothing else counts. A sinful string's alias= and addrs= parameters are written by the spoke
+// itself, so a spoke anywhere could name the AP there; and an address the spoke shares with the
+// schedd's advertised one proves nothing when it is private (two APs behind different NATs or CCB
+// can both be 172.17.0.2). A spoke that cannot pass -- one reached only through CCB or NAT, or whose
+// primary address is not what its AP's name resolves to -- is paired statically
+// (HTCONDORDB_FEDERATE_SPOKES).
 func hostValid(ctx context.Context, sp spokeInfo, sd scheddInfo, resolve func(context.Context, string) ([]string, error)) (string, bool) {
-	claimed := strings.ToLower(hostPart(sp.mirrored))
-	spokeHosts := sinfulHosts(sp.address)
-	if spokeHosts[claimed] {
+	claimed := strings.ToLower(hostPart(sd.name))
+	primary := primaryHost(sp.address)
+	if primary == "" {
+		return fmt.Sprintf("spoke address %q has no host", sp.address), false
+	}
+	if claimed != "" && primary == claimed {
 		return "", true
 	}
-	for h := range sinfulHosts(sd.address) {
-		if spokeHosts[h] {
-			return "", true
-		}
-	}
-	if resolve != nil && claimed != "" {
+	ip := net.ParseIP(primary)
+	if ip != nil && resolve != nil && claimed != "" {
 		if addrs, err := resolve(ctx, claimed); err == nil {
 			for _, a := range addrs {
-				if spokeHosts[strings.ToLower(a)] {
+				if other := net.ParseIP(a); other != nil && other.Equal(ip) {
 					return "", true
 				}
 			}
 		}
 	}
-	hosts := make([]string, 0, len(spokeHosts))
-	for h := range spokeHosts {
-		hosts = append(hosts, h)
-	}
-	sort.Strings(hosts)
-	return fmt.Sprintf("MirroredScheddName host %q is not the spoke's host (%s)", claimed, strings.Join(hosts, ", ")), false
+	return fmt.Sprintf("the spoke's primary address host %q is not %q or an address it resolves to", primary, claimed), false
 }
 
 // hostPart is HTCondor's get_host_part: what follows the last '@', or the whole name.
@@ -314,31 +316,13 @@ func hostPart(name string) string {
 	return name
 }
 
-// sinfulHosts returns the hosts a sinful string names, lowercased: its primary host, its alias
-// parameter, and every address in its addrs parameter.
-func sinfulHosts(sinful string) map[string]bool {
-	out := map[string]bool{}
+// primaryHost returns the host of a sinful string's primary address, lowercased: "<10.0.0.1:9618?...>"
+// is "10.0.0.1", "<[2001:db8::1]:9618>" is "2001:db8::1". Its parameters are ignored.
+func primaryHost(sinful string) string {
 	s := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(sinful), "<"), ">")
-	if s == "" {
-		return out
-	}
-	hostport, query, _ := strings.Cut(s, "?")
+	hostport, _, _ := strings.Cut(s, "?")
 	if h, _, err := net.SplitHostPort(hostport); err == nil {
-		out[strings.ToLower(h)] = true
-	} else if hostport != "" {
-		out[strings.ToLower(hostport)] = true
+		return strings.ToLower(h)
 	}
-	if q, err := url.ParseQuery(query); err == nil {
-		if a := q.Get("alias"); a != "" {
-			out[strings.ToLower(a)] = true
-		}
-		// '+' separates addrs entries; ParseQuery has already decoded it to a space.
-		for _, a := range strings.FieldsFunc(q.Get("addrs"), func(r rune) bool { return r == '+' || r == ' ' }) {
-			// "10.0.0.1-9618" or "[::1]-9618"
-			if i := strings.LastIndexByte(a, '-'); i > 0 {
-				out[strings.ToLower(strings.Trim(a[:i], "[]"))] = true
-			}
-		}
-	}
-	return out
+	return strings.ToLower(strings.Trim(hostport, "[]"))
 }

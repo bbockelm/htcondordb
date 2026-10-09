@@ -48,7 +48,8 @@ Enable a hub with either or both of:
 # Discover the AP set from the collector (COLLECTOR_HOST).
 HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT = regexp("^ap[0-9]+\\.example\\.org$", Name)
 
-# Or name spokes explicitly. Static spokes skip host validation: the admin asserted them.
+# Or name spokes explicitly. Static spokes skip host validation: the admin asserted them. Use them
+# for spokes behind CCB or NAT, and on networks where collector ads cannot be trusted.
 HTCONDORDB_FEDERATE_SPOKES = ap1 ap2
 HTCONDORDB_FEDERATE_SPOKE_AP1_ADDRESS = <10.0.0.1:9620>
 HTCONDORDB_FEDERATE_SPOKE_AP1_SCHEDD  = ap1.example.org
@@ -82,12 +83,24 @@ Every `HTCONDORDB_FEDERATE_DISCOVER_INTERVAL` the hub queries the collector for 
 matching the constraint, for all ScheddAds (to tell "no longer matches" from "gone"), and for
 `HTCondorDB` ads carrying `MirroredScheddName`. It pairs them by name:
 
-- **Validation.** A spoke's claim is accepted only if the host in `MirroredScheddName` (the part
-  after `@`) is the spoke's own host -- its address, its `alias`, or an address that name
-  resolves to -- or the spoke shares a host with the schedd's advertised address. A spoke on
-  another host claiming an AP is rejected and logged (`rejected_spokes_total{reason="host_mismatch"}`);
-  a schedd whose every claimant was rejected is reported `untrusted`. Without this check a
-  misconfigured or hostile spoke could publish rows under another AP's name. Static spokes skip it.
+- **Validation.** A spoke's claim is accepted only if the host of the spoke's *primary* address
+  (`MyAddress`'s host:port, not its `alias=` or `addrs=` parameters) is the schedd's host -- the
+  part of its `Name` after `@` -- by name, or is an address the hub's resolver returns for that
+  name. A spoke on another host claiming an AP is rejected and logged
+  (`rejected_spokes_total{reason="host_mismatch"}`); a schedd whose every claimant was rejected is
+  reported `untrusted`. Static spokes skip it.
+
+  This is a guard against misconfiguration -- a spoke copied to another host still claiming its
+  old AP -- **not authentication**. Every input is a collector ad, written by whoever advertised
+  it: a host that may advertise to the collector can claim to be any spoke. Alias and `addrs`
+  parameters are not consulted because the spoke writes them itself, and an address shared with the
+  schedd's is not consulted because private addresses repeat across hosts (two APs behind
+  different NATs can both be `172.17.0.2`). Consequences:
+  - A spoke reached only through CCB or NAT, or whose primary address is not what its AP's name
+    resolves to on the hub, fails validation: pair it statically (`HTCONDORDB_FEDERATE_SPOKES`).
+  - On a network where advertising cannot be trusted, use static spokes only (no constraint), and
+    restrict who may advertise to the collector (`ALLOW_ADVERTISE_*` / `ALLOW_DAEMON` on the
+    collector).
 - **HA pairs.** Two valid spokes claiming one schedd: the one reporting `Syncing` and caught up
   wins; if both or neither are, the hub declines rather than guess (`reason="ha_tie"`).
 - A failed collector query is not an empty AP set: the constraint's part of the pass is skipped.
