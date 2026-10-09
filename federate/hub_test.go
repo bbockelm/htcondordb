@@ -244,7 +244,11 @@ func TestAbsentIsNotRetiredAndLastSeenPersists(t *testing.T) {
 
 	// Seven days unseen while the hub runs: retired.
 	clock.advance(6 * 24 * time.Hour)
-	waitFor(t, "ap1 retired", func() bool { _, ok := sourceRow(cat, "ap1"); return !ok })
+	// The row goes before the counter moves (retire increments once everything is deleted).
+	waitFor(t, "ap1 retired", func() bool {
+		_, ok := sourceRow(cat, "ap1")
+		return !ok && val(hub.hub.Metrics().Retired) == 1
+	})
 	if n := scheddRows(t, cat, TableJobs, "ap1"); n != 0 {
 		t.Errorf("retired source kept %d jobs rows", n)
 	}
@@ -405,13 +409,12 @@ func TestStalenessThroughHeartbeats(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The live staleness is the summary's (the row's StalenessSeconds is refreshed coarsely).
 	staleSecs := func() int64 {
-		row, ok := sourceRow(cat, "ap1")
-		if !ok {
-			return -1
+		if sum := hub.hub.Summary(); sum != nil && sum.MaxStalenessKnown {
+			return sum.MaxStaleness
 		}
-		v, _ := row.EvaluateAttrInt("StalenessSeconds")
-		return v
+		return -1
 	}
 	// Ten minutes of an idle queue, heartbeating every 5s.
 	for seq := 1; seq <= 120; seq++ {
@@ -426,9 +429,16 @@ func TestStalenessThroughHeartbeats(t *testing.T) {
 	first := staleSecs()
 	clock.advance(time.Minute)
 	waitFor(t, "staleness grows", func() bool { return staleSecs() == first+60 })
-	if s := hub.hub.Summary(); s == nil || s.Stale != 1 || !s.MaxStalenessKnown || s.MaxStaleness != first+60 {
+	if s := hub.hub.Summary(); s == nil || s.Stale != 1 {
 		t.Errorf("summary = %+v", s)
 	}
+	// The row's StalenessSeconds is at most sourceRowRefresh behind.
+	clock.advance(sourceRowRefresh)
+	waitFor(t, "row staleness refreshed", func() bool {
+		row, ok := sourceRow(cat, "ap1")
+		v, _ := row.EvaluateAttrInt("StalenessSeconds")
+		return ok && v >= first+60
+	})
 }
 
 // TestCatchingUpSpokeIsStale: a spoke replaying a large backlog heartbeats on time and its tailer
@@ -470,8 +480,9 @@ func TestCatchingUpSpokeIsStale(t *testing.T) {
 			return false
 		}
 		st, _ := row.EvaluateAttrString("State")
-		secs, _ := row.EvaluateAttrInt("StalenessSeconds")
+		// The live staleness is the summary's (the row's StalenessSeconds is refreshed coarsely):
 		// 295s behind at the last heartbeat, 5s since it arrived, plus the 5s interval.
-		return st == StateStale && secs == 295+5+5
+		sum := hub.hub.Summary()
+		return st == StateStale && sum != nil && sum.MaxStalenessKnown && sum.MaxStaleness == 295+5+5
 	})
 }

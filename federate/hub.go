@@ -115,7 +115,8 @@ type source struct {
 	retiringSince     time.Time
 	rows              map[string]int64
 	runners           map[string]*runnerHandle
-	lastRow           *classad.ClassAd
+	lastStable        *classad.ClassAd // the last written row without its volatile fields
+	lastWrite         time.Time        // when it was written (hub clock)
 }
 
 type runnerHandle struct {
@@ -756,6 +757,7 @@ func (h *Hub) refreshState() {
 	}
 	h.resetMu.Unlock()
 
+	var rows []pendingRow
 	for schedd, s := range h.sources {
 		if t, ok := resets[schedd]; ok && t.After(s.lastReset) {
 			s.lastReset = t
@@ -763,7 +765,7 @@ func (h *Hub) refreshState() {
 		var stale int64
 		staleKnown := false
 		if hb != nil {
-			if row, ok := hb.lookup(HubKey(schedd, syncstatus.Key)); ok {
+			if row, ok := hb.lookup(HubKey(s.schedd, syncstatus.Key)); ok {
 				stale, staleKnown = staleness(row, now)
 			}
 		}
@@ -783,18 +785,30 @@ func (h *Hub) refreshState() {
 			sum.Retiring++
 		}
 		if staleKnown && state != StateRetiring {
-			known[schedd] = float64(stale)
+			known[s.schedd] = float64(stale)
 			if !sum.MaxStalenessKnown || stale > sum.MaxStaleness {
 				sum.MaxStaleness, sum.MaxStalenessKnown = stale, true
 			}
 		}
-		h.writeSourceRow(s, state, reason, stale, staleKnown)
+		rows = append(rows, pendingRow{s, state, reason, stale, staleKnown})
 	}
+	// Summary and metrics before the rows: a reader that sees a row change sees a summary at least
+	// as new.
 	for st, n := range byState {
 		h.metrics.SourcesByState.WithLabelValues(st).Set(n)
 	}
 	h.metrics.setStaleness(known)
 	h.summary.Store(sum)
+	for _, r := range rows {
+		h.writeSourceRow(r.s, r.state, r.reason, r.stale, r.staleKnown, now)
+	}
+}
+
+type pendingRow struct {
+	s             *source
+	state, reason string
+	stale         int64
+	staleKnown    bool
 }
 
 func (h *Hub) logRetire(schedd, why string) error {
@@ -876,7 +890,9 @@ func (h *Hub) stateOf(s *source, stale int64, staleKnown bool, fresh int64) (str
 	case stale <= fresh:
 		return StateFresh, ""
 	default:
-		return StateStale, fmt.Sprintf("staleness %ds exceeds %ds", stale, fresh)
+		// No number that moves every pass: the reason is persisted, and only a change of state or
+		// reason rewrites the row. StalenessSeconds carries the amount.
+		return StateStale, fmt.Sprintf("staleness exceeds %ds", fresh)
 	}
 }
 
@@ -895,62 +911,77 @@ func tablePrefix(table string) string {
 	return table
 }
 
-// writeSourceRow persists s's federation_sources row when it changed.
-func (h *Hub) writeSourceRow(s *source, state, reason string, stale int64, staleKnown bool) {
-	ad := classad.New()
-	ad.InsertAttrString(ScheddNameAttr, s.schedd)
-	ad.InsertAttrString("State", state)
-	if reason != "" {
-		ad.InsertAttrString("Reason", reason)
-	}
-	if staleKnown {
-		ad.InsertAttr("StalenessSeconds", stale)
-	}
-	putTime := func(name string, t time.Time) {
-		if !t.IsZero() {
-			ad.InsertAttr(name, t.Unix())
-		}
-	}
-	putTime("LastSeen", lastSeen(s))
-	putTime("LastCollectorSeen", s.lastCollectorSeen)
-	putTime("LastContact", s.lastContact)
-	putTime("LastReset", s.lastReset)
-	putTime("RetiringSince", s.retiringSince)
-	if s.spokeAddress != "" {
-		ad.InsertAttrString("SpokeAddress", s.spokeAddress)
-	}
-	if s.spokeName != "" {
-		ad.InsertAttrString("SpokeName", s.spokeName)
-	}
-	ad.InsertAttrBool("Static", s.static)
+// sourceRowRefresh bounds how often a federation_sources row is rewritten for its volatile fields
+// alone (StalenessSeconds, LastSeen, LastCollectorSeen, LastContact): they move on every state pass for a connected source, and rewriting every
+// row every few seconds sent each watcher an event per source per pass. A change to any other field
+// -- State, Reason, a stream connecting or failing, row counts -- is written at once. The collector-ad summary and /metrics carry the live values.
+const sourceRowRefresh = time.Minute
+
+// writeSourceRow persists s's federation_sources row when a stable field changed, or its volatile
+// fields when the row is older than sourceRowRefresh.
+func (h *Hub) writeSourceRow(s *source, state, reason string, stale int64, staleKnown bool, now time.Time) {
 	tables := append([]string(nil), h.tables...)
 	sort.Strings(tables)
-	for _, t := range tables {
-		p := tablePrefix(t)
-		rh, ok := s.runners[t]
-		var st cedarsync.Status
-		if ok {
-			st = rh.runner.Status()
-		}
-		ad.InsertAttrBool(p+"Connected", st.Connected)
-		if st.LastError != "" {
-			ad.InsertAttrString(p+"LastError", st.LastError)
-			putTime(p+"LastErrorTime", st.LastErrorTime)
-		}
-		if n, ok := s.rows[t]; ok {
-			ad.InsertAttr(p+"Rows", n)
-		}
+	statuses := map[string]cedarsync.Status{}
+	for t, rh := range s.runners {
+		statuses[t] = rh.runner.Status()
 	}
-	if s.lastRow != nil && s.lastRow.Equal(ad) {
+	build := func(volatile bool) *classad.ClassAd {
+		ad := classad.New()
+		putTime := func(name string, t time.Time) {
+			if !t.IsZero() {
+				ad.InsertAttr(name, t.Unix())
+			}
+		}
+		ad.InsertAttrString(ScheddNameAttr, s.schedd)
+		ad.InsertAttrString("State", state)
+		if reason != "" {
+			ad.InsertAttrString("Reason", reason)
+		}
+		if volatile { // sourceVolatile
+			if staleKnown {
+				ad.InsertAttr("StalenessSeconds", stale)
+			}
+			putTime("LastSeen", lastSeen(s))
+			putTime("LastCollectorSeen", s.lastCollectorSeen)
+			putTime("LastContact", s.lastContact)
+		}
+		putTime("LastReset", s.lastReset)
+		putTime("RetiringSince", s.retiringSince)
+		if s.spokeAddress != "" {
+			ad.InsertAttrString("SpokeAddress", s.spokeAddress)
+		}
+		if s.spokeName != "" {
+			ad.InsertAttrString("SpokeName", s.spokeName)
+		}
+		ad.InsertAttrBool("Static", s.static)
+		for _, t := range tables {
+			p := tablePrefix(t)
+			st := statuses[t]
+			ad.InsertAttrBool(p+"Connected", st.Connected)
+			if st.LastError != "" {
+				// The error, not its time: a stream retrying against a down spoke fails anew
+				// every backoff, and only a different error is news.
+				ad.InsertAttrString(p+"LastError", st.LastError)
+			}
+			if n, ok := s.rows[t]; ok {
+				ad.InsertAttr(p+"Rows", n)
+			}
+		}
+		return ad
+	}
+	stable := build(false)
+	if s.lastStable != nil && s.lastStable.Equal(stable) && now.Sub(s.lastWrite) < sourceRowRefresh &&
+		now.Sub(s.lastWrite) >= 0 {
 		return
 	}
 	tx := h.ht.sources.Begin()
-	tx.NewClassAd(foldName(s.schedd), ad)
+	tx.NewClassAd(foldName(s.schedd), build(true))
 	if err := tx.Commit(); err != nil {
 		h.log.Warn("federate: writing federation_sources row failed", "schedd", s.schedd, "err", err.Error())
 		return
 	}
-	s.lastRow = ad
+	s.lastStable, s.lastWrite = stable, now
 }
 
 // loadSources restores the persisted source set, so a hub restarting while the collector is empty

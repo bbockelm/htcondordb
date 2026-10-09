@@ -181,6 +181,12 @@ and the last live stream), `LastCollectorSeen`, `LastContact`, `LastReset`, `Ret
 `SpokeAddress`, `SpokeName`, `Static`, and per table `<Table>Connected`, `<Table>LastError`,
 `<Table>Rows` (where an index can count them).
 
+A row is rewritten as soon as anything but its clock-driven fields changes -- `State`, `Reason`, a
+stream connecting or failing, a row count. `StalenessSeconds`, `LastSeen`, `LastCollectorSeen` and
+`LastContact` move on every state pass, so on their own they are refreshed at most once a minute:
+a watcher of `federation_sources` sees state changes promptly without an event per source every few
+seconds. The collector ad's summary and `/metrics` carry the live values.
+
 - A schedd missing from the collector is **absent**: its rows are kept and its streams keep
   running against the last validated spoke address. A collector restart makes every AP vanish at
   once; nothing is deleted for it.
