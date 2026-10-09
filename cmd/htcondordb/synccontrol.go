@@ -153,8 +153,22 @@ func (sc *syncController) truncate(ctx context.Context, table string) (string, e
 		defer cancel()
 		return sc.sched.Truncate(tctx, table)
 	}
-	return "", fmt.Errorf("%s; truncating it here would leave it permanently missing those records. %s",
-		sc.describe(table, owners), sc.releaseHint(owners))
+	return "", fmt.Errorf("%s", joinSentences(sc.describe(table, owners)+
+		"; truncating it here would leave it permanently missing those records", sc.releaseHint(owners)))
+}
+
+// joinSentences joins the non-empty sentences, each ending in one period.
+func joinSentences(parts ...string) string {
+	var out []string
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			if !strings.HasSuffix(p, ".") {
+				p += "."
+			}
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 // rotate enforces an owned archive's retention now -- what the periodic archive maintenance does
@@ -235,7 +249,7 @@ func (sc *syncController) ownerNote(table string) string {
 	if len(owners) == 0 {
 		return fmt.Sprintf("table %q is not owned by a writer in this daemon", table)
 	}
-	return sc.describe(table, owners) + "; clients may read and watch it but not modify it. " + sc.insteadHint(owners)
+	return joinSentences(sc.describe(table, owners)+"; clients may read and watch it but not modify it", sc.insteadHint(owners))
 }
 
 // describe says which writer(s) maintain table.
@@ -249,6 +263,8 @@ func (sc *syncController) describe(table string, owners []string) string {
 			parts = append(parts, fmt.Sprintf("replication (HTCONDORDB_REPLICATE_SOURCES: %s)", orUnknown(sc.ced.SourcesFor(table))))
 		case ownerHistoryImport:
 			parts = append(parts, fmt.Sprintf("history import (HTCONDORDB_HISTORY_IMPORT jobs: %s)", orUnknown(sc.imp.JobsFor(table))))
+		case ownerFederation:
+			parts = append(parts, "the federation hub (replicated from its spokes; HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT / HTCONDORDB_FEDERATE_SPOKES)")
 		default:
 			parts = append(parts, o)
 		}
@@ -262,7 +278,7 @@ func (sc *syncController) insteadHint(owners []string) string {
 		return "Use `.resync <jobs|history|epoch>` to rebuild it from the schedd's files, or `.truncate`/`.rotate`/`.retention` " +
 			"(routed through schedd sync); to write it yourself, use another table."
 	}
-	return "`.rotate` and `.retention` still work (routed through the daemon). " + sc.releaseHint(owners)
+	return joinSentences("`.rotate` and `.retention` still work (routed through the daemon)", sc.releaseHint(owners))
 }
 
 // releaseHint says how to take a table back from a replication/import owner.
@@ -274,10 +290,17 @@ func (sc *syncController) releaseHint(owners []string) string {
 	if slices.Contains(owners, ownerHistoryImport) {
 		steps = append(steps, "remove its job from HTCONDORDB_HISTORY_IMPORT (and delete $(LOG)/history-import-<job>.cursors.json to import it again from the start)")
 	}
-	if len(steps) == 0 {
-		return ""
+	var hint string
+	if len(steps) > 0 {
+		hint = "To modify it, first " + strings.Join(steps, " and ") + ", then condor_reconfig; the table is then an ordinary table."
 	}
-	return "To modify it, first " + strings.Join(steps, " and ") + ", then condor_reconfig; the table is then an ordinary table."
+	if slices.Contains(owners, ownerFederation) {
+		// A hub's table is rebuilt only by its spokes, and a resuming spoke never resends what the
+		// hub's cursor has passed. The per-AP removal is retirement.
+		hint = joinSentences(hint, "To remove one access point's rows, use `.retire <schedd>` (its archive rows age out with retention); "+
+			"to stop federating, remove HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT and HTCONDORDB_FEDERATE_SPOKES and condor_reconfig")
+	}
+	return hint
 }
 
 func orUnknown(ss []string) string {

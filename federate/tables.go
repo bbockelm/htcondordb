@@ -22,6 +22,16 @@ var (
 	epochZones         = []string{"EpochWriteDate", "EnteredHistoryTime"}
 )
 
+// HubTables are the tables a hub federating tables (DefaultTables when empty) writes in process:
+// each federated table plus federation_sources. The daemon registers them as owned, so no remote
+// client can write or drop them under the hub.
+func HubTables(tables []string) []string {
+	if len(tables) == 0 {
+		tables = DefaultTables
+	}
+	return append([]string{TableSources}, tables...)
+}
+
 // ArchiveOptions tunes the hub's archives. Zero values leave the library defaults.
 type ArchiveOptions struct {
 	// ExtraCategorical names more categorical indexes (HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS).

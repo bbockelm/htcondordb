@@ -130,6 +130,11 @@ func (m *cedarSyncManager) apply(cfg *config.Config) error {
 				return fmt.Errorf("HTCONDORDB_REPLICATE_%s_TYPE=%q (want archive or table)", strings.ToUpper(s.Name), s.Type)
 			}
 		}
+		// Claim the new targets while the running replicators hold the old: refused, leaving
+		// them running, when another in-process writer holds a target.
+		if err := m.owners.Claim(ownerReplication, unionTables(m.owners.Held(ownerReplication), next.targets())); err != nil {
+			return fmt.Errorf("cedar-sync: %w", err)
+		}
 	}
 
 	if m.cancel != nil {
@@ -139,8 +144,8 @@ func (m *cedarSyncManager) apply(cfg *config.Config) error {
 	}
 	m.sig = ""
 	m.sources = nil
-	// The replicas belong to replication from here on (or no longer, when disabled): claimed
-	// before the runners create or write them, replacing the previous set in one step.
+	// The replicas belong to replication from here on (or no longer, when disabled): the new set
+	// (claimed above) replaces the previous one before the runners create or write them.
 	m.owners.Set(ownerReplication, next.targets())
 	if !next.enabled {
 		m.logger.Info("cedar-sync: disabled")

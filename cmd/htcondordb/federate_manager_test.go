@@ -61,7 +61,7 @@ HTCONDORDB_HISTORY_MAX_BYTES = 10 GB
 func TestFederationRefusesScheddSync(t *testing.T) {
 	cfg := mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nJOB_QUEUE_LOG = /nonexistent\n"+
 		"HTCONDORDB_FEDERATE_SPOKES = ap1\nHTCONDORDB_FEDERATE_SPOKE_AP1_ADDRESS = <127.0.0.1:1>\n")
-	m := newFederationManager(t.Context(), nil, discardLogger())
+	m := newFederationManager(t.Context(), nil, nil, discardLogger())
 	err := m.apply(cfg)
 	if err == nil || !strings.Contains(err.Error(), "HTCONDORDB_SYNC_SCHEDD") {
 		t.Fatalf("hub apply with schedd sync on: err = %v", err)
@@ -73,7 +73,7 @@ func TestFederationRefusesScheddSync(t *testing.T) {
 }
 
 func TestSyncControlRetireNotHub(t *testing.T) {
-	sc := &syncController{fed: newFederationManager(t.Context(), nil, discardLogger())}
+	sc := &syncController{fed: newFederationManager(t.Context(), nil, nil, discardLogger())}
 	req := classad.New()
 	req.InsertAttrString("Action", "retire")
 	req.InsertAttrString("Target", "ap1")

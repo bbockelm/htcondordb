@@ -360,6 +360,10 @@ func run() error {
 	// history file into a "history" archive table (a read model of the schedd's state).
 	// The manager (re)starts the tailers so a JOB_QUEUE_LOG / HISTORY /
 	// HTCONDORDB_SYNC_SCHEDD change takes effect on condor_reconfig without a restart.
+	// The in-process writers below each own their tables (server.TableOwners), and no table may
+	// have two. A reconfigure that moves a table from one writer to another is refused for the
+	// taker while the giver still holds it; ownerRetry re-applies the taker at the end.
+	var ownerRetry reconfigRetry
 	syncMgr := &scheddSyncManager{parent: ctx, svc: svc, logger: d.Slog()}
 	// Stop the tailers (and WAIT for them) before svc.Close runs: a tailer
 	// mid-commit writes the collections' mmap'd segments, which Close munmaps --
@@ -370,7 +374,7 @@ func run() error {
 		return serr
 	}
 	d.OnReconfig(func(newCfg *config.Config) {
-		if serr := syncMgr.apply(newCfg); serr != nil {
+		if serr := ownerRetry.run("schedd-sync", newCfg, syncMgr.apply); serr != nil {
 			log.Error(logging.DestinationGeneral, "reconfigure: schedd-sync not reapplied", "err", serr.Error())
 			return
 		}
@@ -415,7 +419,7 @@ func run() error {
 		return cerr
 	}
 	d.OnReconfig(func(newCfg *config.Config) {
-		if cerr := cedarMgr.apply(newCfg); cerr != nil {
+		if cerr := ownerRetry.run("cedar-sync", newCfg, cedarMgr.apply); cerr != nil {
 			log.Error(logging.DestinationGeneral, "reconfigure: cedar-sync not reapplied", "err", cerr.Error())
 		}
 	})
@@ -423,14 +427,14 @@ func run() error {
 	// Federation hub (federate): fan the spokes of an AP set -- schedds matching
 	// HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT and/or static HTCONDORDB_FEDERATE_SPOKES -- into this
 	// catalog. Reapplied on reconfigure. Off unless one of those is set; refused alongside schedd sync.
-	fedMgr := newFederationManager(ctx, svc.Catalog(), d.Slog())
+	fedMgr := newFederationManager(ctx, svc.Catalog(), svc.Owners(), d.Slog())
 	// An in-process writer like syncMgr: stop-and-wait before svc.Close munmaps.
 	defer fedMgr.Stop()
 	if ferr := fedMgr.apply(cfg); ferr != nil {
 		return ferr
 	}
 	d.OnReconfig(func(newCfg *config.Config) {
-		if ferr := fedMgr.apply(newCfg); ferr != nil {
+		if ferr := ownerRetry.run("federation hub", newCfg, fedMgr.apply); ferr != nil {
 			log.Error(logging.DestinationGeneral, "reconfigure: federation hub not reapplied", "err", ferr.Error())
 		}
 	})
@@ -444,8 +448,14 @@ func run() error {
 		return ierr
 	}
 	d.OnReconfig(func(newCfg *config.Config) {
-		if ierr := impMgr.apply(newCfg); ierr != nil {
+		if ierr := ownerRetry.run("importer manager", newCfg, impMgr.apply); ierr != nil {
 			log.Error(logging.DestinationGeneral, "reconfigure: importer manager not reapplied", "err", ierr.Error())
+		}
+	})
+	// Last: the managers refused above because another one still held a table it has now let go.
+	d.OnReconfig(func(newCfg *config.Config) {
+		for name, err := range ownerRetry.flush(newCfg) {
+			log.Error(logging.DestinationGeneral, "reconfigure: "+name+" not reapplied", "err", err.Error())
 		}
 	})
 

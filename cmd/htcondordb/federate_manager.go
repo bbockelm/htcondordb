@@ -8,14 +8,17 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/golang-htcondor/config"
 
 	"github.com/bbockelm/htcondordb/cedarsync"
 	"github.com/bbockelm/htcondordb/dbad"
 	"github.com/bbockelm/htcondordb/federate"
+	"github.com/bbockelm/htcondordb/server"
 )
 
 // federationManager runs this daemon as a federation hub (see the federate package and
@@ -27,8 +30,13 @@ import (
 type federationManager struct {
 	parent  context.Context
 	cat     *db.Catalog
+	owners  *server.TableOwners // the hub's tables are registered here; nil owns nothing
 	logger  *slog.Logger
 	metrics *federate.Metrics // one set for the daemon's lifetime, across hub restarts
+	// cfg is the latest applied configuration. Spoke dials read it when they connect, so a
+	// reconfigure that changes only security settings reaches the next session without a hub
+	// restart.
+	cfg atomic.Pointer[config.Config]
 
 	mu     sync.Mutex
 	hub    *federate.Hub
@@ -37,8 +45,8 @@ type federationManager struct {
 	sig    string
 }
 
-func newFederationManager(parent context.Context, cat *db.Catalog, logger *slog.Logger) *federationManager {
-	return &federationManager{parent: parent, cat: cat, logger: logger, metrics: federate.NewMetrics()}
+func newFederationManager(parent context.Context, cat *db.Catalog, owners *server.TableOwners, logger *slog.Logger) *federationManager {
+	return &federationManager{parent: parent, cat: cat, owners: owners, logger: logger, metrics: federate.NewMetrics()}
 }
 
 // federationSettings is the resolved hub configuration.
@@ -153,16 +161,30 @@ func (m *federationManager) apply(cfg *config.Config) error {
 		return err
 	}
 
+	m.cfg.Store(cfg)
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if next.sig == m.sig && (m.hub != nil) == next.enabled {
 		return nil
 	}
+	var owned []string
+	if next.enabled {
+		owned = federate.HubTables(next.tables)
+		// Claim the new hub's tables while the running hub still holds its own, so a table kept
+		// across the restart is never writable in between. Refused -- leaving the running hub
+		// alone -- when another in-process writer (schedd sync, a replication target) holds one.
+		if err := m.owners.Claim(ownerFederation, unionTables(m.owners.Held(ownerFederation), owned)); err != nil {
+			return fmt.Errorf("federate: %w", err)
+		}
+	}
 	m.stopLocked()
 	if !next.enabled {
+		m.releaseLocked()
 		return nil
 	}
 	if next.posDir == "" {
+		m.releaseLocked()
 		return errors.New("a federation hub needs a persistent database (set HTCONDORDB_DIR or SPOOL): its archives and cursors live on disk")
 	}
 
@@ -175,7 +197,7 @@ func (m *federationManager) apply(cfg *config.Config) error {
 		Tables:           next.tables,
 		Archive:          next.archive,
 		Discovery:        disc,
-		Dial:             func(addr string) cedarsync.Dial { return dbSessionDial(m.parent, cfg, addr, "federate") },
+		Dial:             m.dial,
 		CursorDir:        filepath.Join(next.posDir, "federate"),
 		DiscoverInterval: next.discoverInterval,
 		StateInterval:    next.stateInterval,
@@ -185,14 +207,19 @@ func (m *federationManager) apply(cfg *config.Config) error {
 		Logger:           m.logger,
 	})
 	if err != nil {
+		m.releaseLocked()
 		return err
 	}
+	// The hub's tables are owned from before it creates or writes them: exactly the new set.
+	m.owners.Set(ownerFederation, owned)
 	ctx, cancel := context.WithCancel(m.parent)
 	done := make(chan struct{})
 	go func() {
-		defer close(done)
-		if err := hub.Run(ctx); err != nil {
-			m.logger.Error("federate: hub stopped", "err", err.Error())
+		err := hub.Run(ctx)
+		close(done)
+		if err != nil && ctx.Err() == nil {
+			m.logger.Error("federate: hub stopped; the next reconfigure restarts it", "err", err.Error())
+			m.forget(hub)
 		}
 	}()
 	m.hub, m.cancel, m.done, m.sig = hub, cancel, done, next.sig
@@ -202,8 +229,28 @@ func (m *federationManager) apply(cfg *config.Config) error {
 	return nil
 }
 
+// dial is the hub's spoke dial: a fresh authenticated DBSession per call, with the security
+// configuration current at the time of the call.
+func (m *federationManager) dial(addr string) cedarsync.Dial {
+	return func(ctx context.Context) (*dbrpc.Client, func(), error) {
+		return dbSessionDial(m.parent, m.cfg.Load(), addr, "federate")(ctx)
+	}
+}
+
+// forget clears a hub whose Run returned on its own (it could not open its tables), so the next
+// apply starts a new one instead of finding the configuration unchanged, and `.retire` reports
+// that no hub is running rather than waiting on one that is gone. Its tables stay claimed until
+// that apply: nothing may write them in between.
+func (m *federationManager) forget(hub *federate.Hub) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.hub == hub {
+		m.hub, m.sig = nil, ""
+	}
+}
+
 // stopLocked stops the running hub and waits for it: the hub writes this catalog in process, so it
-// must be gone before the catalog closes.
+// must be gone before the catalog closes. Ownership is left to the caller.
 func (m *federationManager) stopLocked() {
 	if m.cancel != nil {
 		m.cancel()
@@ -212,11 +259,17 @@ func (m *federationManager) stopLocked() {
 	m.hub, m.cancel, m.done, m.sig = nil, nil, nil, ""
 }
 
-// Stop stops the hub and waits for it. Idempotent.
+// releaseLocked gives up the hub's tables.
+func (m *federationManager) releaseLocked() {
+	m.owners.Set(ownerFederation, nil)
+}
+
+// Stop stops the hub, waits for it and releases its tables. Idempotent.
 func (m *federationManager) Stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.stopLocked()
+	m.releaseLocked()
 }
 
 // Summary is the hub's collector-ad summary, nil when this daemon is not a hub.

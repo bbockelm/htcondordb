@@ -18,7 +18,14 @@ catalog, so one query -- a dashboard aggregate, a `GROUP BY`, a paged job list -
 
 A daemon is a hub *or* runs schedd sync, never both: both write `jobs`, `history` and
 `syncstatus`, under different keys. A daemon configured for both refuses to start (and a reconfig
-into both is refused, leaving whichever was running alone).
+into both is refused, leaving whichever was running alone). A reconfig from one to the other works.
+
+The hub's tables -- each federated table and `federation_sources` -- are
+[owned by the hub](authorization.md#tables-owned-by-an-in-process-writer): clients, DAEMON
+included, may query and watch them but not write, delete or drop them, so no client can plant a
+row under an AP's name or a spoke address for the hub to dial. `.rotate` and `.retention` on the
+hub's archives still work (routed through the daemon); `.truncate` is refused -- use
+`.retire <schedd>`.
 
 ## Spoke side
 
@@ -180,9 +187,6 @@ staleness). Per-source detail is in `federation_sources`, which a consumer can w
 
 ## What is not guaranteed
 
-- **Hub tables are writable by WRITE-level clients.** A client write to a federated table would be
-  overwritten or swept by the next replay, and could claim any `ScheddName`. A per-table write gate
-  in dbrpc is pending; until then restrict `ALLOW_WRITE` on a hub to the hub itself.
 - **Spoke chaining gaps are inherited.** The hub has no cluster ads to repair partial job rows from.
 - **Replays are correct, not cheap.** Every spoke restart replays its tables (spoke watch epochs are
   per process). The hub writes almost nothing for an unchanged spoke, but it still streams and
