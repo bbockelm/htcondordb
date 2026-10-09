@@ -203,6 +203,17 @@ index configuration and hot set are **persisted** in the database directory
 (`indexcfg.json`), so runtime `.addindex`/`.dropindex`/`.addhot` changes survive a
 daemon restart (and the indexes are rebuilt over the loaded ads on open).
 
+### Tables owned by a writer in the daemon
+
+A table that schedd sync, replication or a managed history importer maintains is
+read-only to every session (see [Authorization](authorization.md#tables-owned-by-an-in-process-writer)).
+A refused write prints the reason, and — on a DAEMON-authorized session — which
+writer owns the table. `.truncate`, `.rotate` and `.retention` on such a table are
+sent to the owner over `DBSyncControl` automatically: `.truncate history` wipes
+the archive and has schedd sync re-read the history file; a truncate the owner
+cannot rebuild from (a job_queue.log table, a replica, an import target) is
+refused with what to run instead.
+
 ## Loading ads from a collector or schedd
 
 `INSERT` is impractical for real 50-attribute machine/job ads, so the CLI has a

@@ -91,6 +91,12 @@ type HistorySync struct {
 	// without duplicating or dropping the records it already retains (the archive commonly keeps
 	// far more than the aggressively-rotated history files still hold).
 	resyncReq atomic.Bool
+
+	// truncReq hands an operator truncate (Truncate) to the Run goroutine, which performs it
+	// between polls and closes the carried channel when done. exited is closed when Run returns,
+	// so a Truncate against a stopped syncer fails instead of waiting.
+	truncReq chan chan struct{}
+	exited   chan struct{}
 }
 
 // Resync requests that the next Poll re-read the current history file from its head, deduping
@@ -165,6 +171,8 @@ func NewHistorySync(archive *db.ArchiveTable, cfg HistorySyncConfig) *HistorySyn
 		kind:          "history",
 		keyConstraint: historyKeyConstraint,
 		eventTime:     historyEventTime,
+		truncReq:      make(chan chan struct{}),
+		exited:        make(chan struct{}),
 	}
 	// Advertise the source from construction (see the note in NewJobSync) so History* attributes
 	// appear in the first collector ad. NewJobEpochSync re-publishes after overriding kind.
@@ -195,8 +203,38 @@ func historyEventTime(ad *classad.ClassAd) (int64, bool) {
 	return 0, false
 }
 
+// Truncate empties the archive and rewinds the syncer to the head of the current history file,
+// so the next poll rebuilds the archive from the file: the operator's from-scratch re-sync. The
+// wipe and the rewind both run on the Run goroutine between polls, so no record read from the
+// old position can be appended after the wipe (a truncate from outside the syncer races the tail:
+// an append landing between the wipe and the next poll hides the empty archive from it, and the
+// history is never re-read).
+//
+// It blocks until Run has performed it. It fails, having truncated nothing, when ctx ends first
+// (Run is busy, e.g. in its initial catch-up) or Run is not running.
+func (s *HistorySync) Truncate(ctx context.Context) error {
+	done := make(chan struct{})
+	select {
+	case s.truncReq <- done:
+	case <-s.exited:
+		return fmt.Errorf("the %s syncer is not running", s.kind)
+	case <-ctx.Done():
+		return fmt.Errorf("the %s syncer did not take the truncate (busy?); nothing was truncated: %w", s.kind, ctx.Err())
+	}
+	<-done // accepted: Run performs it without further waiting
+	return nil
+}
+
+// truncateAndRewind is Truncate's body, on the Run goroutine.
+func (s *HistorySync) truncateAndRewind() {
+	s.archive.Truncate()
+	s.log.Warn("scheddsync: archive truncated by operator; re-reading from the start", "kind", s.kind, "file", s.filename)
+	s.rewindToHead(false) // the archive is empty: nothing to dedup against
+}
+
 // Run polls until ctx is cancelled, starting immediately.
 func (s *HistorySync) Run(ctx context.Context) error {
+	defer close(s.exited)
 	if err := s.Poll(ctx); err != nil {
 		s.log.Warn("history initial poll failed", "err", err.Error())
 	}
@@ -230,6 +268,10 @@ func (s *HistorySync) Run(ctx context.Context) error {
 				timer.Reset(wait)
 				continue
 			}
+		case done := <-s.truncReq:
+			s.truncateAndRewind()
+			close(done)
+			// Fall through to poll: the rebuild starts now rather than after an idle interval.
 		case <-timer.C:
 		}
 		before := s.offset

@@ -2,6 +2,7 @@ package consistent
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/hashicorp/raft"
@@ -113,6 +114,12 @@ func (c *Coordinator) handleApply(req, resp *classad.ClassAd) {
 		resp.InsertAttrString(AttrErrorString, err.Error())
 		return
 	}
+	if t, ok := c.firstReadOnlyTable(b); ok {
+		resp.InsertAttrBool(AttrResult, false)
+		resp.InsertAttrString(AttrErrorString, fmt.Sprintf("read-only table %q: it is maintained by a writer inside the daemon "+
+			"(schedd sync, replication, or a managed history importer) and clients may not modify it; batch not applied", t))
+		return
+	}
 	err = c.Apply(b)
 	if c.encodeRedirect(err, resp) {
 		return
@@ -123,6 +130,24 @@ func (c *Coordinator) handleApply(req, resp *classad.ClassAd) {
 		return
 	}
 	resp.InsertAttrBool(AttrResult, true)
+}
+
+// firstReadOnlyTable returns the first table b writes that CoordinatorConfig.TableWritable
+// refuses.
+func (c *Coordinator) firstReadOnlyTable(b *Batch) (string, bool) {
+	if c.cfg.TableWritable == nil {
+		return "", false
+	}
+	for _, op := range b.Ops {
+		t := op.Table
+		if t == "" {
+			t = c.cfg.DefaultTable
+		}
+		if !c.cfg.TableWritable(t) {
+			return t, true
+		}
+	}
+	return "", false
 }
 
 // encodeRedirect, when err is ErrNotLeader, fills the response with a redirect to

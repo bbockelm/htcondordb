@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -18,6 +19,7 @@ import (
 
 	"github.com/bbockelm/htcondordb/cedarsync"
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/server"
 )
 
 // cedarSyncManager owns the native-CEDAR fan-in replicators (cedarsync.Runner): each mirrors a
@@ -33,11 +35,41 @@ type cedarSyncManager struct {
 	parent context.Context
 	cat    *db.Catalog
 	logger *slog.Logger
+	owners *server.TableOwners // replication targets are registered here; nil owns nothing
 
-	mu     sync.Mutex
-	cancel context.CancelFunc // cancels the running runners; nil when stopped
-	done   chan struct{}      // closed once the running runners have exited
-	sig    string             // signature of the running config (change detection)
+	mu      sync.Mutex
+	cancel  context.CancelFunc // cancels the running runners; nil when stopped
+	done    chan struct{}      // closed once the running runners have exited
+	sig     string             // signature of the running config (change detection)
+	sources []replicateSource  // the running config's sources, for operator messages
+}
+
+// targets lists the local tables the sources replicate into (deduplicated: several sources may
+// fan in to one target).
+func (s cedarSyncSettings) targets() []string {
+	var out []string
+	for _, src := range s.sources {
+		if !slices.Contains(out, src.Target) {
+			out = append(out, src.Target)
+		}
+	}
+	return out
+}
+
+// SourcesFor names the configured replication sources writing into table, for operator messages.
+func (m *cedarSyncManager) SourcesFor(table string) []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, src := range m.sources {
+		if strings.EqualFold(src.Target, table) {
+			out = append(out, src.Name)
+		}
+	}
+	return out
 }
 
 // replicateSource is one resolved source->target replication.
@@ -106,6 +138,10 @@ func (m *cedarSyncManager) apply(cfg *config.Config) error {
 		m.cancel, m.done = nil, nil
 	}
 	m.sig = ""
+	m.sources = nil
+	// The replicas belong to replication from here on (or no longer, when disabled): claimed
+	// before the runners create or write them, replacing the previous set in one step.
+	m.owners.Set(ownerReplication, next.targets())
 	if !next.enabled {
 		m.logger.Info("cedar-sync: disabled")
 		return nil
@@ -114,7 +150,7 @@ func (m *cedarSyncManager) apply(cfg *config.Config) error {
 	ctx, cancel := context.WithCancel(m.parent)
 	done := make(chan struct{})
 	go m.run(ctx, cfg, next, done)
-	m.cancel, m.done, m.sig = cancel, done, next.sig
+	m.cancel, m.done, m.sig, m.sources = cancel, done, next.sig, next.sources
 	m.logger.Info("cedar-sync: enabled", "sources", len(next.sources))
 	return nil
 }
@@ -132,6 +168,8 @@ func (m *cedarSyncManager) Stop() {
 		m.cancel, m.done = nil, nil
 	}
 	m.sig = ""
+	m.sources = nil
+	m.owners.Set(ownerReplication, nil)
 }
 
 // run starts one cedarsync.Runner per source and waits for them all to exit (on ctx cancel).

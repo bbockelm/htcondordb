@@ -94,6 +94,28 @@ inherits the condor config and drops to the condor user.
    requires READ authorization; the sync itself writes in-process and needs no
    client credentials.
 
+## The mirror is read-only to clients
+
+While sync is on, the tables it writes (`jobs`, `users`, `jobsets`, `clusters`,
+`header`, `clusterprivate`, `logmeta`, plus `job_metrics`, `history` and
+`epoch_history` when their source is configured) belong to it: every client —
+WRITE and DAEMON alike — may query and `WATCH` them, but writes are refused with
+`read-only table "<name>"`. Ownership follows the configuration: disable sync, or
+drop a source, and `condor_reconfig` makes those tables ordinary again. See
+[Authorization](authorization.md#tables-owned-by-an-in-process-writer).
+
+Repairing the mirror goes through the sync itself (DAEMON-authorized, over
+`DBSyncControl`; the REPL routes these on its own):
+
+| Command | Effect |
+|---------|--------|
+| `.resync jobs` | Rebuild the job_queue.log tables from the current log, non-destructively. |
+| `.resync history` / `.resync epoch` | Re-read the history / epoch file from its start, appending only what the archive is missing. |
+| `.truncate history` / `.truncate epoch_history` | From-scratch re-sync: wipe the archive and re-read the file from its start, in one step on the tailer (records that rotated out of the file are not recovered). |
+| `.truncate job_metrics` | Drop every sample; sampling continues. |
+| `.truncate jobs` (or another job_queue.log table) | Refused — use `.resync jobs`. |
+| `.rotate <archive>`, `.retention <archive> …` | Apply / change retention now. The configured `*_MAX_BYTES` cap is re-applied on restart or when a reconfigure changes it. |
+
 ## Related configuration
 
 | Knob | Default | Meaning |

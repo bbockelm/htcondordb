@@ -40,6 +40,76 @@ type scheddSyncManager struct {
 	current   scheddSyncSettings  // settings the running tailers were started with
 	sources   []dbad.StatusSource // live sources for the collector ad
 	resyncers map[string]resyncer // "jobs"/"history" -> the running tailer, for on-demand resync
+	// histSyncs maps an archive table ("history", "epoch_history") to the tailer that fills it,
+	// for an operator truncate routed through the owner (Truncate).
+	histSyncs map[string]*scheddsync.HistorySync
+}
+
+// jobQueueTables are the mutable tables the job_queue.log tailer maintains.
+var jobQueueTables = []string{"jobs", "users", "jobsets", "clusters", "header", "clusterprivate", "logmeta"}
+
+// ownedTables lists every table the tailers configured by s write, for the ownership registry.
+// It must match what launch creates: a table missing here is writable by remote peers while the
+// tailer mirrors into it.
+func (s scheddSyncSettings) ownedTables() []string {
+	if !s.enabled {
+		return nil
+	}
+	var out []string
+	if s.jobLog != "" {
+		out = append(out, jobQueueTables...)
+		if s.metricsEnabled {
+			out = append(out, scheddsync.DefaultJobMetricsTable)
+		}
+	}
+	if s.histFile != "" {
+		out = append(out, "history")
+	}
+	if s.epochFile != "" {
+		out = append(out, "epoch_history")
+	}
+	return out
+}
+
+// owners is the server's ownership registry (nil in tests that build a bare manager).
+func (m *scheddSyncManager) owners() *server.TableOwners {
+	if m.svc == nil {
+		return nil
+	}
+	return m.svc.Owners()
+}
+
+// Truncate empties an owned table on the operator's behalf (DBSyncControl "truncate"), coherently
+// with the tailer that fills it: a history/epoch archive is wiped and re-read from its file by
+// its own tailer (scheddsync.HistorySync.Truncate); the job_metrics archive is wiped (its samples
+// cannot be re-derived, and the sampler appends on). The job_queue.log tables are refused: they
+// are a projection of the log, and emptying them would only hide jobs until the next update --
+// .resync jobs rebuilds them from the current log instead. Returns a note for the operator.
+func (m *scheddSyncManager) Truncate(ctx context.Context, table string) (string, error) {
+	m.mu.Lock()
+	hs := m.histSyncs[strings.ToLower(table)]
+	metrics := m.current.jobLog != "" && m.current.metricsEnabled
+	m.mu.Unlock()
+
+	switch t := strings.ToLower(table); {
+	case hs != nil:
+		if err := hs.Truncate(ctx); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s truncated; schedd sync is re-reading its file from the start", t), nil
+	case t == scheddsync.DefaultJobMetricsTable && metrics:
+		arch, ok := m.svc.Catalog().ArchiveTable(scheddsync.DefaultJobMetricsTable)
+		if !ok {
+			return "", fmt.Errorf("the %s archive does not exist", t)
+		}
+		arch.Truncate()
+		m.logger.Warn("schedd-sync: job_metrics archive truncated by operator")
+		return fmt.Sprintf("%s truncated; sampling continues from now (past samples are not re-derived)", t), nil
+	case slices.Contains(jobQueueTables, t):
+		return "", fmt.Errorf("table %q is mirrored from job_queue.log by schedd sync and cannot be emptied on its own "+
+			"(it would only hide jobs until the schedd next touched them); run `.resync jobs` to rebuild it from the current log", t)
+	}
+	return "", fmt.Errorf("table %q is not maintained by schedd sync", table)
 }
 
 // resyncer is a running sync a caller can ask to re-read its source from scratch.
@@ -670,22 +740,30 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 	}
 	m.sources = nil
 	m.resyncers = nil
+	m.histSyncs = nil
 	m.current = scheddSyncSettings{}
 
+	// Ownership follows the tailers: the new set replaces the old in one step (a table kept
+	// across the restart is never briefly writable), and is claimed BEFORE the new tailers
+	// create or write anything, so no remote write can land in a table they are about to mirror.
+	// Disabled -> released.
+	m.owners().Set(ownerScheddSync, next.ownedTables())
 	if !next.enabled {
 		return nil
 	}
 
 	ctx, cancel := context.WithCancel(m.parent)
-	sources, resyncers, done, err := m.launch(ctx, next)
+	sources, resyncers, histSyncs, done, err := m.launch(ctx, next)
 	if err != nil {
 		cancel()
+		m.owners().Set(ownerScheddSync, nil)
 		return err
 	}
 	m.cancel = cancel
 	m.done = done
 	m.sources = sources
 	m.resyncers = resyncers
+	m.histSyncs = histSyncs
 	m.current = next
 	return nil
 }
@@ -708,12 +786,14 @@ func (m *scheddSyncManager) Stop() {
 	}
 	m.sources = nil
 	m.resyncers = nil
+	m.histSyncs = nil
 	m.current = scheddSyncSettings{}
+	m.owners().Set(ownerScheddSync, nil)
 }
 
 // launch starts the tailers for settings s under ctx and returns their live
 // status sources plus a channel closed when all of them have exited.
-func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([]dbad.StatusSource, map[string]resyncer, chan struct{}, error) {
+func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([]dbad.StatusSource, map[string]resyncer, map[string]*scheddsync.HistorySync, chan struct{}, error) {
 	syncStore := func(name string) scheddsync.PositionStore {
 		if s.posDir == "" {
 			return nil
@@ -722,6 +802,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	}
 	var sources []dbad.StatusSource
 	resyncers := map[string]resyncer{}
+	histSyncs := map[string]*scheddsync.HistorySync{}
 	var wg sync.WaitGroup
 
 	if s.jobLog != "" {
@@ -732,31 +813,31 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// table).
 		jobs, err := m.svc.Catalog().CreateTable("jobs")
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("schedd-sync: creating jobs table: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating jobs table: %w", err)
 		}
 		users, err := m.svc.Catalog().CreateTable("users")
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("schedd-sync: creating users table: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating users table: %w", err)
 		}
 		jobsets, err := m.svc.Catalog().CreateTable("jobsets")
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("schedd-sync: creating jobsets table: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating jobsets table: %w", err)
 		}
 		clusters, err := m.svc.Catalog().CreateTable("clusters")
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("schedd-sync: creating clusters table: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating clusters table: %w", err)
 		}
 		header, err := m.svc.Catalog().CreateTable("header")
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("schedd-sync: creating header table: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating header table: %w", err)
 		}
 		clusterprivate, err := m.svc.Catalog().CreateTable("clusterprivate")
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("schedd-sync: creating clusterprivate table: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating clusterprivate table: %w", err)
 		}
 		logmeta, err := m.svc.Catalog().CreateTable("logmeta")
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("schedd-sync: creating logmeta table: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating logmeta table: %w", err)
 		}
 		// Resource sampling rides on the same parsed stream, so it is configured here rather than
 		// as a tailer of its own: there is nothing extra to poll, and a second tailer would both
@@ -777,7 +858,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 				GroupSchemaCount: groupSchemaCount(s.metricsGroupSchemas),
 			})
 			if merr != nil {
-				return nil, nil, nil, fmt.Errorf("schedd-sync: creating job_metrics archive: %w", merr)
+				return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating job_metrics archive: %w", merr)
 			}
 			// archiveconfig.json is authoritative on reopen, so the index set above only takes
 			// effect when the table is CREATED. Without this an operator who adds a grouping
@@ -822,7 +903,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			ZoneAttrs: []string{"CompletionDate", scheddsync.EnteredHistoryAttr},
 		})
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("schedd-sync: creating history archive: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating history archive: %w", err)
 		}
 		// The config above only takes effect when the archive is created: archiveconfig.json
 		// is authoritative on reopen, so an existing archive keeps the index set it was made
@@ -851,6 +932,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		go func() { defer wg.Done(); m.runGuardedTailer(ctx, "history", hs.Run) }()
 		sources = append(sources, hs)
 		resyncers["history"] = hs
+		histSyncs["history"] = hs
 		m.logger.Info("schedd-sync: tailing history file", "file", s.histFile, "archive", "history")
 	}
 	if s.epochFile != "" {
@@ -865,7 +947,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			ZoneAttrs: []string{scheddsync.EpochWriteDateAttr, scheddsync.EnteredHistoryAttr},
 		})
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("schedd-sync: creating epoch archive: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating epoch archive: %w", err)
 		}
 		m.reconcileArchiveIndexes(ctx, ep, "epoch_history",
 			splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
@@ -887,10 +969,11 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		go func() { defer wg.Done(); m.runGuardedTailer(ctx, "epoch", es.Run) }()
 		sources = append(sources, es)
 		resyncers["epoch"] = es
+		histSyncs["epoch_history"] = es
 		m.logger.Info("schedd-sync: tailing epoch history file", "file", s.epochFile, "archive", "epoch_history")
 	}
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
-	return sources, resyncers, done, nil
+	return sources, resyncers, histSyncs, done, nil
 }

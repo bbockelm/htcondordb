@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/dbrpc"
 )
 
 // ScheddNameAttr is stamped on every imported record with the discovered schedd's
@@ -99,6 +100,9 @@ func (im *Importer) log() *slog.Logger {
 // RunLoop runs job j once immediately and then every j.Interval until ctx is
 // cancelled. A cycle error is logged and the loop continues (the next cycle
 // retries from the persisted cursors); it returns ctx.Err() on cancellation.
+// The exception is a refusal no retry can fix: the daemon reporting j.Table
+// read-only (dbrpc.ErrTableReadOnly -- another writer in the daemon owns it)
+// ends the loop with that error.
 func (im *Importer) RunLoop(ctx context.Context, j Job) error {
 	interval := j.Interval
 	if interval <= 0 {
@@ -108,6 +112,14 @@ func (im *Importer) RunLoop(ctx context.Context, j Job) error {
 	defer t.Stop()
 	for {
 		st, err := im.RunJob(ctx, j)
+		if errors.Is(err, dbrpc.ErrTableReadOnly) {
+			im.log().Error("historyimport: target table is read-only (owned by another writer in the daemon); stopping",
+				"job", j.Name, "table", j.Table, "err", err)
+			if im.OnCycle != nil {
+				im.OnCycle(st, err)
+			}
+			return err
+		}
 		if err != nil {
 			im.log().Warn("historyimport: cycle failed", "job", j.Name, "err", err)
 		} else {
@@ -145,6 +157,12 @@ func (im *Importer) RunJob(ctx context.Context, j Job) (Stats, error) {
 			n, err = im.importSchedd(ctx, j, sd)
 		}
 		st.Imported += n
+		if errors.Is(err, dbrpc.ErrTableReadOnly) {
+			// Every schedd would fail the same way: stop the cycle rather than
+			// querying the rest of the pool for records that cannot be stored.
+			st.Failures++
+			return st, fmt.Errorf("importing into %q: %w", j.Table, err)
+		}
 		if err != nil {
 			st.Failures++
 			im.log().Warn("historyimport: schedd import failed",

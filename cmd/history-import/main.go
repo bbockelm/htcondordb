@@ -45,9 +45,18 @@ const dbSessionCommand = 74000
 // be well under the manager's liveness timeout so a healthy runner is never killed.
 const statusBeatInterval = 20 * time.Second
 
+// exitTableReadOnly is the exit status when the daemon refused a write because the
+// target table belongs to another writer (dbrpc.ErrTableReadOnly). A supervisor must
+// not restart on it: only a configuration change can fix it. Keep in sync with the
+// daemon's importer manager.
+const exitTableReadOnly = 3
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "history-import:", err)
+		if errors.Is(err, dbrpc.ErrTableReadOnly) {
+			os.Exit(exitTableReadOnly)
+		}
 		os.Exit(1)
 	}
 }
@@ -148,6 +157,11 @@ func cmdRun(args []string) error {
 		err := runJob(ctx, cfg, *addr, job, cursors, beater, log)
 		if err == nil || ctx.Err() != nil {
 			break // clean shutdown
+		}
+		if errors.Is(err, dbrpc.ErrTableReadOnly) {
+			// Terminal: reconnecting writes to the same owned table again.
+			return fmt.Errorf("job %q: table %q is owned by another writer in the daemon (schedd sync, replication, or a managed importer) and is read-only to this importer; point TABLE at another archive: %w",
+				job.Name, job.Table, err)
 		}
 		log.Warn("history-import: stopped; reconnecting", "job", job.Name, "err", err)
 		select {

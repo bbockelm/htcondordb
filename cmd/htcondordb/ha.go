@@ -197,6 +197,9 @@ func (h *haRuntime) startConsistent(ctx context.Context, d *daemon.Daemon, cfg *
 		Peers:       peers,
 		ClusterSize: configInt(cfg, "HTCONDORDB_RAFT_SIZE"),
 		Logger:      d.Slog(),
+		// A write batch over DBControl must not reach a table an in-process writer owns, any
+		// more than a dbrpc write may (server.Service.ServeOptions).
+		TableWritable: func(table string) bool { return svc.Owners().Writable(table, "") },
 	})
 	if err != nil {
 		return err

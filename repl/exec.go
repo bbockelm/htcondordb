@@ -47,8 +47,16 @@ type ExecConfig struct {
 
 	// Resync, if set, backs the `.resync <target>` command: it asks the daemon to re-read/re-export
 	// a sync source (a schedd-sync tailer "jobs"/"history", or an exporter by name) from the start.
-	// The CLI wires it to a DBSyncControl dial. When nil, `.resync` reports it is unavailable.
+	// The CLI wires it to a DBSyncControl dial. When nil, `.resync` falls back to SyncControl,
+	// and reports it is unavailable when both are nil.
 	Resync func(target string) error
+
+	// SyncControl, if set, sends one DBSyncControl request (Action, Target, space-joined Args)
+	// to the daemon and returns its Note. It is how the session reaches a table's owner: the
+	// data-removing admin actions on an owned table (truncate, rotate, retention.set), which the
+	// dbrpc session refuses with dbrpc.ErrTableReadOnly, are re-sent here, and "owner" explains a
+	// refused write. The CLI wires it to a DBSyncControl dial (DAEMON-authorized).
+	SyncControl func(action, target string, args []string) (string, error)
 }
 
 // WriteKind identifies a mutation in a write batch.
@@ -78,6 +86,7 @@ type Executor struct {
 	genKey     func() string
 	applyBatch func([]WriteOp) error
 	resync     func(target string) error
+	syncCtl    func(action, target string, args []string) (string, error)
 
 	// wireRowsOff forces reads onto the old-ClassAd text path even where the wire-form
 	// relay would serve them. It exists so a test can run the same query over both
@@ -177,13 +186,28 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl}
 }
+
+// SyncControl sends one DBSyncControl request to the daemon (see ExecConfig.SyncControl).
+func (e *Executor) SyncControl(action, target string, args ...string) (string, error) {
+	if e.syncCtl == nil {
+		return "", fmt.Errorf("sync control is not available in this session")
+	}
+	return e.syncCtl(action, target, args)
+}
+
+// HasSyncControl reports whether SyncControl has a transport.
+func (e *Executor) HasSyncControl() bool { return e.syncCtl != nil }
 
 // Resync asks the daemon to re-read/re-export the named sync source ("jobs", "history", or an
 // exporter name) from the start. Returns an error if no resync transport is configured.
 func (e *Executor) Resync(target string) error {
 	if e.resync == nil {
+		if e.syncCtl != nil {
+			_, err := e.syncCtl("resync", target, nil)
+			return err
+		}
 		return fmt.Errorf("resync is not available in this session")
 	}
 	return e.resync(target)
