@@ -177,12 +177,15 @@ and the last live stream), `LastCollectorSeen`, `LastContact`, `LastReset`, `Ret
   running against the last validated spoke address. A collector restart makes every AP vanish at
   once; nothing is deleted for it.
 - The table is persisted, so a hub restarting into an empty collector still knows every member and
-  when it was last seen.
+  when it was last seen. Nothing is retired before the restarted hub's first discovery pass.
 - A schedd still advertising but no longer matching a changed constraint, or a static spoke removed
   from the configuration, is **retiring**: its streams stop and its rows stay until
   `HTCONDORDB_FEDERATE_RETIRE_AFTER` has passed. Matching again before then cancels retirement.
-- Rows are deleted only by **retirement**: `HTCONDORDB_FEDERATE_RETIRE_AFTER` after `LastSeen`
-  (absent) or after `RetiringSince` (retiring), or at once with the admin command
+- Rows are deleted only by **retirement**: once an absent source has gone unseen for
+  `HTCONDORDB_FEDERATE_RETIRE_AFTER` *while the hub was running* (time the hub was down does not
+  count, so after a hub restart the delay starts over from the restart; and a spoke the hub's
+  streams reach is seen, whatever the collector says), `HTCONDORDB_FEDERATE_RETIRE_AFTER` after
+  `RetiringSince` (retiring), or at once with the admin command
   `.retire <schedd>` in `htcondordb-cli` (DAEMON). Retirement deletes the AP's rows from the
   mutable tables (`jobs`, `syncstatus`, `federation_sources`) and its cursors. **Archive rows are
   not deleted**: archives are append-only and age out with their retention. A retired AP that is

@@ -178,7 +178,7 @@ func scheddRows(t *testing.T, cat *db.Catalog, table, schedd string) int {
 // TestAbsentIsNotRetiredAndLastSeenPersists: a source that vanishes from the collector is absent
 // with its rows kept; LastSeen survives a hub restart, so a hub restarting into an empty collector
 // does not retire anything early; and the source is retired -- mutable rows deleted, archive rows
-// kept -- once RetireAfter has passed since it was last seen.
+// kept -- once it has gone unseen for RetireAfter while the hub was running.
 func TestAbsentIsNotRetiredAndLastSeenPersists(t *testing.T) {
 	dir := t.TempDir()
 	clock := &testClock{t: time.Unix(1_800_000_000, 0)}
@@ -230,8 +230,15 @@ func TestAbsentIsNotRetiredAndLastSeenPersists(t *testing.T) {
 		t.Fatalf("LastSeen after restart = %d, want %d", v, t0.Unix())
 	}
 
-	// Past seven days since last seen: retired.
+	// Past seven days since last seen, but the hub was down for six of them: not yet.
 	clock.advance(24*time.Hour + time.Minute)
+	time.Sleep(50 * time.Millisecond)
+	if n := scheddRows(t, cat, TableJobs, "ap1"); n != 3 {
+		t.Fatalf("hub downtime counted as unseen time: %d jobs, want 3", n)
+	}
+
+	// Seven days unseen while the hub runs: retired.
+	clock.advance(6 * 24 * time.Hour)
 	waitFor(t, "ap1 retired", func() bool { _, ok := sourceRow(cat, "ap1"); return !ok })
 	if n := scheddRows(t, cat, TableJobs, "ap1"); n != 0 {
 		t.Errorf("retired source kept %d jobs rows", n)

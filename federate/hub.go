@@ -84,7 +84,8 @@ type Hub struct {
 
 	// Everything below is owned by the Run goroutine, except where noted.
 	sources       map[string]*source
-	discoveryDone bool // a discovery pass with a known match set has completed
+	discoveryDone bool      // a discovery pass with a known match set has completed in this run
+	runStart      time.Time // when this Run started: unseen time accrues only while the hub runs
 	runCtx        context.Context
 	retireReq     chan retireReq
 	discoverNow   chan struct{}
@@ -119,6 +120,11 @@ type runnerHandle struct {
 	address string
 	cancel  context.CancelFunc
 	done    chan struct{}
+
+	// The runner status last observed by refreshState: a change in either means the spoke was
+	// reached since, even if the session has dropped again by the time of the tick.
+	seenSessions int
+	seenEvent    time.Time
 }
 
 type retireReq struct {
@@ -223,6 +229,7 @@ func (h *Hub) Run(ctx context.Context) error {
 	}
 	h.ht = ht
 	h.runCtx = ctx
+	h.runStart = h.now()
 	defer h.stopAll()
 
 	h.loadSources()
@@ -558,12 +565,21 @@ func (h *Hub) refreshState() {
 	retireAfter := orDur(h.cfg.RetireAfter, DefaultRetireAfter)
 	fresh := int64(orDur(h.cfg.FreshThreshold, DefaultFreshThreshold) / time.Second)
 
-	// Retirement first, so a retired source is not written back.
+	// Contact first: a spoke reached since the last tick is seen now, whatever retirement says.
+	for _, s := range h.sources {
+		if h.observeRunners(s) {
+			s.lastContact = now
+		}
+	}
+
+	// Retirement next, so a retired source is not written back. Nothing retires before this run's
+	// first discovery pass: until then the hub knows only what it persisted.
 	for schedd, s := range h.sources {
 		switch {
+		case !h.discoveryDone:
 		case !s.retiringSince.IsZero() && now.Sub(s.retiringSince) >= retireAfter:
 			_ = h.logRetire(schedd, fmt.Sprintf("retiring since %s", s.retiringSince.UTC().Format(time.RFC3339)))
-		case h.discoveryDone && !s.inSet && s.retiringSince.IsZero() && now.Sub(lastSeen(s)) >= retireAfter:
+		case !s.inSet && s.retiringSince.IsZero() && h.unseenFor(s, now) >= retireAfter && h.attempted(s):
 			_ = h.logRetire(schedd, fmt.Sprintf("unseen since %s", lastSeen(s).UTC().Format(time.RFC3339)))
 		}
 	}
@@ -585,15 +601,6 @@ func (h *Hub) refreshState() {
 	for schedd, s := range h.sources {
 		if t, ok := resets[schedd]; ok && t.After(s.lastReset) {
 			s.lastReset = t
-		}
-		connected := false
-		for _, rh := range s.runners {
-			if rh.runner.Status().Connected {
-				connected = true
-			}
-		}
-		if connected {
-			s.lastContact = now
 		}
 		var stale int64
 		staleKnown := false
@@ -642,6 +649,44 @@ func (h *Hub) logRetire(schedd, why string) error {
 
 type classadLookup struct {
 	lookup func(string) (*classad.ClassAd, bool)
+}
+
+// observeRunners reports whether s's spoke was reached since the last call: a session open now,
+// or one opened or an event applied since -- a session that connected and dropped between two
+// ticks is contact too.
+func (h *Hub) observeRunners(s *source) bool {
+	reached := false
+	for _, rh := range s.runners {
+		st := rh.runner.Status()
+		if st.Connected || st.Sessions != rh.seenSessions || !st.LastEvent.Equal(rh.seenEvent) {
+			reached = true
+		}
+		rh.seenSessions, rh.seenEvent = st.Sessions, st.LastEvent
+	}
+	return reached
+}
+
+// unseenFor is how long s has gone unseen while this hub was running. Time the hub was down does
+// not count: the hub could not see anything then, and a source seen last before a long hub outage
+// is not thereby gone (its spoke may be up and reachable, and the collector restarting empty).
+func (h *Hub) unseenFor(s *source, now time.Time) time.Duration {
+	since := lastSeen(s)
+	if since.Before(h.runStart) {
+		since = h.runStart
+	}
+	return now.Sub(since)
+}
+
+// attempted reports whether every runner of s has tried its spoke at least once in this run, so a
+// reachable spoke has had its chance to count as contact before s can be retired as unseen.
+func (h *Hub) attempted(s *source) bool {
+	for _, rh := range s.runners {
+		st := rh.runner.Status()
+		if st.Sessions == 0 && st.LastErrorTime.IsZero() {
+			return false
+		}
+	}
+	return true
 }
 
 func lastSeen(s *source) time.Time {
