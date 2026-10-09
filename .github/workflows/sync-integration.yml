@@ -50,3 +50,21 @@ jobs:
         # -count=1 defeats the test cache so the real HTCondor is always exercised; a long
         # timeout accommodates the match+execute pipeline for the history test.
         run: go test -run Integration -v -count=1 -timeout 20m ./scheddsync/ ./historyimport/
+
+      # Collector discovery: locating an htcondordb through a pool, which both the CLI's
+      # -pool/-name and the Grafana datasource's pool option rely on. These tests stand up a
+      # real condor_collector, so they self-skip wherever condor is absent -- which is every
+      # other job. This is the only place they run.
+      - name: Run collector-discovery tests
+        working-directory: htcondordb
+        env:
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+        run: go test -v -count=1 -timeout 10m ./locate/
+
+      - name: Run Grafana datasource discovery tests
+        working-directory: htcondordb/grafana
+        env:
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+        run: go test -v -count=1 -timeout 10m ./pkg/...

@@ -1,0 +1,30 @@
+# Local Grafana with the htcondordb datasource plugin, pointed at a REMOTE
+# htcondordb (e.g. the one on ap40). Nothing runs locally but Grafana itself --
+# the plugin backend dials the remote daemon's CEDAR address directly.
+#
+#   1. cp env.example .env   and fill in HTCONDORDB_POOL / _NAME / _TOKEN
+#   2. ../ npm ci && npm run build   +   go build -o dist/gpx_htcondordb_linux_<arch> ./pkg
+#   3. docker compose up
+#   4. http://localhost:3000  (anonymous admin; no login)
+services:
+  grafana:
+    image: grafana/grafana-oss:11.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      # The plugin is unsigned, so Grafana must be told to load it by id.
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: bbockelm-htcondordb-datasource
+      # Convenience for a demo box: no login prompt, full admin.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_LOG_LEVEL: info
+      # Consumed by provisioning/datasources/htcondordb.yaml.
+      HTCONDORDB_POOL: ${HTCONDORDB_POOL:?set HTCONDORDB_POOL in .env}
+      HTCONDORDB_NAME: ${HTCONDORDB_NAME:-}
+      HTCONDORDB_TOKEN: ${HTCONDORDB_TOKEN:-}
+    volumes:
+      # The built plugin. Grafana discovers it by directory name.
+      - ../dist:/var/lib/grafana/plugins/bbockelm-htcondordb-datasource:ro
+      - ./provisioning:/etc/grafana/provisioning:ro
+      # The bundled "HTCondorDB Overview" dashboard, importable from the plugin page.
+      - ../src/dashboards:/var/lib/grafana/dashboards:ro

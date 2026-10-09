@@ -1,0 +1,23 @@
+# Provisions the htcondordb datasource from the environment, so the pool, the
+# database name and the IDTOKEN live in .env rather than in a file that could get
+# committed.
+apiVersion: 1
+datasources:
+  - name: htcondordb
+    uid: htcondordb-local
+    type: bbockelm-htcondordb-datasource
+    access: proxy
+    isDefault: true
+    editable: true
+    jsonData:
+      # The collector to find the database through, and which database. The lookup
+      # runs on every connection, so a daemon restart (which changes its address)
+      # needs no edit here. To pin an address instead, drop these two and set
+      # address: "<host:9618?sock=htcondordb_...>" -- but then a restart does.
+      pool: ${HTCONDORDB_POOL}
+      name: ${HTCONDORDB_NAME}
+      connectTimeoutSeconds: 30
+    secureJsonData:
+      # HTCondor IDTOKEN. Leave empty for an anonymous read-only session (which
+      # only works if the server permits anonymous READ).
+      token: ${HTCONDORDB_TOKEN}
