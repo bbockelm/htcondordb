@@ -90,7 +90,9 @@ matching the constraint, for all ScheddAds (to tell "no longer matches" from "go
   misconfigured or hostile spoke could publish rows under another AP's name. Static spokes skip it.
 - **HA pairs.** Two valid spokes claiming one schedd: the one reporting `Syncing` and caught up
   wins; if both or neither are, the hub declines rather than guess (`reason="ha_tie"`).
-- A failed collector query is not an empty AP set: the pass is skipped.
+- A failed collector query is not an empty AP set: the constraint's part of the pass is skipped.
+  Static spokes are configuration, not collector data: they are federated whether or not the
+  collector answers.
 
 ## Tables
 

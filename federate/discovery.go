@@ -39,7 +39,9 @@ const (
 
 // Snapshot is one discovery pass's view of the AP set. The Known flags say which parts could be
 // determined: a part that could not (the collector was unreachable) must not be read as empty --
-// "absent from the answer" is not "absent from the pool" when there was no answer.
+// "absent from the answer" is not "absent from the pool" when there was no answer. Static spokes
+// are configuration, not collector data: they are in Matched and Spokes (Static set) whatever the
+// flags say.
 type Snapshot struct {
 	// Matched are the schedds in the AP set (constraint matches plus static spokes).
 	Matched    map[string]bool
@@ -123,10 +125,9 @@ func (d *Discovery) Discover(ctx context.Context) (Snapshot, error) {
 		if d.Collector == nil {
 			return snap, fmt.Errorf("federate: a schedd constraint needs a collector")
 		}
-		schedds, err := d.Collector.Query(ctx, "Schedd", d.ScheddConstraint, scheddProjection)
-		if err != nil {
-			snap.MatchKnown, snap.SpokesKnown, firstErr = false, false, fmt.Errorf("querying schedd ads: %w", err)
-		}
+		// Present first: a schedd that starts advertising between the two queries then reads as
+		// matched (every matched schedd is present), never as present-but-not-matching -- which
+		// is leaving the AP set, and starts retirement.
 		present, perr := d.Collector.Query(ctx, "Schedd", "", []string{"Name"})
 		if perr != nil {
 			snap.PresentKnown = false
@@ -136,6 +137,10 @@ func (d *Discovery) Discover(ctx context.Context) (Snapshot, error) {
 					snap.Present[n] = true
 				}
 			}
+		}
+		schedds, err := d.Collector.Query(ctx, "Schedd", d.ScheddConstraint, scheddProjection)
+		if err != nil {
+			snap.MatchKnown, snap.SpokesKnown, firstErr = false, false, fmt.Errorf("querying schedd ads: %w", err)
 		}
 		if err == nil {
 			var spokes []*classad.ClassAd

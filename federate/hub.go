@@ -100,7 +100,8 @@ type source struct {
 	schedd            string
 	spokeAddress      string
 	spokeName         string
-	static            bool
+	static            bool // configured in HTCONDORDB_FEDERATE_SPOKES now
+	droppedStatic     bool // was static, is no longer, and has not been matched since
 	inSet             bool // matched by the last discovery with a known match set
 	untrusted         string
 	declined          string
@@ -274,32 +275,30 @@ func (h *Hub) discover(ctx context.Context) {
 			"address", r.SpokeAddress, "reason", r.Reason, "detail", r.Detail)
 	}
 
-	// Schedds in the AP set.
+	// The static set is configuration, known on every pass: each source's Static flag is the
+	// current configuration's (a schedd moved from the static list to the constraint is no longer
+	// static, so a later collector outage cannot read as "removed from the static list").
+	static := map[string]bool{}
+	for schedd, sp := range snap.Spokes {
+		if sp.Static {
+			static[schedd] = true
+		}
+	}
+	for schedd, s := range h.sources {
+		if s.static && !static[schedd] {
+			s.droppedStatic = true // left the static list; leaving the set unless the constraint matches it
+		}
+		s.static = static[schedd]
+	}
+
+	// Schedds in the AP set: the static spokes always, the constraint's matches when known.
+	for schedd := range static {
+		h.admit(schedd, snap, now)
+	}
 	if snap.MatchKnown {
 		for schedd := range snap.Matched {
-			s := h.source(schedd)
-			s.inSet = true
-			s.lastCollectorSeen = now
-			if !s.retiringSince.IsZero() {
-				h.log.Info("federate: source matches again; no longer retiring", "schedd", schedd)
-				s.retiringSince = time.Time{}
-			}
-			s.untrusted, s.declined = snap.Untrusted[schedd], snap.Declined[schedd]
-			if sp, ok := snap.Spokes[schedd]; ok {
-				s.static, s.spokeName = sp.Static, sp.SpokeName
-				if sp.Address != s.spokeAddress {
-					if s.spokeAddress != "" {
-						h.log.Info("federate: spoke address changed; restarting runners", "schedd", schedd,
-							"from", s.spokeAddress, "to", sp.Address)
-					}
-					h.stopRunners(s)
-					s.spokeAddress = sp.Address
-				}
-			}
-			// A schedd whose spoke ad is missing, untrusted or declined keeps streaming from the
-			// last validated address, if it has one: membership is sticky.
-			if s.spokeAddress != "" {
-				h.startRunners(s)
+			if !static[schedd] {
+				h.admit(schedd, snap, now)
 			}
 		}
 		h.discoveryDone = true
@@ -311,10 +310,10 @@ func (h *Hub) discover(ctx context.Context) {
 			continue
 		}
 		s.inSet = false
-		leaving := s.static || (snap.PresentKnown && snap.Present[schedd])
+		leaving := s.droppedStatic || (snap.PresentKnown && snap.Present[schedd])
 		if leaving && s.retiringSince.IsZero() {
 			why := "the schedd no longer matches the constraint"
-			if s.static {
+			if s.droppedStatic {
 				why = "the static spoke was removed from HTCONDORDB_FEDERATE_SPOKES"
 			}
 			h.log.Warn("federate: source leaving the AP set; retiring", "schedd", schedd, "reason", why,
@@ -324,6 +323,35 @@ func (h *Hub) discover(ctx context.Context) {
 		}
 	}
 	h.countRows()
+}
+
+// admit applies one pass's view of a schedd in the AP set.
+func (h *Hub) admit(schedd string, snap Snapshot, now time.Time) {
+	s := h.source(schedd)
+	s.inSet = true
+	s.droppedStatic = false
+	s.lastCollectorSeen = now
+	if !s.retiringSince.IsZero() {
+		h.log.Info("federate: source matches again; no longer retiring", "schedd", schedd)
+		s.retiringSince = time.Time{}
+	}
+	s.untrusted, s.declined = snap.Untrusted[schedd], snap.Declined[schedd]
+	if sp, ok := snap.Spokes[schedd]; ok {
+		s.static, s.spokeName = sp.Static, sp.SpokeName
+		if sp.Address != s.spokeAddress {
+			if s.spokeAddress != "" {
+				h.log.Info("federate: spoke address changed; restarting runners", "schedd", schedd,
+					"from", s.spokeAddress, "to", sp.Address)
+			}
+			h.stopRunners(s)
+			s.spokeAddress = sp.Address
+		}
+	}
+	// A schedd whose spoke ad is missing, untrusted or declined keeps streaming from the last
+	// validated address, if it has one: membership is sticky.
+	if s.spokeAddress != "" {
+		h.startRunners(s)
+	}
 }
 
 // source returns (creating if needed) schedd's state.
