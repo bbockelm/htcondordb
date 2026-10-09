@@ -222,16 +222,27 @@ func TestHubOverRealWatch(t *testing.T) {
 		t.Fatalf("ap2 changed by ap1's reconcile: jobs %v, history %d", jobKeysOf(t, cat, "ap2"), hist("ap2"))
 	}
 
-	// ap2's spoke restarts under the running hub: a Reset of an unchanged source writes nothing
-	// and duplicates nothing.
+	// ap2's spoke restarts cleanly under the running hub. Its mutable tables get a new watch epoch,
+	// so they replay: a Reset of an unchanged source writes nothing and duplicates nothing. Its
+	// history archive keeps its epoch across a clean restart, so the hub resumes it without a Reset.
 	jobs, _ := cat.Table(TableJobs)
 	wc := countWrites(t, jobs)
 	before := cursors(t, hub.hub, "ap2")
 	if len(before) != 3 {
 		t.Fatalf("ap2 cursors before restart: %v", before)
 	}
+	histResets := val(metrics.Resets.WithLabelValues(TableHistory))
 	b.restart()
-	waitFor(t, "ap2 replayed to Synced on every table", func() bool { return allChanged(before, cursors(t, hub.hub, "ap2")) })
+	waitFor(t, "ap2's mutable tables replayed to Synced", func() bool {
+		after := cursors(t, hub.hub, "ap2")
+		return after[TableJobs] != before[TableJobs] && after[TableSyncStatus] != before[TableSyncStatus]
+	})
+	if after := cursors(t, hub.hub, "ap2"); after[TableHistory] != before[TableHistory] {
+		t.Errorf("ap2's history cursor changed across a clean spoke restart: the archive was replayed")
+	}
+	if n := val(metrics.Resets.WithLabelValues(TableHistory)); n != histResets {
+		t.Errorf("history Resets went %v -> %v across a clean spoke restart, want no Reset", histResets, n)
+	}
 	ups, dels := wc.settle(t)
 	if ups != 0 || dels != 0 {
 		t.Errorf("replay of unchanged ap2 wrote %d upserts and %d deletes, want 0 and 0", ups, dels)
@@ -258,16 +269,4 @@ func cursors(t *testing.T, h *Hub, schedd string) map[string]string {
 		}
 	}
 	return out
-}
-
-func allChanged(before, after map[string]string) bool {
-	if len(after) < len(before) {
-		return false
-	}
-	for k, v := range before {
-		if after[k] == v {
-			return false
-		}
-	}
-	return true
 }
