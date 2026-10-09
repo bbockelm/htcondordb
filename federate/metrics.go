@@ -50,7 +50,7 @@ func NewMetrics() *Metrics {
 		BelowRetention: cv("below_retention_total",
 			"Archive records of a Reset replay not appended because they are older than anything the hub's capped archive still holds for that AP (the cap already dropped them), by table.", "table"),
 		RejectedSpokes: cv("rejected_spokes_total",
-			"Spoke ads not paired with a schedd, by reason (host_mismatch, ha_tie, no_name).", "reason"),
+			"Spoke ads not paired with a schedd, by reason (host_mismatch, ha_tie).", "reason"),
 		Retired: prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Subsystem: sub, Name: "retired_total",
 			Help: "Sources retired (rows deleted from the hub's mutable tables)."}),
 		SourceStaleness: prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: ns, Subsystem: sub, Name: "source_staleness_seconds",

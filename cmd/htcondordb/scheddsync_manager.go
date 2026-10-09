@@ -312,8 +312,10 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 	if !okMin {
 		note("HTCONDORDB_JOB_METRICS_MIN_INTERVAL")
 	}
+	// Whole seconds: a sub-second value ("500ms") would truncate to 0 and silently become the
+	// default, so it is reported like an unparseable one.
 	syncStatusSecs, okHB := configSeconds(cfg, "HTCONDORDB_SYNCSTATUS_INTERVAL")
-	if !okHB || syncStatusSecs < 0 {
+	if !okHB || syncStatusSecs < 0 || (syncStatusSecs == 0 && strings.TrimSpace(getStr(cfg, "HTCONDORDB_SYNCSTATUS_INTERVAL")) != "") {
 		note("HTCONDORDB_SYNCSTATUS_INTERVAL")
 		syncStatusSecs = 0
 	}

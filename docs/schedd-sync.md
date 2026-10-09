@@ -137,7 +137,7 @@ Repairing the mirror goes through the sync itself (DAEMON-authorized, over
 | `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). **Create-time only.** See [Sizing](#sizing). |
 | `HTCONDORDB_MIRRORED_SCHEDD_NAME` | the schedd's own `Name` | Which schedd this mirror claims (`MirroredScheddName`). See [Naming the mirrored schedd](#naming-the-mirrored-schedd). |
 | `HTCONDORDB_MIRRORED_SCHEDD_ADDRESS_FILE` | `SCHEDD_ADDRESS_FILE` | The mirrored schedd's address file: its address (`MirroredScheddAddress`) and, from HTCondor 25.x, its `Name`. Set it for a schedd other than the host's primary one. |
-| `HTCONDORDB_SYNCSTATUS_INTERVAL` | `5` | Seconds between `syncstatus` heartbeat rows. |
+| `HTCONDORDB_SYNCSTATUS_INTERVAL` | `5` | Whole seconds between `syncstatus` heartbeat rows. A sub-second value (`500ms`) is rejected (logged) and the default used. |
 
 ### Bounding disk usage
 

@@ -75,7 +75,8 @@ with the sum of every AP's completions; **set a size cap**. A hub needs a persis
 (`HTCONDORDB_DIR` or `SPOOL`): archives and resume cursors live on disk.
 
 All of it is reapplied on `condor_reconfig`. A configuration change restarts the hub's streams;
-each resumes from its cursor.
+each resumes from its cursor. A change to security settings alone (`SEC_*`) does not restart them:
+each spoke session reads them when it connects, so it applies from the next reconnect.
 
 ## Discovery
 
@@ -141,24 +142,38 @@ attribute is carried through unchanged and is unique only within its AP.
   delete journal, the spoke replays its whole table (a Reset). The hub records which rows the
   replay touched, writes only rows that differ from what it holds, and at the end of the replay
   deletes that AP's rows the replay did not include. An AP's rows never vanish mid-replay (no
-  clear-then-replay), and a replay of an unchanged queue writes nothing. A replay cut off before
-  it completes deletes nothing; the next one finishes the job.
+  clear-then-replay), and a replay of an unchanged queue writes nothing. A Reset clears the AP's
+  resume cursor before the replay is applied, so a replay cut off before it completes deletes
+  nothing and the next session replays in full and finishes the job. A replayed row whose ad
+  cannot be decoded counts as delivered: the hub keeps the row it holds (`undecodable_total`).
 - **No archive duplicates.** From the start of each session until the spoke says it is caught up
-  -- a Reset replay, or the overlap a resume re-delivers -- each history/epoch record is checked
-  against the hub's archive by its identity and dropped if present. Small catch-ups are checked
-  record by record; a long one loads the AP's identities once and checks in memory. Live records
+  -- a Reset replay, or the overlap a resume re-delivers -- each history/epoch record is checked against what the hub held before the session, by identity
+  and by count. An identity is not unique (a run instance writes a CHECKPOINT epoch record per
+  checkpoint and a COMMON one per common-files group), so if the hub held k records of an identity,
+  the first k replayed are dropped and the rest appended. A resume's overlap is checked record by
+  record; a Reset replay past 256 records loads the AP's identity counts once and checks in
+  memory. Live records
   are appended without a check. A record with no `GlobalJobId` (or, for epochs, no
   `RunInstanceID`) is appended unchecked and counted in `missing_identity_total`.
 - **Bounded replay after a hub restart, no gap after a crash.** Writes are batched into one
   durable transaction per flush (about a second); archive appends are durable when they return.
   The resume cursor is written (and fsynced) only after the data it covers is durable, so neither a
   process nor an OS crash can leave a committed cursor covering lost data. A crash re-applies at
-  most the last flush window, idempotently.
+  most the last flush window, idempotently. A batch that fails to commit is never covered by a
+  saved cursor: the stream stops with the error (`<Table>LastError`), backs off, and re-delivers
+  the batch on reconnect; a write that keeps failing stalls the stream instead of being skipped.
+- **Replays respect the hub's cap.** When a spoke restart replays into a hub archive that is
+  size-capped and at its cap (or age-capped), records older than the oldest the hub still holds
+  for that AP (by `EnteredHistoryTime`, `EpochWriteDate` for epochs) are skipped
+  (`below_retention_total`): the cap already dropped them, and re-appending them would evict other
+  APs' recent history.
 
 ## Freshness
 
-Each spoke heartbeats into `syncstatus`; the hub stamps each new heartbeat with its own clock on
-receipt (`HubReceivedTime`; a redelivered heartbeat keeps its first receipt time). Staleness uses
+Each spoke heartbeats into `syncstatus`; the hub stamps each new live heartbeat with its own clock on
+receipt (`HubReceivedTime`; a redelivered heartbeat keeps its first receipt time; a heartbeat first
+seen during catch-up -- a replay or a resume's overlap -- is not stamped, so the AP is stale until
+the next live heartbeat). Staleness uses
 the hub's clock only, so clock skew between hosts never becomes staleness:
 
 ```
@@ -216,9 +231,11 @@ static spokes OR'd in by name), `SourcesTotal`, `SourcesFresh`, `SourcesStale`, 
 staleness). Per-source detail is in `federation_sources`, which a consumer can watch.
 
 `/metrics` adds `htcondordb_federate_*`: `events_applied_total`, `identical_skips_total`,
-`resets_total`, `dedup_hits_total`, `missing_identity_total`, `phantom_deletes_total` (by table),
-`rejected_spokes_total` (by reason), `retired_total`, `source_staleness_seconds` (by schedd), and
-`sources` (by state).
+`resets_total`, `dedup_hits_total`, `missing_identity_total`, `phantom_deletes_total`,
+`undecodable_total`, `below_retention_total` (by table), `rejected_spokes_total` (by reason:
+`host_mismatch`, `ha_tie`), `retired_total`, `source_staleness_seconds` (by schedd), and `sources`
+(by state). The series are registered on every htcondordb, so a daemon can become a hub on
+reconfig; on one that is not a hub they stay at zero or absent.
 
 ## What is not guaranteed
 

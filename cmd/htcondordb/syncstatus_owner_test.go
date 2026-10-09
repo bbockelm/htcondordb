@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/dbrpc"
 
@@ -81,5 +82,25 @@ func TestScheddSyncOwnsSyncstatus(t *testing.T) {
 	m.Stop()
 	if svc.Owners().Owned(syncstatus.Table) {
 		t.Error("syncstatus still owned after schedd sync stopped")
+	}
+}
+
+// TestSyncStatusIntervalSubSecondReported: the heartbeat interval is whole seconds; "500ms" used to
+// truncate to 0 and silently become the 5 s default. It is now reported as a bad value.
+func TestSyncStatusIntervalSubSecondReported(t *testing.T) {
+	for v, wantBad := range map[string]bool{"500ms": true, "0": true, "2": false, "2s": false, "": false} {
+		s, bad := resolveScheddSyncSettings(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nHTCONDORDB_SYNCSTATUS_INTERVAL = "+v+"\n"))
+		reported := false
+		for _, b := range bad {
+			if strings.HasPrefix(b, "HTCONDORDB_SYNCSTATUS_INTERVAL=") {
+				reported = true
+			}
+		}
+		if reported != wantBad {
+			t.Errorf("HTCONDORDB_SYNCSTATUS_INTERVAL = %q: reported = %v, want %v (bad = %v)", v, reported, wantBad, bad)
+		}
+		if s.syncStatusInterval < time.Second {
+			t.Errorf("HTCONDORDB_SYNCSTATUS_INTERVAL = %q: interval %v", v, s.syncStatusInterval)
+		}
 	}
 }
