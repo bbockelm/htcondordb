@@ -85,8 +85,10 @@ func newArchiveSink(arch *db.ArchiveTable, table, schedd string, store replicate
 	if err != nil {
 		return nil, err
 	}
-	return &archiveSink{arch: arch, table: table, schedd: schedd, store: store, metrics: m, log: log, onReset: onReset,
-		syncData: archiveSync(arch), cur: cur, catchup: true}, nil
+	s := &archiveSink{arch: arch, table: table, schedd: schedd, store: store, metrics: m, log: log, onReset: onReset,
+		syncData: archiveSync(arch), cur: cur}
+	s.startCatchup() // a sink starts in catch-up, as after BeginSession
+	return s, nil
 }
 
 // archiveSync returns the durability step Flush runs before it commits a cursor.

@@ -477,3 +477,35 @@ func TestArchiveForgedScheddNameOverwritten(t *testing.T) {
 		}
 	}
 }
+
+// TestArchiveRedeliveryAfterReconnect: the same sink across a dropped stream. Live records were
+// appended but their cursor not committed; the stream drops (EndSession) and the Runner reconnects
+// (BeginSession), and the catch-up re-delivers them. BeginSession must re-arm the catch-up check,
+// or the re-delivered records are appended a second time.
+func TestArchiveRedeliveryAfterReconnect(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	m := NewMetrics()
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, m)
+	s.BeginSession()
+	apply(t, s, reset(), upsert("r1", histRecord(t, "ap1", 1)), synced("after-1"))
+	for i := 2; i <= 4; i++ {
+		apply(t, s, liveChange(upsert("r", histRecord(t, "ap1", i)), "after-"+itoa(i)))
+	}
+	s.EndSession() // dropped before a flush: the cursor is still after-1
+
+	s.BeginSession()
+	for i := 2; i <= 4; i++ {
+		apply(t, s, upsert("r", histRecord(t, "ap1", i)))
+	}
+	apply(t, s, synced("after-4"))
+	for i := 1; i <= 4; i++ {
+		if n := countArchive(t, hist, fmt.Sprintf(`ClusterId == %d`, i)); n != 1 {
+			t.Errorf("job %d.0 appears %d times after the reconnect, want 1", i, n)
+		}
+	}
+	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 3 {
+		t.Errorf("dedup_hits = %v, want 3", v)
+	}
+}
