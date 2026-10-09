@@ -452,3 +452,28 @@ func TestArchiveUndecodableSkipped(t *testing.T) {
 		t.Errorf("cursor = %q, want c1", got)
 	}
 }
+
+// TestArchiveForgedScheddNameOverwritten: a history or epoch record arriving with a ScheddName
+// naming another AP is stored under the source's identity, in catch-up and live alike.
+func TestArchiveForgedScheddNameOverwritten(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	for _, table := range []string{TableHistory, TableEpochHistory} {
+		a := hubArchive(t, cat, table)
+		s, err := newArchiveSink(a, table, "ap1.example.org", &replicate.MemCursorStore{}, NewMetrics(), discard, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		forged := func(cluster int) replicate.Change {
+			return upsert("r", parseAd(t, fmt.Sprintf(`GlobalJobId = "ap2#%d.0#1"; ClusterId = %d; RunInstanceID = 0; ScheddName = "ap2.example.org"`, cluster, cluster)))
+		}
+		s.BeginSession()
+		apply(t, s, reset(), forged(1), synced("c"), liveChange(forged(2), "l"))
+		if n := countArchive(t, a, `ScheddName == "ap2.example.org"`); n != 0 {
+			t.Errorf("%s: %d forged records kept their claim to ap2", table, n)
+		}
+		if n := countArchive(t, a, `ScheddName == "ap1.example.org"`); n != 2 {
+			t.Errorf("%s: %d records stamped with their source, want 2", table, n)
+		}
+	}
+}
