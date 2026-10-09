@@ -15,13 +15,17 @@ import (
 //   - every record gets ScheddName overwritten from the source's identity;
 //   - from session start until Synced -- which covers both a Reset replay of the spoke's whole
 //     retained archive and the at-least-once overlap a cursor resume re-delivers -- each record is
-//     checked against the hub archive by its identity (see recordIdentity) and dropped if present.
-//     The first probeBudget records of a catch-up are checked with an exact query each; a
-//     catch-up that runs past that is a full replay, and the sink then loads this schedd's
-//     identities from the hub archive once (one projected scan of the schedd's rows) and checks
-//     the rest in memory. A query per record costs about a millisecond -- the archive's active
-//     segment is scanned, not indexed -- which is fine for a resume's overlap and hours for a
-//     replay of a million records;
+//     checked against what the hub archive held BEFORE the catch-up, by identity (see
+//     recordIdentity) and by count: an identity is not unique (one run instance writes a
+//     CHECKPOINT epoch record per checkpoint, a COMMON one per common-files group), so if the hub
+//     held k records of an identity, the first k replayed records of it are dropped and the rest
+//     appended. Records this catch-up appends never count as already held. The count of an
+//     identity is read when the catch-up first meets it -- before it can have appended any -- by
+//     an exact query; a catch-up that runs past probeBudget queries is a full replay, and the sink
+//     then loads every identity count this schedd has in the hub archive once (one projected scan
+//     of the schedd's rows) and checks the rest in memory. A query per record costs about a
+//     millisecond -- the archive's active segment is scanned, not indexed -- which is fine for a
+//     resume's overlap and hours for a replay of a million records;
 //   - live-tail records are new by construction and are appended without a probe;
 //   - a record with no identity is appended and counted (it cannot be deduplicated).
 //
@@ -48,8 +52,12 @@ type archiveSink struct {
 	// syncData makes every append so far durable; Flush calls it once, before committing the
 	// cursor. See archiveSync. A seam for the ordering test.
 	syncData func() error
-	probes   int                   // exact probes made this catch-up
-	idset    map[[16]byte]struct{} // this schedd's identities, once a catch-up outgrows probing
+	probes   int // exact probes made this catch-up
+	// remaining maps an identity digest to how many records of it the hub held before this
+	// catch-up that the catch-up has not yet matched. An identity absent from it has not been
+	// looked up yet -- unless setLoaded, when it was loaded and the hub held none.
+	remaining map[[16]byte]int
+	setLoaded bool // remaining holds every identity of this schedd (a long catch-up)
 
 	mu  sync.Mutex
 	cur []byte
@@ -91,7 +99,7 @@ func (s *archiveSink) BeginSession() {
 	s.startCatchup()
 }
 
-func (s *archiveSink) EndSession() { s.idset = nil }
+func (s *archiveSink) EndSession() { s.endCatchup() }
 
 // fail records err as the session's failure and drops the uncommitted cursor.
 func (s *archiveSink) fail(err error) error {
@@ -103,7 +111,11 @@ func (s *archiveSink) fail(err error) error {
 }
 
 func (s *archiveSink) startCatchup() {
-	s.catchup, s.probes, s.idset = true, 0, nil
+	s.catchup, s.probes, s.remaining, s.setLoaded = true, 0, map[[16]byte]int{}, false
+}
+
+func (s *archiveSink) endCatchup() {
+	s.catchup, s.probes, s.remaining, s.setLoaded = false, 0, nil, false
 }
 
 func (s *archiveSink) Apply(c replicate.Change) error {
@@ -123,16 +135,12 @@ func (s *archiveSink) apply(c replicate.Change) error {
 			break
 		}
 		c.Ad.InsertAttrString(ScheddNameAttr, s.schedd)
-		var id recordIdentity
-		var hasID bool
 		if s.catchup {
-			var present bool
-			var err error
-			id, hasID, present, err = s.present(c)
+			held, err := s.held(c)
 			if err != nil {
 				return err
 			}
-			if present {
+			if held {
 				s.metrics.DedupHits.WithLabelValues(s.table).Inc()
 				break
 			}
@@ -141,9 +149,6 @@ func (s *archiveSink) apply(c replicate.Change) error {
 			return err
 		}
 		s.appended = true
-		if hasID && s.idset != nil {
-			s.idset[id.digest()] = struct{}{}
-		}
 		s.metrics.EventsApplied.WithLabelValues(s.table, "upsert").Inc()
 	case replicate.KindReset:
 		s.startCatchup() // a replay of everything retained: all of it may already be here
@@ -152,7 +157,7 @@ func (s *archiveSink) apply(c replicate.Change) error {
 			s.onReset()
 		}
 	case replicate.KindSynced:
-		s.catchup, s.idset = false, nil
+		s.endCatchup()
 	case replicate.KindDelete, replicate.KindGap:
 		// append-only: nothing to remove
 	}
@@ -165,50 +170,75 @@ func (s *archiveSink) apply(c replicate.Change) error {
 	return nil
 }
 
-// present reports whether the hub archive already holds c's record.
-func (s *archiveSink) present(c replicate.Change) (id recordIdentity, ok, present bool, err error) {
-	id, ok = archiveIdentity(s.table, c.Ad)
+// held reports whether c's record matches one the hub held before this catch-up that no earlier
+// record of the catch-up matched, and consumes that match.
+func (s *archiveSink) held(c replicate.Change) (bool, error) {
+	id, ok := archiveIdentity(s.table, c.Ad)
 	if !ok {
 		s.metrics.MissingIdentity.WithLabelValues(s.table).Inc()
 		s.log.Debug("federate: archive record has no identity; appended without dedup",
 			"table", s.table, "schedd", s.schedd, "key", c.Key)
-		return id, false, false, nil
+		return false, nil
 	}
-	if s.idset == nil && s.probes >= probeBudget {
-		if err := s.loadIdentities(); err != nil {
-			return id, true, false, err
+	d := id.digest()
+	n, known := s.remaining[d]
+	if !known && !s.setLoaded {
+		if s.probes >= probeBudget {
+			if err := s.loadIdentities(); err != nil {
+				return false, err
+			}
+			n = s.remaining[d]
+		} else {
+			s.probes++
+			var err error
+			if n, err = s.countHeld(id); err != nil {
+				return false, err
+			}
 		}
 	}
-	if s.idset != nil {
-		_, present = s.idset[id.digest()]
-		return id, true, present, nil
+	if n == 0 {
+		s.remaining[d] = 0
+		return false, nil
 	}
-	s.probes++
-	seq, err := s.arch.QueryLimit(id.constraint(s.table, s.schedd), 1)
-	if err != nil {
-		return id, true, false, err
-	}
-	for range seq {
-		return id, true, true, nil
-	}
-	return id, true, false, nil
+	s.remaining[d] = n - 1
+	return true, nil
 }
 
-// loadIdentities reads every identity this schedd has in the hub archive.
+// countHeld counts the hub's records of id for this schedd.
+func (s *archiveSink) countHeld(id recordIdentity) (int, error) {
+	seq, err := s.arch.Query(id.constraint(s.table, s.schedd))
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for range seq {
+		n++
+	}
+	return n, nil
+}
+
+// loadIdentities counts every identity this schedd has in the hub archive, for the identities
+// this catch-up has not met yet. One it has met keeps its running count: the scan would also see
+// the records the catch-up appended, and those are not "held before".
 func (s *archiveSink) loadIdentities() error {
 	seq, err := s.arch.QueryProject(scheddConstraint(s.schedd), identityAttrs)
 	if err != nil {
 		return err
 	}
-	set := map[[16]byte]struct{}{}
+	loaded := map[[16]byte]int{}
 	for vals := range seq {
 		if id, ok := identityFromValues(s.table, vals); ok {
-			set[id.digest()] = struct{}{}
+			loaded[id.digest()]++
 		}
 	}
-	s.idset = set
+	for d, n := range loaded {
+		if _, met := s.remaining[d]; !met {
+			s.remaining[d] = n
+		}
+	}
+	s.setLoaded = true
 	s.log.Info("federate: catch-up is a full replay; loaded the hub's identities for it",
-		"table", s.table, "schedd", s.schedd, "identities", len(set))
+		"table", s.table, "schedd", s.schedd, "identities", len(loaded))
 	return nil
 }
 

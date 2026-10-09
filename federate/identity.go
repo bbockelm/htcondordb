@@ -51,6 +51,10 @@ func HubKey(schedd, sourceKey string) string {
 //   - epoch_history: GlobalJobId + RunInstanceID + EpochAdType -- a job has a record per run
 //     attempt, and a run instance can emit both a SPAWN and an EPOCH ad. A missing EpochAdType
 //     reads as "", as scheddsync's own epoch dedup treats it.
+//
+// An identity is not unique: one run instance writes a CHECKPOINT record per checkpoint and a
+// COMMON record per common-files group. The archive sink therefore dedups by count (see
+// archiveSink), never by presence alone.
 type recordIdentity struct {
 	gid string
 	run int64

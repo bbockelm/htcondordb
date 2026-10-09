@@ -240,3 +240,110 @@ func TestArchiveLargeReplayUsesIdentitySet(t *testing.T) {
 		t.Errorf("dedup_hits = %v, want %d", v, n)
 	}
 }
+
+// TestEpochReplayKeepsRepeatedIdentity: one run instance legitimately writes several epoch records
+// with the same (GlobalJobId, RunInstanceID, EpochAdType) -- a CHECKPOINT per checkpoint, a COMMON
+// per common-files group. A replay into an empty hub must store every one of them, not treat the
+// second as a duplicate of the first it just appended.
+func TestEpochReplayKeepsRepeatedIdentity(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	ep := hubArchive(t, cat, TableEpochHistory)
+	s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, NewMetrics(), discard, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.BeginSession()
+	apply(t, s, reset(), checkpointRec(t, 1), checkpointRec(t, 2), checkpointRec(t, 3), synced("c1"))
+	s.EndSession()
+	if n := countArchive(t, ep, `true`); n != 3 {
+		t.Fatalf("hub holds %d of the spoke's 3 CHECKPOINT records for one run instance", n)
+	}
+}
+
+// checkpointRec is the n'th CHECKPOINT epoch record of run 0 of job 5.0: every one shares an
+// identity.
+func checkpointRec(t *testing.T, n int) replicate.Change {
+	return upsert("k"+itoa(n), parseAd(t, `GlobalJobId = "ap1#5.0#1700000000"; ClusterId = 5; ProcId = 0; RunInstanceID = 0; EpochAdType = "CHECKPOINT"; EpochWriteDate = `+itoa(1700000000+n)))
+}
+
+// TestReplayCountsRepeatedIdentity: N records sharing an identity, replayed into a hub that already
+// holds M of them, leave exactly N -- for M below, at and (0) far below N, through both the
+// per-record probe and the identity set a long replay loads.
+func TestReplayCountsRepeatedIdentity(t *testing.T) {
+	const n = 3
+	for _, path := range []string{"probe", "set", "split"} {
+		for _, m := range []int{0, 1, 2, 3} {
+			t.Run(fmt.Sprintf("%s/held=%d", path, m), func(t *testing.T) {
+				cat := openCatalog(t, t.TempDir())
+				t.Cleanup(func() { _ = cat.Close() })
+				ep := hubArchive(t, cat, TableEpochHistory)
+				metrics := NewMetrics()
+				s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, metrics, discard, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// The hub already holds the first m (appended live: the live tail does not dedup).
+				s.BeginSession()
+				apply(t, s, reset(), synced("c0"))
+				for i := 1; i <= m; i++ {
+					apply(t, s, liveChange(checkpointRec(t, i), "l"+itoa(i)))
+				}
+				s.EndSession()
+
+				// "set": the shared records come after the probe budget is spent, so they are checked
+				// in the identity set; "split": the first is probed (and appended) before the set
+				// loads, the rest are checked in it.
+				filler, first := 0, 1
+				switch path {
+				case "set":
+					filler = probeBudget + 10
+				case "split":
+					filler, first = probeBudget+10, 2
+				}
+				s.BeginSession()
+				changes := []replicate.Change{reset()}
+				if first == 2 {
+					changes = append(changes, checkpointRec(t, 1))
+				}
+				for i := 1; i <= filler; i++ {
+					changes = append(changes, upsert("f", parseAd(t, fmt.Sprintf(`GlobalJobId = "ap1#%d.0#1"; RunInstanceID = 0; EpochAdType = "EPOCH"`, 1000+i))))
+				}
+				for i := first; i <= n; i++ {
+					changes = append(changes, checkpointRec(t, i))
+				}
+				apply(t, s, append(changes, synced("c1"))...)
+				s.EndSession()
+				if val(metrics.DedupHits.WithLabelValues(TableEpochHistory)) != float64(m) {
+					t.Errorf("dedup_hits = %v, want %d", val(metrics.DedupHits.WithLabelValues(TableEpochHistory)), m)
+				}
+				if got := countArchive(t, ep, `EpochAdType == "CHECKPOINT"`); got != n {
+					t.Fatalf("hub holds %d CHECKPOINT records after replaying %d into a hub holding %d, want %d", got, n, m, n)
+				}
+				if got := countArchive(t, ep, `true`); got != n+filler {
+					t.Fatalf("hub holds %d records, want %d", got, n+filler)
+				}
+			})
+		}
+	}
+}
+
+// TestHistoryReplayCountsIdentity: history identities are counted too. A history record that
+// (oddly) appears twice at the spoke appears twice at the hub, however often it is replayed.
+func TestHistoryReplayCountsIdentity(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, NewMetrics())
+	for i := 0; i < 2; i++ {
+		s.BeginSession()
+		apply(t, s, reset(), upsert("r1", histRecord(t, "ap1", 1)), upsert("r1", histRecord(t, "ap1", 1)), upsert("r2", histRecord(t, "ap1", 2)), synced("c"+itoa(i)))
+		s.EndSession()
+	}
+	if n := countArchive(t, hist, `ClusterId == 1`); n != 2 {
+		t.Errorf("job 1.0: %d records, want 2", n)
+	}
+	if n := countArchive(t, hist, `ClusterId == 2`); n != 1 {
+		t.Errorf("job 2.0: %d records, want 1", n)
+	}
+}
