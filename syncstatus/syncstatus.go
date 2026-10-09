@@ -52,10 +52,10 @@ const (
 	// heartbeat may be without knowing the spoke's configuration.
 	AttrHeartbeatInterval = "HeartbeatIntervalSeconds"
 	// AttrSpokeLagSeconds is the largest per-source lag below (see LagSeconds). Absent when any
-	// source whose file exists has no known lag -- not yet seen caught up by this process: an
-	// unknown lag must not read as zero. A source whose
-	// file does not exist (an epoch history on a schedd that has written none) has nothing to be
-	// behind on and does not hold it back; it is reported with <Prefix>FilePresent = false.
+	// source whose file exists has no known lag -- not yet seen caught up by this process -- or
+	// when the job_queue.log does not exist: an unknown lag must not read as zero. A history or
+	// epoch file that does not exist (a schedd that has written none) has nothing to be behind on
+	// and does not hold it back. A missing file is reported with <Prefix>FilePresent = false.
 	AttrSpokeLagSeconds = "SpokeLagSeconds"
 
 	SuffixCaughtUp    = "CaughtUp"
@@ -147,6 +147,11 @@ func BuildAd(r Row) *classad.ClassAd {
 		}
 		if r.Missing[i] && st.LastSync.IsZero() {
 			ad.InsertAttrBool(p+SuffixFilePresent, false)
+			if st.Kind == "job_queue.log" {
+				// Every schedd has a job queue: a missing one is a stopped or removed schedd, or a
+				// wrong path, and the mirror cannot say how current it is.
+				lagKnown = false
+			}
 			continue
 		}
 		ad.InsertAttrBool(p+SuffixCaughtUp, st.CaughtUp)

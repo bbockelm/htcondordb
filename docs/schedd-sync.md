@@ -175,19 +175,21 @@ starts.
 ### The syncstatus heartbeat
 
 Schedd sync also keeps a one-row mutable table, `syncstatus` (key `status`), rewritten every
-`HTCONDORDB_SYNCSTATUS_INTERVAL` seconds. It carries `MirroredScheddName`, `HeartbeatSeq`
-(continues across restarts), `HeartbeatTime` (this host's clock, informational),
-`HeartbeatIntervalSeconds`, and for each source the collector ad's health fields --
-`JobQueueCaughtUp`/`LagBytes`, `HistoryCaughtUp`/`LagBytes`/`GapDetected`, the `Epoch`
-equivalents -- plus `<Source>LagSeconds`, an upper bound on how old the newest state the mirror
+`HTCONDORDB_SYNCSTATUS_INTERVAL` seconds. It carries `MirroredScheddName`,
+`MirroredScheddAddress` (when the schedd's address file is readable), `HeartbeatSeq` (continues
+across restarts), `HeartbeatTime` (this host's clock, informational), `HeartbeatIntervalSeconds`,
+and for each source the collector ad's health fields -- `JobQueueCaughtUp`/`LagBytes`,
+`HistoryCaughtUp`/`LagBytes`/`GapDetected`, the `Epoch` equivalents, and `<Source>LastSyncTime`
+(this host's clock, informational) -- plus `<Source>LagSeconds`, an upper bound on how old the newest state the mirror
 is guaranteed to hold is. While the source is caught up (the ad's `CaughtUp` definition) that is
 the ad's `<Source>SecondsSinceSync`, taken when the row is written; while it is behind it is the
 time since it was last caught up, and keeps growing -- a tailer working through a backlog applies
 records on every pass, so time since the last pass would read a mirror gigabytes behind as fresh.
 `SpokeLagSeconds` is the largest of them. It is absent while any source's lag is unknown: before
 the source is first seen caught up by this process, so a daemon that restarts behind reports no
-lag until it catches up. A source whose file does not exist is reported as
-`<Source>FilePresent = false` and does not hold it back. A federation hub replicates the row and
+lag until it catches up -- and while the job_queue.log does not exist (a stopped or removed
+schedd, or a wrong path). A history or epoch file that does not exist has nothing to be behind on
+and does not hold it back. A missing file is reported as `<Source>FilePresent = false`. A federation hub replicates the row and
 computes freshness from it; see [Federation](federation.md).
 
 ## Job resource metrics

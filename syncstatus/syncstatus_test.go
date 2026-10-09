@@ -249,3 +249,30 @@ func TestCatchingUpLagGrows(t *testing.T) {
 	}
 	_ = f.Close()
 }
+
+// TestMissingJobQueueLogLagUnknown: a missing history or epoch file has nothing to be behind on,
+// but a missing job_queue.log is a schedd that is gone or a mistyped path -- the mirror cannot say
+// how current it is, so the heartbeat states no lag (stale at a hub), never zero (fresh).
+func TestMissingJobQueueLogLagUnknown(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	ad := BuildAd(Row{Now: now, Interval: 5 * time.Second, Seq: 1,
+		Sources: []scheddsync.SyncStatus{{Kind: "job_queue.log", Source: "/wrong/path/job_queue.log"}},
+		Missing: map[int]bool{0: true}})
+	if lag, ok := ad.EvaluateAttrInt(AttrSpokeLagSeconds); ok {
+		t.Errorf("missing job_queue.log: SpokeLagSeconds = %d, want absent", lag)
+	}
+	if v, ok := ad.EvaluateAttrBool("JobQueue" + SuffixFilePresent); !ok || v {
+		t.Errorf("JobQueueFilePresent = %v, %v; want false", v, ok)
+	}
+
+	// A missing history file next to a caught-up job queue still leaves the lag known.
+	ad = BuildAd(Row{Now: now, Interval: 5 * time.Second, Seq: 1,
+		Sources: []scheddsync.SyncStatus{
+			{Kind: "job_queue.log", CaughtUp: true, LastSync: now.Add(-2 * time.Second)},
+			{Kind: "history", Source: "/no/history"},
+		},
+		Missing: map[int]bool{1: true}})
+	if lag, ok := ad.EvaluateAttrInt(AttrSpokeLagSeconds); !ok || lag != 2 {
+		t.Errorf("missing history: SpokeLagSeconds = %d, %v; want 2", lag, ok)
+	}
+}
