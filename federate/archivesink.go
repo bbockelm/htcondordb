@@ -7,6 +7,8 @@ import (
 
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/db/replicate"
+
+	"github.com/bbockelm/htcondordb/cedarsync"
 )
 
 // archiveSink replicates one spoke's archive (history, epoch_history) into the hub's archive of the
@@ -65,6 +67,8 @@ type archiveSink struct {
 	mu  sync.Mutex
 	cur []byte
 }
+
+var _ cedarsync.UndecodableSink = (*archiveSink)(nil)
 
 func newArchiveSink(arch *db.ArchiveTable, table, schedd string, store replicate.CursorStore, m *Metrics, log *slog.Logger, onReset func()) (*archiveSink, error) {
 	cur, err := store.Load()
@@ -134,7 +138,8 @@ func (s *archiveSink) Apply(c replicate.Change) error {
 func (s *archiveSink) apply(c replicate.Change) error {
 	switch c.Kind {
 	case replicate.KindUpsert:
-		if c.Ad == nil {
+		if c.Ad == nil { // undecodable: nothing to append
+			s.metrics.Undecodable.WithLabelValues(s.table).Inc()
 			break
 		}
 		c.Ad.InsertAttrString(ScheddNameAttr, s.schedd)
@@ -172,6 +177,13 @@ func (s *archiveSink) apply(c replicate.Change) error {
 		return s.flush()
 	}
 	return nil
+}
+
+// ApplyUndecodable takes an upsert whose ad could not be decoded (cedarsync.UndecodableSink): it is
+// counted and skipped.
+func (s *archiveSink) ApplyUndecodable(c replicate.Change, _ error) error {
+	c.Kind, c.Ad = replicate.KindUpsert, nil
+	return s.Apply(c)
 }
 
 // held reports whether c's record matches one the hub held before this catch-up that no earlier

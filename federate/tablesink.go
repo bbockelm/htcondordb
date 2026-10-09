@@ -9,6 +9,7 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/db/replicate"
 
+	"github.com/bbockelm/htcondordb/cedarsync"
 	"github.com/bbockelm/htcondordb/syncstatus"
 )
 
@@ -59,6 +60,8 @@ type tableSink struct {
 	mu  sync.Mutex
 	cur []byte
 }
+
+var _ cedarsync.UndecodableSink = (*tableSink)(nil)
 
 func newTableSink(tbl *db.DB, table, schedd string, store replicate.CursorStore, m *Metrics, now func() time.Time, onReset func()) (*tableSink, error) {
 	cur, err := store.Load()
@@ -116,7 +119,8 @@ func (s *tableSink) apply(c replicate.Change) error {
 	switch c.Kind {
 	case replicate.KindUpsert:
 		if c.Ad == nil {
-			return nil
+			s.undecodable(c.Key)
+			break
 		}
 		if err := s.upsert(c.Key, c.Ad); err != nil {
 			return err
@@ -161,6 +165,21 @@ func (s *tableSink) apply(c replicate.Change) error {
 		return s.flush()
 	}
 	return nil
+}
+
+// ApplyUndecodable takes an upsert whose ad could not be decoded (cedarsync.UndecodableSink). The
+// source has the key, so a Reset replay counts it as delivered and the sweep keeps the hub's row;
+// the row stays as the hub holds it (or absent) until the source changes it again.
+func (s *tableSink) ApplyUndecodable(c replicate.Change, _ error) error {
+	c.Kind, c.Ad = replicate.KindUpsert, nil
+	return s.Apply(c)
+}
+
+func (s *tableSink) undecodable(key string) {
+	if s.resetting {
+		s.touched[HubKey(s.schedd, key)] = struct{}{}
+	}
+	s.metrics.Undecodable.WithLabelValues(s.table).Inc()
 }
 
 func (s *tableSink) upsert(key string, ad *classad.ClassAd) error {

@@ -72,6 +72,16 @@ type SessionAware interface {
 	EndSession()
 }
 
+// UndecodableSink is implemented by a sink that must account for an upsert whose ad arrived but
+// could not be decoded. The Runner passes it to ApplyUndecodable -- in place of Apply, and past the
+// client-side Constraint, which cannot evaluate it -- as the Change Apply would have received, with
+// Kind KindUpsert and a nil Ad. A sink without it never sees such a change (the Runner logs and
+// skips it), which is wrong for one reconciling a Reset replay: a key missing from the replay
+// reads as deleted at the source.
+type UndecodableSink interface {
+	ApplyUndecodable(c replicate.Change, err error) error
+}
+
 // Status is a Runner's connection state, for health reporting.
 type Status struct {
 	Connected     bool      // a watch session is open
@@ -230,34 +240,58 @@ func (r *Runner) session(ctx context.Context) (err error) {
 			if !ok {
 				return errStreamClosed
 			}
-			ch, ok := r.toChange(ev, &ver)
-			if !ok {
-				continue
-			}
-			if ch.Kind == replicate.KindUpsert && r.matcher != nil && ch.Ad != nil && !r.matcher.Matches(ch.Ad) {
-				continue // selective: drop a non-matching upsert
-			}
-			if err := r.sink.Apply(ch); err != nil {
+			if err := r.deliver(ev, &ver); err != nil {
 				return err
 			}
-			r.setStatus(func(s *Status) {
-				s.LastEvent = time.Now()
-				if ch.Kind == replicate.KindSynced {
-					s.LastError = "" // a session that reached Synced is healthy
-				}
-			})
 		}
 	}
 }
 
-// toChange converts a watch event to a replicate.Change. The ad arrives decoded (see
-// watchfeed), so this only has to notice one that could not be decoded.
-// ver is advanced only for a sink-visible change. ok is false for an undecodable ad or a resync.
-func (r *Runner) toChange(ev watchfeed.Event, ver *uint64) (replicate.Change, bool) {
+// deliver hands one watch event to the sink.
+func (r *Runner) deliver(ev watchfeed.Event, ver *uint64) error {
 	if ev.Err != nil {
-		r.log.Warn("cedarsync: skipping undecodable ad", "src", r.cfg.Src, "key", ev.Key, "err", ev.Err)
-		return replicate.Change{}, false
+		return r.deliverUndecodable(ev, ver)
 	}
+	ch, ok := r.toChange(ev, ver)
+	if !ok {
+		return nil
+	}
+	if ch.Kind == replicate.KindUpsert && r.matcher != nil && ch.Ad != nil && !r.matcher.Matches(ch.Ad) {
+		return nil // selective: drop a non-matching upsert
+	}
+	if err := r.sink.Apply(ch); err != nil {
+		return err
+	}
+	r.setStatus(func(s *Status) {
+		s.LastEvent = time.Now()
+		if ch.Kind == replicate.KindSynced {
+			s.LastError = "" // a session that reached Synced is healthy
+		}
+	})
+	return nil
+}
+
+// deliverUndecodable hands an upsert whose ad could not be decoded to an UndecodableSink, and
+// skips it for any other sink.
+func (r *Runner) deliverUndecodable(ev watchfeed.Event, ver *uint64) error {
+	us, ok := r.sink.(UndecodableSink)
+	if !ok || db.WatchKind(ev.Kind) != db.WatchUpsert {
+		r.log.Warn("cedarsync: skipping undecodable ad", "src", r.cfg.Src, "key", ev.Key, "err", ev.Err)
+		return nil
+	}
+	r.log.Warn("cedarsync: undecodable ad; the sink keeps what it holds for the key", "src", r.cfg.Src, "key", ev.Key, "err", ev.Err)
+	ch, _ := replicate.ChangeFromWatch(db.WatchEvent{Kind: db.WatchUpsert, Key: ev.Key, Cursor: ev.Cursor}, r.cfg.Src, *ver)
+	*ver++
+	if err := us.ApplyUndecodable(ch, ev.Err); err != nil {
+		return err
+	}
+	r.setStatus(func(s *Status) { s.LastEvent = time.Now() })
+	return nil
+}
+
+// toChange converts a decoded watch event to a replicate.Change. ver is advanced only for a
+// sink-visible change; ok is false for a resync.
+func (r *Runner) toChange(ev watchfeed.Event, ver *uint64) (replicate.Change, bool) {
 	we := db.WatchEvent{Kind: db.WatchKind(ev.Kind), Key: ev.Key, Cursor: ev.Cursor, Ad: ev.Ad}
 	ch, ok := replicate.ChangeFromWatch(we, r.cfg.Src, *ver)
 	if ok {

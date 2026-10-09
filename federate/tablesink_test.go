@@ -1,6 +1,7 @@
 package federate
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -323,5 +324,54 @@ func TestScheddIdentityIgnoresCase(t *testing.T) {
 	}
 	if got := jobKeysOf(t, cat, "ap1.example.org"); !sameKeys(got, 1) {
 		t.Errorf("ap1 rows after a delete under the other spelling = %v, want 1.0", got)
+	}
+}
+
+// undecodable is the change the Runner hands an UndecodableSink for an upsert whose ad could not
+// be decoded.
+func undecodable(key string) replicate.Change {
+	return replicate.Change{Kind: replicate.KindUpsert, Key: key}
+}
+
+// TestUndecodableReplayRowKept: a Reset replay that delivers a key whose ad could not be decoded
+// has still delivered the key -- the source has the row. The hub keeps the row it holds rather than
+// sweeping it as gone, and counts the event. A key the replay does not deliver at all is still
+// swept.
+func TestUndecodableReplayRowKept(t *testing.T) {
+	cat := openCatalog(t, "")
+	t.Cleanup(func() { _ = cat.Close() })
+	jobs := mustTable(t, cat, TableJobs)
+	m := NewMetrics()
+	a := newJobsSink(t, jobs, "ap1.example.org", m)
+	apply(t, a, reset(), upsert("1.0", jobAd(t, 1, 0, "")), upsert("2.0", jobAd(t, 2, 0, "")), upsert("3.0", jobAd(t, 3, 0, "")), synced("c1"))
+	a.EndSession()
+
+	a.BeginSession()
+	apply(t, a, reset(), upsert("1.0", jobAd(t, 1, 0, "")))
+	if err := a.ApplyUndecodable(undecodable("2.0"), errors.New("bad wire ad")); err != nil {
+		t.Fatal(err)
+	}
+	apply(t, a, synced("c2"))
+	if got := jobKeysOf(t, cat, "ap1.example.org"); !sameKeys(got, 1, 2) {
+		t.Errorf("rows after a replay with an undecodable 2.0 and no 3.0 = %v, want 1.0 and 2.0", got)
+	}
+	if v := val(m.Undecodable.WithLabelValues(TableJobs)); v != 1 {
+		t.Errorf("undecodable_total = %v, want 1", v)
+	}
+
+	// Live: the row is left as it was and the cursor moves past the event.
+	live := undecodable("1.0")
+	live.Cursor = []byte("c3")
+	if err := a.ApplyUndecodable(live, errors.New("bad wire ad")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(a.Cursor()); got != "c3" {
+		t.Errorf("cursor = %q, want c3", got)
+	}
+	if got := jobKeysOf(t, cat, "ap1.example.org"); !sameKeys(got, 1, 2) {
+		t.Errorf("rows after a live undecodable upsert = %v, want 1.0 and 2.0", got)
 	}
 }

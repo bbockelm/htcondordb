@@ -1,6 +1,7 @@
 package federate
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -424,5 +425,30 @@ func TestArchiveDedupIgnoresScheddCase(t *testing.T) {
 	}
 	if n := countArchive(t, hist, `ClusterId == 1`); n != 2 {
 		t.Errorf("records = %d, want 2 (one for ap1 under either spelling, one for ap10)", n)
+	}
+}
+
+// TestArchiveUndecodableSkipped: an archive record whose ad could not be decoded is counted and
+// skipped -- there is nothing to append -- and does not stop the stream.
+func TestArchiveUndecodableSkipped(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	m := NewMetrics()
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, m)
+	s.BeginSession()
+	apply(t, s, reset(), upsert("r1", histRecord(t, "ap1", 1)))
+	if err := s.ApplyUndecodable(undecodable("r2"), errors.New("bad wire ad")); err != nil {
+		t.Fatal(err)
+	}
+	apply(t, s, upsert("r3", histRecord(t, "ap1", 3)), synced("c1"))
+	if n := countArchive(t, hist, `true`); n != 2 {
+		t.Errorf("hub history = %d records, want 2", n)
+	}
+	if v := val(m.Undecodable.WithLabelValues(TableHistory)); v != 1 {
+		t.Errorf("undecodable_total = %v, want 1", v)
+	}
+	if got := string(s.Cursor()); got != "c1" {
+		t.Errorf("cursor = %q, want c1", got)
 	}
 }
