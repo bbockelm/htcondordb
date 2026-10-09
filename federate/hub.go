@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -433,6 +434,12 @@ func (h *Hub) cursorStore(schedd, table string) (replicate.CursorStore, error) {
 }
 
 // retire deletes schedd's rows from the mutable tables and forgets it.
+//
+// The cursors go first, durably, and a failure to remove them fails the retirement with nothing
+// deleted. In the other order a source whose cursors survived (a removal error, or a crash between
+// the steps) would resume from them when rediscovered and never re-send the rows just deleted;
+// in this order the worst case is rows kept with no cursor, which the next session's full replay
+// reconciles.
 func (h *Hub) retire(schedd, why string) error {
 	s, known := h.sources[schedd]
 	if known {
@@ -441,6 +448,11 @@ func (h *Hub) retire(schedd, why string) error {
 	_, hasRow := h.ht.sources.LookupClassAd(schedd)
 	if !known && !hasRow {
 		return fmt.Errorf("no federated source named %q", schedd)
+	}
+	if dir := h.cursorDir(schedd); dir != "" {
+		if err := removeDirDurably(dir); err != nil {
+			return fmt.Errorf("federate: retiring %s: removing its cursors (no rows deleted): %w", schedd, err)
+		}
 	}
 	deleted := map[string]int{}
 	for table, d := range h.ht.mutable {
@@ -457,11 +469,6 @@ func (h *Hub) retire(schedd, why string) error {
 			return fmt.Errorf("federate: retiring %s: %w", schedd, err)
 		}
 	}
-	if dir := h.cursorDir(schedd); dir != "" {
-		if err := os.RemoveAll(dir); err != nil {
-			h.log.Warn("federate: could not remove retired source's cursors", "schedd", schedd, "dir", dir, "err", err.Error())
-		}
-	}
 	delete(h.sources, schedd)
 	h.resetMu.Lock()
 	delete(h.resetTimes, schedd)
@@ -470,6 +477,23 @@ func (h *Hub) retire(schedd, why string) error {
 	h.log.Warn("federate: source retired", "schedd", schedd, "reason", why, "deleted_rows", fmt.Sprint(deleted),
 		"note", "archive rows are kept and age out with retention")
 	return nil
+}
+
+// removeDirDurably removes dir and everything in it, then syncs its parent so the removal survives
+// an OS crash. A dir that does not exist is already removed.
+func removeDirDurably(dir string) error {
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	parent, err := os.Open(filepath.Dir(dir))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = parent.Close() }()
+	return parent.Sync()
 }
 
 // staleness computes the upper bound on how far the hub's copy of an AP is behind its schedd,
