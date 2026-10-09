@@ -239,9 +239,11 @@ func TestCursorCommittedOnFlush(t *testing.T) {
 	}
 }
 
-// TestHeartbeatReceiptTime: a syncstatus row is stamped with the hub's clock on receipt, and a
-// redelivery of the same heartbeat keeps its original receipt time -- otherwise a replay would
-// make an old heartbeat look new.
+// TestHeartbeatReceiptTime: a syncstatus row is stamped with the hub's clock when a live heartbeat
+// arrives, and a redelivery of the same heartbeat keeps its original receipt time -- otherwise a
+// replay would make an old heartbeat look new. A heartbeat the hub first sees during catch-up (a
+// Reset replay or a resume's overlap) may be arbitrarily old, so it is not stamped at all: its
+// staleness is unknown, hence stale, until the next live heartbeat.
 func TestHeartbeatReceiptTime(t *testing.T) {
 	cat := openCatalog(t, "")
 	t.Cleanup(func() { _ = cat.Close() })
@@ -252,33 +254,46 @@ func TestHeartbeatReceiptTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hb := func(seq int) replicate.Change {
-		return upsert("status", parseAd(t, `HeartbeatSeq = `+itoa(seq)+`; HeartbeatTime = `+itoa(1_600_000_000+seq)+`; SpokeLagSeconds = 1; HeartbeatIntervalSeconds = 5`))
+	hb := func(seq int, extra string) replicate.Change {
+		return upsert("status", parseAd(t, `HeartbeatSeq = `+itoa(seq)+`; HeartbeatTime = `+itoa(1_600_000_000+seq)+`; SpokeLagSeconds = 1; HeartbeatIntervalSeconds = 5`+extra))
 	}
-	recv := func() int64 {
+	recv := func() (int64, bool) {
+		t.Helper()
+		if err := s.Flush(); err != nil {
+			t.Fatal(err)
+		}
 		row, ok := ss.LookupClassAd(HubKey("ap1.example.org", "status"))
 		if !ok {
 			t.Fatal("no hub syncstatus row")
 		}
-		v, _ := row.EvaluateAttrInt(HubReceivedTimeAttr)
-		return v
+		return row.EvaluateAttrInt(HubReceivedTimeAttr)
 	}
-	apply(t, s, reset(), hb(1), synced("c"))
-	if got := recv(); got != clock.Unix() {
-		t.Fatalf("HubReceivedTime = %d, want %d", got, clock.Unix())
+
+	s.BeginSession()
+	apply(t, s, reset(), hb(1, ""), synced("c1"))
+	if v, ok := recv(); ok {
+		t.Errorf("heartbeat first seen in a Reset replay stamped HubReceivedTime = %d, want none", v)
 	}
+	apply(t, s, hb(2, ""))
+	if v, _ := recv(); v != clock.Unix() {
+		t.Fatalf("live heartbeat HubReceivedTime = %d, want %d", v, clock.Unix())
+	}
+
 	clock = clock.Add(time.Minute)
 	s.BeginSession()
-	apply(t, s, reset(), hb(1), synced("c2")) // replay of the same heartbeat
-	if got := recv(); got != clock.Add(-time.Minute).Unix() {
-		t.Errorf("redelivered heartbeat restamped: HubReceivedTime = %d", got)
+	apply(t, s, reset(), hb(2, ""), synced("c2")) // replay of the same heartbeat
+	if v, _ := recv(); v != clock.Add(-time.Minute).Unix() {
+		t.Errorf("redelivered heartbeat restamped: HubReceivedTime = %d", v)
 	}
-	apply(t, s, hb(2))
-	if err := s.Flush(); err != nil {
-		t.Fatal(err)
+
+	s.BeginSession()
+	apply(t, s, hb(3, `; HubReceivedTime = 1999999999`), synced("c3")) // a resume's overlap, with a forged stamp
+	if v, ok := recv(); ok {
+		t.Errorf("heartbeat first seen in a resume's catch-up stamped HubReceivedTime = %d, want none", v)
 	}
-	if got := recv(); got != clock.Unix() {
-		t.Errorf("new heartbeat HubReceivedTime = %d, want %d", got, clock.Unix())
+	apply(t, s, hb(4, ""))
+	if v, _ := recv(); v != clock.Unix() {
+		t.Errorf("new live heartbeat HubReceivedTime = %d, want %d", v, clock.Unix())
 	}
 }
 

@@ -211,22 +211,32 @@ func (s *tableSink) upsert(key string, ad *classad.ClassAd) error {
 	return nil
 }
 
-// stampHeartbeat sets HubReceivedTime on a syncstatus row: now, unless this is a redelivery of the
-// heartbeat already stored (same HeartbeatSeq and HeartbeatTime), which keeps its original receipt
-// time. Without that, a hub restart or a spoke Reset would replay a heartbeat that might be minutes
-// old and stamp it as just received, and a dead syncer would read as fresh.
+// stampHeartbeat sets HubReceivedTime on a syncstatus row. A redelivery of the heartbeat already
+// stored (same HeartbeatSeq and HeartbeatTime) keeps its original receipt time; otherwise a hub
+// restart or a spoke Reset would replay a heartbeat that might be minutes old and stamp it as just
+// received, and a dead syncer would read as fresh. A heartbeat the hub has not seen is stamped now
+// only when it arrives live: one first seen during catch-up (a Reset replay, or a resume's
+// overlap) may be arbitrarily old, so it gets no stamp -- staleness unknown, hence stale -- until
+// the next live heartbeat. Any HubReceivedTime the row arrives with is the spoke's claim, never
+// kept.
 func (s *tableSink) stampHeartbeat(tx *db.Txn, hk string, ad *classad.ClassAd) {
-	recv := s.now().Unix()
 	if stored, ok := tx.LookupClassAd(hk); ok {
 		seq, ok1 := ad.EvaluateAttrInt(syncstatus.AttrHeartbeatSeq)
 		ht, ok2 := ad.EvaluateAttrInt(syncstatus.AttrHeartbeatTime)
 		oseq, ok3 := stored.EvaluateAttrInt(syncstatus.AttrHeartbeatSeq)
 		oht, ok4 := stored.EvaluateAttrInt(syncstatus.AttrHeartbeatTime)
-		if prev, ok5 := stored.EvaluateAttrInt(HubReceivedTimeAttr); ok1 && ok2 && ok3 && ok4 && ok5 && seq == oseq && ht == oht {
-			recv = prev
+		if ok1 && ok2 && ok3 && ok4 && seq == oseq && ht == oht {
+			if prev, ok := stored.EvaluateAttrInt(HubReceivedTimeAttr); ok {
+				ad.InsertAttr(HubReceivedTimeAttr, prev)
+				return
+			}
 		}
 	}
-	ad.InsertAttr(HubReceivedTimeAttr, recv)
+	if s.catchup {
+		ad.Delete(HubReceivedTimeAttr)
+		return
+	}
+	ad.InsertAttr(HubReceivedTimeAttr, s.now().Unix())
 }
 
 // sweep deletes this schedd's rows that the just-finished Reset replay did not deliver: the source
