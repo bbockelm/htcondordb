@@ -82,12 +82,25 @@ type CollectorQuerier interface {
 
 // PoolCollector queries the pool collector at Address with the process's ambient HTCondor
 // security configuration, like every other pool client here.
-type PoolCollector struct{ Address string }
+type PoolCollector struct {
+	Address string
 
-// Query returns every matching ad (no result cap), projected.
+	client adQuerier // nil: htcondor.NewCollector(Address); a seam for tests
+}
+
+// adQuerier is the part of *htcondor.Collector PoolCollector uses.
+type adQuerier interface {
+	QueryAdsWithOptions(ctx context.Context, adType, constraint string, opts *htcondor.QueryOptions) ([]*classad.ClassAd, *htcondor.PageInfo, error)
+}
+
+// Query returns every matching ad, projected. The limit is explicitly unlimited: the client's
+// default caps a query at 50 ads, and an AP set silently cut at 50 would read the rest as absent.
 func (p PoolCollector) Query(ctx context.Context, adType, constraint string, projection []string) ([]*classad.ClassAd, error) {
-	ads, _, err := htcondor.NewCollector(p.Address).QueryAdsWithOptions(ctx, adType, constraint,
-		&htcondor.QueryOptions{Limit: -1, Projection: projection})
+	c := p.client
+	if c == nil {
+		c = htcondor.NewCollector(p.Address)
+	}
+	ads, _, err := c.QueryAdsWithOptions(ctx, adType, constraint, &htcondor.QueryOptions{Limit: -1, Projection: projection})
 	return ads, err
 }
 
