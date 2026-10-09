@@ -23,7 +23,7 @@ func TestScheddNameCaseInsensitive(t *testing.T) {
 	hub := startHub(t, Config{Catalog: cat, Discovery: disc, Dial: unreachable, CursorDir: dir + "/cursors"})
 	defer hub.stop(t)
 	waitFor(t, "known", func() bool { return sourceState(cat, "ap1") != "" })
-	time.Sleep(50 * time.Millisecond)
+	hub.statePasses(t, 2)
 	src, _ := cat.Table(TableSources)
 	if n := countWhere(t, src, "true"); n != 1 {
 		t.Fatalf("federation_sources rows = %d, want 1 for two spellings of one schedd", n)
@@ -56,8 +56,8 @@ func TestCaseVariantRowsMergedOnRestore(t *testing.T) {
 	src := mustTable(t, cat, TableSources)
 	now := time.Now().Unix()
 	for key, text := range map[string]string{
-		"ap1": `ScheddName = "ap1"; LastSeen = ` + itoa(int(now-100)),
-		"AP1": `ScheddName = "AP1"; LastSeen = ` + itoa(int(now)),
+		"ap1": `ScheddName = "ap1"; SpokeAddress = "spoke-of-ap1"; LastSeen = ` + itoa(int(now-100)),
+		"AP1": `ScheddName = "AP1"; SpokeAddress = "spoke-of-ap1"; LastSeen = ` + itoa(int(now)),
 	} {
 		tx := src.Begin()
 		tx.NewClassAd(key, parseAd(t, text))
@@ -71,17 +71,18 @@ func TestCaseVariantRowsMergedOnRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	disc := &fakeDiscovery{}
-	disc.set(members("AP1"))
+	disc.set(members()) // nothing in the collector: LastSeen comes from the merged rows alone
 	hub := startHub(t, Config{Catalog: cat, Discovery: disc, Dial: unreachable, CursorDir: dir + "/cursors"})
 	defer hub.stop(t)
-	waitFor(t, "one row", func() bool { return countWhere(t, src, "true") == 1 })
-	row, ok := src.LookupClassAd("ap1")
-	if !ok {
-		t.Fatal("no row under the folded key")
-	}
-	if v, _ := row.EvaluateAttrInt("LastSeen"); v < now {
-		t.Errorf("merged LastSeen = %d, want the later (%d)", v, now)
-	}
+	// The merged source's row is rewritten under the folded key with the later LastSeen.
+	waitFor(t, "one merged row", func() bool {
+		row, ok := src.LookupClassAd("ap1")
+		if !ok || countWhere(t, src, "true") != 1 {
+			return false
+		}
+		v, _ := row.EvaluateAttrInt("LastSeen")
+		return v == now
+	})
 	waitFor(t, "legacy cursor dir dropped", func() bool { _, err := os.Stat(legacy); return os.IsNotExist(err) })
 }
 

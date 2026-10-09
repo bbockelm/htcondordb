@@ -44,6 +44,7 @@ func (f *fakeDiscovery) callCount() int { f.mu.Lock(); defer f.mu.Unlock(); retu
 
 func members(schedds ...string) Snapshot {
 	s := Snapshot{Matched: map[string]bool{}, Present: map[string]bool{}, Spokes: map[string]Spoke{},
+		Untrusted: map[string]string{}, Declined: map[string]string{},
 		MatchKnown: true, PresentKnown: true, SpokesKnown: true}
 	for _, n := range schedds {
 		s.Matched[n], s.Present[n] = true, true
@@ -109,6 +110,23 @@ func (rh *runningHub) stop(t *testing.T) {
 	t.Helper()
 	if err := rh.halt(); err != nil {
 		t.Fatalf("hub Run: %v", err)
+	}
+}
+
+// statePasses waits for n state passes to complete after the call (each publishes a new summary).
+// Two guarantee one that started after the call: the deterministic way to say "and then nothing
+// happened" after advancing the test clock.
+func (rh *runningHub) statePasses(t *testing.T, n int) {
+	t.Helper()
+	seen := rh.hub.Summary()
+	for i := 0; i < n; i++ {
+		waitFor(t, "a state pass", func() bool {
+			if cur := rh.hub.Summary(); cur != seen {
+				seen = cur
+				return true
+			}
+			return false
+		})
 	}
 }
 
@@ -237,7 +255,7 @@ func TestAbsentIsNotRetiredAndLastSeenPersists(t *testing.T) {
 
 	// Past seven days since last seen, but the hub was down for six of them: not yet.
 	clock.advance(24*time.Hour + time.Minute)
-	time.Sleep(50 * time.Millisecond)
+	hub.statePasses(t, 2)
 	if n := scheddRows(t, cat, TableJobs, "ap1"); n != 3 {
 		t.Fatalf("hub downtime counted as unseen time: %d jobs, want 3", n)
 	}
@@ -289,7 +307,7 @@ func TestRetiringWhenConstraintStopsMatching(t *testing.T) {
 	hub.hub.Rediscover()
 	waitFor(t, "ap1 back", func() bool { return sourceState(cat, "ap1") == StateStale })
 	clock.advance(time.Hour)
-	time.Sleep(50 * time.Millisecond)
+	hub.statePasses(t, 2)
 	if n := scheddRows(t, cat, TableJobs, "ap1"); n != 2 {
 		t.Fatalf("un-retired source lost rows: %d", n)
 	}

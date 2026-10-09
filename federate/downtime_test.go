@@ -47,14 +47,15 @@ func TestHubDowntimeDoesNotRetire(t *testing.T) {
 	defer hub.stop(t)
 	waitFor(t, "first discovery after restart", func() bool { return disc.callCount() >= 2 })
 	waitFor(t, "ap1 absent", func() bool { return sourceState(cat, "ap1") == StateAbsent })
-	time.Sleep(300 * time.Millisecond) // several state passes, the spoke dialed and connected
+	waitFor(t, "ap1's spoke reached", func() bool { v, _ := sourceRowAttrBool(cat, "ap1", "JobsConnected"); return v })
+	hub.statePasses(t, 2)
 	if n := len(jobKeysOf(t, cat, "ap1")); n != 3 {
 		t.Fatalf("reachable spoke's rows deleted after hub downtime + empty collector: %d jobs left", n)
 	}
 
 	// A week of this run with the spoke still reachable: contact keeps it.
 	clock.advance(8 * 24 * time.Hour)
-	time.Sleep(200 * time.Millisecond)
+	hub.statePasses(t, 2)
 	if n := len(jobKeysOf(t, cat, "ap1")); n != 3 || val(hub.hub.Metrics().Retired) != 0 {
 		t.Fatalf("reachable absent spoke retired: %d jobs left", n)
 	}

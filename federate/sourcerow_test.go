@@ -24,12 +24,12 @@ func TestSourceRowVolatileFieldsCoarse(t *testing.T) {
 		Now: clock.now, FlushInterval: 20 * time.Millisecond, StateInterval: 5 * time.Millisecond})
 	defer hub.stop(t)
 	waitFor(t, "connected", func() bool { v, _ := sourceRowAttrBool(cat, "ap1", "JobsConnected"); return v })
-	time.Sleep(50 * time.Millisecond)
+	hub.statePasses(t, 2)
 
 	wc := countWrites(t, mustTable(t, cat, TableSources))
 	for i := 0; i < 24; i++ { // two minutes of 5 s state passes
 		clock.advance(5 * time.Second)
-		time.Sleep(15 * time.Millisecond)
+		hub.statePasses(t, 2)
 	}
 	upserts, _ := wc.settle(t)
 	if upserts > 3 {

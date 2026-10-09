@@ -62,7 +62,7 @@ func TestRestoredSpokeAddressRevalidated(t *testing.T) {
 	defer hub.stop(t)
 	waitFor(t, "ap1 dialed", func() bool { return dl.count("<10.0.0.1:9620>") > 0 })
 	waitFor(t, "ap3 dialed", func() bool { return dl.count("<10.9.9.9:9620>") > 0 })
-	time.Sleep(200 * time.Millisecond)
+	hub.statePasses(t, 2)
 	if n := dl.count("<10.6.6.6:9620>"); n != 0 {
 		t.Fatalf("restored address that fails host validation was dialed %d times", n)
 	}
