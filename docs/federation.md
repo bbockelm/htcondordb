@@ -104,6 +104,12 @@ matching the constraint, for all ScheddAds (to tell "no longer matches" from "go
     collector).
 - **HA pairs.** Two valid spokes claiming one schedd: the one reporting `Syncing` and caught up
   wins; if both or neither are, the hub declines rather than guess (`reason="ha_tie"`).
+- **Validated pairings are sticky.** `untrusted` (every claimant rejected) and a declined HA tie
+  apply only to a schedd with no previously validated spoke. A schedd that had one keeps streaming
+  from that address -- a rejected impostor or a tie does not stop an established stream; only a new
+  *valid* claim moves it. To force a re-pairing, `.retire` the schedd.
+- `rejected_spokes_total` counts rejections per discovery pass: one misconfigured spoke adds one
+  every `HTCONDORDB_FEDERATE_DISCOVER_INTERVAL`, so read it as a rate, not a count of spokes.
 - A failed collector query is not an empty AP set: the constraint's part of the pass is skipped.
   Static spokes are configuration, not collector data: they are federated whether or not the
   collector answers.
@@ -126,9 +132,11 @@ the lowercased name; `ScheddName` keeps the spelling the hub first saw), one set
 
 A hub upgraded from a release that keyed sources by spelling merges the rows of an AP known under
 several spellings into one at startup, and drops cursors it kept under a capitalised spelling: such
-an AP replays once (correct -- the replay reconciles -- but a full replay). The storage keys of the hub's mutable tables are an
-internal encoding of (schedd, spoke key); it may change between releases (which would mean
-rebuilding the hub from its spokes), so never parse or construct one. The spoke's own `Key`
+an AP replays once (correct -- the replay reconciles -- but a full replay).
+
+The storage keys of the hub's mutable tables are an internal encoding of (schedd, spoke key); it
+may change between releases (which would mean rebuilding the hub from its spokes), so never parse
+or construct one. The spoke's own `Key`
 attribute is carried through unchanged and is unique only within its AP.
 
 `clusters`, `jobsets`, `users`, `header` and the other spoke-internal tables are not replicated:
@@ -138,8 +146,9 @@ attribute is carried through unchanged and is unique only within its AP.
 
 - **No collisions.** Two APs' job `123.0` are two rows; a delete from one AP never touches the
   other's.
-- **No phantoms.** When a spoke restarts (its watch epoch changes) or the hub falls out of its
-  delete journal, the spoke replays its whole table (a Reset). The hub records which rows the
+- **No phantoms.** When a spoke restarts (a mutable table's watch epoch changes with every spoke
+  process) or the hub falls out of its delete journal, the spoke replays its whole table (a
+  Reset). The hub records which rows the
   replay touched, writes only rows that differ from what it holds, and at the end of the replay
   deletes that AP's rows the replay did not include. An AP's rows never vanish mid-replay (no
   clear-then-replay), and a replay of an unchanged queue writes nothing. A Reset clears the AP's
@@ -240,8 +249,10 @@ reconfig; on one that is not a hub they stay at zero or absent.
 ## What is not guaranteed
 
 - **Spoke chaining gaps are inherited.** The hub has no cluster ads to repair partial job rows from.
-- **Replays are correct, not cheap.** Every spoke restart replays its tables (spoke watch epochs are
-  per process). The hub writes almost nothing for an unchanged spoke, but it still streams and
+- **Replays are correct, not cheap.** Every spoke restart replays its mutable tables (`jobs`,
+  `syncstatus`: their watch epochs are per process). An archive (`history`, `epoch_history`) keeps
+  its epoch across a clean spoke restart and resumes; a spoke that crashed or was killed replays it
+  too. The hub writes almost nothing for an unchanged spoke, but a history replay still streams and
   checks the spoke's whole retained history.
 - **Archive ingest pays one msync per record.** classad's archive has no non-durable append and no
   batch sync, so the hub cannot defer durability to the once-per-flush point it uses for tables.
