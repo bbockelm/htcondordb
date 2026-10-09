@@ -20,9 +20,7 @@ type CollectorDiscovery struct{}
 // Schedds returns the schedds advertising to pool that satisfy constraint.
 func (CollectorDiscovery) Schedds(ctx context.Context, pool, constraint string) ([]ScheddRef, error) {
 	coll := htcondor.NewCollector(pool)
-	ads, _, err := coll.QueryAdsWithOptions(ctx, "Schedd", constraint, &htcondor.QueryOptions{
-		Projection: []string{"Name", "MyAddress", "ScheddIpAddr"},
-	})
+	ads, _, err := coll.QueryAdsWithOptions(ctx, "Schedd", constraint, scheddQueryOptions())
 	if err != nil {
 		return nil, err
 	}
@@ -39,6 +37,17 @@ func (CollectorDiscovery) Schedds(ctx context.Context, pool, constraint string) 
 		out = append(out, ScheddRef{Name: name, Address: addr})
 	}
 	return out, nil
+}
+
+// scheddQueryOptions is the collector query for the pool's schedds: every match, not
+// the first 50. The collector client reads a zero Limit as "unset" and substitutes its
+// interactive default of 50, so a pool with more schedds than that would silently
+// import from an arbitrary 50 of them.
+func scheddQueryOptions() *htcondor.QueryOptions {
+	return &htcondor.QueryOptions{
+		Projection: []string{"Name", "MyAddress", "ScheddIpAddr"},
+		Limit:      -1,
+	}
 }
 
 // ScheddHistorySource implements Source via a remote condor_history stream

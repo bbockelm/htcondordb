@@ -35,3 +35,12 @@ func TestHistoryQueryIsUncapped(t *testing.T) {
 		})
 	}
 }
+
+// TestScheddDiscoveryIsUncapped pins the same trap on the collector query: a zero Limit
+// becomes 50 there too, so discovery in a pool of more than 50 schedds would drop the rest.
+func TestScheddDiscoveryIsUncapped(t *testing.T) {
+	opts := scheddQueryOptions()
+	if effective := opts.ApplyDefaults(); !effective.IsUnlimited() {
+		t.Errorf("after ApplyDefaults the schedd query is capped at %d", effective.Limit)
+	}
+}
