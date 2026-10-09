@@ -16,7 +16,19 @@ import (
 // cursor survives an OS crash. replicate.FileCursorStore renames without either sync, so after a
 // crash the file can be missing or empty -- harmless here (an empty cursor replays, and the sinks
 // reconcile and deduplicate) but a waste of a full replay.
-type fileCursorStore struct{ path string }
+type fileCursorStore struct {
+	path string
+	// syncFile and syncDir fsync the new cursor file and its directory; nil means
+	// (*os.File).Sync. Seams for the ordering test.
+	syncFile, syncDir func(*os.File) error
+}
+
+func fsync(f *os.File, hook func(*os.File) error) error {
+	if hook != nil {
+		return hook(f)
+	}
+	return f.Sync()
+}
 
 func (f fileCursorStore) Load() ([]byte, error) {
 	b, err := os.ReadFile(f.path)
@@ -36,7 +48,7 @@ func (f fileCursorStore) Save(cursor []byte) error {
 		_ = fh.Close()
 		return err
 	}
-	if err := fh.Sync(); err != nil {
+	if err := fsync(fh, f.syncFile); err != nil {
 		_ = fh.Close()
 		return err
 	}
@@ -51,7 +63,7 @@ func (f fileCursorStore) Save(cursor []byte) error {
 		return err
 	}
 	defer func() { _ = dir.Close() }()
-	return dir.Sync()
+	return fsync(dir, f.syncDir)
 }
 
 // clearCursor durably commits an empty cursor and clears the sink's copy (*cur, guarded by mu). A

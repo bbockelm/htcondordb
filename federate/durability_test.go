@@ -2,6 +2,8 @@ package federate
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -255,5 +257,36 @@ func TestArchiveAppendIsDurable(t *testing.T) {
 		if got := hist.OpStats().Sync.Count - before; got < int64(i) {
 			t.Fatalf("after %d appends the archive has synced %d times: an append returned before it was durable", i, got)
 		}
+	}
+}
+
+// TestFileCursorStoreSyncOrder: Save fsyncs the new cursor file before renaming it over the old
+// one, and fsyncs the directory after the rename -- otherwise an OS crash can leave the cursor file
+// empty or missing (or the old one), and the next start replays from scratch.
+func TestFileCursorStoreSyncOrder(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "jobs.cursor")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var steps []string
+	current := func() string { b, _ := os.ReadFile(path); return string(b) }
+	st := fileCursorStore{path: path,
+		syncFile: func(f *os.File) error {
+			steps = append(steps, "file:"+filepath.Base(f.Name())+" cursor="+current())
+			return f.Sync()
+		},
+		syncDir: func(f *os.File) error {
+			steps = append(steps, "dir:"+f.Name()+" cursor="+current())
+			return f.Sync()
+		},
+	}
+	if err := st.Save([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	// The temp file is synced while the old cursor is still in place (before the rename); the
+	// directory after it.
+	if !sameSteps(steps, "file:jobs.cursor.tmp cursor=old", "dir:"+dir+" cursor=new") {
+		t.Fatalf("sync steps = %q, want the temp file synced before the rename, then the directory", steps)
 	}
 }
