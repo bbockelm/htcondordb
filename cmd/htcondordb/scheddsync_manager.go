@@ -56,7 +56,10 @@ func (s scheddSyncSettings) ownedTables() []string {
 	if !s.enabled {
 		return nil
 	}
-	var out []string
+	// The heartbeat table is written whenever schedd sync runs (launch creates it first): a remote
+	// write would forge the freshness a hub computes from it, and a drop would pull it out from
+	// under the writer.
+	out := []string{syncstatus.Table}
 	if s.jobLog != "" {
 		out = append(out, jobQueueTables...)
 		if s.metricsEnabled {
@@ -85,7 +88,8 @@ func (m *scheddSyncManager) owners() *server.TableOwners {
 // its own tailer (scheddsync.HistorySync.Truncate); the job_metrics archive is wiped (its samples
 // cannot be re-derived, and the sampler appends on). The job_queue.log tables are refused: they
 // are a projection of the log, and emptying them would only hide jobs until the next update --
-// .resync jobs rebuilds them from the current log instead. Returns a note for the operator.
+// .resync jobs rebuilds them from the current log instead, and the syncstatus heartbeat has nothing
+// to empty. Returns a note for the operator.
 func (m *scheddSyncManager) Truncate(ctx context.Context, table string) (string, error) {
 	m.mu.Lock()
 	hs := m.histSyncs[strings.ToLower(table)]
@@ -106,11 +110,24 @@ func (m *scheddSyncManager) Truncate(ctx context.Context, table string) (string,
 		arch.Truncate()
 		m.logger.Warn("schedd-sync: job_metrics archive truncated by operator")
 		return fmt.Sprintf("%s truncated; sampling continues from now (past samples are not re-derived)", t), nil
+	case t == syncstatus.Table:
+		return "", fmt.Errorf("table %q holds the one heartbeat row schedd sync rewrites every %s for a federation hub; "+
+			"there is nothing to empty, and it would be rewritten at the next heartbeat", t, m.heartbeatInterval())
 	case slices.Contains(jobQueueTables, t):
 		return "", fmt.Errorf("table %q is mirrored from job_queue.log by schedd sync and cannot be emptied on its own "+
 			"(it would only hide jobs until the schedd next touched them); run `.resync jobs` to rebuild it from the current log", t)
 	}
 	return "", fmt.Errorf("table %q is not maintained by schedd sync", table)
+}
+
+// heartbeatInterval is the running syncstatus cadence, for operator messages.
+func (m *scheddSyncManager) heartbeatInterval() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.current.syncStatusInterval > 0 {
+		return m.current.syncStatusInterval
+	}
+	return syncstatus.DefaultInterval
 }
 
 // resyncer is a running sync a caller can ask to re-read its source from scratch.
@@ -764,6 +781,12 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 		if next.jobLog == "" && next.histFile == "" && next.epochFile == "" {
 			return fmt.Errorf("HTCONDORDB_SYNC_SCHEDD is set but none of JOB_QUEUE_LOG, HISTORY, or JOB_EPOCH_HISTORY is configured")
 		}
+		// Claim what the new tailers will write while the old ones still hold theirs. Refused when
+		// another in-process writer (a federation hub, a replication target) holds one of them,
+		// and then nothing here changes.
+		if err := m.owners().Claim(ownerScheddSync, unionTables(m.owners().Held(ownerScheddSync), next.ownedTables())); err != nil {
+			return fmt.Errorf("schedd-sync: %w", err)
+		}
 	}
 
 	// Stop the currently-running tailers (if any) and wait for them to exit before
@@ -779,10 +802,10 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 	m.histSyncs = nil
 	m.current = scheddSyncSettings{}
 
-	// Ownership follows the tailers: the new set replaces the old in one step (a table kept
-	// across the restart is never briefly writable), and is claimed BEFORE the new tailers
-	// create or write anything, so no remote write can land in a table they are about to mirror.
-	// Disabled -> released.
+	// Ownership follows the tailers: the new set (claimed above, with the old) replaces the old
+	// in one step (a table kept across the restart is never briefly writable), BEFORE the new
+	// tailers create or write anything, so no remote write can land in a table they are about to
+	// mirror. Disabled -> released.
 	m.owners().Set(ownerScheddSync, next.ownedTables())
 	if !next.enabled {
 		return nil

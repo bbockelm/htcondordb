@@ -96,9 +96,9 @@ inherits the condor config and drops to the condor user.
 
 ## The mirror is read-only to clients
 
-While sync is on, the tables it writes (`jobs`, `users`, `jobsets`, `clusters`,
-`header`, `clusterprivate`, `logmeta`, plus `job_metrics`, `history` and
-`epoch_history` when their source is configured) belong to it: every client —
+While sync is on, the tables it writes (`syncstatus`, `jobs`, `users`, `jobsets`,
+`clusters`, `header`, `clusterprivate`, `logmeta`, plus `job_metrics`, `history`
+and `epoch_history` when their source is configured) belong to it: every client —
 WRITE and DAEMON alike — may query and `WATCH` them, but writes are refused with
 `read-only table "<name>"`. Ownership follows the configuration: disable sync, or
 drop a source, and `condor_reconfig` makes those tables ordinary again. See

@@ -65,13 +65,13 @@ func TestScheddSyncOwnershipFollowsReconfig(t *testing.T) {
 	m := &scheddSyncManager{parent: ctx, svc: svc, logger: slog.Default()}
 	defer m.Stop()
 
-	all := append(slices.Clone(jobQueueTables), "history", "epoch_history", scheddsync.DefaultJobMetricsTable)
+	all := append(slices.Clone(jobQueueTables), "history", "epoch_history", scheddsync.DefaultJobMetricsTable, "syncstatus")
 	base := "HTCONDORDB_SYNC_SCHEDD = true\nHTCONDORDB_DIR = " + dir + "/db\nJOB_EPOCH_HISTORY =\n"
 
 	if err := m.apply(mkSyncCfg(t, base+"HTCONDORDB_JOB_QUEUE_LOG = "+jobLog+"\nHTCONDORDB_HISTORY = "+hist+"\nHTCONDORDB_JOB_METRICS = true\n")); err != nil {
 		t.Fatal(err)
 	}
-	want := append(slices.Clone(jobQueueTables), "history", scheddsync.DefaultJobMetricsTable)
+	want := append(slices.Clone(jobQueueTables), "history", scheddsync.DefaultJobMetricsTable, "syncstatus")
 	if got := ownedSet(svc.Owners(), all...); !slices.Equal(got, want) {
 		t.Errorf("enabled: owned %v, want %v", got, want)
 	}
@@ -83,8 +83,8 @@ func TestScheddSyncOwnershipFollowsReconfig(t *testing.T) {
 	if err := m.apply(mkSyncCfg(t, base+"HTCONDORDB_JOB_QUEUE_LOG = "+jobLog+"\nHISTORY =\n")); err != nil {
 		t.Fatal(err)
 	}
-	if got := ownedSet(svc.Owners(), all...); !slices.Equal(got, jobQueueTables) {
-		t.Errorf("history dropped: owned %v, want %v", got, jobQueueTables)
+	if got, want := ownedSet(svc.Owners(), all...), append(slices.Clone(jobQueueTables), "syncstatus"); !slices.Equal(got, want) {
+		t.Errorf("history dropped: owned %v, want %v", got, want)
 	}
 
 	if err := m.apply(mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = false\n")); err != nil {
