@@ -19,15 +19,30 @@ import (
 // TestFederationIntegration is the end-to-end check on the federation hub: real htcondordb
 // processes over real FS-authenticated CEDAR. Three spokes each run schedd sync over a synthetic
 // job_queue.log and history file the test writes (no condor needed); spokes 1 and 2 both have job
-// 1.0. One hub federates them as static spokes. It asserts both directions throughout -- each AP's
-// rows present under its own ScheddName and nothing more -- across a spoke restart, a delete while
-// the hub is down, a job_queue.log compaction, and a stopped spoke.
+// 1.0. The spokes grant the hub's identity READ only. One hub federates them as static spokes. It
+// asserts both directions throughout -- each AP's rows present under its own ScheddName and nothing
+// more -- across a delete made while a spoke is down followed by its unclean restart (a Reset whose
+// sweep must remove the job), a delete while the hub is down, a job_queue.log compaction, and a
+// stopped spoke; and that a client cannot write the hub's tables.
+//
+// Discovery by constraint is not exercised end to end: that needs a collector, which this harness
+// does not run. It is covered by the federate package's tests (pairing and validation against a fake
+// collector, and PoolCollector's unlimited query).
+//
+// CI sets HTCONDORDB_REQUIRE_FEDERATION_TEST=1 so that a run which would skip fails instead.
 func TestFederationIntegration(t *testing.T) {
+	skip := func(why string) {
+		t.Helper()
+		if os.Getenv("HTCONDORDB_REQUIRE_FEDERATION_TEST") != "" {
+			t.Fatalf("HTCONDORDB_REQUIRE_FEDERATION_TEST is set but the test would skip: %s", why)
+		}
+		t.Skip(why)
+	}
 	if testing.Short() {
-		t.Skip("integration test (builds + forks the daemon)")
+		skip("integration test (builds + forks the daemon)")
 	}
 	if os.Geteuid() == 0 {
-		t.Skip("schedd-sync refuses to run as root")
+		skip("schedd-sync refuses to run as root")
 	}
 	bin := htcondordbBinary(t)
 	id := fsIdentity(t)
@@ -53,6 +68,10 @@ HTCONDORDB_SYNCSTATUS_INTERVAL = 1
 HTCONDORDB_SCHEDDSYNC_POLL_MS = 100
 HTCONDORDB_SCHEDDSYNC_IDLE_MAX_MS = 200
 HTCONDORDB_ADVERTISE = false
+# A hub needs READ on its spokes and nothing more.
+ALLOW_WRITE = nobody@nowhere.test
+ALLOW_DAEMON = nobody@nowhere.test
+ALLOW_ADMINISTRATOR = nobody@nowhere.test
 `, sp.jobLog, sp.hist, sp.name))
 		spokes[i] = sp
 	}
@@ -161,18 +180,26 @@ HTCONDORDB_ADVERTISE = false
 		waitUntil(t, sp.name+" fresh", 20*time.Second, func() bool { return sourceState(hc, sp.name) == "fresh" })
 	}
 
-	// 2. A spoke restart (new watch epoch => Reset on every table): identical counts, zero
-	//    history duplicates.
+	// 2. A job deleted while its spoke is down, then an unclean spoke restart: a new watch epoch,
+	//    so a Reset on the mutable tables. No delete event can carry the job's removal; the
+	//    Reset's sweep must. History is unchanged and not duplicated.
 	resetBefore := lastReset(hc, spokes[0].name)
 	time.Sleep(1100 * time.Millisecond) // LastReset has one-second resolution
 	_ = spokes[0].proc.Process.Kill()
 	_, _ = spokes[0].proc.Process.Wait()
+	appendFile(t, spokes[0].jobLog, "102 2.0\n")
 	spokes[0].addr, spokes[0].proc = restartNodeAt(t, bin, spokes[0].dir, spokes[0].cfg, spokes[0].addr)
-	waitUntil(t, "ap1 fresh after its restart", 30*time.Second, func() bool { return sourceState(hc, spokes[0].name) == "fresh" })
 	waitUntil(t, "ap1's restart replayed as a Reset", 30*time.Second, func() bool { return lastReset(hc, spokes[0].name) > resetBefore })
-	wantSteady(hc, "steady after spoke restart")
-	stableFor(t, 3*time.Second, func() bool { return histCount(hc, "true") == 6 && allJobs(hc) == 6 },
-		"history duplicated or jobs changed after a spoke restart")
+	waitUntil(t, "job deleted while its spoke was down is swept", 30*time.Second, func() bool {
+		return exact(jobsOf(hc, spokes[0].name), 1, 3) && exact(jobsOf(hc, spokes[1].name), 1, 5) &&
+			exact(jobsOf(hc, spokes[2].name), 7) && allJobs(hc) == 5 && histCount(hc, "true") == 6
+	})
+	waitUntil(t, "ap1 fresh after its restart", 30*time.Second, func() bool { return sourceState(hc, spokes[0].name) == "fresh" })
+
+	// The hub's tables belong to the hub: a client write is refused.
+	if err := hubWrite(hc); err == nil {
+		t.Fatal("a client wrote the hub's jobs table")
+	}
 
 	// 3. A delete on a spoke while the hub is down is gone after the hub restarts.
 	_ = hubProc.Process.Kill()
@@ -183,18 +210,22 @@ HTCONDORDB_ADVERTISE = false
 		rows, err := sc.QueryTable(context.Background(), "jobs", "ClusterId == 5", 0)
 		return err == nil && len(rows) == 0
 	})
+	// The identity the hub uses really has READ only on the spokes.
+	if err := tableWrite(sc, "scratch"); err == nil {
+		t.Fatal("the test identity can write a spoke; the READ-only hub check proves nothing")
+	}
 	hubAddr, _ = restartNodeAt(t, bin, hubDir, hubCfgPath, hubAddr)
 	hc = dbClient(t, hubAddr)
 	waitUntil(t, "delete made while the hub was down", 30*time.Second, func() bool {
-		return exact(jobsOf(hc, spokes[1].name), 1) && exact(jobsOf(hc, spokes[0].name), 1, 2, 3)
+		return exact(jobsOf(hc, spokes[1].name), 1) && exact(jobsOf(hc, spokes[0].name), 1, 3)
 	})
 
 	// 4. A job_queue.log compaction (the schedd rewrites the log as a new file holding the current
-	//    state, here also dropping job 2.0): no phantoms, nothing else lost.
-	writeQueue(t, spokes[0].jobLog, spokes[0].name, 2, []int{1, 3})
+	//    state, here also dropping job 3.0): no phantoms, nothing else lost.
+	writeQueue(t, spokes[0].jobLog, spokes[0].name, 2, []int{1})
 	waitUntil(t, "compaction reconciled", 30*time.Second, func() bool {
-		return exact(jobsOf(hc, spokes[0].name), 1, 3) && exact(jobsOf(hc, spokes[1].name), 1) &&
-			exact(jobsOf(hc, spokes[2].name), 7) && allJobs(hc) == 4
+		return exact(jobsOf(hc, spokes[0].name), 1) && exact(jobsOf(hc, spokes[1].name), 1) &&
+			exact(jobsOf(hc, spokes[2].name), 7) && allJobs(hc) == 3
 	})
 
 	// 5. A stopped spoke: its source goes stale and its rows stay.
@@ -210,6 +241,22 @@ HTCONDORDB_ADVERTISE = false
 	if n := histCount(hc, "true"); n != 6 {
 		t.Fatalf("hub history = %d records, want 6 (no duplicates across the whole run)", n)
 	}
+}
+
+// hubWrite tries to write a row into the hub's jobs table as a client.
+func hubWrite(c *dbrpc.Client) error { return tableWrite(c, "jobs") }
+
+// tableWrite tries to write one row into table as a client.
+func tableWrite(c *dbrpc.Client, table string) error {
+	ctx := context.Background()
+	tx, err := c.BeginTable(ctx, table)
+	if err != nil {
+		return err
+	}
+	if err := tx.NewClassAd(ctx, "planted", "ScheddName = \"ap1.test\"\nClusterId = 99\n"); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // parseRow parses a dbrpc query row, in whichever ClassAd syntax it arrives.

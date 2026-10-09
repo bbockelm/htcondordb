@@ -51,4 +51,13 @@ jobs:
         run: |
           go vet ./...
           go build ./...
-          go test -race -count=1 -timeout 15m ./...
+          go test -race -count=1 -timeout 15m -skip '^TestFederationIntegration$' ./...
+
+      # The federation hub's end-to-end test (real htcondordb processes over FS-authenticated
+      # CEDAR; no HTCondor needed), as its own visible step. HTCONDORDB_REQUIRE_FEDERATION_TEST
+      # makes a run that would skip fail instead.
+      - name: Federation integration test
+        working-directory: htcondordb
+        env:
+          HTCONDORDB_REQUIRE_FEDERATION_TEST: '1'
+        run: go test -count=1 -timeout 5m -run '^TestFederationIntegration$' -v ./cmd/htcondordb/
