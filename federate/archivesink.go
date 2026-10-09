@@ -69,6 +69,7 @@ type archiveSink struct {
 	// looked up yet -- unless setLoaded, when it was loaded and the hub held none.
 	remaining map[[16]byte]int
 	setLoaded bool // remaining holds every identity of this schedd (a long catch-up)
+	setLoads  int  // identity-set loads since the sink was made (for tests)
 	// floor is the oldest floorAttr value the hub holds for this schedd, read when a Reset begins;
 	// floorOK only when the archive is capped and at its cap (see retentionDropped).
 	floor   float64
@@ -282,6 +283,7 @@ func (s *archiveSink) loadIdentities() error {
 		}
 	}
 	s.setLoaded = true
+	s.setLoads++
 	s.log.Info("federate: catch-up is a full replay; loaded the hub's identities for it",
 		"table", s.table, "schedd", s.schedd, "identities", len(loaded))
 	return nil

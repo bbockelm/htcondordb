@@ -234,6 +234,9 @@ func TestArchiveLargeReplayUsesIdentitySet(t *testing.T) {
 		t.Fatalf("first replay appended %d, want %d", got, n)
 	}
 	replay(n+5, "c2")
+	if s.setLoads != 2 {
+		t.Errorf("identity set loaded %d times over two long replays, want 2", s.setLoads)
+	}
 	if got := countArchive(t, ep, `true`); got != n+5 {
 		t.Fatalf("after second replay: %d records, want %d", got, n+5)
 	}
@@ -395,7 +398,8 @@ func TestResumeCatchupProbesWithoutLoadingSet(t *testing.T) {
 	}
 }
 
-// TestResetReplayLoadsSet: a Reset replay past the probe budget does load the set.
+// TestResetReplayLoadsSet: a Reset replay past the probe budget loads the identity set once and
+// then checks every further record in it -- no more queries, no reload.
 func TestResetReplayLoadsSet(t *testing.T) {
 	cat := openCatalog(t, t.TempDir())
 	t.Cleanup(func() { _ = cat.Close() })
@@ -403,11 +407,41 @@ func TestResetReplayLoadsSet(t *testing.T) {
 	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, NewMetrics())
 	s.BeginSession()
 	apply(t, s, reset())
-	for i := 1; i <= probeBudget+1; i++ {
+	for i := 1; i <= probeBudget+100; i++ {
 		apply(t, s, upsert("r", histRecord(t, "ap1", i)))
 	}
-	if !s.setLoaded {
-		t.Error("a Reset replay past the probe budget did not load the identity set")
+	if s.setLoads != 1 || !s.setLoaded {
+		t.Errorf("identity set loaded %d times during one long replay, want 1", s.setLoads)
+	}
+	if s.probes != probeBudget {
+		t.Errorf("%d probe queries, want %d (none once the set is loaded)", s.probes, probeBudget)
+	}
+}
+
+// TestIdentitySetIsScopedToTheAP: the identity set holds only this AP's records. Another AP's
+// records with the same GlobalJobIds must not suppress this AP's replay.
+func TestIdentitySetIsScopedToTheAP(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	n := probeBudget + 50
+	replay := func(schedd string) *archiveSink {
+		s := newHistSink(t, hist, schedd, &replicate.MemCursorStore{}, NewMetrics())
+		s.BeginSession()
+		changes := []replicate.Change{reset()}
+		for i := 1; i <= n; i++ {
+			changes = append(changes, upsert("r", histRecord(t, "ap1", i))) // same GlobalJobIds from both
+		}
+		apply(t, s, changes...)
+		return s
+	}
+	replay("ap2")
+	s := replay("ap1")
+	if s.setLoads != 1 {
+		t.Fatalf("precondition: identity set loaded %d times, want 1", s.setLoads)
+	}
+	if got := countArchive(t, hist, `ScheddName == "ap1"`); got != n {
+		t.Errorf("ap1 appended %d of %d records; another AP's identities suppressed the rest", got, n)
 	}
 }
 
