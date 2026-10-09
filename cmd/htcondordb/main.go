@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -40,6 +39,7 @@ import (
 
 	"github.com/bbockelm/htcondordb/command"
 	"github.com/bbockelm/htcondordb/dbad"
+	"github.com/bbockelm/htcondordb/dbdir"
 	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/metrics"
 	"github.com/bbockelm/htcondordb/server"
@@ -538,19 +538,9 @@ func localUIDDomain(cfg *config.Config) string {
 	return ""
 }
 
-// resolveDBDir resolves the on-disk database directory from config alone: HTCONDORDB_DIR if
-// set, else $(SPOOL)/htcondordb, else "" (in-memory). It is the single source of truth for
-// the DB dir so everything under it -- the catalog, archives, and the schedd-sync position
-// store -- lands in the same place regardless of which knob is set.
-func resolveDBDir(cfg *config.Config) string {
-	if v, ok := cfg.Get("HTCONDORDB_DIR"); ok && strings.TrimSpace(v) != "" {
-		return strings.TrimSpace(v)
-	}
-	if spool, ok := cfg.Get("SPOOL"); ok && strings.TrimSpace(spool) != "" {
-		return filepath.Join(strings.TrimSpace(spool), "htcondordb")
-	}
-	return ""
-}
+// resolveDBDir resolves the on-disk database directory. The rule lives in package
+// dbdir because htcondordb-cli's fsck needs the same answer and the two must not drift.
+func resolveDBDir(cfg *config.Config) string { return dbdir.Resolve(cfg) }
 
 func databaseDir(d *daemon.Daemon, cfg *config.Config) string {
 	dir := resolveDBDir(cfg)
