@@ -200,9 +200,9 @@ func TestIncompleteResetDoesNotSweep(t *testing.T) {
 	if n := countWhere(t, jobs, `ScheddName == "ap1.example.org"`); n != 2 {
 		t.Fatalf("rows after an interrupted replay = %d, want 2 (nothing swept)", n)
 	}
-	// The cursor did not advance past the pre-replay one, so the next session replays again.
-	if got := string(a.Cursor()); got != "c1" {
-		t.Errorf("cursor after interrupted replay = %q, want c1", got)
+	// The Reset cleared the cursor, so the next session is a full replay again and that one sweeps.
+	if got := a.Cursor(); len(got) != 0 {
+		t.Errorf("cursor after interrupted replay = %q, want none", got)
 	}
 }
 

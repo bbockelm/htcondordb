@@ -2,9 +2,13 @@ package federate
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
+
+	"github.com/PelicanPlatform/classad/db/replicate"
 )
 
 // fileCursorStore persists a resume cursor like replicate.FileCursorStore, but durably: the new
@@ -48,4 +52,19 @@ func (f fileCursorStore) Save(cursor []byte) error {
 	}
 	defer func() { _ = dir.Close() }()
 	return dir.Sync()
+}
+
+// clearCursor durably commits an empty cursor and clears the sink's copy (*cur, guarded by mu). A
+// sink calls it when a Reset begins: until the replay reaches Synced the hub's state is part old
+// and part replayed, and the only safe resume point is a full replay -- never the pre-Reset
+// cursor, which a source could resume incrementally (an HA peer still on the old watch epoch),
+// leaving the unfinished replay's rows unreconciled.
+func clearCursor(store replicate.CursorStore, mu *sync.Mutex, cur *[]byte) error {
+	if err := store.Save([]byte{}); err != nil {
+		return fmt.Errorf("federate: clearing the cursor for a Reset: %w", err)
+	}
+	mu.Lock()
+	*cur = nil
+	mu.Unlock()
+	return nil
 }

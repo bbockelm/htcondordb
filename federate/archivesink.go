@@ -159,6 +159,12 @@ func (s *archiveSink) apply(c replicate.Change) error {
 		s.appended = true
 		s.metrics.EventsApplied.WithLabelValues(s.table, "upsert").Inc()
 	case replicate.KindReset:
+		if err := s.flush(); err != nil {
+			return err
+		}
+		if err := clearCursor(s.store, &s.mu, &s.cur); err != nil {
+			return err
+		}
 		s.startCatchup() // a replay of everything retained: all of it may already be here
 		s.full = true
 		s.metrics.Resets.WithLabelValues(s.table).Inc()

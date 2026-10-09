@@ -99,8 +99,8 @@ func (s *tableSink) fail(err error) error {
 }
 
 // EndSession abandons an unfinished Reset replay WITHOUT sweeping: the replay did not deliver the
-// whole source, so the untouched set is not "rows the source no longer has". The next session
-// resumes from the pre-replay cursor, so the source replays again and that replay sweeps.
+// whole source, so the untouched set is not "rows the source no longer has". The Reset cleared the
+// committed cursor, so the next session is a full replay again and that replay sweeps.
 func (s *tableSink) EndSession() {
 	s.resetting, s.touched = false, nil
 }
@@ -135,6 +135,9 @@ func (s *tableSink) apply(c replicate.Change) error {
 		}
 	case replicate.KindReset:
 		if err := s.flush(); err != nil {
+			return err
+		}
+		if err := clearCursor(s.store, &s.mu, &s.cur); err != nil {
 			return err
 		}
 		s.resetting, s.touched, s.catchup = true, map[string]struct{}{}, true
