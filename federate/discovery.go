@@ -157,9 +157,9 @@ func (d *Discovery) Discover(ctx context.Context) (Snapshot, error) {
 				firstErr = fmt.Errorf("querying HTCondorDB ads: %w", err)
 			}
 			infos := scheddInfos(schedds)
-			for n := range infos {
-				snap.Matched[n] = true
-				snap.Present[n] = true
+			for _, si := range infos {
+				snap.Matched[si.name] = true
+				snap.Present[si.name] = true
 			}
 			accepted, rejected, untrusted, declined := pair(ctx, infos, spokeInfos(spokes), d.resolver())
 			snap.Spokes, snap.Rejected, snap.Untrusted, snap.Declined = accepted, rejected, untrusted, declined
@@ -220,7 +220,7 @@ func scheddInfos(ads []*classad.ClassAd) map[string]scheddInfo {
 			continue
 		}
 		a, _ := ad.EvaluateAttrString("MyAddress")
-		out[n] = scheddInfo{name: n, address: a}
+		out[foldName(n)] = scheddInfo{name: n, address: a} // names are case-insensitive
 	}
 	return out
 }
@@ -258,17 +258,17 @@ func pair(ctx context.Context, schedds map[string]scheddInfo, spokes []spokeInfo
 	valid := map[string][]spokeInfo{}
 	mismatched := map[string]int{}
 	for _, sp := range spokes {
-		sd, ok := schedds[sp.mirrored]
+		sd, ok := schedds[foldName(sp.mirrored)]
 		if !ok {
 			continue // claims a schedd outside the AP set
 		}
 		if why, ok := hostValid(ctx, sp, sd, resolve); !ok {
-			rejected = append(rejected, Rejection{Schedd: sp.mirrored, SpokeName: sp.name, SpokeAddress: sp.address,
+			rejected = append(rejected, Rejection{Schedd: sd.name, SpokeName: sp.name, SpokeAddress: sp.address,
 				Reason: RejectHostMismatch, Detail: why})
-			mismatched[sp.mirrored]++
+			mismatched[sd.name]++
 			continue
 		}
-		valid[sp.mirrored] = append(valid[sp.mirrored], sp)
+		valid[sd.name] = append(valid[sd.name], sp)
 	}
 	for schedd, n := range mismatched {
 		if len(valid[schedd]) == 0 {

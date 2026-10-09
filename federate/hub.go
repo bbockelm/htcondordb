@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -106,7 +107,8 @@ type source struct {
 	inSet             bool // matched by the last discovery with a known match set
 	untrusted         string
 	declined          string
-	unverified        string // why a restored spoke address is not dialed until discovery pairs it
+	unverified        string   // why a restored spoke address is not dialed until discovery pairs it
+	spellings         []string // every spelling of the name seen, for cursors kept by spelling
 	lastCollectorSeen time.Time
 	lastContact       time.Time
 	lastReset         time.Time
@@ -278,6 +280,7 @@ func (h *Hub) discover(ctx context.Context) {
 		return
 	}
 	now := h.now()
+	snap, names := foldSnapshot(snap)
 	for _, r := range snap.Rejected {
 		h.metrics.RejectedSpokes.WithLabelValues(r.Reason).Inc()
 		h.log.Warn("federate: spoke rejected", "schedd", r.Schedd, "spoke", r.SpokeName,
@@ -301,13 +304,13 @@ func (h *Hub) discover(ctx context.Context) {
 	}
 
 	// Schedds in the AP set: the static spokes always, the constraint's matches when known.
-	for schedd := range static {
-		h.admit(schedd, snap, now)
+	for key := range static {
+		h.admit(key, names[key], snap, now)
 	}
 	if snap.MatchKnown {
-		for schedd := range snap.Matched {
-			if !static[schedd] {
-				h.admit(schedd, snap, now)
+		for key := range snap.Matched {
+			if !static[key] {
+				h.admit(key, names[key], snap, now)
 			}
 		}
 		h.discoveryDone = true
@@ -334,9 +337,11 @@ func (h *Hub) discover(ctx context.Context) {
 	h.countRows()
 }
 
-// admit applies one pass's view of a schedd in the AP set.
-func (h *Hub) admit(schedd string, snap Snapshot, now time.Time) {
+// admit applies one pass's view of a schedd in the AP set. key is its folded name (snap is folded)
+// and schedd its spelling.
+func (h *Hub) admit(key, schedd string, snap Snapshot, now time.Time) {
 	s := h.source(schedd)
+	s.noteSpelling(schedd)
 	s.inSet = true
 	s.droppedStatic = false
 	s.lastCollectorSeen = now
@@ -344,8 +349,8 @@ func (h *Hub) admit(schedd string, snap Snapshot, now time.Time) {
 		h.log.Info("federate: source matches again; no longer retiring", "schedd", schedd)
 		s.retiringSince = time.Time{}
 	}
-	s.untrusted, s.declined = snap.Untrusted[schedd], snap.Declined[schedd]
-	if sp, ok := snap.Spokes[schedd]; ok {
+	s.untrusted, s.declined = snap.Untrusted[key], snap.Declined[key]
+	if sp, ok := snap.Spokes[key]; ok {
 		s.static, s.spokeName = sp.Static, sp.SpokeName
 		s.unverified = "" // paired by this pass
 		if sp.Address != s.spokeAddress {
@@ -364,15 +369,86 @@ func (h *Hub) admit(schedd string, snap Snapshot, now time.Time) {
 	}
 }
 
-// source returns (creating if needed) schedd's state.
+// source returns (creating if needed) schedd's state. Schedd names are case-insensitive, as
+// HTCondor's are: every spelling of one name is one source, which keeps the spelling it was first
+// known by.
 func (h *Hub) source(schedd string) *source {
-	s, ok := h.sources[schedd]
+	key := foldName(schedd)
+	s, ok := h.sources[key]
 	if !ok {
 		s = &source{schedd: schedd, runners: map[string]*runnerHandle{}, rows: map[string]int64{}}
-		h.sources[schedd] = s
+		h.sources[key] = s
 		h.log.Info("federate: new source", "schedd", schedd)
 	}
 	return s
+}
+
+// noteSpelling records a spelling of s's name.
+func (s *source) noteSpelling(name string) {
+	if !slices.Contains(s.spellings, name) {
+		s.spellings = append(s.spellings, name)
+	}
+}
+
+// legacyCursorDirs are the cursor directories a hub before case folding kept for s's spellings.
+func (h *Hub) legacyCursorDirs(s *source) []string {
+	var out []string
+	for _, n := range append([]string{s.schedd}, s.spellings...) {
+		if d := h.legacyCursorDir(n); d != "" && !slices.Contains(out, d) {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// foldName is the case-folded schedd name the hub keys sources, federation_sources rows and cursor
+// directories by.
+func foldName(schedd string) string { return strings.ToLower(schedd) }
+
+// foldSnapshot rekeys snap by folded schedd name, merging case variants of one name (the first
+// spelling in sorted order wins, so the choice is stable), and returns the spelling of each key.
+func foldSnapshot(snap Snapshot) (Snapshot, map[string]string) {
+	names := map[string]string{}
+	note := func(n string) string {
+		k := foldName(n)
+		if cur, ok := names[k]; !ok || n < cur {
+			names[k] = n
+		}
+		return k
+	}
+	foldBool := func(m map[string]bool) map[string]bool {
+		out := make(map[string]bool, len(m))
+		for n, v := range m {
+			if v {
+				out[note(n)] = true
+			}
+		}
+		return out
+	}
+	foldStr := func(m map[string]string) map[string]string {
+		out := make(map[string]string, len(m))
+		for n, v := range m {
+			out[note(n)] = v
+		}
+		return out
+	}
+	out := snap
+	out.Matched, out.Present = foldBool(snap.Matched), foldBool(snap.Present)
+	out.Untrusted, out.Declined = foldStr(snap.Untrusted), foldStr(snap.Declined)
+	out.Spokes = make(map[string]Spoke, len(snap.Spokes))
+	spokeNames := make([]string, 0, len(snap.Spokes))
+	for n := range snap.Spokes {
+		spokeNames = append(spokeNames, n)
+	}
+	sort.Strings(spokeNames)
+	for _, n := range spokeNames {
+		k := note(n)
+		// A static spoke wins over a discovered one for the same name; else the first spelling.
+		if cur, ok := out.Spokes[k]; !ok || (snap.Spokes[n].Static && !cur.Static) {
+			out.Spokes[k] = snap.Spokes[n]
+		}
+	}
+	return out, names
 }
 
 // revalidateRestored checks each restored spoke address before anything dials it: the persisted
@@ -417,14 +493,14 @@ func (h *Hub) startRunners(s *source) {
 }
 
 func (h *Hub) startRunner(s *source, table string) error {
-	store, err := h.cursorStore(s.schedd, table)
+	store, err := h.cursorStore(s, table)
 	if err != nil {
 		return err
 	}
-	schedd := s.schedd
+	schedd, key := s.schedd, foldName(s.schedd)
 	onReset := func() {
 		h.resetMu.Lock()
-		h.resetTimes[schedd] = h.now()
+		h.resetTimes[key] = h.now()
 		h.resetMu.Unlock()
 	}
 	var sink replicate.Sink
@@ -467,9 +543,22 @@ func (h *Hub) stopAll() {
 	}
 }
 
-// cursorDir is the per-schedd cursor directory: a readable prefix of the name plus a hash, so any
-// schedd name maps to one safe, distinct directory.
+// cursorDir is the per-schedd cursor directory: a readable prefix of the folded name plus a hash,
+// so any schedd name maps to one safe directory, the same for every spelling of it.
 func (h *Hub) cursorDir(schedd string) string {
+	return h.cursorDirOf(foldName(schedd))
+}
+
+// legacyCursorDir is where a hub before case folding kept schedd's cursors: named by its spelling.
+// "" when that is the folded directory.
+func (h *Hub) legacyCursorDir(schedd string) string {
+	if schedd == foldName(schedd) {
+		return ""
+	}
+	return h.cursorDirOf(schedd)
+}
+
+func (h *Hub) cursorDirOf(schedd string) string {
 	if h.cfg.CursorDir == "" {
 		return ""
 	}
@@ -489,10 +578,23 @@ func (h *Hub) cursorDir(schedd string) string {
 	return filepath.Join(h.cfg.CursorDir, b.String()+"-"+hex.EncodeToString(sum[:6]))
 }
 
-func (h *Hub) cursorStore(schedd, table string) (replicate.CursorStore, error) {
+func (h *Hub) cursorStore(s *source, table string) (replicate.CursorStore, error) {
+	schedd := s.schedd
 	dir := h.cursorDir(schedd)
 	if dir == "" {
 		return &replicate.MemCursorStore{}, nil
+	}
+	// A source named with capitals has cursors under its spelling from before case folding. They
+	// are dropped, not adopted: the rows they cover are stored under the earlier key encoding, and
+	// only a full replay -- whose Reset sweep deletes what it does not re-deliver -- moves them.
+	for _, legacy := range h.legacyCursorDirs(s) {
+		if _, err := os.Stat(legacy); err == nil {
+			h.log.Warn("federate: dropping cursors kept under a case-sensitive name; the source replays once",
+				"schedd", schedd, "dir", legacy)
+			if err := removeDirDurably(legacy); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -508,15 +610,32 @@ func (h *Hub) cursorStore(schedd, table string) (replicate.CursorStore, error) {
 // in this order the worst case is rows kept with no cursor, which the next session's full replay
 // reconciles.
 func (h *Hub) retire(schedd, why string) error {
-	s, known := h.sources[schedd]
+	key := foldName(schedd)
+	s, known := h.sources[key]
 	if known {
 		h.stopRunners(s)
+		schedd = s.schedd
 	}
-	_, hasRow := h.ht.sources.LookupClassAd(schedd)
+	// Every spelling's row (ScheddName == is case-insensitive), including rows a hub before case
+	// folding keyed by spelling.
+	hasRow := false
+	if seq, err := h.ht.sources.Query(scheddConstraint(schedd)); err == nil {
+		for range seq {
+			hasRow = true
+			break
+		}
+	}
 	if !known && !hasRow {
 		return fmt.Errorf("no federated source named %q", schedd)
 	}
-	if dir := h.cursorDir(schedd); dir != "" {
+	dirs := []string{h.cursorDir(schedd), h.legacyCursorDir(schedd)}
+	if known {
+		dirs = append(dirs, h.legacyCursorDirs(s)...)
+	}
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
 		if err := removeDirDurably(dir); err != nil {
 			return fmt.Errorf("federate: retiring %s: removing its cursors (no rows deleted): %w", schedd, err)
 		}
@@ -530,15 +649,13 @@ func (h *Hub) retire(schedd, why string) error {
 		deleted[table] = n
 	}
 	if hasRow {
-		tx := h.ht.sources.Begin()
-		tx.DestroyClassAd(schedd)
-		if err := tx.Commit(); err != nil {
+		if _, err := h.ht.sources.DeleteWhere(scheddConstraint(schedd)); err != nil {
 			return fmt.Errorf("federate: retiring %s: %w", schedd, err)
 		}
 	}
-	delete(h.sources, schedd)
+	delete(h.sources, key)
 	h.resetMu.Lock()
-	delete(h.resetTimes, schedd)
+	delete(h.resetTimes, key)
 	h.resetMu.Unlock()
 	h.metrics.Retired.Inc()
 	h.log.Warn("federate: source retired", "schedd", schedd, "reason", why, "deleted_rows", fmt.Sprint(deleted),
@@ -828,7 +945,7 @@ func (h *Hub) writeSourceRow(s *source, state, reason string, stale int64, stale
 		return
 	}
 	tx := h.ht.sources.Begin()
-	tx.NewClassAd(s.schedd, ad)
+	tx.NewClassAd(foldName(s.schedd), ad)
 	if err := tx.Commit(); err != nil {
 		h.log.Warn("federate: writing federation_sources row failed", "schedd", s.schedd, "err", err.Error())
 		return
@@ -838,11 +955,19 @@ func (h *Hub) writeSourceRow(s *source, state, reason string, stale int64, stale
 
 // loadSources restores the persisted source set, so a hub restarting while the collector is empty
 // still knows every member, its last validated spoke address and when it was last seen.
+//
+// Rows are keyed by folded name. A hub before case folding keyed them by spelling, so one schedd
+// may have several: they are merged into one source (its latest times win) and the rows under
+// other keys are deleted when it is written back.
 func (h *Hub) loadSources() {
+	var spellings []string
 	h.ht.sources.ForEach(func(ad *classad.ClassAd) bool {
 		name, _ := ad.EvaluateAttrString(ScheddNameAttr)
 		if name == "" {
 			return true
+		}
+		if name != foldName(name) {
+			spellings = append(spellings, name)
 		}
 		s := &source{schedd: name, runners: map[string]*runnerHandle{}, rows: map[string]int64{}}
 		s.spokeAddress, _ = ad.EvaluateAttrString("SpokeAddress")
@@ -866,12 +991,50 @@ func (h *Hub) loadSources() {
 				s.rows[t] = n
 			}
 		}
-		h.sources[name] = s
+		key := foldName(name)
+		s.noteSpelling(name)
+		if prev, ok := h.sources[key]; ok {
+			spellings := append(prev.spellings, name)
+			s = mergeRestored(prev, s)
+			s.spellings = spellings
+		}
+		h.sources[key] = s
 		return true
 	})
+	if len(spellings) > 0 {
+		tx := h.ht.sources.Begin()
+		for _, n := range spellings {
+			tx.DestroyClassAd(n) // rewritten under the folded key by the next state pass
+		}
+		if err := tx.Commit(); err != nil {
+			h.log.Warn("federate: removing case-variant federation_sources rows", "err", err.Error())
+		}
+	}
 	if len(h.sources) > 0 {
 		h.log.Info("federate: restored persisted sources", "count", len(h.sources))
 	}
+}
+
+// mergeRestored merges two persisted rows of one schedd (case variants from before case folding):
+// the later of each time, and the pairing from the more recently contacted.
+func mergeRestored(a, b *source) *source {
+	keep, other := a, b
+	if b.lastContact.After(a.lastContact) {
+		keep, other = b, a
+	}
+	later := func(x, y time.Time) time.Time {
+		if y.After(x) {
+			return y
+		}
+		return x
+	}
+	keep.lastCollectorSeen = later(keep.lastCollectorSeen, other.lastCollectorSeen)
+	keep.lastReset = later(keep.lastReset, other.lastReset)
+	if keep.retiringSince.IsZero() || other.retiringSince.IsZero() {
+		keep.retiringSince = time.Time{}
+	}
+	keep.static = keep.static || other.static
+	return keep
 }
 
 // countRows refreshes per-source row counts where an index can answer them cheaply. A count the

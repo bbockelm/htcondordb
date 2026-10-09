@@ -115,11 +115,17 @@ matching the constraint, for all ScheddAds (to tell "no longer matches" from "go
 | `syncstatus` | mutable | spoke `syncstatus` | schedd | -- |
 | `history` | archive | spoke `history` | `GlobalJobId` | categorical `ScheddName`, `Owner`, `User`, `GlobalJobId`; value `ClusterId`; zones `CompletionDate`, `EnteredHistoryTime` |
 | `epoch_history` | archive | spoke `epoch_history` | `GlobalJobId` + `RunInstanceID` + `EpochAdType` | as history; zones `EpochWriteDate`, `EnteredHistoryTime` |
-| `federation_sources` | mutable | computed | schedd name (the key) | -- |
+| `federation_sources` | mutable | computed | schedd name, lowercased (the key) | -- |
 
 Every replicated row carries `ScheddName`, **overwritten** from the source's validated identity --
 a row cannot claim another AP. Select an AP's rows with `ScheddName == "..."` and a job with
-`ScheddName`, `ClusterId` and `ProcId`. The storage keys of the hub's mutable tables are an
+`ScheddName`, `ClusterId` and `ProcId`. A schedd's identity is case-insensitive, as in HTCondor:
+two spellings of one schedd name are one AP -- one source, one `federation_sources` row (keyed by
+the lowercased name; `ScheddName` keeps the spelling the hub first saw), one set of cursors.
+
+A hub upgraded from a release that keyed sources by spelling merges the rows of an AP known under
+several spellings into one at startup, and drops cursors it kept under a capitalised spelling: such
+an AP replays once (correct -- the replay reconciles -- but a full replay). The storage keys of the hub's mutable tables are an
 internal encoding of (schedd, spoke key); it may change between releases (which would mean
 rebuilding the hub from its spokes), so never parse or construct one. The spoke's own `Key`
 attribute is carried through unchanged and is unique only within its AP.
