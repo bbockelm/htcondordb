@@ -206,3 +206,54 @@ func TestResetClearsCursor(t *testing.T) {
 		t.Errorf("archive sink: cursor after a crash mid-replay = %q, want none", cur)
 	}
 }
+
+// TestTableCommitIsDurable exercises the production commit path (no seam) on a persistent store
+// and reads the store's own counter of durable commits: each flush that writes, and each sweep,
+// is one durable commit -- never CommitNondurable, since the cursor saved after it must not cover
+// writes a crash could lose.
+func TestTableCommitIsDurable(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	jobs := mustTable(t, cat, TableJobs)
+	s := newJobsSink(t, jobs, "ap1", NewMetrics())
+	durable := func() int64 { return jobs.OpStats().CommitSync.Count }
+
+	s.BeginSession()
+	apply(t, s, reset(), upsert("1.0", jobAd(t, 1, 0, "")), upsert("2.0", jobAd(t, 2, 0, "")), synced("c1"))
+	before := durable()
+	apply(t, s, liveChange(upsert("3.0", jobAd(t, 3, 0, "")), "c2"), liveChange(del("1.0"), "c3"))
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := durable() - before; got != 1 {
+		t.Errorf("a flush made %d durable commits, want 1", got)
+	}
+	s.EndSession()
+
+	s.BeginSession()
+	before = durable()
+	apply(t, s, reset(), upsert("3.0", jobAd(t, 3, 0, "")), synced("c4")) // sweeps 2.0
+	if got := durable() - before; got != 1 {
+		t.Errorf("a Reset whose only write is the sweep made %d durable commits, want 1", got)
+	}
+}
+
+// TestArchiveAppendIsDurable: the archive sink commits a cursor with no sync step of its own
+// (archiveSync is a no-op), which is correct only because each Append is durable when it returns.
+// The archive's own sync counter must advance with every append.
+func TestArchiveAppendIsDurable(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, NewMetrics())
+	s.BeginSession()
+	apply(t, s, reset(), synced("c0"))
+	before := hist.OpStats().Sync.Count
+	const n = 5
+	for i := 1; i <= n; i++ {
+		apply(t, s, liveChange(upsert("r", histRecord(t, "ap1", i)), "c"+itoa(i)))
+		if got := hist.OpStats().Sync.Count - before; got < int64(i) {
+			t.Fatalf("after %d appends the archive has synced %d times: an append returned before it was durable", i, got)
+		}
+	}
+}
