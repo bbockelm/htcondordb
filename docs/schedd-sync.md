@@ -135,7 +135,8 @@ Repairing the mirror goes through the sync itself (DAEMON-authorized, over
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | inherits default | Per-table size cap for `job_metrics`. |
 | `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap against `SampleTime`, e.g. `30d`. |
 | `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). **Create-time only.** See [Sizing](#sizing). |
-| `HTCONDORDB_MIRRORED_SCHEDD_NAME` | the schedd's own rule | Which schedd this mirror claims (`MirroredScheddName`). See [Naming the mirrored schedd](#naming-the-mirrored-schedd). |
+| `HTCONDORDB_MIRRORED_SCHEDD_NAME` | the schedd's own `Name` | Which schedd this mirror claims (`MirroredScheddName`). See [Naming the mirrored schedd](#naming-the-mirrored-schedd). |
+| `HTCONDORDB_MIRRORED_SCHEDD_ADDRESS_FILE` | `SCHEDD_ADDRESS_FILE` | The mirrored schedd's address file: its address (`MirroredScheddAddress`) and, from HTCondor 25.x, its `Name`. Set it for a schedd other than the host's primary one. |
 | `HTCONDORDB_SYNCSTATUS_INTERVAL` | `5` | Seconds between `syncstatus` heartbeat rows. |
 
 ### Bounding disk usage
@@ -158,19 +159,37 @@ See [Configuration](configuration.md) for the full knob list.
 
 While schedd sync runs, the collector ad and the `DBSyncStatus` reply carry
 `MirroredScheddName` -- the schedd whose files this daemon reads -- and, when the schedd's
-address file (`SCHEDD_ADDRESS_FILE`) is readable, `MirroredScheddAddress`. A consumer pairs a
-mirror with its schedd by this name instead of guessing from the host. With schedd sync off
-neither attribute is published.
+address file is readable, `MirroredScheddAddress`. A consumer pairs a mirror with its schedd by
+this name instead of guessing from the host. With schedd sync off neither attribute is published.
 
-The name follows the schedd's own rule (`build_valid_daemon_name` / `default_daemon_name` in
-HTCondor): `SCHEDD.SCHEDD_NAME` or `SCHEDD_NAME` verbatim when it contains `@`; the full hostname
-when it names this host; otherwise `name@$(FULL_HOSTNAME)`. With no `SCHEDD_NAME` it is
-`$(FULL_HOSTNAME)` when this daemon runs as root or the condor user (as it does under
-`condor_master`), else `user@$(FULL_HOSTNAME)` (a personal condor). HTCondor resolves a configured
-name through DNS to decide "names this host"; htcondordb compares it with `FULL_HOSTNAME` and
-`HOSTNAME` instead, so a DNS alias of this host needs `HTCONDORDB_MIRRORED_SCHEDD_NAME`. The chosen
-name, the rule that produced it, and whether the address file was found are logged when sync
-starts.
+The address file is `HTCONDORDB_MIRRORED_SCHEDD_ADDRESS_FILE`, else the primary schedd's
+`SCHEDD_ADDRESS_FILE`. A second schedd on the host, configured under a local name (`SCHEDD2`, say),
+writes its own (`SCHEDD2.SCHEDD_ADDRESS_FILE`): a spoke mirroring it sets
+`HTCONDORDB_MIRRORED_SCHEDD_ADDRESS_FILE` to that path. `MirroredScheddAddress` is the file's first
+line, which is what the schedd writes there: its *private* network address when it has one, else
+its public one -- an address for clients on the schedd's own network, not necessarily the one it
+advertises to the collector.
+
+The name, in order of precedence:
+
+1. `HTCONDORDB_MIRRORED_SCHEDD_NAME`, when set.
+2. The `Name` the schedd writes into its address file. Since HTCondor 25.x the schedd appends a
+   ClassAd after the address, version and platform lines carrying its own `Name` (and `Machine`);
+   this is the schedd's own answer, local names and `-name` included. It is re-read with the
+   address, so a schedd restarted under another name is followed.
+3. Derived from configuration, following the schedd's own rule (`build_valid_daemon_name` /
+   `default_daemon_name` in HTCondor): `SCHEDD.SCHEDD_NAME` or `SCHEDD_NAME` verbatim when it
+   contains `@`; the full hostname when it names this host; otherwise `name@$(FULL_HOSTNAME)`.
+   With no `SCHEDD_NAME` it is `$(FULL_HOSTNAME)` when this daemon runs as root or the condor
+   user (as it does under `condor_master`), else `user@$(FULL_HOSTNAME)` (a personal condor). With
+   no `FULL_HOSTNAME` no name is advertised. HTCondor resolves a configured name through DNS to
+   decide "names this host", and qualifies an unqualified hostname with `DEFAULT_DOMAIN_NAME`;
+   htcondordb does neither (it compares with `FULL_HOSTNAME` and `HOSTNAME`), so a DNS alias of
+   this host, or a pre-25 schedd relying on `DEFAULT_DOMAIN_NAME`, needs
+   `HTCONDORDB_MIRRORED_SCHEDD_NAME`.
+
+The chosen name, the rule that produced it, and whether the address file was found are logged when
+sync starts.
 
 ### The syncstatus heartbeat
 

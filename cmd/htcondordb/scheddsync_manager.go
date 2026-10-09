@@ -745,10 +745,14 @@ func (m *scheddSyncManager) Mirrored() *dbad.Mirrored {
 	m.mu.Lock()
 	cur := m.current
 	m.mu.Unlock()
-	if !cur.enabled || cur.mirrored.name == "" {
+	if !cur.enabled {
 		return nil
 	}
-	return &dbad.Mirrored{Name: cur.mirrored.name, Address: cur.mirrored.address()}
+	name, addr := cur.mirrored.current()
+	if name == "" {
+		return nil
+	}
+	return &dbad.Mirrored{Name: name, Address: addr}
 }
 
 // apply reconciles the running tailers with cfg: a no-op when the resolved
@@ -813,8 +817,12 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 
 	// Say which schedd this daemon claims to mirror and why: a hub pairs on this name, and a wrong
 	// one is a wrong pairing rather than an error anywhere.
-	addr := next.mirrored.address()
-	m.logger.Info("schedd-sync: mirrored schedd", "name", next.mirrored.name, "rule", next.mirrored.rule,
+	name, addr := next.mirrored.current()
+	rule := next.mirrored.rule
+	if name != next.mirrored.name {
+		rule = "the Name in the schedd's address file"
+	}
+	m.logger.Info("schedd-sync: mirrored schedd", "name", name, "rule", rule,
 		"address", addr, "address_file", next.mirrored.addrFile, "address_found", addr != "")
 
 	ctx, cancel := context.WithCancel(m.parent)
@@ -1050,7 +1058,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	w := &syncstatus.Writer{
 		Table:    hb,
 		Sources:  func() []dbad.StatusSource { return statusSources },
-		Mirrored: func() (string, string) { return s.mirrored.name, s.mirrored.address() },
+		Mirrored: s.mirrored.current,
 		Interval: s.syncStatusInterval,
 		Logger:   m.logger,
 	}
