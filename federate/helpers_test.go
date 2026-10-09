@@ -143,9 +143,15 @@ func countWrites(t *testing.T, d *db.DB) *writeCounter {
 	}
 	wc := &writeCounter{d: d, marks: map[string]bool{}, done: make(chan struct{})}
 	wc.cond = sync.NewCond(&wc.mu)
+	live := make(chan struct{})
 	go func() {
 		defer close(wc.done)
+		synced := false
 		for ev := range seq {
+			if ev.Kind == db.WatchSynced && !synced {
+				synced = true
+				close(live)
+			}
 			wc.mu.Lock()
 			switch {
 			case strings.HasPrefix(ev.Key, markPrefix):
@@ -160,6 +166,15 @@ func countWrites(t *testing.T, d *db.DB) *writeCounter {
 		}
 	}()
 	t.Cleanup(func() { cancel(); <-wc.done })
+	// Return only once the watch is registered and live. A watcher that registers while a delete
+	// commits can see that delete twice or not at all (classad v0.31.0 collections: commitSeq
+	// advances under the shard lock, but the delete reaches the delete journal only after the
+	// unlock and sync, so catch-up and the live stream disagree about it).
+	select {
+	case <-live:
+	case <-time.After(10 * time.Second):
+		t.Fatal("write counter's watch never went live")
+	}
 	return wc
 }
 
