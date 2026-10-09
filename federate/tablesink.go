@@ -47,6 +47,10 @@ type tableSink struct {
 	tx      *db.Txn
 	pending int
 	nextCur []byte // cursor to commit once the pending transaction commits
+	// failed is the error that dropped a batch this session. Until the next BeginSession the sink
+	// commits no cursor: the dropped batch's changes are covered by every later cursor of the
+	// session, and only a new session (resuming from the last committed cursor) re-delivers them.
+	failed error
 
 	catchup   bool                // before this session's Synced
 	resetting bool                // a Reset replay is in progress
@@ -65,7 +69,31 @@ func newTableSink(tbl *db.DB, table, schedd string, store replicate.CursorStore,
 		commit: (*db.Txn).Commit, cur: cur, catchup: true}, nil
 }
 
-func (s *tableSink) BeginSession() { s.catchup = true }
+// BeginSession starts from the committed cursor with nothing pending: whatever a failed session
+// left behind (an uncommitted batch, its cursor) is discarded, since the session re-delivers it.
+func (s *tableSink) BeginSession() {
+	s.discard()
+	s.failed = nil
+	s.catchup = true
+}
+
+// discard drops the pending batch and the cursor that would have covered it.
+func (s *tableSink) discard() {
+	if s.tx != nil {
+		s.tx.Abort()
+		s.tx = nil
+	}
+	s.pending, s.nextCur = 0, nil
+}
+
+// fail records err as the session's failure and drops what it covers.
+func (s *tableSink) fail(err error) error {
+	s.discard()
+	if s.failed == nil {
+		s.failed = err
+	}
+	return err
+}
 
 // EndSession abandons an unfinished Reset replay WITHOUT sweeping: the replay did not deliver the
 // whole source, so the untouched set is not "rows the source no longer has". The next session
@@ -75,6 +103,16 @@ func (s *tableSink) EndSession() {
 }
 
 func (s *tableSink) Apply(c replicate.Change) error {
+	if s.failed != nil {
+		return fmt.Errorf("federate: %s from %s: a batch failed this session: %w", s.table, s.schedd, s.failed)
+	}
+	if err := s.apply(c); err != nil {
+		return s.fail(err)
+	}
+	return nil
+}
+
+func (s *tableSink) apply(c replicate.Change) error {
 	switch c.Kind {
 	case replicate.KindUpsert:
 		if c.Ad == nil {
@@ -92,7 +130,7 @@ func (s *tableSink) Apply(c replicate.Change) error {
 			s.metrics.EventsApplied.WithLabelValues(s.table, "delete").Inc()
 		}
 	case replicate.KindReset:
-		if err := s.Flush(); err != nil {
+		if err := s.flush(); err != nil {
 			return err
 		}
 		s.resetting, s.touched, s.catchup = true, map[string]struct{}{}, true
@@ -120,7 +158,7 @@ func (s *tableSink) Apply(c replicate.Change) error {
 		s.nextCur = c.Cursor
 	}
 	if s.pending >= maxBatch {
-		return s.Flush()
+		return s.flush()
 	}
 	return nil
 }
@@ -215,9 +253,20 @@ func (s *tableSink) commitTxn() error {
 }
 
 // Flush commits the pending batch durably and only then the cursor of its last change, so a
-// committed cursor never covers a write a crash could lose. A failed commit leaves the cursor
-// where it was: the next session re-delivers the batch.
+// committed cursor never covers a write a crash could lose. A failed commit drops the batch and
+// its cursor and commits no further cursor this session: the next session resumes from the last
+// committed cursor and re-delivers the batch.
 func (s *tableSink) Flush() error {
+	if s.failed != nil {
+		return s.failed
+	}
+	if err := s.flush(); err != nil {
+		return s.fail(err)
+	}
+	return nil
+}
+
+func (s *tableSink) flush() error {
 	if err := s.commitTxn(); err != nil {
 		return err
 	}

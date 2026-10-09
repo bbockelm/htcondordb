@@ -40,6 +40,9 @@ type archiveSink struct {
 
 	catchup bool
 	nextCur []byte
+	// failed is the error that stopped this session. Until the next BeginSession the sink commits
+	// no cursor (see tableSink.failed).
+	failed error
 	// appended is set by an append since the last flush.
 	appended bool
 	// syncData makes every append so far durable; Flush calls it once, before committing the
@@ -80,14 +83,40 @@ func archiveSync(_ *db.ArchiveTable) func() error {
 // the identity set instead.
 const probeBudget = 256
 
-func (s *archiveSink) BeginSession() { s.startCatchup() }
-func (s *archiveSink) EndSession()   { s.idset = nil }
+// BeginSession starts from the committed cursor: a cursor a failed session left uncommitted is
+// discarded, since the session re-delivers what it covers. (appended is kept: those appends still
+// need their sync before any cursor that follows them.)
+func (s *archiveSink) BeginSession() {
+	s.nextCur, s.failed = nil, nil
+	s.startCatchup()
+}
+
+func (s *archiveSink) EndSession() { s.idset = nil }
+
+// fail records err as the session's failure and drops the uncommitted cursor.
+func (s *archiveSink) fail(err error) error {
+	s.nextCur = nil
+	if s.failed == nil {
+		s.failed = err
+	}
+	return err
+}
 
 func (s *archiveSink) startCatchup() {
 	s.catchup, s.probes, s.idset = true, 0, nil
 }
 
 func (s *archiveSink) Apply(c replicate.Change) error {
+	if s.failed != nil {
+		return fmt.Errorf("federate: %s from %s: an earlier change failed this session: %w", s.table, s.schedd, s.failed)
+	}
+	if err := s.apply(c); err != nil {
+		return s.fail(err)
+	}
+	return nil
+}
+
+func (s *archiveSink) apply(c replicate.Change) error {
 	switch c.Kind {
 	case replicate.KindUpsert:
 		if c.Ad == nil {
@@ -131,7 +160,7 @@ func (s *archiveSink) Apply(c replicate.Change) error {
 		s.nextCur = c.Cursor
 	}
 	if c.Kind == replicate.KindSynced {
-		return s.Flush()
+		return s.flush()
 	}
 	return nil
 }
@@ -185,8 +214,18 @@ func (s *archiveSink) loadIdentities() error {
 
 // Flush makes the appends since the last flush durable (once, not per record) and only then
 // commits the cursor of the last applied change, so a committed cursor never covers an append a
-// crash could lose. A failed sync leaves the cursor where it was.
+// crash could lose. A failed sync drops the cursor and commits none for the rest of the session.
 func (s *archiveSink) Flush() error {
+	if s.failed != nil {
+		return s.failed
+	}
+	if err := s.flush(); err != nil {
+		return s.fail(err)
+	}
+	return nil
+}
+
+func (s *archiveSink) flush() error {
 	if s.appended {
 		if err := s.syncData(); err != nil {
 			return fmt.Errorf("federate: syncing %s appends from %s: %w", s.table, s.schedd, err)
