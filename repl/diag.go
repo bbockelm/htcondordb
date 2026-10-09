@@ -126,11 +126,15 @@ func (s *session) retire(console io.Writer, arg string) {
 		fmt.Fprintln(console, "usage: .retire <schedd-name>   (federation hub: delete that AP's rows from the mutable tables now)")
 		return
 	}
-	if err := s.exec.Retire(schedd); err != nil {
+	note, err := s.exec.Retire(schedd)
+	if err != nil {
 		fmt.Fprintln(console, "error:", err.Error())
 		return
 	}
-	fmt.Fprintf(console, "retired %q\n", schedd)
+	if note == "" {
+		note = fmt.Sprintf("retired %q", schedd)
+	}
+	fmt.Fprintln(console, note)
 }
 
 // timeTravel handles ".timetravel on <window> [checkpoint] | off" for the current

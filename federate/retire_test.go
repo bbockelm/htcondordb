@@ -56,3 +56,21 @@ func TestRetireRemovesCursorsBeforeRows(t *testing.T) {
 	hub.hub.Rediscover()
 	waitFor(t, "rediscovered source replayed", func() bool { return sameKeys(jobKeysOf(t, cat, "ap1"), 1, 2, 3) })
 }
+
+// TestRetireAfterRunExited: Retire on a hub whose Run has returned answers at once instead of
+// waiting out the caller's deadline.
+func TestRetireAfterRunExited(t *testing.T) {
+	disc := &fakeDiscovery{}
+	disc.set(members("ap1"))
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hub := startHub(t, Config{Catalog: cat, Discovery: disc, Dial: unreachable})
+	hub.stop(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := hub.hub.Retire(ctx, "ap1")
+	if err == nil || ctx.Err() != nil || time.Since(start) > time.Second {
+		t.Fatalf("Retire after Run returned: err = %v after %v", err, time.Since(start))
+	}
+}

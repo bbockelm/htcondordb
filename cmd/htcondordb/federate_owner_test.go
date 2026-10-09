@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PelicanPlatform/classad/db"
+
 	"github.com/bbockelm/htcondordb/server"
 )
 
@@ -224,5 +226,78 @@ func TestReplicationTargetCollidesWithHub(t *testing.T) {
 	}
 	if o := svc.Owners().Owners("history"); !slices.Equal(o, []string{ownerReplication}) {
 		t.Errorf("owners(history) = %v", o)
+	}
+}
+
+// TestFederationRetireEndToEnd: `.retire` from the REPL reaches the hub through DBSyncControl and
+// prints the daemon's note; an unknown name is an error.
+func TestFederationRetireEndToEnd(t *testing.T) {
+	svc := newOwnerTestService(t)
+	fm := newFederationManager(t.Context(), svc.Catalog(), svc.Owners(), slog.Default())
+	defer fm.Stop()
+	if err := fm.apply(mkSyncCfg(t, hubCfg(t.TempDir(), ""))); err != nil {
+		t.Fatal(err)
+	}
+	sc := &syncController{fed: fm, owners: svc.Owners(), cat: svc.Catalog()}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if tb, ok := svc.Catalog().Table("federation_sources"); ok {
+			if _, ok := tb.LookupClassAd("ap1"); ok {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ap1 never known")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	out := daemonSession(t, svc, sc, ".retire ap1\n.retire nosuch\n")
+	if !strings.Contains(out, `retired "ap1"`) || !strings.Contains(out, "archive rows age out") ||
+		!strings.Contains(out, "no federated source") {
+		t.Errorf(".retire output = %q, want the daemon's note and the unknown-name error", out)
+	}
+}
+
+// TestFederationHubExitedEarly: a hub whose Run fails (it cannot open its tables) is forgotten, so
+// `.retire` says no hub is running instead of waiting for one, and the next apply of the same
+// configuration starts it again.
+func TestFederationHubExitedEarly(t *testing.T) {
+	svc := newOwnerTestService(t)
+	// An archive named jobs: the hub cannot create its mutable jobs table.
+	if _, err := svc.Catalog().CreateArchiveTable("jobs", db.ArchiveConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	fm := newFederationManager(t.Context(), svc.Catalog(), svc.Owners(), slog.Default())
+	defer fm.Stop()
+	cfg := mkSyncCfg(t, hubCfg(t.TempDir(), ""))
+	if err := fm.apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		fm.mu.Lock()
+		gone := fm.hub == nil
+		fm.mu.Unlock()
+		if gone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a hub whose Run failed is still registered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	start := time.Now()
+	resp := (&syncController{fed: fm}).handle(t.Context(), mkReq("retire", "ap1"))
+	if ok, _ := resp.EvaluateAttrBool("Ok"); ok || time.Since(start) > 2*time.Second {
+		t.Fatalf("retire with no running hub: ok=%v after %v", ok, time.Since(start))
+	}
+	if err := fm.apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	fm.mu.Lock()
+	restarted := fm.hub != nil
+	fm.mu.Unlock()
+	if !restarted {
+		t.Error("the same configuration did not restart the hub")
 	}
 }

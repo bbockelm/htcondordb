@@ -90,6 +90,7 @@ type Hub struct {
 	runCtx        context.Context
 	retireReq     chan retireReq
 	discoverNow   chan struct{}
+	exited        chan struct{} // closed when Run returns
 
 	summary atomic.Pointer[dbad.Federation]
 
@@ -155,6 +156,7 @@ func New(cfg Config) (*Hub, error) {
 	h := &Hub{
 		cfg: cfg, log: cfg.Logger, metrics: cfg.Metrics, now: cfg.Now, tables: tables,
 		sources: map[string]*source{}, retireReq: make(chan retireReq), discoverNow: make(chan struct{}, 1),
+		exited:     make(chan struct{}),
 		resetTimes: map[string]time.Time{},
 	}
 	if h.log == nil {
@@ -203,6 +205,8 @@ func (h *Hub) Retire(ctx context.Context, schedd string) error {
 	req := retireReq{schedd: schedd, resp: make(chan error, 1)}
 	select {
 	case h.retireReq <- req:
+	case <-h.exited:
+		return errors.New("the federation hub is not running")
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -225,6 +229,7 @@ func (h *Hub) Rediscover() {
 // Run replicates until ctx is cancelled. It returns only after every runner and background index
 // backfill has stopped, so the caller may close the catalog afterwards.
 func (h *Hub) Run(ctx context.Context) error {
+	defer close(h.exited)
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	ht, err := ensureTables(h.cfg.Catalog, h.tables, h.cfg.Archive, h.log, &wg)

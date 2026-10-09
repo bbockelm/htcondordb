@@ -219,17 +219,16 @@ func (e *Executor) Resync(target string) error {
 	return e.resync(target)
 }
 
-// Retire asks a federation hub to retire the named source. Returns an error if no transport is
-// configured.
-func (e *Executor) Retire(schedd string) error {
+// Retire asks a federation hub to retire the named source and returns the daemon's note (empty
+// when the transport carries none). Returns an error if no transport is configured.
+func (e *Executor) Retire(schedd string) (string, error) {
 	if e.retire == nil {
 		if e.syncCtl != nil {
-			_, err := e.syncCtl("retire", schedd, nil)
-			return err
+			return e.syncCtl("retire", schedd, nil)
 		}
-		return fmt.Errorf("retire is not available in this session")
+		return "", fmt.Errorf("retire is not available in this session")
 	}
-	return e.retire(schedd)
+	return "", e.retire(schedd)
 }
 
 // commit applies a batch of write ops to table. Inside an explicit transaction (BEGIN)

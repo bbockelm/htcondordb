@@ -33,8 +33,8 @@ type syncController struct {
 	fed    *federationManager
 }
 
-// ownerTruncateTimeout bounds how long a truncate waits for the owning tailer to take it. The
-// CLI gives the whole exchange 30s.
+// ownerTruncateTimeout bounds how long a truncate (or a hub retire) waits for the owner to take
+// it. The CLI gives the whole exchange 30s.
 const ownerTruncateTimeout = 20 * time.Second
 
 // handle runs one request ClassAd and returns the response ClassAd. Request attributes:
@@ -64,7 +64,7 @@ func (sc *syncController) handle(ctx context.Context, reqAd *classad.ClassAd) *c
 			note = fmt.Sprintf("resync requested for %q", target)
 		}
 	case "retire":
-		note, err = sc.retire(target)
+		note, err = sc.retire(ctx, target)
 	case "truncate":
 		note, err = sc.truncate(ctx, target)
 	case "rotate":
@@ -91,14 +91,16 @@ func fail(resp *classad.ClassAd, msg string) *classad.ClassAd {
 }
 
 // retire has a federation hub retire a source now: its rows leave the hub's mutable tables.
-func (sc *syncController) retire(target string) (string, error) {
+// It runs under the request's context, bounded below the CLI's 30s so the operator gets the
+// answer (or the timeout) rather than a dropped connection.
+func (sc *syncController) retire(ctx context.Context, target string) (string, error) {
 	if target == "" {
 		return "", fmt.Errorf("retire requires a target (a federated schedd name)")
 	}
 	if sc.fed == nil {
 		return "", fmt.Errorf("this daemon is not a federation hub")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, ownerTruncateTimeout)
 	defer cancel()
 	if err := sc.fed.Retire(ctx, target); err != nil {
 		return "", err
