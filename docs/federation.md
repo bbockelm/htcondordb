@@ -177,7 +177,10 @@ and the last live stream), `LastCollectorSeen`, `LastContact`, `LastReset`, `Ret
   running against the last validated spoke address. A collector restart makes every AP vanish at
   once; nothing is deleted for it.
 - The table is persisted, so a hub restarting into an empty collector still knows every member and
-  when it was last seen. Nothing is retired before the restarted hub's first discovery pass.
+  when it was last seen. Nothing is retired before the restarted hub's first discovery pass. A
+  restarted hub resumes streaming from a persisted `SpokeAddress` only if it is a configured static
+  spoke or passes host validation again (the persisted `Static` flag is not trusted); otherwise the
+  source is `untrusted` and streams nothing until discovery pairs it with a spoke again.
 - A schedd still advertising but no longer matching a changed constraint, or a static spoke removed
   from the configuration, is **retiring**: its streams stop and its rows stay until
   `HTCONDORDB_FEDERATE_RETIRE_AFTER` has passed. Matching again before then cancels retirement.

@@ -35,6 +35,11 @@ func (f *fakeDiscovery) Discover(context.Context) (Snapshot, error) {
 
 func (f *fakeDiscovery) Constraint() string { return `Name == "ap1"` }
 
+// ValidateRestored accepts every persisted pairing: these tests restore what they replicated.
+func (f *fakeDiscovery) ValidateRestored(context.Context, string, string) (string, bool) {
+	return "", true
+}
+
 func (f *fakeDiscovery) callCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.calls }
 
 func members(schedds ...string) Snapshot {

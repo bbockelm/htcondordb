@@ -106,6 +106,7 @@ type source struct {
 	inSet             bool // matched by the last discovery with a known match set
 	untrusted         string
 	declined          string
+	unverified        string // why a restored spoke address is not dialed until discovery pairs it
 	lastCollectorSeen time.Time
 	lastContact       time.Time
 	lastReset         time.Time
@@ -233,6 +234,7 @@ func (h *Hub) Run(ctx context.Context) error {
 	defer h.stopAll()
 
 	h.loadSources()
+	h.revalidateRestored(ctx)
 	for _, s := range h.sources {
 		if s.retiringSince.IsZero() && s.spokeAddress != "" {
 			h.startRunners(s)
@@ -345,6 +347,7 @@ func (h *Hub) admit(schedd string, snap Snapshot, now time.Time) {
 	s.untrusted, s.declined = snap.Untrusted[schedd], snap.Declined[schedd]
 	if sp, ok := snap.Spokes[schedd]; ok {
 		s.static, s.spokeName = sp.Static, sp.SpokeName
+		s.unverified = "" // paired by this pass
 		if sp.Address != s.spokeAddress {
 			if s.spokeAddress != "" {
 				h.log.Info("federate: spoke address changed; restarting runners", "schedd", schedd,
@@ -372,8 +375,37 @@ func (h *Hub) source(schedd string) *source {
 	return s
 }
 
-// startRunners starts any missing runner for s, one per federated table.
+// revalidateRestored checks each restored spoke address before anything dials it: the persisted
+// row is only a record of an earlier pairing (made under an earlier configuration, or written by
+// something other than the hub), and the hub streams its data under a real AP's name. An address
+// that fails is kept but not dialed until a discovery pass pairs the schedd with a spoke again.
+// Without a RestoreValidator nothing restored is dialed before discovery.
+func (h *Hub) revalidateRestored(ctx context.Context) {
+	v, _ := h.cfg.Discovery.(RestoreValidator)
+	for _, s := range h.sources {
+		if s.spokeAddress == "" || !s.retiringSince.IsZero() {
+			continue
+		}
+		reason, ok := "no validator for persisted spoke addresses", false
+		if v != nil {
+			vctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			reason, ok = v.ValidateRestored(vctx, s.schedd, s.spokeAddress)
+			cancel()
+		}
+		if !ok {
+			s.unverified = "persisted spoke address " + s.spokeAddress + " not revalidated (" + reason + "); waiting for discovery"
+			h.log.Warn("federate: not resuming a persisted spoke address until discovery pairs it again",
+				"schedd", s.schedd, "spoke", s.spokeAddress, "reason", reason)
+		}
+	}
+}
+
+// startRunners starts any missing runner for s, one per federated table. A source whose address
+// is unverified streams nothing.
 func (h *Hub) startRunners(s *source) {
+	if s.unverified != "" {
+		return
+	}
 	for _, table := range h.tables {
 		if rh, ok := s.runners[table]; ok && rh.address == s.spokeAddress {
 			continue
@@ -696,14 +728,17 @@ func lastSeen(s *source) time.Time {
 	return s.lastCollectorSeen
 }
 
-// stateOf decides a source's state. Precedence: retiring, then absent (not in the AP set, or in
-// it with no spoke ever paired), then untrusted, then fresh/stale by measured staleness.
+// stateOf decides a source's state. Precedence: retiring, then absent (not in the AP set), then a
+// restored address not yet revalidated (untrusted), then absent/untrusted for a schedd with no
+// paired spoke, then fresh/stale by measured staleness.
 func (h *Hub) stateOf(s *source, stale int64, staleKnown bool, fresh int64) (string, string) {
 	switch {
 	case !s.retiringSince.IsZero():
 		return StateRetiring, "left the AP set; rows are deleted when the retirement delay passes"
 	case h.discoveryDone && !s.inSet:
 		return StateAbsent, "not in the AP set at the last discovery; rows kept"
+	case s.unverified != "":
+		return StateUntrusted, s.unverified
 	case s.spokeAddress == "" && s.untrusted != "":
 		return StateUntrusted, s.untrusted
 	case s.spokeAddress == "" && s.declined != "":

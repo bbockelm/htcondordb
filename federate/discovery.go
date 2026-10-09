@@ -67,6 +67,14 @@ type Discoverer interface {
 	Constraint() string
 }
 
+// RestoreValidator is implemented by a Discoverer that can re-check a persisted pairing without the
+// collector. A hub restarting resumes streaming from a persisted spoke address only when it passes;
+// otherwise it waits for discovery to pair the schedd again.
+type RestoreValidator interface {
+	// ValidateRestored reports whether the spoke at address may stream as schedd, and why not.
+	ValidateRestored(ctx context.Context, schedd, address string) (reason string, ok bool)
+}
+
 // CollectorQuerier queries a collector. Behind an interface so discovery is testable with fakes.
 type CollectorQuerier interface {
 	Query(ctx context.Context, adType, constraint string, projection []string) ([]*classad.ClassAd, error)
@@ -169,6 +177,24 @@ func (d *Discovery) Discover(ctx context.Context) (Snapshot, error) {
 		return snap, firstErr
 	}
 	return snap, nil
+}
+
+// ValidateRestored accepts a persisted pairing that is a configured static spoke, or that passes the
+// same host validation a discovered spoke does. The persisted Static flag is not consulted: the
+// configuration decides what is static.
+func (d *Discovery) ValidateRestored(ctx context.Context, schedd, address string) (string, bool) {
+	for _, s := range d.Static {
+		if strings.EqualFold(s.Schedd, schedd) {
+			if s.Address == address {
+				return "", true
+			}
+			return fmt.Sprintf("the configured static spoke for this schedd is %s, not %s", s.Address, address), false
+		}
+	}
+	if strings.TrimSpace(d.ScheddConstraint) == "" {
+		return "not a configured static spoke, and there is no constraint to discover it by", false
+	}
+	return hostValid(ctx, spokeInfo{address: address}, scheddInfo{name: schedd}, d.resolver())
 }
 
 func (d *Discovery) resolver() func(context.Context, string) ([]string, error) {
