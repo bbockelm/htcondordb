@@ -579,16 +579,25 @@ func staleness(row *classad.ClassAd, now time.Time) (int64, bool) {
 	if !ok1 || !ok2 {
 		return 0, false
 	}
+	if lag < 0 {
+		return 0, false // a spoke never reports one; reading it as 0 would be fresh
+	}
 	iv, ok := row.EvaluateAttrInt(syncstatus.AttrHeartbeatInterval)
 	if !ok || iv <= 0 {
 		iv = int64(syncstatus.DefaultInterval / time.Second)
 	}
 	since := now.Unix() - recv
 	if since < 0 {
-		since = 0
+		// Stamped by this hub's clock, so only a backward step of it gets here. "Received just
+		// now" would read a dead spoke fresh for as long as the step: unknown instead.
+		return 0, false
 	}
-	return since + lag + iv, true
+	return min(since, maxStaleness) + min(lag, maxStaleness) + min(iv, maxStaleness), true
 }
+
+// maxStaleness caps each term of staleness (about 100 years), so a nonsense spoke value cannot
+// overflow the sum into a negative -- fresh -- staleness.
+const maxStaleness = 100 * 365 * 24 * 3600
 
 // refreshState recomputes every source's state, persists changed federation_sources rows, retires
 // what is due, and publishes the summary and metrics.

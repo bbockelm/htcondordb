@@ -163,7 +163,9 @@ staleness = (hub_now - HubReceivedTime) + SpokeLagSeconds + HeartbeatIntervalSec
 spoke was caught up, not from its last read pass), so a spoke replaying a large backlog is stale
 however promptly it heartbeats. An idle AP keeps heartbeating and stays fresh; a stopped heartbeat
 is staleness that grows. No heartbeat yet, or a spoke that cannot state its lag (one that restarted
-behind and has not caught up), is `stale` with no `StalenessSeconds` -- never fresh.
+behind and has not caught up), is `stale` with no `StalenessSeconds` -- never fresh. So is a
+heartbeat received "in the future" (the hub's clock stepped backwards since) until the clock passes
+the receipt time again.
 
 ## Membership is sticky
 

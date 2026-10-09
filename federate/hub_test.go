@@ -352,10 +352,24 @@ func TestStalenessFormula(t *testing.T) {
 	if _, ok := staleness(nil, now); ok {
 		t.Error("staleness known with no heartbeat")
 	}
-	// A hub clock behind the receipt stamp (it was stamped by this hub, so only a clock step) does
-	// not produce negative staleness.
-	if s, _ := staleness(row, time.Unix(1_800_000_000, 0)); s != 8 {
-		t.Errorf("staleness with clock behind = %d, want 8", s)
+}
+
+// TestStalenessUnknownOnClockStepOrBadLag: a hub clock behind the receipt stamp (only a backward
+// step of the hub's own clock can do that) is unknown, not "received just now" -- which made a dead
+// spoke read fresh for as long as the step. A negative lag is unknown too (a spoke never reports
+// one), and a huge one is capped rather than overflowing into a negative sum.
+func TestStalenessUnknownOnClockStepOrBadLag(t *testing.T) {
+	now := time.Unix(1_800_000_100, 0)
+	row := parseAd(t, `HubReceivedTime = 1800000090; SpokeLagSeconds = 3; HeartbeatIntervalSeconds = 5`)
+	if s, ok := staleness(row, now.Add(-100*time.Second)); ok {
+		t.Errorf("staleness with the hub clock stepped back = %d, known; want unknown", s)
+	}
+	if s, ok := staleness(parseAd(t, `HubReceivedTime = 1800000090; SpokeLagSeconds = -100; HeartbeatIntervalSeconds = 5`), now); ok {
+		t.Errorf("staleness with a negative lag = %d, known; want unknown", s)
+	}
+	s, ok := staleness(parseAd(t, `HubReceivedTime = 1800000090; SpokeLagSeconds = 9223372036854775807; HeartbeatIntervalSeconds = 9223372036854775807`), now)
+	if !ok || s <= 60 {
+		t.Errorf("staleness with a huge lag = %d, %v; want known and large", s, ok)
 	}
 }
 
