@@ -3,6 +3,7 @@ package federate
 import (
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -30,6 +31,11 @@ import (
 //     a replay of a million records. A resume's catch-up is always probed: it re-delivers only the
 //     overlap since the committed cursor (after a WatchResync, up to the spoke's watch buffer), and
 //     loading the AP's whole history for that would cost more than the probes;
+//   - during a Reset replay into a capped archive that has reached its cap, a record older than
+//     the oldest the hub still holds for this schedd (by EnteredHistoryTime, or EpochWriteDate for
+//     epochs) is skipped: the cap already dropped it, and re-appending it would make it the newest
+//     data in the archive, evicting other APs' recent records at the next rotation -- on every
+//     spoke restart;
 //   - live-tail records are new by construction and are appended without a probe;
 //   - a record with no identity is appended and counted (it cannot be deduplicated).
 //
@@ -63,6 +69,10 @@ type archiveSink struct {
 	// looked up yet -- unless setLoaded, when it was loaded and the hub held none.
 	remaining map[[16]byte]int
 	setLoaded bool // remaining holds every identity of this schedd (a long catch-up)
+	// floor is the oldest floorAttr value the hub holds for this schedd, read when a Reset begins;
+	// floorOK only when the archive is capped and at its cap (see retentionDropped).
+	floor   float64
+	floorOK bool
 
 	mu  sync.Mutex
 	cur []byte
@@ -119,10 +129,12 @@ func (s *archiveSink) fail(err error) error {
 
 func (s *archiveSink) startCatchup() {
 	s.catchup, s.full, s.probes, s.remaining, s.setLoaded = true, false, 0, map[[16]byte]int{}, false
+	s.floorOK = false
 }
 
 func (s *archiveSink) endCatchup() {
 	s.catchup, s.full, s.probes, s.remaining, s.setLoaded = false, false, 0, nil, false
+	s.floorOK = false
 }
 
 func (s *archiveSink) Apply(c replicate.Change) error {
@@ -143,6 +155,12 @@ func (s *archiveSink) apply(c replicate.Change) error {
 			break
 		}
 		c.Ad.InsertAttrString(ScheddNameAttr, s.schedd)
+		if s.full && s.floorOK {
+			if v, ok := c.Ad.EvaluateAttrNumber(floorAttr(s.table)); ok && v < s.floor {
+				s.metrics.BelowRetention.WithLabelValues(s.table).Inc()
+				break
+			}
+		}
 		if s.catchup {
 			held, err := s.held(c)
 			if err != nil {
@@ -167,6 +185,9 @@ func (s *archiveSink) apply(c replicate.Change) error {
 		}
 		s.startCatchup() // a replay of everything retained: all of it may already be here
 		s.full = true
+		if err := s.loadFloor(); err != nil {
+			return err
+		}
 		s.metrics.Resets.WithLabelValues(s.table).Inc()
 		if s.onReset != nil {
 			s.onReset()
@@ -262,6 +283,58 @@ func (s *archiveSink) loadIdentities() error {
 	s.log.Info("federate: catch-up is a full replay; loaded the hub's identities for it",
 		"table", s.table, "schedd", s.schedd, "identities", len(loaded))
 	return nil
+}
+
+// floorAttr is the time attribute a replayed record is compared to the hub's retained floor by.
+func floorAttr(table string) string {
+	if table == TableEpochHistory {
+		return "EpochWriteDate"
+	}
+	return "EnteredHistoryTime"
+}
+
+// loadFloor reads, when the archive's cap has dropped data, the oldest floorAttr value the hub
+// holds for this schedd.
+func (s *archiveSink) loadFloor() error {
+	s.floorOK = false
+	if !retentionDropped(s.arch) {
+		return nil
+	}
+	attr := floorAttr(s.table)
+	rows, err := s.arch.Aggregate(scheddConstraint(s.schedd), nil, []db.AggSpec{{Func: db.AggMin, Arg: attr}})
+	if err != nil {
+		return fmt.Errorf("federate: reading the oldest retained %s of %s: %w", attr, s.schedd, err)
+	}
+	if len(rows) == 0 || len(rows[0].Values) == 0 {
+		return nil
+	}
+	v, err := strconv.ParseFloat(rows[0].Values[0], 64)
+	if err != nil {
+		return nil // undefined: the hub holds nothing of this schedd's to compare with
+	}
+	s.floor, s.floorOK = v, true
+	s.log.Info("federate: replaying into a capped archive; records older than the hub retains are skipped",
+		"table", s.table, "schedd", s.schedd, "attr", attr, "floor", v)
+	return nil
+}
+
+// retentionDropped reports whether an archive's retention has (or may have) dropped records: it is
+// capped by segment count or bytes and is within one segment of that cap -- an append-only archive
+// that has reached its cap stays there, so being under it means rotation has dropped nothing
+// (unless the cap was raised since) -- or it is capped by age, which drops whatever ages out.
+func retentionDropped(a *db.ArchiveTable) bool {
+	r := a.Retention()
+	if r.MaxAge > 0 {
+		return true
+	}
+	st := a.Stats()
+	if st.Segments == 0 {
+		return false
+	}
+	if r.MaxSegments > 0 && st.Segments >= r.MaxSegments {
+		return true
+	}
+	return r.MaxBytes > 0 && st.UsedBytes+st.UsedBytes/int64(st.Segments) > r.MaxBytes
 }
 
 // Flush makes the appends since the last flush durable (once, not per record) and only then

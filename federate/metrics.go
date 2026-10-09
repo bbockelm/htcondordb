@@ -17,6 +17,7 @@ type Metrics struct {
 	MissingIdentity  *prometheus.CounterVec // labels: table -- archive records with no dedup identity
 	PhantomDeletes   *prometheus.CounterVec // labels: table -- rows a Reset replay did not re-send
 	Undecodable      *prometheus.CounterVec // labels: table -- changes whose ad could not be decoded
+	BelowRetention   *prometheus.CounterVec // labels: table -- replayed records the hub's cap already dropped
 	RejectedSpokes   *prometheus.CounterVec // labels: reason
 	Retired          prometheus.Counter
 	SourceStaleness  *prometheus.GaugeVec // labels: schedd
@@ -46,6 +47,8 @@ func NewMetrics() *Metrics {
 			"Hub rows deleted at the end of a Reset replay because the spoke no longer has them, by table.", "table"),
 		Undecodable: cv("undecodable_total",
 			"Replicated upserts whose ad could not be decoded, by table. A mutable table keeps the row it holds for the key; an archive skips the record.", "table"),
+		BelowRetention: cv("below_retention_total",
+			"Archive records of a Reset replay not appended because they are older than anything the hub's capped archive still holds for that AP (the cap already dropped them), by table.", "table"),
 		RejectedSpokes: cv("rejected_spokes_total",
 			"Spoke ads not paired with a schedd, by reason (host_mismatch, ha_tie, no_name).", "reason"),
 		Retired: prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Subsystem: sub, Name: "retired_total",
@@ -74,7 +77,7 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 
 func (m *Metrics) collectors() []prometheus.Collector {
 	return []prometheus.Collector{m.EventsApplied, m.IdenticalSkips, m.Resets, m.DedupHits, m.MissingIdentity,
-		m.PhantomDeletes, m.Undecodable, m.RejectedSpokes, m.Retired, m.SourceStaleness, m.SourcesByState}
+		m.PhantomDeletes, m.Undecodable, m.BelowRetention, m.RejectedSpokes, m.Retired, m.SourceStaleness, m.SourcesByState}
 }
 
 // setStaleness publishes the per-source staleness gauges, dropping sources no longer present or
