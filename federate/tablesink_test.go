@@ -280,3 +280,48 @@ func TestHeartbeatReceiptTime(t *testing.T) {
 		t.Errorf("new heartbeat HubReceivedTime = %d, want %d", got, clock.Unix())
 	}
 }
+
+// TestScheddIdentityIgnoresCase: schedd names are case-insensitive (as in HTCondor, and as ClassAd
+// == compares ScheddName), so rows written under two spellings of one schedd are one AP's rows --
+// the same keys, no duplicates, and a Reset under either spelling reconciles all of them. Another
+// schedd's rows are never touched.
+func TestScheddIdentityIgnoresCase(t *testing.T) {
+	if HubKey("AP1.example.org", "1.0") != HubKey("ap1.example.org", "1.0") {
+		t.Fatal("HubKey depends on the case of the schedd name")
+	}
+	cat := openCatalog(t, "")
+	t.Cleanup(func() { _ = cat.Close() })
+	jobs := mustTable(t, cat, TableJobs)
+	lower := newJobsSink(t, jobs, "ap1.example.org", NewMetrics())
+	upper := newJobsSink(t, jobs, "AP1.example.org", NewMetrics())
+	other := newJobsSink(t, jobs, "ap10.example.org", NewMetrics())
+	apply(t, other, reset(), upsert("1.0", jobAd(t, 1, 0, "")), upsert("2.0", jobAd(t, 2, 0, "")), synced("o1"))
+	apply(t, lower, reset(), upsert("1.0", jobAd(t, 1, 0, "")), upsert("2.0", jobAd(t, 2, 0, "")), synced("l1"))
+	// The same AP, now spelled in capitals, replays: 2.0 is gone at the source, 7.0 is new.
+	apply(t, upper, reset(), upsert("1.0", jobAd(t, 1, 0, "")), upsert("7.0", jobAd(t, 7, 0, "")), synced("u1"))
+
+	if got := jobKeysOf(t, cat, "ap1.example.org"); !sameKeys(got, 1, 7) {
+		t.Errorf("ap1 rows = %v, want 1.0 and 7.0", got)
+	}
+	if got := jobKeysOf(t, cat, "ap10.example.org"); !sameKeys(got, 1, 2) {
+		t.Errorf("ap10 rows = %v, want 1.0 and 2.0 (another schedd's rows untouched)", got)
+	}
+	if n := jobs.Len(); n != 4 {
+		t.Errorf("hub rows = %d, want 4 (no duplicate rows for one AP under two spellings)", n)
+	}
+	row, ok := jobs.LookupClassAd(HubKey("ap1.example.org", "1.0"))
+	if !ok {
+		t.Fatal("ap1's 1.0 missing")
+	}
+	if name, _ := row.EvaluateAttrString(ScheddNameAttr); name != "AP1.example.org" {
+		t.Errorf("ScheddName = %q, want the spelling the source last used", name)
+	}
+	// A delete under one spelling removes the row written under the other.
+	apply(t, lower, del("7.0"))
+	if err := lower.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := jobKeysOf(t, cat, "ap1.example.org"); !sameKeys(got, 1) {
+		t.Errorf("ap1 rows after a delete under the other spelling = %v, want 1.0", got)
+	}
+}

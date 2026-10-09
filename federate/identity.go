@@ -37,10 +37,14 @@ const (
 //
 // The encoding is internal to this package and may change between releases (which would require
 // rebuilding a hub's mutable tables from its spokes). Nothing outside this function may construct
-// or parse one: readers select rows by their ScheddName / ClusterId / ProcId attributes. It is
-// injective -- the schedd's length leads -- so no (schedd, key) pair can collide with another
-// however either is spelled.
+// or parse one: readers select rows by their ScheddName / ClusterId / ProcId attributes.
+//
+// A schedd's identity is case-insensitive, as schedd names are in HTCondor and as ClassAd ==
+// compares ScheddName: the schedd is folded to lower case, so every spelling of one schedd maps
+// to one key space (the row's ScheddName keeps the spelling its source uses). Otherwise the key
+// is injective -- the folded schedd's length leads -- so two different schedds never collide.
 func HubKey(schedd, sourceKey string) string {
+	schedd = strings.ToLower(schedd)
 	return strconv.Itoa(len(schedd)) + ":" + schedd + ":" + sourceKey
 }
 
@@ -131,7 +135,7 @@ func (id recordIdentity) digest() [16]byte {
 	return out
 }
 
-// scheddConstraint selects one AP's rows.
+// scheddConstraint selects one AP's rows. ClassAd == ignores case, matching HubKey's folding.
 func scheddConstraint(schedd string) string {
 	return ScheddNameAttr + " == " + stringLit(schedd)
 }

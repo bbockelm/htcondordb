@@ -409,3 +409,20 @@ func TestResetReplayLoadsSet(t *testing.T) {
 		t.Error("a Reset replay past the probe budget did not load the identity set")
 	}
 }
+
+// TestArchiveDedupIgnoresScheddCase: a replay under another spelling of the same schedd is the
+// same AP's replay; a different schedd's identical GlobalJobId is not.
+func TestArchiveDedupIgnoresScheddCase(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	for _, schedd := range []string{"ap1.example.org", "AP1.Example.Org", "ap10.example.org"} {
+		s := newHistSink(t, hist, schedd, &replicate.MemCursorStore{}, NewMetrics())
+		s.BeginSession()
+		apply(t, s, reset(), upsert("r1", histRecord(t, "ap1.example.org", 1)), synced("c"))
+		s.EndSession()
+	}
+	if n := countArchive(t, hist, `ClusterId == 1`); n != 2 {
+		t.Errorf("records = %d, want 2 (one for ap1 under either spelling, one for ap10)", n)
+	}
+}
