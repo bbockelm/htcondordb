@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -57,18 +59,52 @@ HTCONDORDB_HISTORY_MAX_BYTES = 10 GB
 }
 
 // TestFederationRefusesScheddSync: a hub and schedd sync in one daemon would write the same tables
-// under different keys; both managers refuse the combination.
+// under different keys; both managers refuse the combination, and a reconfigure into it leaves
+// whichever was running running, and the other stopped.
 func TestFederationRefusesScheddSync(t *testing.T) {
-	cfg := mkSyncCfg(t, "HTCONDORDB_SYNC_SCHEDD = true\nJOB_QUEUE_LOG = /nonexistent\n"+
-		"HTCONDORDB_FEDERATE_SPOKES = ap1\nHTCONDORDB_FEDERATE_SPOKE_AP1_ADDRESS = <127.0.0.1:1>\n")
-	m := newFederationManager(t.Context(), nil, nil, discardLogger())
-	err := m.apply(cfg)
-	if err == nil || !strings.Contains(err.Error(), "HTCONDORDB_SYNC_SCHEDD") {
-		t.Fatalf("hub apply with schedd sync on: err = %v", err)
+	if os.Geteuid() == 0 {
+		t.Skip("schedd-sync refuses to run as root")
 	}
-	sm := &scheddSyncManager{parent: t.Context(), logger: discardLogger()}
-	if err := sm.apply(cfg); err == nil || !strings.Contains(err.Error(), "federation hub") {
-		t.Fatalf("schedd-sync apply with a hub configured: err = %v", err)
+	dir := t.TempDir()
+	jobLog := filepath.Join(dir, "job_queue.log")
+	if err := os.WriteFile(jobLog, []byte("101 1.0 Job Machine\n103 1.0 ProcId 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spokeCfg := "HTCONDORDB_SYNC_SCHEDD = true\nHTCONDORDB_DIR = " + dir + "/db\nJOB_EPOCH_HISTORY =\nHISTORY =\nJOB_QUEUE_LOG = " + jobLog + "\n"
+	hubCfg := "HTCONDORDB_DIR = " + dir + "/db\nHTCONDORDB_FEDERATE_SPOKES = ap1\nHTCONDORDB_FEDERATE_SPOKE_AP1_ADDRESS = <127.0.0.1:1>\n"
+	both := mkSyncCfg(t, spokeCfg+"HTCONDORDB_FEDERATE_SPOKES = ap1\nHTCONDORDB_FEDERATE_SPOKE_AP1_ADDRESS = <127.0.0.1:1>\n")
+
+	for _, running := range []string{"hub", "schedd sync"} {
+		t.Run(running+" running", func(t *testing.T) {
+			svc := newOwnerTestService(t)
+			fm := newFederationManager(t.Context(), svc.Catalog(), svc.Owners(), discardLogger())
+			defer fm.Stop()
+			sm := &scheddSyncManager{parent: t.Context(), svc: svc, logger: discardLogger()}
+			defer sm.Stop()
+			hubRunning := func() bool { fm.mu.Lock(); defer fm.mu.Unlock(); return fm.hub != nil }
+			syncRunning := func() bool { sm.mu.Lock(); defer sm.mu.Unlock(); return sm.cancel != nil }
+			if running == "hub" {
+				if err := fm.apply(mkSyncCfg(t, hubCfg)); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := sm.apply(mkSyncCfg(t, spokeCfg)); err != nil {
+				t.Fatal(err)
+			}
+
+			// The reconfigure into both, in main.go's order.
+			serr := sm.apply(both)
+			ferr := fm.apply(both)
+			if ferr == nil || !strings.Contains(ferr.Error(), "HTCONDORDB_SYNC_SCHEDD") {
+				t.Errorf("hub apply with schedd sync on: err = %v", ferr)
+			}
+			if running == "hub" && (serr == nil || !strings.Contains(serr.Error(), "federation hub")) {
+				t.Errorf("schedd-sync apply with a hub configured: err = %v", serr)
+			}
+			if hubRunning() != (running == "hub") || syncRunning() != (running == "schedd sync") {
+				t.Errorf("after the refused reconfigure: hub running=%v, schedd sync running=%v; want only the %s",
+					hubRunning(), syncRunning(), running)
+			}
+		})
 	}
 }
 
