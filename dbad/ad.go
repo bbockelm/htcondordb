@@ -174,6 +174,9 @@ var unreadableReasons = []struct{ reason, suffix string }{
 	{"segment-gone", "SegmentGone"},
 	{"reassemble", "Reassemble"},
 	{"decode", "Decode"},
+	// A record whose own checksum did not match its bytes (classad VerifyReads): on-disk
+	// corruption caught at read time rather than decoded as if it were real data.
+	{"record-crc", "RecordCRC"},
 	// The delta-chain reasons. These replaced a single "delta-chain" count, which on this
 	// deployment absorbed 100% of the refusals and so said only that the fault was somewhere
 	// in the chain walk. NoBase is the one that means a live delta's whole record is gone;
