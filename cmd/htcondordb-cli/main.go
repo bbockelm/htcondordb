@@ -39,6 +39,7 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/dbdir"
 	"github.com/bbockelm/htcondordb/ha/consistent"
 	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/repl"
@@ -50,6 +51,7 @@ Usage:
   htcondordb-cli [flags]                 start an interactive shell
   htcondordb-cli [flags] -e "<sql>"      run one statement and exit
   htcondordb-cli [flags] load [-key A]   load a ClassAd stream from stdin
+  htcondordb-cli fsck [-dir D] [-table T] check the database files on disk
 
 Flags:
   -addr <host:port>   daemon address (default: HTCONDORDB_ADDRESS_FILE / HTCONDORDB_HOST,
@@ -63,6 +65,15 @@ Flags:
   -consistent         route writes through the raft cluster (consistent HA mode)
   -debug              log at DEBUG (default is WARNING; quiets library chatter)
   -h, -help           show this help
+
+fsck subcommand:
+  Reads the database's files directly and reports what is intact, what is damaged,
+  and what is unreadable. It never writes, and it does not contact a daemon -- the
+  situation it exists for is the one where the database will not open. Run it with
+  the daemon stopped; a report taken while something is appending describes a moment
+  that has already passed. Exits non-zero when any table is damaged.
+  -dir <path>         database directory (default: HTCONDORDB_DIR, else $(SPOOL)/htcondordb)
+  -table <name>       inspect only this table (e.g. jobs, or archives/history)
 
 load subcommand:
   condor_status -long        | htcondordb-cli load -table machines
@@ -93,7 +104,12 @@ func main() {
 	repl.BuildVersion = version
 
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "htcondordb-cli:", err)
+		// Damage found is a RESULT, not a failure to run: the report has already
+		// described it in full, so exit non-zero without a second line that reads
+		// like the command crashed.
+		if !errors.Is(err, errDamageFound) {
+			fmt.Fprintln(os.Stderr, "htcondordb-cli:", err)
+		}
 		os.Exit(1)
 	}
 }
@@ -123,6 +139,29 @@ func run() error {
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "TOOL"})
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
+	}
+
+	// Subcommand: `fsck` inspects files on disk. It runs before the daemon is
+	// located, because the case it exists for is the one where there is no daemon to
+	// locate -- the database will not open.
+	if len(fs.args) > 0 && fs.args[0] == "fsck" {
+		dir := strings.TrimSpace(fs.fsckDir)
+		if dir == "" && len(fs.args) > 1 {
+			dir = fs.args[1] // allow `fsck <dir>` as well as `-dir <dir> fsck`
+		}
+		if dir == "" {
+			dir = dbdir.Resolve(cfg)
+		}
+		damaged, err := runFsck(os.Stdout, dir, strings.TrimSpace(fs.loadTable))
+		if err != nil {
+			return err
+		}
+		if damaged > 0 {
+			// Exit non-zero so this is usable from monitoring, without making damage
+			// look like a failure to run.
+			return errDamageFound
+		}
+		return nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -232,8 +271,9 @@ type flags struct {
 	consistent bool
 	loadKey    string // `load`: source attribute used as the primary key
 	format     string // one-shot output format (-format)
-	loadTable  string // `load`: target table (default "ads")
+	loadTable  string // -table: `load`'s target table (default "ads"), or `fsck`'s filter
 	loadAuto   bool   // `load`: route each ad to a table named for its MyType
+	fsckDir    string // `fsck`: database directory to inspect (default: from config)
 	help       bool
 	debug      bool
 	version    bool
@@ -256,6 +296,11 @@ func parseFlags() *flags {
 			i++
 			if i < len(args) {
 				f.pool = args[i]
+			}
+		case "-dir", "--dir":
+			if i+1 < len(args) {
+				i++
+				f.fsckDir = args[i]
 			}
 		case "-name", "--name":
 			i++
