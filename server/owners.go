@@ -1,6 +1,8 @@
 package server
 
 import (
+	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -13,9 +15,11 @@ import (
 // registry on every mutating request (see Service.ServeOptions), so a client can read and watch
 // a mirror but cannot change it underneath the writer that maintains it.
 //
-// Ownership follows configuration: each manager calls Set with the tables its CURRENT writers
+// Ownership follows configuration: each manager calls Claim with the tables its CURRENT writers
 // own on every (re)apply, and Set(owner, nil) when it is disabled or stopped, so a table stops
-// being owned the moment its writer goes away.
+// being owned the moment its writer goes away. Claim refuses a table another owner holds, so two
+// in-process writers can never both be configured onto one table -- whatever order a reconfigure
+// applies the managers in.
 //
 // A writer that runs out of process (the history importer) reaches the daemon over a minted
 // CEDAR session; GrantSession lets connections resumed from that session write the tables its
@@ -62,6 +66,48 @@ func (o *TableOwners) Set(owner string, tables []string) {
 		o.byOwner[owner] = slices.Clone(tables)
 	}
 	o.publish()
+}
+
+// ErrTableClaimed is returned (wrapped) by Claim when a table is held by a different owner.
+var ErrTableClaimed = errors.New("table is already maintained by another writer in this daemon")
+
+// Claim is Set, refusing: when any of tables is held by an owner other than owner it changes
+// nothing and returns an error wrapping ErrTableClaimed that names the table and its holder. A
+// manager claims before its writers start, so a refusal leaves the other writer alone and starts
+// nothing.
+func (o *TableOwners) Claim(owner string, tables []string) error {
+	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for other, held := range o.byOwner {
+		if other == owner {
+			continue
+		}
+		for _, t := range tables {
+			if slices.ContainsFunc(held, func(h string) bool { return foldTable(h) == foldTable(t) }) {
+				return fmt.Errorf("%w: %q is held by %s", ErrTableClaimed, t, other)
+			}
+		}
+	}
+	if len(tables) == 0 {
+		delete(o.byOwner, owner)
+	} else {
+		o.byOwner[owner] = slices.Clone(tables)
+	}
+	o.publish()
+	return nil
+}
+
+// Held returns the tables owner holds, as given to Set or Claim.
+func (o *TableOwners) Held(owner string) []string {
+	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return slices.Clone(o.byOwner[owner])
 }
 
 // GrantSession lets connections on CEDAR session id write the tables owner holds. Used for an

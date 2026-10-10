@@ -62,7 +62,40 @@ type Input struct {
 	Delta        DeltaStat
 	Exporters    []ExporterStatus
 	Importers    []ImporterStatus
-	Now          time.Time
+	// Mirrored names the schedd this daemon's schedd-sync mirrors. Nil when schedd-sync is off:
+	// a daemon that mirrors nothing must not claim a schedd, or a hub would pair it with one.
+	Mirrored *Mirrored
+	// Federation is a federation hub's source summary. Nil unless this daemon is a hub.
+	Federation *Federation
+	Now        time.Time
+}
+
+// Mirrored identifies the schedd whose job_queue.log/history a spoke's schedd-sync reads. Name is
+// the schedd's own Name (what its ScheddAd carries); Address is its command address from the
+// schedd's address file, empty when that file could not be read.
+type Mirrored struct {
+	Name    string
+	Address string
+}
+
+// Federation is the summary a federation hub advertises about its sources. Per-source state lives
+// in the hub's federation_sources table, not here: fifty sources' worth of attributes do not belong
+// in a collector ad.
+type Federation struct {
+	// Constraint is the ScheddAd constraint the hub federates (static spokes folded in as name
+	// equality terms), so an API server can find a hub covering its AP set.
+	Constraint string
+	Total      int
+	Fresh      int
+	Stale      int
+	Absent     int
+	Retiring   int
+	Untrusted  int
+	// MaxStaleness is the largest staleness, in seconds, among sources whose staleness is known.
+	// MaxStalenessKnown is false when no source has a measured staleness yet, so a hub with no
+	// heartbeats does not advertise a reassuring zero.
+	MaxStaleness      int64
+	MaxStalenessKnown bool
 }
 
 // DeltaStat is the process-wide delta-record write accounting. Observe-only: these say why patch
@@ -258,6 +291,27 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 	ad.InsertAttr("TotalAds", totalAds)
 	ad.InsertAttr("TotalLiveBytes", totalLive)
 	ad.InsertAttr("TotalDeadBytes", totalDead)
+
+	// The schedd this daemon mirrors, so a consumer pairs mirror and schedd by name instead of by a
+	// host heuristic. Absent (not empty) when schedd-sync is off.
+	if m := in.Mirrored; m != nil && m.Name != "" {
+		ad.InsertAttrString("MirroredScheddName", m.Name)
+		if m.Address != "" {
+			ad.InsertAttrString("MirroredScheddAddress", m.Address)
+		}
+	}
+	if f := in.Federation; f != nil {
+		ad.InsertAttrString("FederationConstraint", f.Constraint)
+		ad.InsertAttr("SourcesTotal", int64(f.Total))
+		ad.InsertAttr("SourcesFresh", int64(f.Fresh))
+		ad.InsertAttr("SourcesStale", int64(f.Stale))
+		ad.InsertAttr("SourcesAbsent", int64(f.Absent))
+		ad.InsertAttr("SourcesRetiring", int64(f.Retiring))
+		ad.InsertAttr("SourcesUntrusted", int64(f.Untrusted))
+		if f.MaxStalenessKnown {
+			ad.InsertAttr("MaxSourceStaleness", f.MaxStaleness)
+		}
+	}
 
 	// Per-source sync health.
 	ad.InsertAttrBool("Syncing", len(in.Sources) > 0)

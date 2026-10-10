@@ -189,7 +189,7 @@ func run() error {
 		// endpoint, following leader redirects. Reads still use the dbrpc session.
 		execCfg.ApplyBatch = consistentWriter(ctx, cfg, addr)
 	}
-	// `.resync <target>`, and truncate/rotate/retention on a table a writer inside the daemon
+	// `.resync <target>`, `.retire <schedd>` (federation hub), and truncate/rotate/retention on a table a writer inside the daemon
 	// owns, reach the daemon's sync managers over the DBSyncControl command.
 	execCfg.SyncControl = syncControlClient(ctx, cfg, addr)
 	exec := repl.NewExecutor(dbc, execCfg)

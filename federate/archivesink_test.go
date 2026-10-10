@@ -1,0 +1,545 @@
+package federate
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
+	"testing"
+
+	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/db/replicate"
+)
+
+func hubArchive(t *testing.T, cat *db.Catalog, table string) *db.ArchiveTable {
+	t.Helper()
+	var wg sync.WaitGroup
+	ht, err := ensureTables(cat, []string{table}, ArchiveOptions{}, discard, &wg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	return ht.archives[table]
+}
+
+func histRecord(t *testing.T, schedd string, cluster int) *classad.ClassAd {
+	t.Helper()
+	return parseAd(t, fmt.Sprintf(`GlobalJobId = "%s#%d.0#1700000000"; ClusterId = %d; ProcId = 0; Owner = "alice"; CompletionDate = %d`,
+		schedd, cluster, cluster, 1_700_000_000+cluster))
+}
+
+func newHistSink(t *testing.T, a *db.ArchiveTable, schedd string, store replicate.CursorStore, m *Metrics) *archiveSink {
+	t.Helper()
+	s, err := newArchiveSink(a, TableHistory, schedd, store, m, discard, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// TestArchiveReplayNoDuplicates: every spoke restart replays its whole retained history (a Reset).
+// The stock archive sink re-appended all of it each time; the hub must append only what is new.
+func TestArchiveReplayNoDuplicates(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	m := NewMetrics()
+	s := newHistSink(t, hist, "ap1.example.org", &replicate.MemCursorStore{}, m)
+
+	session := func(n int, cur string) {
+		s.BeginSession()
+		changes := []replicate.Change{reset()}
+		for i := 1; i <= n; i++ {
+			changes = append(changes, upsert(fmt.Sprintf("r%d", i), histRecord(t, "ap1.example.org", i)))
+		}
+		apply(t, s, append(changes, synced(cur))...)
+		s.EndSession()
+	}
+	session(5, "c1")
+	session(5, "c2") // spoke restart, nothing new
+	session(6, "c3") // spoke restart, one new completion
+
+	if n := countArchive(t, hist, `true`); n != 6 {
+		t.Fatalf("hub history holds %d records after three replays of 5, 5, 6, want 6", n)
+	}
+	for i := 1; i <= 6; i++ {
+		if n := countArchive(t, hist, fmt.Sprintf(`ClusterId == %d`, i)); n != 1 {
+			t.Errorf("job %d.0 appears %d times, want 1", i, n)
+		}
+	}
+	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 10 {
+		t.Errorf("dedup_hits = %v, want 10", v)
+	}
+	if n := countArchive(t, hist, `ScheddName == "ap1.example.org"`); n != 6 {
+		t.Errorf("records stamped with the source = %d, want 6", n)
+	}
+}
+
+// TestArchiveRedeliveryAfterCrash: the hub crashes after appending live records but before their
+// cursor is committed. On restart the spoke re-delivers them from the committed cursor during
+// catch-up; none may be appended twice.
+func TestArchiveRedeliveryAfterCrash(t *testing.T) {
+	dir := t.TempDir()
+	cursorPath := filepath.Join(t.TempDir(), "history.cursor")
+	m := NewMetrics()
+
+	cat := openCatalog(t, dir)
+	hist := hubArchive(t, cat, TableHistory)
+	s := newHistSink(t, hist, "ap1.example.org", fileCursorStore{path: cursorPath}, m)
+	s.BeginSession()
+	apply(t, s, reset(), upsert("r1", histRecord(t, "ap1.example.org", 1)), synced("after-1"))
+	for i := 2; i <= 4; i++ {
+		live := upsert(fmt.Sprintf("r%d", i), histRecord(t, "ap1.example.org", i))
+		live.Cursor = []byte(fmt.Sprintf("after-%d", i))
+		apply(t, s, live)
+	}
+	// Crash: no Flush, no EndSession. The appends are in the archive; the cursor is not.
+	_ = cat.Close()
+
+	cat = openCatalog(t, dir)
+	t.Cleanup(func() { _ = cat.Close() })
+	hist = hubArchive(t, cat, TableHistory)
+	if n := countArchive(t, hist, `true`); n != 4 {
+		t.Fatalf("precondition: %d records survived the crash, want 4", n)
+	}
+	s = newHistSink(t, hist, "ap1.example.org", fileCursorStore{path: cursorPath}, m)
+	if got := string(s.Cursor()); got != "after-1" {
+		t.Fatalf("resume cursor = %q, want after-1 (the last committed)", got)
+	}
+	// The spoke resumes after-1: catch-up re-delivers 2..4 (no cursors), then Synced, then live 5.
+	s.BeginSession()
+	for i := 2; i <= 4; i++ {
+		apply(t, s, upsert(fmt.Sprintf("r%d", i), histRecord(t, "ap1.example.org", i)))
+	}
+	apply(t, s, synced("after-4"))
+	live := upsert("r5", histRecord(t, "ap1.example.org", 5))
+	live.Cursor = []byte("after-5")
+	apply(t, s, live)
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := countArchive(t, hist, `true`); n != 5 {
+		t.Fatalf("hub history = %d records after redelivery, want 5", n)
+	}
+	for i := 1; i <= 5; i++ {
+		if n := countArchive(t, hist, fmt.Sprintf(`ClusterId == %d`, i)); n != 1 {
+			t.Errorf("job %d.0 appears %d times, want 1", i, n)
+		}
+	}
+	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 3 {
+		t.Errorf("dedup_hits = %v, want 3", v)
+	}
+}
+
+// TestArchiveLiveTailAppends: after Synced, records are new by construction and are appended
+// without a probe -- so the live tail costs no index lookup per record.
+func TestArchiveLiveTailAppends(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	m := NewMetrics()
+	s := newHistSink(t, hist, "ap1.example.org", &replicate.MemCursorStore{}, m)
+	apply(t, s, reset(), synced("c"))
+	for i := 1; i <= 3; i++ {
+		apply(t, s, upsert(fmt.Sprintf("r%d", i), histRecord(t, "ap1.example.org", i)))
+	}
+	// A record whose identity is already present still appends: the live tail does not probe.
+	apply(t, s, upsert("r1-again", histRecord(t, "ap1.example.org", 1)))
+	if n := countArchive(t, hist, `true`); n != 4 {
+		t.Fatalf("live tail appended %d, want 4", n)
+	}
+	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 0 {
+		t.Errorf("live tail probed: dedup_hits = %v", v)
+	}
+}
+
+// TestArchiveIdentity covers the identity edge cases: a record without GlobalJobId appends and is
+// counted; epochs dedup on the (GlobalJobId, RunInstanceID, EpochAdType) triple; and dedup is
+// scoped to the source, so one AP's record cannot suppress another's.
+func TestArchiveIdentity(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	m := NewMetrics()
+
+	hist := hubArchive(t, cat, TableHistory)
+	s := newHistSink(t, hist, "ap1.example.org", &replicate.MemCursorStore{}, m)
+	noID := parseAd(t, `ClusterId = 99; ProcId = 0`)
+	apply(t, s, reset(), upsert("x", noID), upsert("x", parseAd(t, `ClusterId = 99; ProcId = 0`)), synced("c"))
+	if n := countArchive(t, hist, `ClusterId == 99`); n != 2 {
+		t.Errorf("identity-less records appended = %d, want 2", n)
+	}
+	if v := val(m.MissingIdentity.WithLabelValues(TableHistory)); v != 2 {
+		t.Errorf("missing_identity = %v, want 2", v)
+	}
+
+	// ap2 replays a record carrying ap1's GlobalJobId: it is ap2's row, not a duplicate of ap1's.
+	b := newHistSink(t, hist, "ap2.example.org", &replicate.MemCursorStore{}, m)
+	apply(t, s, reset(), upsert("r1", histRecord(t, "ap1.example.org", 1)), synced("c2"))
+	apply(t, b, reset(), upsert("r1", histRecord(t, "ap1.example.org", 1)), synced("d"))
+	if n := countArchive(t, hist, `ClusterId == 1`); n != 2 {
+		t.Errorf("cross-AP identical GlobalJobId rows = %d, want 2 (one per AP)", n)
+	}
+
+	ep := hubArchive(t, cat, TableEpochHistory)
+	es, err := newArchiveSink(ep, TableEpochHistory, "ap1.example.org", &replicate.MemCursorStore{}, m, discard, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := func(run int, typ string) *classad.ClassAd {
+		return parseAd(t, fmt.Sprintf(`GlobalJobId = "ap1#5.0#1"; ClusterId = 5; ProcId = 0; RunInstanceID = %d; EpochAdType = "%s"`, run, typ))
+	}
+	batch := []replicate.Change{reset(), upsert("e", rec(0, "SPAWN")), upsert("e", rec(0, "EPOCH")), upsert("e", rec(1, "EPOCH")), synced("e1")}
+	apply(t, es, batch...)
+	es.BeginSession()
+	batch = []replicate.Change{reset(), upsert("e", rec(0, "SPAWN")), upsert("e", rec(0, "EPOCH")), upsert("e", rec(1, "EPOCH")), synced("e2")}
+	apply(t, es, batch...)
+	if n := countArchive(t, ep, `true`); n != 3 {
+		t.Errorf("epoch records = %d, want 3 (three distinct run/type pairs, replayed once)", n)
+	}
+}
+
+// TestArchiveLargeReplayUsesIdentitySet: a replay longer than the probe budget switches to the
+// in-memory identity set; it must deduplicate exactly as the per-record probe does, including
+// records appended earlier in the same replay and epochs with no EpochAdType.
+func TestArchiveLargeReplayUsesIdentitySet(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	m := NewMetrics()
+	ep := hubArchive(t, cat, TableEpochHistory)
+	s, err := newArchiveSink(ep, TableEpochHistory, "ap1.example.org", &replicate.MemCursorStore{}, m, discard, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := probeBudget + 200
+	rec := func(i int) *classad.ClassAd {
+		typ := `EpochAdType = "EPOCH"; `
+		if i%3 == 0 {
+			typ = "" // no EpochAdType: identity reads it as ""
+		}
+		return parseAd(t, fmt.Sprintf(`%sGlobalJobId = "ap1#%d.0#1"; ClusterId = %d; ProcId = 0; RunInstanceID = 0`, typ, i, i))
+	}
+	replay := func(count int, cur string) {
+		s.BeginSession()
+		changes := []replicate.Change{reset()}
+		for i := 1; i <= count; i++ {
+			changes = append(changes, upsert("e", rec(i)))
+		}
+		apply(t, s, append(changes, synced(cur))...)
+		s.EndSession()
+	}
+	replay(n, "c1")
+	if got := countArchive(t, ep, `true`); got != n {
+		t.Fatalf("first replay appended %d, want %d", got, n)
+	}
+	replay(n+5, "c2")
+	if s.setLoads != 2 {
+		t.Errorf("identity set loaded %d times over two long replays, want 2", s.setLoads)
+	}
+	if got := countArchive(t, ep, `true`); got != n+5 {
+		t.Fatalf("after second replay: %d records, want %d", got, n+5)
+	}
+	if v := val(m.DedupHits.WithLabelValues(TableEpochHistory)); v != float64(n) {
+		t.Errorf("dedup_hits = %v, want %d", v, n)
+	}
+}
+
+// TestEpochReplayKeepsRepeatedIdentity: one run instance legitimately writes several epoch records
+// with the same (GlobalJobId, RunInstanceID, EpochAdType) -- a CHECKPOINT per checkpoint, a COMMON
+// per common-files group. A replay into an empty hub must store every one of them, not treat the
+// second as a duplicate of the first it just appended.
+func TestEpochReplayKeepsRepeatedIdentity(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	ep := hubArchive(t, cat, TableEpochHistory)
+	s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, NewMetrics(), discard, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.BeginSession()
+	apply(t, s, reset(), checkpointRec(t, 1), checkpointRec(t, 2), checkpointRec(t, 3), synced("c1"))
+	s.EndSession()
+	if n := countArchive(t, ep, `true`); n != 3 {
+		t.Fatalf("hub holds %d of the spoke's 3 CHECKPOINT records for one run instance", n)
+	}
+}
+
+// checkpointRec is the n'th CHECKPOINT epoch record of run 0 of job 5.0: every one shares an
+// identity.
+func checkpointRec(t *testing.T, n int) replicate.Change {
+	return upsert("k"+itoa(n), parseAd(t, `GlobalJobId = "ap1#5.0#1700000000"; ClusterId = 5; ProcId = 0; RunInstanceID = 0; EpochAdType = "CHECKPOINT"; EpochWriteDate = `+itoa(1700000000+n)))
+}
+
+// TestReplayCountsRepeatedIdentity: N records sharing an identity, replayed into a hub that already
+// holds M of them, leave exactly N -- for M below, at and (0) far below N, through both the
+// per-record probe and the identity set a long replay loads.
+func TestReplayCountsRepeatedIdentity(t *testing.T) {
+	const n = 3
+	for _, path := range []string{"probe", "set", "split"} {
+		for _, m := range []int{0, 1, 2, 3} {
+			t.Run(fmt.Sprintf("%s/held=%d", path, m), func(t *testing.T) {
+				cat := openCatalog(t, t.TempDir())
+				t.Cleanup(func() { _ = cat.Close() })
+				ep := hubArchive(t, cat, TableEpochHistory)
+				metrics := NewMetrics()
+				s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, metrics, discard, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// The hub already holds the first m (appended live: the live tail does not dedup).
+				s.BeginSession()
+				apply(t, s, reset(), synced("c0"))
+				for i := 1; i <= m; i++ {
+					apply(t, s, liveChange(checkpointRec(t, i), "l"+itoa(i)))
+				}
+				s.EndSession()
+
+				// "set": the shared records come after the probe budget is spent, so they are checked
+				// in the identity set; "split": the first is probed (and appended) before the set
+				// loads, the rest are checked in it.
+				filler, first := 0, 1
+				switch path {
+				case "set":
+					filler = probeBudget + 10
+				case "split":
+					filler, first = probeBudget+10, 2
+				}
+				s.BeginSession()
+				changes := []replicate.Change{reset()}
+				if first == 2 {
+					changes = append(changes, checkpointRec(t, 1))
+				}
+				for i := 1; i <= filler; i++ {
+					changes = append(changes, upsert("f", parseAd(t, fmt.Sprintf(`GlobalJobId = "ap1#%d.0#1"; RunInstanceID = 0; EpochAdType = "EPOCH"`, 1000+i))))
+				}
+				for i := first; i <= n; i++ {
+					changes = append(changes, checkpointRec(t, i))
+				}
+				apply(t, s, append(changes, synced("c1"))...)
+				s.EndSession()
+				if val(metrics.DedupHits.WithLabelValues(TableEpochHistory)) != float64(m) {
+					t.Errorf("dedup_hits = %v, want %d", val(metrics.DedupHits.WithLabelValues(TableEpochHistory)), m)
+				}
+				if got := countArchive(t, ep, `EpochAdType == "CHECKPOINT"`); got != n {
+					t.Fatalf("hub holds %d CHECKPOINT records after replaying %d into a hub holding %d, want %d", got, n, m, n)
+				}
+				if got := countArchive(t, ep, `true`); got != n+filler {
+					t.Fatalf("hub holds %d records, want %d", got, n+filler)
+				}
+			})
+		}
+	}
+}
+
+// TestHistoryReplayCountsIdentity: history identities are counted too. A history record that
+// (oddly) appears twice at the spoke appears twice at the hub, however often it is replayed.
+func TestHistoryReplayCountsIdentity(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, NewMetrics())
+	for i := 0; i < 2; i++ {
+		s.BeginSession()
+		apply(t, s, reset(), upsert("r1", histRecord(t, "ap1", 1)), upsert("r1", histRecord(t, "ap1", 1)), upsert("r2", histRecord(t, "ap1", 2)), synced("c"+itoa(i)))
+		s.EndSession()
+	}
+	if n := countArchive(t, hist, `ClusterId == 1`); n != 2 {
+		t.Errorf("job 1.0: %d records, want 2", n)
+	}
+	if n := countArchive(t, hist, `ClusterId == 2`); n != 1 {
+		t.Errorf("job 2.0: %d records, want 1", n)
+	}
+}
+
+// TestResumeCatchupProbesWithoutLoadingSet: a resume's catch-up re-delivers at most the overlap
+// since the committed cursor (after a WatchResync, up to the spoke's watch buffer of ~1024 events),
+// so it is probed record by record however long it runs -- loading the AP's whole identity set is
+// for a Reset's full replay only. It still dedups exactly, repeated identities included.
+func TestResumeCatchupProbesWithoutLoadingSet(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	ep := hubArchive(t, cat, TableEpochHistory)
+	m := NewMetrics()
+	s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, m, discard, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := func(i int) replicate.Change {
+		return upsert("e", parseAd(t, fmt.Sprintf(`GlobalJobId = "ap1#%d.0#1"; RunInstanceID = 0; EpochAdType = "EPOCH"`, i)))
+	}
+	// Live: records 1..n and one CHECKPOINT; none committed a cursor past "s0".
+	n := probeBudget + 44
+	s.BeginSession()
+	apply(t, s, reset(), synced("s0"))
+	for i := 1; i <= n; i++ {
+		apply(t, s, rec(i))
+	}
+	apply(t, s, checkpointRec(t, 1))
+	s.EndSession()
+
+	// Resume from s0: the overlap re-delivers all of it, then two more CHECKPOINTs and one new
+	// record.
+	s.BeginSession()
+	for i := 1; i <= n; i++ {
+		apply(t, s, rec(i))
+	}
+	apply(t, s, checkpointRec(t, 1), checkpointRec(t, 2), checkpointRec(t, 3), rec(n+1))
+	if s.setLoaded {
+		t.Error("a resume catch-up loaded the identity set")
+	}
+	apply(t, s, synced("s1"))
+	s.EndSession()
+	if got := countArchive(t, ep, `true`); got != n+4 {
+		t.Fatalf("hub holds %d records, want %d", got, n+4)
+	}
+	if v := val(m.DedupHits.WithLabelValues(TableEpochHistory)); v != float64(n+1) {
+		t.Errorf("dedup_hits = %v, want %d", v, n+1)
+	}
+}
+
+// TestResetReplayLoadsSet: a Reset replay past the probe budget loads the identity set once and
+// then checks every further record in it -- no more queries, no reload.
+func TestResetReplayLoadsSet(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, NewMetrics())
+	s.BeginSession()
+	apply(t, s, reset())
+	for i := 1; i <= probeBudget+100; i++ {
+		apply(t, s, upsert("r", histRecord(t, "ap1", i)))
+	}
+	if s.setLoads != 1 || !s.setLoaded {
+		t.Errorf("identity set loaded %d times during one long replay, want 1", s.setLoads)
+	}
+	if s.probes != probeBudget {
+		t.Errorf("%d probe queries, want %d (none once the set is loaded)", s.probes, probeBudget)
+	}
+}
+
+// TestIdentitySetIsScopedToTheAP: the identity set holds only this AP's records. Another AP's
+// records with the same GlobalJobIds must not suppress this AP's replay.
+func TestIdentitySetIsScopedToTheAP(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	n := probeBudget + 50
+	replay := func(schedd string) *archiveSink {
+		s := newHistSink(t, hist, schedd, &replicate.MemCursorStore{}, NewMetrics())
+		s.BeginSession()
+		changes := []replicate.Change{reset()}
+		for i := 1; i <= n; i++ {
+			changes = append(changes, upsert("r", histRecord(t, "ap1", i))) // same GlobalJobIds from both
+		}
+		apply(t, s, changes...)
+		return s
+	}
+	replay("ap2")
+	s := replay("ap1")
+	if s.setLoads != 1 {
+		t.Fatalf("precondition: identity set loaded %d times, want 1", s.setLoads)
+	}
+	if got := countArchive(t, hist, `ScheddName == "ap1"`); got != n {
+		t.Errorf("ap1 appended %d of %d records; another AP's identities suppressed the rest", got, n)
+	}
+}
+
+// TestArchiveDedupIgnoresScheddCase: a replay under another spelling of the same schedd is the
+// same AP's replay; a different schedd's identical GlobalJobId is not.
+func TestArchiveDedupIgnoresScheddCase(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	for _, schedd := range []string{"ap1.example.org", "AP1.Example.Org", "ap10.example.org"} {
+		s := newHistSink(t, hist, schedd, &replicate.MemCursorStore{}, NewMetrics())
+		s.BeginSession()
+		apply(t, s, reset(), upsert("r1", histRecord(t, "ap1.example.org", 1)), synced("c"))
+		s.EndSession()
+	}
+	if n := countArchive(t, hist, `ClusterId == 1`); n != 2 {
+		t.Errorf("records = %d, want 2 (one for ap1 under either spelling, one for ap10)", n)
+	}
+}
+
+// TestArchiveUndecodableSkipped: an archive record whose ad could not be decoded is counted and
+// skipped -- there is nothing to append -- and does not stop the stream.
+func TestArchiveUndecodableSkipped(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	m := NewMetrics()
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, m)
+	s.BeginSession()
+	apply(t, s, reset(), upsert("r1", histRecord(t, "ap1", 1)))
+	if err := s.ApplyUndecodable(undecodable("r2"), errors.New("bad wire ad")); err != nil {
+		t.Fatal(err)
+	}
+	apply(t, s, upsert("r3", histRecord(t, "ap1", 3)), synced("c1"))
+	if n := countArchive(t, hist, `true`); n != 2 {
+		t.Errorf("hub history = %d records, want 2", n)
+	}
+	if v := val(m.Undecodable.WithLabelValues(TableHistory)); v != 1 {
+		t.Errorf("undecodable_total = %v, want 1", v)
+	}
+	if got := string(s.Cursor()); got != "c1" {
+		t.Errorf("cursor = %q, want c1", got)
+	}
+}
+
+// TestArchiveForgedScheddNameOverwritten: a history or epoch record arriving with a ScheddName
+// naming another AP is stored under the source's identity, in catch-up and live alike.
+func TestArchiveForgedScheddNameOverwritten(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	for _, table := range []string{TableHistory, TableEpochHistory} {
+		a := hubArchive(t, cat, table)
+		s, err := newArchiveSink(a, table, "ap1.example.org", &replicate.MemCursorStore{}, NewMetrics(), discard, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		forged := func(cluster int) replicate.Change {
+			return upsert("r", parseAd(t, fmt.Sprintf(`GlobalJobId = "ap2#%d.0#1"; ClusterId = %d; RunInstanceID = 0; ScheddName = "ap2.example.org"`, cluster, cluster)))
+		}
+		s.BeginSession()
+		apply(t, s, reset(), forged(1), synced("c"), liveChange(forged(2), "l"))
+		if n := countArchive(t, a, `ScheddName == "ap2.example.org"`); n != 0 {
+			t.Errorf("%s: %d forged records kept their claim to ap2", table, n)
+		}
+		if n := countArchive(t, a, `ScheddName == "ap1.example.org"`); n != 2 {
+			t.Errorf("%s: %d records stamped with their source, want 2", table, n)
+		}
+	}
+}
+
+// TestArchiveRedeliveryAfterReconnect: the same sink across a dropped stream. Live records were
+// appended but their cursor not committed; the stream drops (EndSession) and the Runner reconnects
+// (BeginSession), and the catch-up re-delivers them. BeginSession must re-arm the catch-up check,
+// or the re-delivered records are appended a second time.
+func TestArchiveRedeliveryAfterReconnect(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	m := NewMetrics()
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, m)
+	s.BeginSession()
+	apply(t, s, reset(), upsert("r1", histRecord(t, "ap1", 1)), synced("after-1"))
+	for i := 2; i <= 4; i++ {
+		apply(t, s, liveChange(upsert("r", histRecord(t, "ap1", i)), "after-"+itoa(i)))
+	}
+	s.EndSession() // dropped before a flush: the cursor is still after-1
+
+	s.BeginSession()
+	for i := 2; i <= 4; i++ {
+		apply(t, s, upsert("r", histRecord(t, "ap1", i)))
+	}
+	apply(t, s, synced("after-4"))
+	for i := 1; i <= 4; i++ {
+		if n := countArchive(t, hist, fmt.Sprintf(`ClusterId == %d`, i)); n != 1 {
+			t.Errorf("job %d.0 appears %d times after the reconnect, want 1", i, n)
+		}
+	}
+	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 3 {
+		t.Errorf("dedup_hits = %v, want 3", v)
+	}
+}

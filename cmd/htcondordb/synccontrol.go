@@ -30,10 +30,11 @@ type syncController struct {
 	imp    *importerManager
 	owners *server.TableOwners
 	cat    *db.Catalog
+	fed    *federationManager
 }
 
-// ownerTruncateTimeout bounds how long a truncate waits for the owning tailer to take it. The
-// CLI gives the whole exchange 30s.
+// ownerTruncateTimeout bounds how long a truncate (or a hub retire) waits for the owner to take
+// it. The CLI gives the whole exchange 30s.
 const ownerTruncateTimeout = 20 * time.Second
 
 // handle runs one request ClassAd and returns the response ClassAd. Request attributes:
@@ -42,6 +43,9 @@ const ownerTruncateTimeout = 20 * time.Second
 //	Action = "truncate" | "rotate"           Target = <owned table>
 //	Action = "retention.set"                 Target = <owned archive>, Args = "<maxSegments> <maxBytes> [attr ageSeconds]"
 //	Action = "owner"                         Target = <table>   (who owns it, and what to run instead)
+//
+//	Action = "retire"   (federation hub)
+//	Target = "<schedd-name>"
 //
 // Response: Ok (bool); on failure Error (string); on success Note (string).
 func (sc *syncController) handle(ctx context.Context, reqAd *classad.ClassAd) *classad.ClassAd {
@@ -59,6 +63,8 @@ func (sc *syncController) handle(ctx context.Context, reqAd *classad.ClassAd) *c
 		if err = sc.resync(target); err == nil {
 			note = fmt.Sprintf("resync requested for %q", target)
 		}
+	case "retire":
+		note, err = sc.retire(ctx, target)
 	case "truncate":
 		note, err = sc.truncate(ctx, target)
 	case "rotate":
@@ -68,7 +74,7 @@ func (sc *syncController) handle(ctx context.Context, reqAd *classad.ClassAd) *c
 	case "owner":
 		note, err = sc.ownerNote(target), nil
 	default:
-		err = fmt.Errorf("unknown sync action %q (want resync, truncate, rotate, retention.set, or owner)", action)
+		err = fmt.Errorf("unknown sync action %q (want resync, truncate, rotate, retention.set, owner, or retire)", action)
 	}
 	if err != nil {
 		return fail(resp, err.Error())
@@ -82,6 +88,25 @@ func fail(resp *classad.ClassAd, msg string) *classad.ClassAd {
 	resp.InsertAttrBool("Ok", false)
 	resp.InsertAttrString("Error", msg)
 	return resp
+}
+
+// retire has a federation hub retire a source now: its rows leave the hub's mutable tables.
+// It runs under the request's context, bounded below the CLI's 30s so the operator gets the
+// answer (or the timeout) rather than a dropped connection.
+func (sc *syncController) retire(ctx context.Context, target string) (string, error) {
+	if target == "" {
+		return "", fmt.Errorf("retire requires a target (a federated schedd name)")
+	}
+	if sc.fed == nil {
+		return "", fmt.Errorf("this daemon is not a federation hub")
+	}
+	ctx, cancel := context.WithTimeout(ctx, ownerTruncateTimeout)
+	defer cancel()
+	if err := sc.fed.Retire(ctx, target); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("retired %q: its jobs/syncstatus/federation_sources rows are deleted; "+
+		"archive rows age out with retention. If it is still in the AP set it returns at the next discovery, replayed from scratch", target), nil
 }
 
 // resync routes a target to its owning manager. "jobs"/"history"/"epoch" are the schedd-sync
@@ -130,8 +155,22 @@ func (sc *syncController) truncate(ctx context.Context, table string) (string, e
 		defer cancel()
 		return sc.sched.Truncate(tctx, table)
 	}
-	return "", fmt.Errorf("%s; truncating it here would leave it permanently missing those records. %s",
-		sc.describe(table, owners), sc.releaseHint(owners))
+	return "", fmt.Errorf("%s", joinSentences(sc.describe(table, owners)+
+		"; truncating it here would leave it permanently missing those records", sc.releaseHint(owners)))
+}
+
+// joinSentences joins the non-empty sentences, each ending in one period.
+func joinSentences(parts ...string) string {
+	var out []string
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			if !strings.HasSuffix(p, ".") {
+				p += "."
+			}
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 // rotate enforces an owned archive's retention now -- what the periodic archive maintenance does
@@ -212,7 +251,7 @@ func (sc *syncController) ownerNote(table string) string {
 	if len(owners) == 0 {
 		return fmt.Sprintf("table %q is not owned by a writer in this daemon", table)
 	}
-	return sc.describe(table, owners) + "; clients may read and watch it but not modify it. " + sc.insteadHint(owners)
+	return joinSentences(sc.describe(table, owners)+"; clients may read and watch it but not modify it", sc.insteadHint(owners))
 }
 
 // describe says which writer(s) maintain table.
@@ -226,6 +265,8 @@ func (sc *syncController) describe(table string, owners []string) string {
 			parts = append(parts, fmt.Sprintf("replication (HTCONDORDB_REPLICATE_SOURCES: %s)", orUnknown(sc.ced.SourcesFor(table))))
 		case ownerHistoryImport:
 			parts = append(parts, fmt.Sprintf("history import (HTCONDORDB_HISTORY_IMPORT jobs: %s)", orUnknown(sc.imp.JobsFor(table))))
+		case ownerFederation:
+			parts = append(parts, "the federation hub (replicated from its spokes; HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT / HTCONDORDB_FEDERATE_SPOKES)")
 		default:
 			parts = append(parts, o)
 		}
@@ -239,7 +280,7 @@ func (sc *syncController) insteadHint(owners []string) string {
 		return "Use `.resync <jobs|history|epoch>` to rebuild it from the schedd's files, or `.truncate`/`.rotate`/`.retention` " +
 			"(routed through schedd sync); to write it yourself, use another table."
 	}
-	return "`.rotate` and `.retention` still work (routed through the daemon). " + sc.releaseHint(owners)
+	return joinSentences("`.rotate` and `.retention` still work (routed through the daemon)", sc.releaseHint(owners))
 }
 
 // releaseHint says how to take a table back from a replication/import owner.
@@ -251,10 +292,17 @@ func (sc *syncController) releaseHint(owners []string) string {
 	if slices.Contains(owners, ownerHistoryImport) {
 		steps = append(steps, "remove its job from HTCONDORDB_HISTORY_IMPORT (and delete $(LOG)/history-import-<job>.cursors.json to import it again from the start)")
 	}
-	if len(steps) == 0 {
-		return ""
+	var hint string
+	if len(steps) > 0 {
+		hint = "To modify it, first " + strings.Join(steps, " and ") + ", then condor_reconfig; the table is then an ordinary table."
 	}
-	return "To modify it, first " + strings.Join(steps, " and ") + ", then condor_reconfig; the table is then an ordinary table."
+	if slices.Contains(owners, ownerFederation) {
+		// A hub's table is rebuilt only by its spokes, and a resuming spoke never resends what the
+		// hub's cursor has passed. The per-AP removal is retirement.
+		hint = joinSentences(hint, "To remove one access point's rows, use `.retire <schedd>` (its archive rows age out with retention); "+
+			"to stop federating, remove HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT and HTCONDORDB_FEDERATE_SPOKES and condor_reconfig")
+	}
+	return hint
 }
 
 func orUnknown(ss []string) string {

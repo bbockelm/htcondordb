@@ -115,11 +115,18 @@ func startNode(t *testing.T, bin, dir, cfgPath string) string {
 // (e.g. SIGHUP to reconfigure).
 func startNodeCmd(t *testing.T, bin, dir, cfgPath string) (string, *exec.Cmd) {
 	t.Helper()
-	logFile, err := os.Create(filepath.Join(dir, "stderr.log"))
+	return startNodeCmdListen(t, bin, dir, cfgPath, "127.0.0.1:0")
+}
+
+// startNodeCmdListen is startNodeCmd on a chosen listen address (to restart a node where its peers
+// expect it). Each start appends to the node's stderr.log.
+func startNodeCmdListen(t *testing.T, bin, dir, cfgPath, listen string) (string, *exec.Cmd) {
+	t.Helper()
+	logFile, err := os.OpenFile(filepath.Join(dir, "stderr.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bin, "-listen", "127.0.0.1:0")
+	cmd := exec.Command(bin, "-listen", listen)
 	cmd.Env = append(os.Environ(), "CONDOR_CONFIG="+cfgPath)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	if err := cmd.Start(); err != nil {

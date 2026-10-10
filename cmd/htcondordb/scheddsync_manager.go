@@ -21,6 +21,7 @@ import (
 	"github.com/bbockelm/htcondordb/dbad"
 	"github.com/bbockelm/htcondordb/scheddsync"
 	"github.com/bbockelm/htcondordb/server"
+	"github.com/bbockelm/htcondordb/syncstatus"
 )
 
 // scheddSyncManager owns the schedd-sync tailers so their configuration
@@ -55,7 +56,10 @@ func (s scheddSyncSettings) ownedTables() []string {
 	if !s.enabled {
 		return nil
 	}
-	var out []string
+	// The heartbeat table is written whenever schedd sync runs (launch creates it first): a remote
+	// write would forge the freshness a hub computes from it, and a drop would pull it out from
+	// under the writer.
+	out := []string{syncstatus.Table}
 	if s.jobLog != "" {
 		out = append(out, jobQueueTables...)
 		if s.metricsEnabled {
@@ -84,7 +88,8 @@ func (m *scheddSyncManager) owners() *server.TableOwners {
 // its own tailer (scheddsync.HistorySync.Truncate); the job_metrics archive is wiped (its samples
 // cannot be re-derived, and the sampler appends on). The job_queue.log tables are refused: they
 // are a projection of the log, and emptying them would only hide jobs until the next update --
-// .resync jobs rebuilds them from the current log instead. Returns a note for the operator.
+// .resync jobs rebuilds them from the current log instead, and the syncstatus heartbeat has nothing
+// to empty. Returns a note for the operator.
 func (m *scheddSyncManager) Truncate(ctx context.Context, table string) (string, error) {
 	m.mu.Lock()
 	hs := m.histSyncs[strings.ToLower(table)]
@@ -105,11 +110,24 @@ func (m *scheddSyncManager) Truncate(ctx context.Context, table string) (string,
 		arch.Truncate()
 		m.logger.Warn("schedd-sync: job_metrics archive truncated by operator")
 		return fmt.Sprintf("%s truncated; sampling continues from now (past samples are not re-derived)", t), nil
+	case t == syncstatus.Table:
+		return "", fmt.Errorf("table %q holds the one heartbeat row schedd sync rewrites every %s for a federation hub; "+
+			"there is nothing to empty, and it would be rewritten at the next heartbeat", t, m.heartbeatInterval())
 	case slices.Contains(jobQueueTables, t):
 		return "", fmt.Errorf("table %q is mirrored from job_queue.log by schedd sync and cannot be emptied on its own "+
 			"(it would only hide jobs until the schedd next touched them); run `.resync jobs` to rebuild it from the current log", t)
 	}
 	return "", fmt.Errorf("table %q is not maintained by schedd sync", table)
+}
+
+// heartbeatInterval is the running syncstatus cadence, for operator messages.
+func (m *scheddSyncManager) heartbeatInterval() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.current.syncStatusInterval > 0 {
+		return m.current.syncStatusInterval
+	}
+	return syncstatus.DefaultInterval
 }
 
 // resyncer is a running sync a caller can ask to re-read its source from scratch.
@@ -210,6 +228,11 @@ type scheddSyncSettings struct {
 	historyMaxBytes int64
 	epochMaxBytes   int64
 
+	// mirrored names the schedd these files belong to, for the collector ad and the heartbeat row.
+	mirrored mirroredSchedd
+	// syncStatusInterval is the heartbeat row's cadence (HTCONDORDB_SYNCSTATUS_INTERVAL).
+	syncStatusInterval time.Duration
+
 	// Job resource-metrics sampling (the job_metrics archive). metricsEnabled turns the sampler
 	// on; the rest tune what it records and how much of it is kept. metricsAttrs names ADDITIONAL
 	// job attributes to copy into each sample -- an AccountingGroup, a ProjectName, or a metric
@@ -289,6 +312,17 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 	if !okMin {
 		note("HTCONDORDB_JOB_METRICS_MIN_INTERVAL")
 	}
+	// Whole seconds: a sub-second value ("500ms") would truncate to 0 and silently become the
+	// default, so it is reported like an unparseable one.
+	syncStatusSecs, okHB := configSeconds(cfg, "HTCONDORDB_SYNCSTATUS_INTERVAL")
+	if !okHB || syncStatusSecs < 0 || (syncStatusSecs == 0 && strings.TrimSpace(getStr(cfg, "HTCONDORDB_SYNCSTATUS_INTERVAL")) != "") {
+		note("HTCONDORDB_SYNCSTATUS_INTERVAL")
+		syncStatusSecs = 0
+	}
+	syncStatusInterval := time.Duration(syncStatusSecs) * time.Second
+	if syncStatusInterval <= 0 {
+		syncStatusInterval = syncstatus.DefaultInterval
+	}
 	derivedCols, missingDerived := resolveDerivedColumns(cfg)
 	for _, name := range missingDerived {
 		bad = append(bad, "HTCONDORDB_JOB_METRICS_DERIVED_"+strings.ToUpper(name)+"=<unset>")
@@ -325,6 +359,9 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 		// default. Values accept a unit suffix ("10 GB", "500MiB") or plain bytes.
 		historyMaxBytes: configBytesOr(cfg, "HTCONDORDB_HISTORY_MAX_BYTES", defArchiveMaxBytes),
 		epochMaxBytes:   configBytesOr(cfg, "HTCONDORDB_EPOCH_HISTORY_MAX_BYTES", defArchiveMaxBytes),
+
+		mirrored:           resolveMirroredSchedd(cfg),
+		syncStatusInterval: syncStatusInterval,
 
 		// Off by default: sampling adds a record per running job per shadow update, which is a
 		// real volume decision an admin should make rather than inherit.
@@ -704,6 +741,22 @@ func (m *scheddSyncManager) Sources() []dbad.StatusSource {
 	return m.sources
 }
 
+// Mirrored returns the schedd this daemon mirrors, for the collector ad, or nil while schedd-sync is
+// off. The address is read from the schedd's address file on each call.
+func (m *scheddSyncManager) Mirrored() *dbad.Mirrored {
+	m.mu.Lock()
+	cur := m.current
+	m.mu.Unlock()
+	if !cur.enabled {
+		return nil
+	}
+	name, addr := cur.mirrored.current()
+	if name == "" {
+		return nil
+	}
+	return &dbad.Mirrored{Name: name, Address: addr}
+}
+
 // apply reconciles the running tailers with cfg: a no-op when the resolved
 // settings are unchanged, otherwise it stops the current tailers and (if still
 // enabled) starts fresh ones. Called once at startup and again on each reconfig.
@@ -721,12 +774,24 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 		return nil // nothing changed
 	}
 	if next.enabled {
+		// A federation hub writes the same tables (see checkFederationExclusive).
+		if fs, _, ferr := resolveFederationSettings(cfg); ferr == nil {
+			if err := checkFederationExclusive(cfg, fs); err != nil {
+				return err
+			}
+		}
 		// Never read a schedd's job_queue.log/history as root (symlink risk).
 		if err := scheddSyncGuardEUID(os.Geteuid()); err != nil {
 			return err
 		}
 		if next.jobLog == "" && next.histFile == "" && next.epochFile == "" {
 			return fmt.Errorf("HTCONDORDB_SYNC_SCHEDD is set but none of JOB_QUEUE_LOG, HISTORY, or JOB_EPOCH_HISTORY is configured")
+		}
+		// Claim what the new tailers will write while the old ones still hold theirs. Refused when
+		// another in-process writer (a federation hub, a replication target) holds one of them,
+		// and then nothing here changes.
+		if err := m.owners().Claim(ownerScheddSync, unionTables(m.owners().Held(ownerScheddSync), next.ownedTables())); err != nil {
+			return fmt.Errorf("schedd-sync: %w", err)
 		}
 	}
 
@@ -743,14 +808,24 @@ func (m *scheddSyncManager) apply(cfg *config.Config) error {
 	m.histSyncs = nil
 	m.current = scheddSyncSettings{}
 
-	// Ownership follows the tailers: the new set replaces the old in one step (a table kept
-	// across the restart is never briefly writable), and is claimed BEFORE the new tailers
-	// create or write anything, so no remote write can land in a table they are about to mirror.
-	// Disabled -> released.
+	// Ownership follows the tailers: the new set (claimed above, with the old) replaces the old
+	// in one step (a table kept across the restart is never briefly writable), BEFORE the new
+	// tailers create or write anything, so no remote write can land in a table they are about to
+	// mirror. Disabled -> released.
 	m.owners().Set(ownerScheddSync, next.ownedTables())
 	if !next.enabled {
 		return nil
 	}
+
+	// Say which schedd this daemon claims to mirror and why: a hub pairs on this name, and a wrong
+	// one is a wrong pairing rather than an error anywhere.
+	name, addr := next.mirrored.current()
+	rule := next.mirrored.rule
+	if name != next.mirrored.name {
+		rule = "the Name in the schedd's address file"
+	}
+	m.logger.Info("schedd-sync: mirrored schedd", "name", name, "rule", rule,
+		"address", addr, "address_file", next.mirrored.addrFile, "address_found", addr != "")
 
 	ctx, cancel := context.WithCancel(m.parent)
 	sources, resyncers, histSyncs, done, err := m.launch(ctx, next)
@@ -804,6 +879,12 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	resyncers := map[string]resyncer{}
 	histSyncs := map[string]*scheddsync.HistorySync{}
 	var wg sync.WaitGroup
+
+	// Created before any tailer starts, so a failure here leaves nothing running.
+	hb, err := m.svc.Catalog().CreateTable(syncstatus.Table)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating %s table: %w", syncstatus.Table, err)
+	}
 
 	if s.jobLog != "" {
 		// job_queue.log flattens into five tables by key namespace: proc ads -> jobs, cluster ads
@@ -972,6 +1053,19 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		histSyncs["epoch_history"] = es
 		m.logger.Info("schedd-sync: tailing epoch history file", "file", s.epochFile, "archive", "epoch_history")
 	}
+
+	// The heartbeat row a federation hub reads freshness from. Written by this process only, from
+	// the same live status the collector ad reports.
+	statusSources := append([]dbad.StatusSource(nil), sources...)
+	w := &syncstatus.Writer{
+		Table:    hb,
+		Sources:  func() []dbad.StatusSource { return statusSources },
+		Mirrored: s.mirrored.current,
+		Interval: s.syncStatusInterval,
+		Logger:   m.logger,
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); w.Run(ctx) }()
 
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()

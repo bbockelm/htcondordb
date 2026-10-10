@@ -96,9 +96,9 @@ inherits the condor config and drops to the condor user.
 
 ## The mirror is read-only to clients
 
-While sync is on, the tables it writes (`jobs`, `users`, `jobsets`, `clusters`,
-`header`, `clusterprivate`, `logmeta`, plus `job_metrics`, `history` and
-`epoch_history` when their source is configured) belong to it: every client —
+While sync is on, the tables it writes (`syncstatus`, `jobs`, `users`, `jobsets`,
+`clusters`, `header`, `clusterprivate`, `logmeta`, plus `job_metrics`, `history`
+and `epoch_history` when their source is configured) belong to it: every client —
 WRITE and DAEMON alike — may query and `WATCH` them, but writes are refused with
 `read-only table "<name>"`. Ownership follows the configuration: disable sync, or
 drop a source, and `condor_reconfig` makes those tables ordinary again. See
@@ -135,6 +135,9 @@ Repairing the mirror goes through the sync itself (DAEMON-authorized, over
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | inherits default | Per-table size cap for `job_metrics`. |
 | `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap against `SampleTime`, e.g. `30d`. |
 | `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | Group schemas for attributes only some jobs have (GPU, container networking). **Create-time only.** See [Sizing](#sizing). |
+| `HTCONDORDB_MIRRORED_SCHEDD_NAME` | the schedd's own `Name` | Which schedd this mirror claims (`MirroredScheddName`). See [Naming the mirrored schedd](#naming-the-mirrored-schedd). |
+| `HTCONDORDB_MIRRORED_SCHEDD_ADDRESS_FILE` | `SCHEDD_ADDRESS_FILE` | The mirrored schedd's address file: its address (`MirroredScheddAddress`) and, from HTCondor 25.x, its `Name`. Set it for a schedd other than the host's primary one. |
+| `HTCONDORDB_SYNCSTATUS_INTERVAL` | `5` | Whole seconds between `syncstatus` heartbeat rows. A sub-second value (`500ms`) is rejected (logged) and the default used. |
 
 ### Bounding disk usage
 
@@ -151,6 +154,62 @@ segments once a table exceeds its cap. The caps are applied on every start and `
 so a configuration-management change takes effect without recreating the database.
 
 See [Configuration](configuration.md) for the full knob list.
+
+### Naming the mirrored schedd
+
+While schedd sync runs, the collector ad and the `DBSyncStatus` reply carry
+`MirroredScheddName` -- the schedd whose files this daemon reads -- and, when the schedd's
+address file is readable, `MirroredScheddAddress`. A consumer pairs a mirror with its schedd by
+this name instead of guessing from the host. With schedd sync off neither attribute is published.
+
+The address file is `HTCONDORDB_MIRRORED_SCHEDD_ADDRESS_FILE`, else the primary schedd's
+`SCHEDD_ADDRESS_FILE`. A second schedd on the host, configured under a local name (`SCHEDD2`, say),
+writes its own (`SCHEDD2.SCHEDD_ADDRESS_FILE`): a spoke mirroring it sets
+`HTCONDORDB_MIRRORED_SCHEDD_ADDRESS_FILE` to that path. `MirroredScheddAddress` is the file's first
+line, which is what the schedd writes there: its *private* network address when it has one, else
+its public one -- an address for clients on the schedd's own network, not necessarily the one it
+advertises to the collector.
+
+The name, in order of precedence:
+
+1. `HTCONDORDB_MIRRORED_SCHEDD_NAME`, when set.
+2. The `Name` the schedd writes into its address file. Since HTCondor 25.x the schedd appends a
+   ClassAd after the address, version and platform lines carrying its own `Name` (and `Machine`);
+   this is the schedd's own answer, local names and `-name` included. It is re-read with the
+   address, so a schedd restarted under another name is followed.
+3. Derived from configuration, following the schedd's own rule (`build_valid_daemon_name` /
+   `default_daemon_name` in HTCondor): `SCHEDD.SCHEDD_NAME` or `SCHEDD_NAME` verbatim when it
+   contains `@`; the full hostname when it names this host; otherwise `name@$(FULL_HOSTNAME)`.
+   With no `SCHEDD_NAME` it is `$(FULL_HOSTNAME)` when this daemon runs as root or the condor
+   user (as it does under `condor_master`), else `user@$(FULL_HOSTNAME)` (a personal condor). With
+   no `FULL_HOSTNAME` no name is advertised. HTCondor resolves a configured name through DNS to
+   decide "names this host", and qualifies an unqualified hostname with `DEFAULT_DOMAIN_NAME`;
+   htcondordb does neither (it compares with `FULL_HOSTNAME` and `HOSTNAME`), so a DNS alias of
+   this host, or a pre-25 schedd relying on `DEFAULT_DOMAIN_NAME`, needs
+   `HTCONDORDB_MIRRORED_SCHEDD_NAME`.
+
+The chosen name, the rule that produced it, and whether the address file was found are logged when
+sync starts.
+
+### The syncstatus heartbeat
+
+Schedd sync also keeps a one-row mutable table, `syncstatus` (key `status`), rewritten every
+`HTCONDORDB_SYNCSTATUS_INTERVAL` seconds. It carries `MirroredScheddName`,
+`MirroredScheddAddress` (when the schedd's address file is readable), `HeartbeatSeq` (continues
+across restarts), `HeartbeatTime` (this host's clock, informational), `HeartbeatIntervalSeconds`,
+and for each source the collector ad's health fields -- `JobQueueCaughtUp`/`LagBytes`,
+`HistoryCaughtUp`/`LagBytes`/`GapDetected`, the `Epoch` equivalents, and `<Source>LastSyncTime`
+(this host's clock, informational) -- plus `<Source>LagSeconds`, an upper bound on how old the newest state the mirror
+is guaranteed to hold is. While the source is caught up (the ad's `CaughtUp` definition) that is
+the ad's `<Source>SecondsSinceSync`, taken when the row is written; while it is behind it is the
+time since it was last caught up, and keeps growing -- a tailer working through a backlog applies
+records on every pass, so time since the last pass would read a mirror gigabytes behind as fresh.
+`SpokeLagSeconds` is the largest of them. It is absent while any source's lag is unknown: before
+the source is first seen caught up by this process, so a daemon that restarts behind reports no
+lag until it catches up -- and while the job_queue.log does not exist (a stopped or removed
+schedd, or a wrong path). A history or epoch file that does not exist has nothing to be behind on
+and does not hold it back. A missing file is reported as `<Source>FilePresent = false`. A federation hub replicates the row and
+computes freshness from it; see [Federation](federation.md).
 
 ## Job resource metrics
 

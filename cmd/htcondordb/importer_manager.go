@@ -179,6 +179,17 @@ func (m *importerManager) apply(cfg *config.Config) error {
 	if next.equal(m.current) {
 		return nil
 	}
+	bin := ""
+	if next.enabled {
+		bin = resolveBinary(next.binOverride, "history-import")
+	}
+	if bin != "" {
+		// Claim the new targets while the running jobs hold the old: refused, leaving them
+		// running, when another in-process writer holds a target.
+		if err := m.owners.Claim(ownerHistoryImport, unionTables(m.owners.Held(ownerHistoryImport), next.tables())); err != nil {
+			return fmt.Errorf("importer manager: %w", err)
+		}
+	}
 	if m.cancel != nil {
 		m.cancel()
 		<-m.done
@@ -192,7 +203,6 @@ func (m *importerManager) apply(cfg *config.Config) error {
 		return nil
 	}
 
-	bin := resolveBinary(next.binOverride, "history-import")
 	if bin == "" {
 		// An external runner writes over an ordinary session, so its tables must stay writable.
 		m.owners.Set(ownerHistoryImport, nil)

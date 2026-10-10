@@ -592,7 +592,9 @@ func (b *behindTracker) Collect(ch chan<- prometheus.Metric) {
 // (RSS, open FDs, ...) collectors. sources, exporters, and importers may be nil (their metric
 // families are then simply absent). It uses a private registry so it can be mounted without
 // global-registry collisions.
-func Handler(ctx context.Context, cat *db.Catalog, sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus, importers func() []dbad.ImporterStatus) http.Handler {
+//
+// extra collectors (a federation hub's metrics, say) are registered alongside.
+func Handler(ctx context.Context, cat *db.Catalog, sources func() []dbad.StatusSource, exporters func() []dbad.ExporterStatus, importers func() []dbad.ImporterStatus, extra ...prometheus.Collector) http.Handler {
 	// Integrate per-source time-behind in the background (Prometheus runs nothing between scrapes),
 	// stopped when ctx is cancelled. Registered as its own collector so the counter carries the
 	// same kind/source labels as the sync gauges.
@@ -622,5 +624,6 @@ func Handler(ctx context.Context, cat *db.Catalog, sources func() []dbad.StatusS
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
+	reg.MustRegister(extra...)
 	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 }

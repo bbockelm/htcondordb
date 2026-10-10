@@ -130,6 +130,11 @@ func (m *cedarSyncManager) apply(cfg *config.Config) error {
 				return fmt.Errorf("HTCONDORDB_REPLICATE_%s_TYPE=%q (want archive or table)", strings.ToUpper(s.Name), s.Type)
 			}
 		}
+		// Claim the new targets while the running replicators hold the old: refused, leaving
+		// them running, when another in-process writer holds a target.
+		if err := m.owners.Claim(ownerReplication, unionTables(m.owners.Held(ownerReplication), next.targets())); err != nil {
+			return fmt.Errorf("cedar-sync: %w", err)
+		}
 	}
 
 	if m.cancel != nil {
@@ -139,8 +144,8 @@ func (m *cedarSyncManager) apply(cfg *config.Config) error {
 	}
 	m.sig = ""
 	m.sources = nil
-	// The replicas belong to replication from here on (or no longer, when disabled): claimed
-	// before the runners create or write them, replacing the previous set in one step.
+	// The replicas belong to replication from here on (or no longer, when disabled): the new set
+	// (claimed above) replaces the previous one before the runners create or write them.
 	m.owners.Set(ownerReplication, next.targets())
 	if !next.enabled {
 		m.logger.Info("cedar-sync: disabled")
@@ -197,21 +202,27 @@ func (m *cedarSyncManager) run(ctx context.Context, cfg *config.Config, s cedarS
 	wg.Wait()
 }
 
-// dialFor builds a cedarsync.Dial that opens a fresh authenticated dbrpc session to the leader at
-// addr (a normal DBSession, so any htcondordb is a source). A fresh dial per session lets a
-// reconnect recover from a dropped connection.
+// dialFor builds a cedarsync.Dial to the leader at addr; see dbSessionDial.
 func (m *cedarSyncManager) dialFor(cfg *config.Config, addr string) cedarsync.Dial {
+	return dbSessionDial(m.parent, cfg, addr, "cedar-sync")
+}
+
+// dbSessionDial builds a cedarsync.Dial that opens a fresh authenticated dbrpc session to the
+// htcondordb at addr: a normal DBSession, so any htcondordb is a source, and the level it is granted
+// is whatever the source's ALLOW_* policy gives this daemon's identity. A fresh dial per session lets
+// a reconnect recover from a dropped connection. parent bounds the connection's lifetime.
+func dbSessionDial(parent context.Context, cfg *config.Config, addr, who string) cedarsync.Dial {
 	return func(dctx context.Context) (*dbrpc.Client, func(), error) {
 		sec, err := htcondor.GetSecurityConfig(cfg, command.DBSession, "CLIENT")
 		if err != nil {
-			return nil, nil, fmt.Errorf("cedar-sync: security config: %w", err)
+			return nil, nil, fmt.Errorf("%s: security config: %w", who, err)
 		}
 		sec.Command = command.DBSession
 		cl, err := cedarclient.ConnectAndAuthenticate(dctx, addr, sec)
 		if err != nil {
-			return nil, nil, fmt.Errorf("cedar-sync: connecting to %s: %w", addr, err)
+			return nil, nil, fmt.Errorf("%s: connecting to %s: %w", who, addr, err)
 		}
-		c := dbrpc.NewClient(dbrpc.NewCedarConn(m.parent, cl.GetStream()))
+		c := dbrpc.NewClient(dbrpc.NewCedarConn(parent, cl.GetStream()))
 		return c, func() { _ = c.Close(); _ = cl.Close() }, nil
 	}
 }

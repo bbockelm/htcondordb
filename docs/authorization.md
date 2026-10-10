@@ -28,13 +28,19 @@ every client — DAEMON included:
 
 | Owner | Tables | While |
 |-------|--------|-------|
-| schedd sync | `jobs`, `users`, `jobsets`, `clusters`, `header`, `clusterprivate`, `logmeta` (job_queue.log); `job_metrics` (`HTCONDORDB_JOB_METRICS`); `history`; `epoch_history` | `HTCONDORDB_SYNC_SCHEDD` is on and the source file is configured |
+| schedd sync | `syncstatus` (the heartbeat); `jobs`, `users`, `jobsets`, `clusters`, `header`, `clusterprivate`, `logmeta` (job_queue.log); `job_metrics` (`HTCONDORDB_JOB_METRICS`); `history`; `epoch_history` | `HTCONDORDB_SYNC_SCHEDD` is on (`syncstatus`), and the source file is configured (the rest) |
+| federation hub | `federation_sources` and each table in `HTCONDORDB_FEDERATE_TABLES` (`jobs`, `history`, `syncstatus`, `epoch_history`) | `HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT` or `HTCONDORDB_FEDERATE_SPOKES` is set |
 | replication (cedar-sync) | each `HTCONDORDB_REPLICATE_<NAME>_TARGET` | the source is listed in `HTCONDORDB_REPLICATE_SOURCES` |
 | history import | each managed `HTCONDORDB_HISTORY_IMPORT_<NAME>_TABLE` | the job is configured and the daemon runs the importer (not with `HTCONDORDB_MANAGE_HISTORY_IMPORT = false` or no `history-import` binary) |
 
 Ownership follows configuration: it is re-evaluated on every reconfigure, and a
 table is an ordinary table again once its writer is disabled. Names match
-case-insensitively.
+case-insensitively. A table has at most one owner: a configuration that gives
+one table to two writers (a replication target named `jobs` on a hub, say) is
+refused for whichever is applied second -- at startup the daemon exits, on a
+reconfigure the writer already running keeps the table. A reconfigure that
+moves a table from one writer to another (a hub becoming schedd sync) works in
+one step: the taker is applied after the giver has let go.
 
 Clients may query and `WATCH` an owned table, but every write is refused with
 `read-only table "<name>": … not permitted` (`dbrpc.ErrTableReadOnly`, a
@@ -55,9 +61,13 @@ refused:
   `.truncate job_metrics` wipes the samples (they are not re-derived).
 - `.truncate` of a job_queue.log table is refused: run `.resync jobs`, which
   rebuilds them from the current log.
+- `.truncate syncstatus` is refused: it is one heartbeat row, rewritten every
+  `HTCONDORDB_SYNCSTATUS_INTERVAL`.
 - `.truncate` of a replica or import target is refused, since neither source
   resends what its cursor has passed: remove the source/job from the config and
   `condor_reconfig` first (and delete its cursor file to fill the table again).
+- `.truncate` of a hub table is refused for the same reason. To remove one
+  access point's rows use `.retire <schedd>`.
 - `.rotate` and `.retention` work on any owned archive. For a schedd-sync
   archive the configured size cap (`HTCONDORDB_*_MAX_BYTES`) is re-applied when
   the daemon restarts or a reconfigure changes it.
@@ -70,7 +80,7 @@ refused:
 | `DBReplicate` | 74001 | DAEMON | (reserved) dedicated commit stream. |
 | `DBRaft` | 74002 | DAEMON | Raft transport tunneled over CEDAR. |
 | `DBControl` | 74003 | WRITE | Consistent-mode control (leader discovery, peer registration, write-batch apply). |
-| `DBSyncControl` | 74004 | DAEMON | Sync control: `resync` a schedd-sync tailer or exporter; `truncate`/`rotate`/`retention.set` an owned table through its owner; `owner` (who owns a table). |
+| `DBSyncControl` | 74004 | DAEMON | Sync control: `resync` a schedd-sync tailer or exporter; `truncate`/`rotate`/`retention.set` an owned table through its owner; `owner` (who owns a table); `retire` a federation hub's source. |
 | `DBSyncStatus` | 74005 | READ | Sync health ad. |
 
 ## Getting WRITE
