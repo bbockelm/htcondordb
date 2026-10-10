@@ -91,22 +91,20 @@ matching the constraint, for all ScheddAds (to tell "no longer matches" from "go
   (`rejected_spokes_total{reason="host_mismatch"}`); a schedd whose every claimant was rejected is
   reported `untrusted`. Static spokes skip it.
 
-  This is a guard against misconfiguration -- a spoke copied to another host still claiming its
-  old AP -- **not authentication**. Every input is a collector ad, written by whoever advertised
-  it: a host that may advertise to the collector can claim to be any spoke. Alias and `addrs`
+  Trust in a spoke's ad is HTCondor's usual trust in collector ads: whoever may advertise to the
+  collector is trusted for what it advertises, as the negotiator trusts schedd ads, and the
+  collector's `ALLOW_ADVERTISE_*` / `ALLOW_DAEMON` policy decides who that is. Validation catches
+  misconfiguration -- a spoke copied to another host still claiming its old AP. Alias and `addrs`
   parameters are not consulted because the spoke writes them itself, and an address shared with the
   schedd's is not consulted because private addresses repeat across hosts (two APs behind
-  different NATs can both be `172.17.0.2`). Consequences:
-  - A spoke reached only through CCB or NAT, or whose primary address is not what its AP's name
-    resolves to on the hub, fails validation: pair it statically (`HTCONDORDB_FEDERATE_SPOKES`).
-  - On a network where advertising cannot be trusted, use static spokes only (no constraint), and
-    restrict who may advertise to the collector (`ALLOW_ADVERTISE_*` / `ALLOW_DAEMON` on the
-    collector).
+  different NATs can both be `172.17.0.2`). A spoke reached only through CCB or NAT, or whose
+  primary address is not what its AP's name resolves to on the hub, fails validation: pair it
+  statically (`HTCONDORDB_FEDERATE_SPOKES`).
 - **HA pairs.** Two valid spokes claiming one schedd: the one reporting `Syncing` and caught up
   wins; if both or neither are, the hub declines rather than guess (`reason="ha_tie"`).
 - **Validated pairings are sticky.** `untrusted` (every claimant rejected) and a declined HA tie
   apply only to a schedd with no previously validated spoke. A schedd that had one keeps streaming
-  from that address -- a rejected impostor or a tie does not stop an established stream; only a new
+  from that address -- a rejected claimant or a tie does not stop an established stream; only a new
   *valid* claim moves it. To force a re-pairing, `.retire` the schedd.
 - `rejected_spokes_total` counts rejections per discovery pass: one misconfigured spoke adds one
   every `HTCONDORDB_FEDERATE_DISCOVER_INTERVAL`, so read it as a rate, not a count of spokes.

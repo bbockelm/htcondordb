@@ -25,6 +25,6 @@
 // Retirement removes the source's cursors, then deletes from the mutable tables only; archives are
 // append-only and age out through their retention.
 //
-// Host validation (Discovery) guards against misconfiguration, not impersonation: every input is a
-// collector ad. Untrusted networks use static spokes.
+// Host validation (Discovery) catches misconfiguration. Trust in spoke ads is the collector's
+// advertise authorization, as for any HTCondor ad; spokes behind CCB or NAT pair statically.
 package federate

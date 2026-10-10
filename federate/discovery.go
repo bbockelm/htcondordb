@@ -261,9 +261,9 @@ func spokeInfos(ads []*classad.ClassAd) []spokeInfo {
 // pair validates each spoke's claim and picks one spoke per matched schedd.
 //
 // A claim is accepted only when the spoke's primary address is the claimed schedd's host (see
-// hostValid). This is a guard against misconfiguration -- a spoke on one host claiming another's
-// schedd would publish rows under that AP's name -- not authentication: every input comes from
-// collector ads, which their advertisers write. Two valid claimants for one schedd (an HA pair) are
+// hostValid). This catches misconfiguration -- a spoke on one host claiming another's schedd would
+// publish rows under that AP's name; trust in the ads themselves is the collector's advertise
+// authorization, as for any HTCondor ad. Two valid claimants for one schedd (an HA pair) are
 // resolved by preferring the one that is syncing and caught up; on a tie the schedd is declined
 // rather than guessed.
 func pair(ctx context.Context, schedds map[string]scheddInfo, spokes []spokeInfo, resolve func(context.Context, string) ([]string, error)) (accepted map[string]Spoke, rejected []Rejection, untrusted, declined map[string]string) {
