@@ -3,11 +3,11 @@ module github.com/bbockelm/htcondordb
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.31.1
-	github.com/PelicanPlatform/classad/changefeed v0.31.1
-	github.com/PelicanPlatform/classad/collections v0.31.1
-	github.com/PelicanPlatform/classad/db v0.31.1
-	github.com/PelicanPlatform/classad/dbrpc v0.31.1
+	github.com/PelicanPlatform/classad v0.31.2
+	github.com/PelicanPlatform/classad/changefeed v0.31.2
+	github.com/PelicanPlatform/classad/collections v0.31.2
+	github.com/PelicanPlatform/classad/db v0.31.2
+	github.com/PelicanPlatform/classad/dbrpc v0.31.2
 	github.com/bbockelm/cedar v0.7.2
 	github.com/bbockelm/golang-htcondor v0.16.4-0.20260926032345-41c11247a087
 	github.com/chzyer/readline v1.5.1
@@ -16,6 +16,7 @@ require (
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	github.com/prometheus/client_golang v1.24.0
+	github.com/prometheus/client_model v0.6.2
 	golang.org/x/sys v0.48.0
 )
 
@@ -51,7 +52,6 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pressly/goose/v3 v3.27.3 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.0 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
