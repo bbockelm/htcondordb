@@ -52,6 +52,12 @@ const (
 	// same run, with suspended time subtracted -- the denominator every derived rate uses. Absent
 	// on a run's first observation.
 	SampleIntervalAttr = "SampleInterval"
+	// SampleIntervalClockAttr names the clock SampleInterval was measured on: "starter" (the
+	// starter's StatsLastUpdateTimeStarter), "lifetime" (the starter's StatsLifetimeStarter
+	// uptime counter) or "ingest" (when this tailer read the commits). Written with
+	// SampleInterval; a row with SampleInterval and no SampleIntervalClock predates it, and its
+	// interval is the starter's clock unless SampleTimeFromIngest is set.
+	SampleIntervalClockAttr = "SampleIntervalClock"
 	// SampleTriggerAttr names what caused the commit this sample was taken from, so a panel can
 	// narrow to an even series ("periodic") or find run endpoints ("terminal") without a join.
 	SampleTriggerAttr = "SampleTrigger"
@@ -77,7 +83,44 @@ const numShadowStartsAttr = "NumShadowStarts"
 
 // statsClockAttr is the starter's own "when I gathered these" timestamp, renamed by the shadow so
 // it does not collide with schedd statistics of the same name.
+//
+// It is rarely there. The starter publishes StatsLastUpdateTime only at the VERBOSE level
+// (StarterStatistics::Publish, vanilla_proc.cpp), and its default publish flags are BASIC|RECENT
+// unless STATISTICS_TO_PUBLISH asks for STARTER:2 -- so although the shadow renames it and the
+// schedd's queue-update list (qmgr_job_updater.cpp) carries it, a default starter never sends it.
+// On ap2001 not one of a million samples had it.
 const statsClockAttr = "StatsLastUpdateTimeStarter"
+
+// statsLifetimeAttr is the starter's uptime counter, seconds since the starter's job object was
+// created (generic_stats_Tick: now - InitTime, ticked as the update ad is built). It is published
+// at the BASIC level, so every update carries it beside the counters it was gathered with, and
+// its difference between two updates is the starter's own elapsed time between them: the
+// interval clock when statsClockAttr is absent. It restarts with each starter, so a value seen
+// across a run boundary is the previous run's -- which the run-boundary rule already refuses.
+const statsLifetimeAttr = "StatsLifetimeStarter"
+
+// intervalClock is the clock an observation's interval is measured on.
+type intervalClock uint8
+
+const (
+	// clockIngest is when this tailer read the commit. Its differences are tailer timing: a
+	// batch of commits read within a second divides a five-minute counter delta by one.
+	clockIngest intervalClock = iota
+	// clockStarter is StatsLastUpdateTimeStarter, the starter's own timestamp.
+	clockStarter
+	// clockLifetime is StatsLifetimeStarter, the starter's uptime counter.
+	clockLifetime
+)
+
+func (c intervalClock) String() string {
+	switch c {
+	case clockStarter:
+		return "starter"
+	case clockLifetime:
+		return "lifetime"
+	}
+	return "ingest"
+}
 
 // attrClass says how an attribute behaves over time, which decides whether differentiating it is
 // meaningful and across what span.
@@ -129,7 +172,7 @@ var sampleAttrs = map[string]attrClass{
 	"RequestDisk":                  classContext,
 	"RequestGpus":                  classContext,
 	"TotalSuspensions":             classContext,
-	"StatsLifetimeStarter":         classContext,
+	statsLifetimeAttr:              classContext,
 
 	// high-water marks
 	"MemoryUsage":         classHWM,
@@ -361,11 +404,20 @@ type prevObservation struct {
 	gpuAvg     float64
 	hasGPU     bool
 	jobStatus  int64
-	// fromStarter records WHICH CLOCK sampleTime came from. Differentiating a starter-clock
-	// instant against an ingest-clock one measures the AP/EP skew as if it were elapsed time: with
-	// the AP behind, the interval can even go negative and silently drop every rate in the window.
-	// The two are not comparable, so an interval spanning both is refused.
-	fromStarter bool
+	// clock records WHICH CLOCK the interval to the next observation is measured on.
+	// Differentiating a starter-clock instant against an ingest-clock one measures the AP/EP skew
+	// as if it were elapsed time: with the AP behind, the interval can even go negative and
+	// silently drop every rate in the window. No two clocks are comparable, so an interval
+	// spanning two is refused.
+	clock intervalClock
+	// lifetime is StatsLifetimeStarter, for clockLifetime.
+	lifetime float64
+	// staleLifetime marks a lifetime that may be the PREVIOUS starter's: the value a run's first
+	// observation carries (the job ad still holds the last run's until the new starter reports),
+	// and that same value carried forward until it changes. Measured from it, an interval spans
+	// two starters' uptimes -- too short whenever the previous run was shorter than the new
+	// starter's first report -- so no rate is derived from a stale base.
+	staleLifetime bool
 }
 
 // JobMetricsConfig configures the sampler.
@@ -456,6 +508,7 @@ func isBuiltinDerived(name string) bool {
 	}
 	switch strings.ToLower(name) {
 	case "gpuutil", strings.ToLower(SampleTimeAttr), strings.ToLower(SampleIntervalAttr),
+		strings.ToLower(SampleIntervalClockAttr),
 		strings.ToLower(SampleTriggerAttr), strings.ToLower(SampleBaselineAttr),
 		strings.ToLower(SampleLogSeqAttr), strings.ToLower(RunInstanceAttr), strings.ToLower(KeyAttr):
 		return true
@@ -507,6 +560,7 @@ type jobMetrics struct {
 	mThrottled   atomic.Int64
 	mAfterEnd    atomic.Int64
 	mClockMix    atomic.Int64
+	mStalled     atomic.Int64
 	mBaseline    atomic.Int64
 	mResets      atomic.Int64
 	mInherited   atomic.Int64
@@ -792,6 +846,11 @@ func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd,
 	}
 
 	cur := m.observe(job, run, sampleTime, fromStarter)
+	if cur.clock == clockLifetime {
+		firstOfRun := prev == nil || prev.run != run
+		cur.staleLifetime = firstOfRun ||
+			(prev.clock == clockLifetime && prev.staleLifetime && prev.lifetime == cur.lifetime)
+	}
 	if m.deriveRates(s, prev, cur, run, haveRun) {
 		if prev != nil && prev.run != run {
 			// A new run whose counters did not restart: the sample carries values inherited from
@@ -872,9 +931,20 @@ func (m *jobMetrics) applyDerived(s *classad.ClassAd) {
 }
 
 // observe snapshots the counters this sample will be differentiated from next time.
+//
+// Its interval clock is the starter's timestamp when the job has one, else the starter's uptime
+// counter, else the ingest clock. SampleTime itself stays on the ingest clock in the second case:
+// the uptime counter starts when the starter creates the job's process object, which is near but
+// not at any instant the job ad records (JobCurrentStartExecutingDate is the shadow's clock when
+// it heard execution began), so anchoring a time axis on it would invent precision.
 func (m *jobMetrics) observe(job *classad.ClassAd, run, sampleTime int64, fromStarter bool) *prevObservation {
-	o := &prevObservation{run: run, sampleTime: sampleTime, fromStarter: fromStarter,
+	o := &prevObservation{run: run, sampleTime: sampleTime, clock: clockIngest,
 		counters: map[string]float64{}}
+	if fromStarter {
+		o.clock = clockStarter
+	} else if lt, ok := job.EvaluateAttrNumber(statsLifetimeAttr); ok {
+		o.clock, o.lifetime = clockLifetime, lt
+	}
 	for name, class := range sampleAttrs {
 		if class != classRunCounter && class != classCrossRunCounter {
 			continue
@@ -910,22 +980,40 @@ func (m *jobMetrics) deriveRates(s *classad.ClassAd, prev, cur *prevObservation,
 	if prev.run != run {
 		return true
 	}
-	// An interval may not span two different clocks. sampleTime is the starter's when it reports
-	// stats and the ingest clock otherwise, and the gap between them is AP/EP skew, not elapsed
-	// time. With the AP behind, the difference even goes negative and silently drops every rate
-	// in the window; ahead, every rate is understated by the skew with nothing on the record.
-	if prev.fromStarter != cur.fromStarter {
+	// An interval may not span two different clocks: the starter's timestamp, the starter's
+	// uptime counter, and the ingest clock measure different things, and the gap between a
+	// starter instant and an ingest one is AP/EP skew, not elapsed time. With the AP behind, the
+	// difference even goes negative and silently drops every rate in the window; ahead, every
+	// rate is understated by the skew with nothing on the record.
+	if prev.clock != cur.clock {
 		m.mClockMix.Add(1)
 		return true
 	}
-	// Elapsed wall time less the time the job spent suspended: a suspended interval advances the
+	elapsed := float64(cur.sampleTime - prev.sampleTime)
+	if cur.clock == clockLifetime {
+		// The starter's own elapsed time between the two updates. Not more than zero means the
+		// same starter update committed again -- a checkpoint commit and its follow-ups, or the
+		// shadow flushing between starter reports -- so the counters have not moved either and
+		// there is no interval to divide by. (The ingest clock divided by whatever second the
+		// tailer read each copy in: 276 CPU-seconds over "1 s" read as 276 cores.)
+		elapsed = cur.lifetime - prev.lifetime
+		if elapsed <= 0 {
+			m.mStalled.Add(1)
+			return true
+		}
+		if prev.staleLifetime {
+			return true // may be the previous starter's uptime; see staleLifetime
+		}
+	}
+	// Elapsed time less the time the job spent suspended: a suspended interval advances the
 	// clock while the counters stand still, and dividing by the raw elapsed time would report a
 	// spuriously low rate rather than no rate.
-	interval := float64(cur.sampleTime-prev.sampleTime) - (cur.suspended - prev.suspended)
+	interval := elapsed - (cur.suspended - prev.suspended)
 	if interval <= 0 {
 		return true
 	}
 	_ = s.Set(SampleIntervalAttr, interval)
+	_ = s.Set(SampleIntervalClockAttr, cur.clock.String())
 
 	wrote := false
 	for _, r := range derivedRates {
@@ -1190,9 +1278,13 @@ type MetricsStatus struct {
 	// A steady trickle is normal: HTCondor bumps NumShadowStarts one transaction AFTER it sets
 	// JobStatus=2, so every re-run has a brief window still reporting the previous run's id.
 	AfterEnd int64
-	// ClockMix counts rates suppressed because the interval would have spanned the starter's
-	// clock and the ingest clock. Nonzero means starter stats are intermittent on this pool.
+	// ClockMix counts rates suppressed because the interval would have spanned two clocks (the
+	// starter's timestamp, its uptime counter, the ingest clock). A few per run are normal: a
+	// run's spawn commit carries no starter stats.
 	ClockMix int64
+	// Stalled counts rates suppressed because the starter's uptime counter did not advance
+	// between two samples: the same starter update committed more than once.
+	Stalled int64
 }
 
 func (m *jobMetrics) status() MetricsStatus {
@@ -1209,6 +1301,7 @@ func (m *jobMetrics) status() MetricsStatus {
 		AppendFailures:    m.mAppendFails.Load(),
 		AfterEnd:          m.mAfterEnd.Load(),
 		ClockMix:          m.mClockMix.Load(),
+		Stalled:           m.mStalled.Load(),
 	}
 }
 
