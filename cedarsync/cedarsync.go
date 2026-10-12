@@ -90,6 +90,15 @@ type Status struct {
 	LastEvent     time.Time // when the last event was applied
 	LastError     string    // the last session error, "" if none since the last clean session
 	LastErrorTime time.Time
+	// Synced is true while the current session has reached Synced -- the end of its catch-up (a
+	// Reset replay, applied in full including the sink's reconcile, or a resume's overlap) -- and
+	// nothing has sent it back into catch-up since: false from the moment a session opens, on a
+	// Reset or a Resync, and whenever no session is open. Only while it is true does the sink hold
+	// everything the source had at the last Synced plus the live tail since.
+	Synced bool
+	// SyncedAt is when a session last reached Synced (zero if none has). It is kept after Synced
+	// turns false.
+	SyncedAt time.Time
 }
 
 const (
@@ -194,7 +203,7 @@ func (r *Runner) session(ctx context.Context) (err error) {
 	}
 	defer stop()
 	r.log.Debug("cedarsync: change feed open", "src", r.cfg.Src, "wire", wireForm)
-	r.setStatus(func(s *Status) { s.Connected, s.LastConnected = true, time.Now(); s.Sessions++ })
+	r.setStatus(func(s *Status) { s.Connected, s.LastConnected, s.Synced = true, time.Now(), false; s.Sessions++ })
 
 	flusher, _ := r.sink.(Flusher)
 	sa, _ := r.sink.(SessionAware)
@@ -213,7 +222,7 @@ func (r *Runner) session(ctx context.Context) (err error) {
 		if sa != nil {
 			sa.EndSession()
 		}
-		r.setStatus(func(s *Status) { s.Connected = false })
+		r.setStatus(func(s *Status) { s.Connected, s.Synced = false, false })
 	}()
 
 	var flushC <-chan time.Time
@@ -254,10 +263,16 @@ func (r *Runner) deliver(ev watchfeed.Event, ver *uint64) error {
 	}
 	ch, ok := r.toChange(ev, ver)
 	if !ok {
+		// A Resync: the live stream fell behind and the source re-enters catch-up.
+		r.setStatus(func(s *Status) { s.Synced = false })
 		return nil
 	}
 	if ch.Kind == replicate.KindUpsert && r.matcher != nil && ch.Ad != nil && !r.matcher.Matches(ch.Ad) {
 		return nil // selective: drop a non-matching upsert
+	}
+	if ch.Kind == replicate.KindReset {
+		// Before the sink sees it: from here until the next Synced the sink is being rebuilt.
+		r.setStatus(func(s *Status) { s.Synced = false })
 	}
 	if err := r.sink.Apply(ch); err != nil {
 		return err
@@ -265,7 +280,9 @@ func (r *Runner) deliver(ev watchfeed.Event, ver *uint64) error {
 	r.setStatus(func(s *Status) {
 		s.LastEvent = time.Now()
 		if ch.Kind == replicate.KindSynced {
+			// Only once the sink has applied it (a table sink's Reset sweep included).
 			s.LastError = "" // a session that reached Synced is healthy
+			s.Synced, s.SyncedAt = true, s.LastEvent
 		}
 	})
 	return nil

@@ -28,6 +28,7 @@ type testSpoke struct {
 	srv   *dbrpc.Server
 	conns []net.Conn
 	wg    sync.WaitGroup
+	gate  *replayGate // when set, wraps the hub's end of each new connection
 }
 
 func newTestSpoke(t *testing.T) *testSpoke {
@@ -77,14 +78,18 @@ func (s *testSpoke) dial(context.Context) (*dbrpc.Client, func(), error) {
 		return nil, nil, errors.New("spoke down")
 	}
 	cp, sp := net.Pipe()
-	s.conns = append(s.conns, cp, sp)
+	hubEnd := cp
+	if s.gate != nil {
+		hubEnd = s.gate.wrap(cp)
+	}
+	s.conns = append(s.conns, hubEnd, sp)
 	srv := s.srv
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		_ = srv.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{Privileged: true})
 	}()
-	c := dbrpc.NewClient(dbrpc.NewStreamConn(cp))
+	c := dbrpc.NewClient(dbrpc.NewStreamConn(hubEnd))
 	return c, func() { _ = c.Close() }, nil
 }
 

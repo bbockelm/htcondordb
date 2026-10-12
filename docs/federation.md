@@ -195,19 +195,58 @@ behind and has not caught up), is `stale` with no `StalenessSeconds` -- never fr
 heartbeat received "in the future" (the hub's clock stepped backwards since) until the clock passes
 the receipt time again.
 
+The heartbeat measures the `syncstatus` stream only. A source is `fresh` only if, in addition, each
+of its mutable tables' streams (`jobs`, `syncstatus`) is caught up (`<Table>Synced`, below);
+otherwise it is `stale` with a `Reason` naming the stream that is not connected or is catching up.
+A replay -- possibly into a table holding none of the AP's rows -- is not bounded by the heartbeat.
+Archive streams do not hold a source back from `fresh`: a history replay can take hours. Their
+`<Table>Synced` is published all the same.
+
+## Catch-up and absence
+
+Each federated table is streamed separately, and each stream is either caught up or not.
+`<Table>Synced` in `federation_sources` is true only while that table's stream for the AP has
+reached the end of its current session's catch-up (Synced: a Reset replay applied in full,
+including the sweep of rows it did not deliver, or a resume's re-delivered overlap) and nothing has
+sent it back since. It is false from the moment a session opens, through a Reset or a resync, while
+the stream is disconnected, and in the row a restarted hub inherits until its first state pass
+(written before restored spokes are revalidated). `<Table>SyncedAt` is when the stream last reached
+Synced; it stays after the flag turns false, and is absent until the hub's current stream for the
+table has reached Synced (a hub restart, a retirement or a changed spoke address starts a new one).
+
+**An AP's row missing from a table means "gone at the AP" only while that table's `<Table>Synced`
+is true.** While it is false the table may be part-way through a replay -- a new source, one
+retired and rediscovered, a rebuilt hub table, a second hub catching up -- and a job missing from
+`jobs` may simply not have been replayed yet. A consumer that infers a job finished from its
+absence should:
+
+1. read the AP's `federation_sources` row and require `JobsSynced = true`;
+2. query `jobs`;
+3. read the row again and require `JobsSynced = true` with the same `JobsSyncedAt`.
+
+Rows are added during a catch-up, never cleared first; the only deletions are live deletes, a
+completed Reset's sweep (both real removals at the AP) and retirement, which deletes the
+`federation_sources` row before the AP's data rows. A missing row is also not vouched for, so the
+check in 3 catches a retirement between 1 and 2.
+
+The flag is computed from the stream's live state and written at the next state pass
+(`HTCONDORDB_FEDERATE_STATE_INTERVAL`), not on the once-a-minute refresh of clock-driven fields.
+
 ## Membership is sticky
 
 `federation_sources` holds one row per schedd: `State` (`fresh`, `stale`, `absent`, `untrusted`,
 `retiring`), `Reason`, `StalenessSeconds`, `LastSeen` (the later of the last collector sighting
 and the last live stream), `LastCollectorSeen`, `LastContact`, `LastReset`, `RetiringSince`,
-`SpokeAddress`, `SpokeName`, `Static`, and per table `<Table>Connected`, `<Table>LastError`,
+`SpokeAddress`, `SpokeName`, `Static`, and per table `<Table>Connected`, `<Table>Synced`,
+`<Table>SyncedAt` (see [Catch-up and absence](#catch-up-and-absence)), `<Table>LastError`,
 `<Table>Rows` (where an index can count them).
 
-A row is rewritten as soon as anything but its clock-driven fields changes -- `State`, `Reason`, a
-stream connecting or failing, a row count. `StalenessSeconds`, `LastSeen`, `LastCollectorSeen` and
-`LastContact` move on every state pass, so on their own they are refreshed at most once a minute:
-a watcher of `federation_sources` sees state changes promptly without an event per source every few
-seconds. The collector ad's summary and `/metrics` carry the live values.
+A row is rewritten at the next state pass whenever anything but its clock-driven fields changes --
+`State`, `Reason`, a stream connecting, failing or reaching Synced, a row count.
+`StalenessSeconds`, `LastSeen`, `LastCollectorSeen` and `LastContact` move on every state pass, so
+on their own they are refreshed at most once a minute: a watcher of `federation_sources` sees state
+changes promptly without an event per source every few seconds. The collector ad's summary and
+`/metrics` carry the live values.
 
 - A schedd missing from the collector is **absent**: its rows are kept and its streams keep
   running against the last validated spoke address. A collector restart makes every AP vanish at
@@ -225,10 +264,11 @@ seconds. The collector ad's summary and `/metrics` carry the live values.
   count, so after a hub restart the delay starts over from the restart; and a spoke the hub's
   streams reach is seen, whatever the collector says), `HTCONDORDB_FEDERATE_RETIRE_AFTER` after
   `RetiringSince` (retiring), or at once with the admin command
-  `.retire <schedd>` in `htcondordb-cli` (DAEMON). Retirement deletes the AP's rows from the
-  mutable tables (`jobs`, `syncstatus`, `federation_sources`) and its cursors. **Archive rows are
-  not deleted**: archives are append-only and age out with their retention. A retired AP that is
-  still in the AP set comes back at the next discovery and is replayed from scratch.
+  `.retire <schedd>` in `htcondordb-cli` (DAEMON). Retirement deletes the AP's cursors, then its
+  `federation_sources` row, then its rows in the other mutable tables (`jobs`, `syncstatus`).
+  **Archive rows are not deleted**: archives are append-only and age out with their retention. A
+  retired AP that is still in the AP set comes back at the next discovery and is replayed from
+  scratch.
 
 ## Monitoring
 

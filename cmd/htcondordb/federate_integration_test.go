@@ -21,7 +21,7 @@ import (
 // job_queue.log and history file the test writes (no condor needed); spokes 1 and 2 both have job
 // 1.0. The spokes grant the hub's identity READ only. One hub federates them as static spokes. It
 // asserts both directions throughout -- each AP's rows present under its own ScheddName and nothing
-// more -- across a delete made while a spoke is down followed by its unclean restart (a Reset whose
+// more, and a fresh source's streams caught up (<Table>Synced) -- across a delete made while a spoke is down followed by its unclean restart (a Reset whose
 // sweep must remove the job), a delete while the hub is down, a job_queue.log compaction, and a
 // stopped spoke; and that a client cannot write the hub's tables.
 //
@@ -157,6 +157,20 @@ ALLOW_ADMINISTRATOR = nobody@nowhere.test
 		}
 		return ""
 	}
+	// synced reads <Table>Synced for each prefix: a fresh source must have caught up its jobs and
+	// syncstatus streams, and a caught-up history stream says so too.
+	synced := func(c *dbrpc.Client, schedd string, prefixes ...string) bool {
+		ad := sourceRow(c, schedd)
+		if ad == nil {
+			return false
+		}
+		for _, p := range prefixes {
+			if v, ok := ad.EvaluateAttrBool(p + "Synced"); !ok || !v {
+				return false
+			}
+		}
+		return true
+	}
 	lastReset := func(c *dbrpc.Client, schedd string) int64 {
 		if ad := sourceRow(c, schedd); ad != nil {
 			v, _ := ad.EvaluateAttrInt("LastReset")
@@ -178,6 +192,15 @@ ALLOW_ADMINISTRATOR = nobody@nowhere.test
 	wantSteady(hc, "initial federation")
 	for _, sp := range spokes {
 		waitUntil(t, sp.name+" fresh", 20*time.Second, func() bool { return sourceState(hc, sp.name) == "fresh" })
+		if !synced(hc, sp.name, "Jobs", "SyncStatus") {
+			t.Errorf("%s fresh without JobsSynced and SyncStatusSynced: %v", sp.name, sourceRow(hc, sp.name))
+		}
+		waitUntil(t, sp.name+" HistorySynced", 20*time.Second, func() bool { return synced(hc, sp.name, "History") })
+		if ad := sourceRow(hc, sp.name); ad != nil {
+			if v, ok := ad.EvaluateAttrInt("JobsSyncedAt"); !ok || v <= 0 {
+				t.Errorf("%s JobsSyncedAt = %d (present %v)", sp.name, v, ok)
+			}
+		}
 	}
 
 	// 2. A job deleted while its spoke is down, then an unclean spoke restart: a new watch epoch,
@@ -195,6 +218,9 @@ ALLOW_ADMINISTRATOR = nobody@nowhere.test
 			exact(jobsOf(hc, spokes[2].name), 7) && allJobs(hc) == 5 && histCount(hc, "true") == 6
 	})
 	waitUntil(t, "ap1 fresh after its restart", 30*time.Second, func() bool { return sourceState(hc, spokes[0].name) == "fresh" })
+	if !synced(hc, spokes[0].name, "Jobs") {
+		t.Errorf("ap1 fresh after its restart without JobsSynced: %v", sourceRow(hc, spokes[0].name))
+	}
 
 	// The hub's tables belong to the hub: a client write is refused.
 	if err := hubWrite(hc); err == nil {
@@ -219,6 +245,10 @@ ALLOW_ADMINISTRATOR = nobody@nowhere.test
 	waitUntil(t, "delete made while the hub was down", 30*time.Second, func() bool {
 		return exact(jobsOf(hc, spokes[1].name), 1) && exact(jobsOf(hc, spokes[0].name), 1, 3)
 	})
+	// The restarted hub's streams are new: each source's jobs stream is caught up again.
+	for _, sp := range spokes {
+		waitUntil(t, sp.name+" JobsSynced after the hub restart", 30*time.Second, func() bool { return synced(hc, sp.name, "Jobs") })
+	}
 
 	// 4. A job_queue.log compaction (the schedd rewrites the log as a new file holding the current
 	//    state, here also dropping job 3.0): no phantoms, nothing else lost.
@@ -232,6 +262,14 @@ ALLOW_ADMINISTRATOR = nobody@nowhere.test
 	_ = spokes[2].proc.Process.Kill()
 	_, _ = spokes[2].proc.Process.Wait()
 	waitUntil(t, "stopped spoke goes stale", 30*time.Second, func() bool { return sourceState(hc, spokes[2].name) == "stale" })
+	waitUntil(t, "stopped spoke's streams not Synced", 30*time.Second, func() bool {
+		ad := sourceRow(hc, spokes[2].name)
+		if ad == nil {
+			return false
+		}
+		v, ok := ad.EvaluateAttrBool("JobsSynced")
+		return ok && !v
+	})
 	if got := jobsOf(hc, spokes[2].name); !exact(got, 7) {
 		t.Fatalf("stopped spoke's rows changed: %v", got)
 	}
