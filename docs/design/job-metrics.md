@@ -213,6 +213,7 @@ LogSeq,                                  # the job_queue.log generation (op-107 
 SampleTime,                              # StatsLastUpdateTimeStarter (starter clock)
 SampleTimeFromIngest,                    # true when that clock was unavailable and this is ours
 SampleInterval,                          # elapsed since the previous sample, net of suspension
+SampleIntervalClock,                     # starter|lifetime|ingest: what SampleInterval was measured on
 SampleTrigger,                           # periodic|status|checkpoint|terminal|update|chirp
 SampleBaseline,                          # true => no usable predecessor, so no rates
 JobCurrentStartExecutingDate, JobStatus, CumulativeSuspensionTime
@@ -349,6 +350,21 @@ The rules that keep these honest all come out of §2.4:
   elapsed time: with the AP behind it can even go negative and silently drop every rate in the
   window. `prevObservation` records which clock it came from and a mixed interval derives nothing
   (counted as `clock_mix`).
+- **`StatsLastUpdateTimeStarter` is usually absent; measure the interval on
+  `StatsLifetimeStarter`.** The starter publishes `StatsLastUpdateTime` only at the verbose
+  statistics level (`StarterStatistics::Publish`, `vanilla_proc.cpp`), and its default publish
+  flags are basic|recent, so although the shadow renames it and `qmgr_job_updater.cpp` forwards
+  it, a default pool never sees it (ap2001: none of a million samples). `StatsLifetime` is
+  published at the basic level in the same update ad as the counters: the starter's uptime,
+  `now - InitTime` as of building that ad. Its difference between two updates of one run is the
+  starter's elapsed time between them. Ingest-clock intervals were the fallback before this,
+  and a burst of commits read within a second turned 276 CPU-seconds over 280 s into "276
+  cores". Rules: a non-positive difference is the same update committed again (refused, counted
+  as `stalled`); a run's first observation carries the previous starter's uptime, so no interval
+  is measured from it (or from that value carried forward). `SampleTime` stays on the ingest
+  clock: `InitTime` is when the starter built the job's process object, near but not equal to
+  any instant the job ad records (`JobCurrentStartExecutingDate` is the shadow's clock when it
+  heard execution began). `SampleIntervalClock` records `starter`, `lifetime` or `ingest`.
 - **Anchor a run on its observed zero.** The shadow writes `RemoteUserCpu = 0` at run start
   and it reaches the queue (§2.4 note 2). Treat the first observation of a `RunInstanceID`
   carrying `RemoteUserCpu == 0` as that run's t0. An observation carrying a *new*

@@ -373,6 +373,23 @@ Two properties of HTCondor's counters will mislead a dashboard built without the
 `SampleInterval` is elapsed time **net of suspension**, so a suspended interval reports the
 rate over the time the job was actually running.
 
+`SampleIntervalClock` names the clock it was measured on: `starter`
+(`StatsLastUpdateTimeStarter`, when the starter publishes it), else `lifetime` (the
+difference of `StatsLifetimeStarter`, the starter's uptime, which every update carries), else
+`ingest` (when the tailer read the commits). A default starter publishes no
+`StatsLastUpdateTimeStarter` -- it is a verbose-level statistic -- so `lifetime` is the usual
+case. An `ingest` interval is only as good as the tailer's timing: commits read within one
+second divide minutes of counter growth by one. Rows written before `SampleIntervalClock`
+existed have none; their interval was on the ingest clock when `SampleTimeFromIngest` is set.
+To count the rate rows whose interval came from the ingest clock and was short enough to be
+suspect:
+
+```sql
+SELECT Owner, COUNT(*), MAX(CpuUtil) FROM job_metrics
+WHERE SampleInterval < 60 && (SampleIntervalClock =?= "ingest" || (SampleIntervalClock =?= undefined && SampleTimeFromIngest =?= true))
+GROUP BY Owner ORDER BY COUNT(*) DESC;
+```
+
 ### Watching it
 
 `htcondordb_job_metrics_samples_total{outcome=...}` counts samples by outcome. Two of the
@@ -381,6 +398,11 @@ outcomes are bug signals rather than workload signals and should stay at zero:
 - `reset` — a rate was suppressed because its counter went backwards, i.e. HTCondor reset a
   counter in a way the sampler does not model.
 - `inherited` — a new run was still carrying the previous run's counters when first observed.
+
+`stalled` counts intervals refused because the starter's uptime did not advance: the same
+starter update committed more than once, as a self-checkpointing job's checkpoint commits do.
+`clock_mix` counts intervals refused because they would span two clocks; a run's spawn commit,
+which carries no starter statistics, makes one per run.
 
 `deduped` counts samples suppressed because their log position had already been flushed — a
 restart or a commit-conflict rewind re-reading a region. `baseline` is expected at a low rate (roughly one or two per run); `throttled` is whatever
