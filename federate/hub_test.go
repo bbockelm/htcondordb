@@ -405,10 +405,21 @@ func TestStalenessThroughHeartbeats(t *testing.T) {
 	cat := openCatalog(t, t.TempDir())
 	t.Cleanup(func() { _ = cat.Close() })
 	ss := mustTable(t, cat, TableSyncStatus)
-	hub := startHub(t, Config{Catalog: cat, Discovery: disc, Dial: unreachable, Now: clock.now, FreshThreshold: 60 * time.Second})
+	// A reachable spoke with an empty syncstatus: fresh needs the jobs and syncstatus streams caught
+	// up; the heartbeats below are applied as the syncstatus runner would apply them.
+	spoke := newTestSpoke(t)
+	hub := startHub(t, Config{Catalog: cat, Discovery: disc, Dial: func(string) cedarsync.Dial { return spoke.dial },
+		Now: clock.now, FreshThreshold: 60 * time.Second})
 	defer hub.stop(t)
 
-	waitFor(t, "ap1 stale before any heartbeat", func() bool { return sourceState(cat, "ap1") == StateStale })
+	waitFor(t, "ap1's streams caught up", func() bool {
+		j, _ := sourceRowAttrBool(cat, "ap1", "JobsSynced")
+		s, _ := sourceRowAttrBool(cat, "ap1", "SyncStatusSynced")
+		return j && s
+	})
+	if st := sourceState(cat, "ap1"); st != StateStale {
+		t.Errorf("state before any heartbeat = %q, want stale", st)
+	}
 	if row, _ := sourceRow(cat, "ap1"); row != nil {
 		if _, ok := row.EvaluateAttrInt("StalenessSeconds"); ok {
 			t.Error("StalenessSeconds published with no heartbeat")

@@ -242,6 +242,10 @@ func (h *Hub) Run(ctx context.Context) error {
 	defer h.stopAll()
 
 	h.loadSources()
+	// Rewrite the restored rows before anything slower (revalidation dials spokes): a persisted row
+	// says what the previous run's streams had reached, and <Table>Synced from it must not outlive
+	// that run -- the table it vouched for may not even be the one this run opened.
+	h.refreshState()
 	h.revalidateRestored(ctx)
 	for _, s := range h.sources {
 		if s.retiringSince.IsZero() && s.spokeAddress != "" {
@@ -615,6 +619,10 @@ func (h *Hub) cursorStore(s *source, table string) (replicate.CursorStore, error
 // the steps) would resume from them when rediscovered and never re-send the rows just deleted;
 // in this order the worst case is rows kept with no cursor, which the next session's full replay
 // reconciles.
+//
+// The federation_sources row goes before the data rows: while it stands with <Table>Synced true, a
+// consumer reads an AP's row missing from that table as gone at the AP, and the AP's jobs must not
+// all read as finished because they were retired.
 func (h *Hub) retire(schedd, why string) error {
 	key := foldName(schedd)
 	s, known := h.sources[key]
@@ -646,6 +654,14 @@ func (h *Hub) retire(schedd, why string) error {
 			return fmt.Errorf("federate: retiring %s: removing its cursors (no rows deleted): %w", schedd, err)
 		}
 	}
+	if hasRow {
+		if _, err := h.ht.sources.DeleteWhere(scheddConstraint(schedd)); err != nil {
+			return fmt.Errorf("federate: retiring %s: %w", schedd, err)
+		}
+		if known {
+			s.lastStable = nil // a retirement that fails below leaves the source; rewrite its row
+		}
+	}
 	deleted := map[string]int{}
 	for table, d := range h.ht.mutable {
 		n, err := d.DeleteWhere(scheddConstraint(schedd))
@@ -653,11 +669,6 @@ func (h *Hub) retire(schedd, why string) error {
 			return fmt.Errorf("federate: retiring %s: deleting its %s rows: %w", schedd, table, err)
 		}
 		deleted[table] = n
-	}
-	if hasRow {
-		if _, err := h.ht.sources.DeleteWhere(scheddConstraint(schedd)); err != nil {
-			return fmt.Errorf("federate: retiring %s: %w", schedd, err)
-		}
 	}
 	delete(h.sources, key)
 	h.resetMu.Lock()
@@ -774,7 +785,13 @@ func (h *Hub) refreshState() {
 				stale, staleKnown = staleness(row, now)
 			}
 		}
-		state, reason := h.stateOf(s, stale, staleKnown, fresh)
+		// One read of each stream's status per pass, so State and the per-table fields of the
+		// row agree.
+		statuses := make(map[string]cedarsync.Status, len(s.runners))
+		for t, rh := range s.runners {
+			statuses[t] = rh.runner.Status()
+		}
+		state, reason := h.stateOf(s, statuses, stale, staleKnown, fresh)
 		byState[state]++
 		sum.Total++
 		switch state {
@@ -795,7 +812,7 @@ func (h *Hub) refreshState() {
 				sum.MaxStaleness, sum.MaxStalenessKnown = stale, true
 			}
 		}
-		rows = append(rows, pendingRow{s, state, reason, stale, staleKnown})
+		rows = append(rows, pendingRow{s, statuses, state, reason, stale, staleKnown})
 	}
 	// Summary and metrics before the rows: a reader that sees a row change sees a summary at least
 	// as new.
@@ -805,12 +822,13 @@ func (h *Hub) refreshState() {
 	h.metrics.setStaleness(known)
 	h.summary.Store(sum)
 	for _, r := range rows {
-		h.writeSourceRow(r.s, r.state, r.reason, r.stale, r.staleKnown, now)
+		h.writeSourceRow(r.s, r.statuses, r.state, r.reason, r.stale, r.staleKnown, now)
 	}
 }
 
 type pendingRow struct {
 	s             *source
+	statuses      map[string]cedarsync.Status // by table
 	state, reason string
 	stale         int64
 	staleKnown    bool
@@ -875,8 +893,9 @@ func lastSeen(s *source) time.Time {
 
 // stateOf decides a source's state. Precedence: retiring, then absent (not in the AP set), then a
 // restored address not yet revalidated (untrusted), then absent/untrusted for a schedd with no
-// paired spoke, then fresh/stale by measured staleness.
-func (h *Hub) stateOf(s *source, stale int64, staleKnown bool, fresh int64) (string, string) {
+// paired spoke, then stale by measured staleness, then stale while a mutable table's stream is not
+// caught up (see notCaughtUp), else fresh.
+func (h *Hub) stateOf(s *source, statuses map[string]cedarsync.Status, stale int64, staleKnown bool, fresh int64) (string, string) {
 	switch {
 	case !s.retiringSince.IsZero():
 		return StateRetiring, "left the AP set; rows are deleted when the retirement delay passes"
@@ -892,13 +911,45 @@ func (h *Hub) stateOf(s *source, stale int64, staleKnown bool, fresh int64) (str
 		return StateAbsent, "no spoke advertises MirroredScheddName for this schedd"
 	case !staleKnown:
 		return StateStale, "no heartbeat with a measured lag received yet"
-	case stale <= fresh:
-		return StateFresh, ""
-	default:
+	case stale > fresh:
 		// No number that moves every pass: the reason is persisted, and only a change of state or
 		// reason rewrites the row. StalenessSeconds carries the amount.
 		return StateStale, fmt.Sprintf("staleness exceeds %ds", fresh)
 	}
+	if why := h.notCaughtUp(statuses); why != "" {
+		return StateStale, why
+	}
+	return StateFresh, ""
+}
+
+// notCaughtUp names the first federated mutable table (jobs, syncstatus) whose stream, by statuses,
+// has not reached Synced in its current session, or "" if every one has.
+//
+// Staleness is measured on the syncstatus stream alone, and says how far behind the hub's copy is
+// only if the other streams are live too. A jobs stream that is replaying -- into a table that may
+// hold none of the AP's rows yet (a new or retired-and-rediscovered source, a rebuilt hub table) --
+// or not connected at all, is not bounded by the heartbeat; calling the source fresh then would let
+// a consumer read a job missing from a partial replay as gone. Archive streams do not count: a
+// history replay can take hours, and the job queue is what fresh vouches for. Their own
+// <Table>Synced flags are published for consumers that need them.
+func (h *Hub) notCaughtUp(statuses map[string]cedarsync.Status) string {
+	for _, t := range h.tables {
+		if isArchiveTable(t) {
+			continue
+		}
+		st, ok := statuses[t]
+		if !ok {
+			return "the " + t + " stream is not running"
+		}
+		switch {
+		case st.Synced:
+		case !st.Connected:
+			return "the " + t + " stream is not connected"
+		default:
+			return "the " + t + " stream is catching up"
+		}
+	}
+	return ""
 }
 
 // Table attribute prefixes in federation_sources.
@@ -919,18 +970,15 @@ func tablePrefix(table string) string {
 // sourceRowRefresh bounds how often a federation_sources row is rewritten for its volatile fields
 // alone (StalenessSeconds, LastSeen, LastCollectorSeen, LastContact): they move on every state pass for a connected source, and rewriting every
 // row every few seconds sent each watcher an event per source per pass. A change to any other field
-// -- State, Reason, a stream connecting or failing, row counts -- is written at once. The collector-ad summary and /metrics carry the live values.
+// -- State, Reason, a stream connecting, failing or reaching Synced, row counts -- is written at
+// the next state pass. The collector-ad summary and /metrics carry the live values.
 const sourceRowRefresh = time.Minute
 
 // writeSourceRow persists s's federation_sources row when a stable field changed, or its volatile
 // fields when the row is older than sourceRowRefresh.
-func (h *Hub) writeSourceRow(s *source, state, reason string, stale int64, staleKnown bool, now time.Time) {
+func (h *Hub) writeSourceRow(s *source, statuses map[string]cedarsync.Status, state, reason string, stale int64, staleKnown bool, now time.Time) {
 	tables := append([]string(nil), h.tables...)
 	sort.Strings(tables)
-	statuses := map[string]cedarsync.Status{}
-	for t, rh := range s.runners {
-		statuses[t] = rh.runner.Status()
-	}
 	build := func(volatile bool) *classad.ClassAd {
 		ad := classad.New()
 		putTime := func(name string, t time.Time) {
@@ -964,6 +1012,10 @@ func (h *Hub) writeSourceRow(s *source, state, reason string, stale int64, stale
 			p := tablePrefix(t)
 			st := statuses[t]
 			ad.InsertAttrBool(p+"Connected", st.Connected)
+			// Stable, so a consumer sees the transition at the next state pass: an AP's row
+			// missing from this table means "gone at the AP" only while this is true.
+			ad.InsertAttrBool(p+"Synced", st.Synced)
+			putTime(p+"SyncedAt", st.SyncedAt)
 			if st.LastError != "" {
 				// The error, not its time: a stream retrying against a down spoke fails anew
 				// every backoff, and only a different error is news.
