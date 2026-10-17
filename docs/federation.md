@@ -37,6 +37,11 @@ Nothing to configure beyond schedd sync itself. With schedd sync on, a spoke:
 - rewrites a heartbeat row in its `syncstatus` table every `HTCONDORDB_SYNCSTATUS_INTERVAL`
   seconds (default 5) -- see [the syncstatus heartbeat](schedd-sync.md#the-syncstatus-heartbeat).
 
+A spoke has `job_metrics` only with `HTCONDORDB_JOB_METRICS = true` (see
+[job metrics](design/job-metrics.md)), and `epoch_history` only when it syncs an epoch history
+file. A hub federating either from a spoke without it reports the table missing for that AP; see
+[Optional tables](#optional-tables).
+
 The hub must be allowed to read the spoke: grant the hub's identity READ on the spoke
 (`ALLOW_READ`). The hub dials an ordinary `DBSession`.
 
@@ -61,7 +66,7 @@ HTCONDORDB_FEDERATE_SPOKE_AP2_SCHEDD  = ap2.example.org
 |------|---------|---------|
 | `HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT` | unset | ScheddAd constraint defining the AP set. Requires `COLLECTOR_HOST`. |
 | `HTCONDORDB_FEDERATE_SPOKES` | unset | Names of static spokes. Each needs `HTCONDORDB_FEDERATE_SPOKE_<NAME>_ADDRESS` (the spoke's command address) and may set `_SCHEDD` (the schedd it mirrors; default `<NAME>`). |
-| `HTCONDORDB_FEDERATE_TABLES` | `jobs history syncstatus` | Spoke tables to fan in. `epoch_history` is also supported. Without `syncstatus` no source can be measured fresh. |
+| `HTCONDORDB_FEDERATE_TABLES` | `jobs history syncstatus` | Spoke tables to fan in. `epoch_history` and `job_metrics` are also supported. Without `syncstatus` no source can be measured fresh. |
 | `HTCONDORDB_FEDERATE_RETIRE_AFTER` | `7d` | How long a source may go unseen, or stay unmatched after the constraint changed, before its rows are deleted. Seconds, or a suffix (`36h`, `7d`). |
 | `HTCONDORDB_FEDERATE_FRESH_SECONDS` | `60` | Staleness at or under this is `fresh`. |
 | `HTCONDORDB_FEDERATE_DISCOVER_INTERVAL` | `60` | Seconds between collector discovery passes. |
@@ -69,9 +74,17 @@ HTCONDORDB_FEDERATE_SPOKE_AP2_SCHEDD  = ap2.example.org
 
 The hub's archives take the same tuning knobs as schedd sync's: `HTCONDORDB_ARCHIVE_MAX_BYTES`,
 `HTCONDORDB_HISTORY_MAX_BYTES`, `HTCONDORDB_EPOCH_HISTORY_MAX_BYTES`,
-`HTCONDORDB_ARCHIVE_SEGMENT_SIZE`, and extra index attributes in
-`HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS` / `HTCONDORDB_ARCHIVE_VALUE_ATTRS`. A hub's history grows
-with the sum of every AP's completions; **set a size cap**. A hub needs a persistent database
+`HTCONDORDB_JOB_METRICS_MAX_BYTES` (each per-table cap defaults to `HTCONDORDB_ARCHIVE_MAX_BYTES`),
+`HTCONDORDB_JOB_METRICS_MAX_AGE` (seconds or a suffix such as `30d`, against `SampleTime`; unset or
+unparseable is no age cap), `HTCONDORDB_ARCHIVE_SEGMENT_SIZE`, and extra index attributes in
+`HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS` / `HTCONDORDB_ARCHIVE_VALUE_ATTRS`. `job_metrics` is stored
+as a spoke stores it, with the spoke's knobs and defaults instead of those three:
+`HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` (default: the library's), `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS`
+(default `Owner`) and `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` (default on); see
+[job metrics §3.5](design/job-metrics.md#35-indexes-zone-maps-retention). The segment size and group
+schemas apply when the archive is created. The hub's own indexes are added in every case. A hub's history grows
+with the sum of every AP's completions, and its job_metrics with every AP's running jobs;
+**set a size cap**. A hub needs a persistent database
 (`HTCONDORDB_DIR` or `SPOOL`): archives and resume cursors live on disk.
 
 All of it is reapplied on `condor_reconfig`. A configuration change restarts the hub's streams;
@@ -120,11 +133,20 @@ matching the constraint, for all ScheddAds (to tell "no longer matches" from "go
 | `syncstatus` | mutable | spoke `syncstatus` | schedd | -- |
 | `history` | archive | spoke `history` | `GlobalJobId` | categorical `ScheddName`, `Owner`, `User`, `GlobalJobId`; value `ClusterId`; zones `CompletionDate`, `EnteredHistoryTime` |
 | `epoch_history` | archive | spoke `epoch_history` | `GlobalJobId` + `RunInstanceID` + `EpochAdType` | as history; zones `EpochWriteDate`, `EnteredHistoryTime` |
+| `job_metrics` | archive | spoke `job_metrics` | `Key` + `RunInstanceID` + `SampleTime` + `SampleTrigger` + `LogSeq` + `LogOffset` | as history; zone `SampleTime` |
 | `federation_sources` | mutable | computed | schedd name, lowercased (the key) | -- |
 
 Every replicated row carries `ScheddName`, **overwritten** from the source's validated identity --
 a row cannot claim another AP. Select an AP's rows with `ScheddName == "..."` and a job with
-`ScheddName`, `ClusterId` and `ProcId`. A schedd's identity is case-insensitive, as in HTCondor:
+`ScheddName`, `ClusterId` and `ProcId`.
+
+A `job_metrics` row is one resource sample of one run of one job, as the spoke's sampler wrote it
+(the attributes are in [job metrics](design/job-metrics.md#32-record-shape)), plus `ScheddName`. Every
+sample carries `Key`, `ClusterId`, `ProcId`, `RunInstanceID`, `SampleTime` and `SampleTrigger`;
+`User`, `Owner` and `GlobalJobId` are copied from the job and are missing only on a sample of a
+proc row the spoke never chained to its cluster ad -- so a reader scoped by `User` does not see it.
+`LogSeq` and `LogOffset` are the spoke's job_queue.log position of the commit sampled; a spoke
+older than `LogOffset` writes `LogSeq` alone. A schedd's identity is case-insensitive, as in HTCondor:
 two spellings of one schedd name are one AP -- one source, one `federation_sources` row (keyed by
 the lowercased name; `ScheddName` keeps the spelling the hub first saw), one set of cursors.
 
@@ -154,14 +176,21 @@ attribute is carried through unchanged and is unique only within its AP.
   nothing and the next session replays in full and finishes the job. A replayed row whose ad
   cannot be decoded counts as delivered: the hub keeps the row it holds (`undecodable_total`).
 - **No archive duplicates.** From the start of each session until the spoke says it is caught up
-  -- a Reset replay, or the overlap a resume re-delivers -- each history/epoch record is checked against what the hub held before the session, by identity
-  and by count. An identity is not unique (a run instance writes a CHECKPOINT epoch record per
-  checkpoint and a COMMON one per common-files group), so if the hub held k records of an identity,
-  the first k replayed are dropped and the rest appended. A resume's overlap is checked record by
+  -- a Reset replay, or the overlap a resume re-delivers -- each archive record is checked against
+  what the hub held before the session, by identity and by count. An identity is not unique (a run
+  instance writes a CHECKPOINT epoch record per checkpoint and a COMMON one per common-files group),
+  so if the hub held k records of an identity, the first k replayed are dropped and the rest
+  appended. A `job_metrics` sample's identity is the spoke's own name for it: the log position of
+  the commit it came from (`LogSeq`, `LogOffset`) and the job (`Key`) -- a commit samples a job at
+  most once. Job, run, `SampleTime` and trigger alone are not unique (ingest-clock samples of one
+  job read in one pass share a `SampleTime`), and in a resume's overlap a new sample matching a held
+  one on them would be dropped; they are in the identity for samples from a spoke that predates
+  `LogOffset`, which are deduplicated by them alone. A resume's overlap is checked record by
   record; a Reset replay past 256 records loads the AP's identity counts once and checks in
   memory. Live records
   are appended without a check. A record with no `GlobalJobId` (or, for epochs, no
-  `RunInstanceID`) is appended unchecked and counted in `missing_identity_total`.
+  `RunInstanceID`; for samples, no `Key`, `RunInstanceID` or `SampleTime`) is appended unchecked
+  and counted in `missing_identity_total`.
 - **Bounded replay after a hub restart, no gap after a crash.** Writes are batched into one
   durable transaction per flush (about a second); archive appends are durable when they return.
   The resume cursor is written (and fsynced) only after the data it covers is durable, so neither a
@@ -171,7 +200,8 @@ attribute is carried through unchanged and is unique only within its AP.
   the batch on reconnect; a write that keeps failing stalls the stream instead of being skipped.
 - **Replays respect the hub's cap.** When a spoke restart replays into a hub archive that is
   size-capped and at its cap (or age-capped), records older than the oldest the hub still holds
-  for that AP (by `EnteredHistoryTime`, `EpochWriteDate` for epochs) are skipped
+  for that AP (by `EnteredHistoryTime`; `EpochWriteDate` for epochs, `SampleTime` for samples) are
+  skipped
   (`below_retention_total`): the cap already dropped them, and re-appending them would evict other
   APs' recent history.
 
@@ -232,6 +262,34 @@ check in 3 catches a retirement between 1 and 2.
 The flag is computed from the stream's live state and written at the next state pass
 (`HTCONDORDB_FEDERATE_STATE_INTERVAL`), not on the once-a-minute refresh of clock-driven fields.
 
+## Optional tables
+
+`job_metrics` and `epoch_history` exist on a spoke only when it is configured to keep them. A spoke
+without one answers the hub's watch with "no such table"; for these two tables that is not a stream
+failure. The AP's `federation_sources` row then carries, for that table (`JobMetrics*` or
+`EpochHistory*`):
+
+| Attribute | Value |
+|---|---|
+| `<Table>Missing` | `true`; absent once the stream connects, or when an attempt fails for another reason (the spoke unreachable, say), which is then reported as an ordinary fault |
+| `<Table>Connected`, `<Table>Synced` | `false` |
+| `<Table>SyncedAt` | absent, unless this hub's stream for the table reached Synced earlier |
+| `<Table>LastError` | `the spoke has no job_metrics table (HTCONDORDB_JOB_METRICS is not enabled on it)` (for `epoch_history`: `the spoke has no epoch_history table (it does not sync an epoch history file)`) |
+| `<Table>Rows` | the AP's rows the hub already holds, if any |
+
+Nothing else about the AP changes: its other streams run, and `State` is unaffected (archive
+streams never hold a source back from `fresh`). The hub asks again every 5 minutes, with one
+warning when the table goes missing rather than one per attempt, so a spoke that turns
+`HTCONDORDB_JOB_METRICS` on starts streaming within that time with no hub restart. Read "this AP
+has no job metrics" as `JobMetricsMissing =?= true`; `JobMetricsConnected` false without it is an
+ordinary stream fault, with `JobMetricsLastError` saying what. A spoke that turned job metrics off
+after having them keeps its table: it reads as connected and caught up, with no new samples.
+
+`jobs`, `history` and `syncstatus` are not optional: every spoke running schedd sync has them. A
+spoke answering "no such table" for one is broken, and that stream fails like any other -- the
+server's error in `<Table>LastError`, retried at the error backoff, a warning per attempt, no
+`<Table>Missing` -- and a failing `jobs` or `syncstatus` stream keeps the source from `fresh`.
+
 ## Membership is sticky
 
 `federation_sources` holds one row per schedd: `State` (`fresh`, `stale`, `absent`, `untrusted`,
@@ -239,7 +297,8 @@ The flag is computed from the stream's live state and written at the next state 
 and the last live stream), `LastCollectorSeen`, `LastContact`, `LastReset`, `RetiringSince`,
 `SpokeAddress`, `SpokeName`, `Static`, and per table `<Table>Connected`, `<Table>Synced`,
 `<Table>SyncedAt` (see [Catch-up and absence](#catch-up-and-absence)), `<Table>LastError`,
-`<Table>Rows` (where an index can count them).
+`<Table>Missing` (`JobMetrics` and `EpochHistory` only; see [Optional tables](#optional-tables)),
+`<Table>Rows` (where an index can count them). `<Table>` is `Jobs`, `History`, `EpochHistory`, `JobMetrics` or `SyncStatus`.
 
 A row is rewritten at the next state pass whenever anything but its clock-driven fields changes --
 `State`, `Reason`, a stream connecting, failing or reaching Synced, a row count.
@@ -266,7 +325,7 @@ changes promptly without an event per source every few seconds. The collector ad
   `RetiringSince` (retiring), or at once with the admin command
   `.retire <schedd>` in `htcondordb-cli` (DAEMON). Retirement deletes the AP's cursors, then its
   `federation_sources` row, then its rows in the other mutable tables (`jobs`, `syncstatus`).
-  **Archive rows are not deleted**: archives are append-only and age out with their retention. A
+  **Archive rows (`history`, `epoch_history`, `job_metrics`) are not deleted**: archives are append-only and age out with their retention. A
   retired AP that is still in the AP set comes back at the next discovery and is replayed from
   scratch.
 
@@ -288,10 +347,21 @@ reconfig; on one that is not a hub they stay at zero or absent.
 
 - **Spoke chaining gaps are inherited.** The hub has no cluster ads to repair partial job rows from.
 - **Replays are correct, not cheap.** Every spoke restart replays its mutable tables (`jobs`,
-  `syncstatus`: their watch epochs are per process). An archive (`history`, `epoch_history`) keeps
-  its epoch across a clean spoke restart and resumes; a spoke that crashed or was killed replays it
-  too. The hub writes almost nothing for an unchanged spoke, but a history replay still streams and
-  checks the spoke's whole retained history.
+  `syncstatus`: their watch epochs are per process). An archive (`history`, `epoch_history`,
+  `job_metrics`) keeps its epoch across a clean spoke restart and resumes; a spoke that crashed or
+  was killed replays it too. The hub writes almost nothing for an unchanged spoke, but an archive
+  replay still streams and checks the spoke's whole retained archive.
+
+  Past its first 256 records, an archive replay checks against an in-memory set of every identity
+  the hub holds for that AP, kept until the replay ends: memory and a scan proportional to the AP's
+  held records. `job_metrics` is where this is large, since it holds a record per running job per
+  shadow update. Measured (`BenchmarkJobMetricsIdentitySet`, Apple M2 Pro, 1M held samples): about
+  56 bytes of heap and 2.3 µs of scan per held sample. An AP with 10,000 running jobs sampled 4
+  times an hour and 30 days retained holds about 29M samples, so an unclean restart of its spoke
+  costs the hub about 1.6 GB and a 70-second scan before the replay can continue. Each AP replaying
+  at once holds its own set, so size the hub's memory for the APs that can crash together (a site
+  power event takes them all), or bound `job_metrics` with `HTCONDORDB_JOB_METRICS_MAX_AGE` /
+  `_MAX_BYTES`. The set is bounded by the AP's held records, not by the number of replays.
 - **Archive ingest pays one msync per record.** classad's archive has no non-durable append and no
   batch sync, so the hub cannot defer durability to the once-per-flush point it uses for tables.
 - **Absent sources keep their last state.** `absent` says the collector does not list the AP; the

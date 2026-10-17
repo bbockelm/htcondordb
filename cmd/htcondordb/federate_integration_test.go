@@ -23,7 +23,9 @@ import (
 // asserts both directions throughout -- each AP's rows present under its own ScheddName and nothing
 // more, and a fresh source's streams caught up (<Table>Synced) -- across a delete made while a spoke is down followed by its unclean restart (a Reset whose
 // sweep must remove the job), a delete while the hub is down, a job_queue.log compaction, and a
-// stopped spoke; and that a client cannot write the hub's tables.
+// stopped spoke; and that a client cannot write the hub's tables. Spoke 1 samples job metrics: a
+// job it runs reaches the hub's job_metrics under its ScheddName and User, without duplicates
+// across the restarts; spokes 2 and 3 do not, and are fresh with JobMetricsMissing.
 //
 // Discovery by constraint is not exercised end to end: that needs a collector, which this harness
 // does not run. It is covered by the federate package's tests (pairing and validation against a fake
@@ -54,6 +56,10 @@ func TestFederationIntegration(t *testing.T) {
 	spokes := make([]*spoke, 3)
 	for i := range spokes {
 		sp := &spoke{name: fmt.Sprintf("ap%d.test", i+1), dir: t.TempDir()}
+		metrics := ""
+		if i == 0 {
+			metrics = "HTCONDORDB_JOB_METRICS = true"
+		}
 		schedd := filepath.Join(sp.dir, "schedd")
 		if err := os.MkdirAll(schedd, 0o755); err != nil {
 			t.Fatal(err)
@@ -72,7 +78,8 @@ HTCONDORDB_ADVERTISE = false
 ALLOW_WRITE = nobody@nowhere.test
 ALLOW_DAEMON = nobody@nowhere.test
 ALLOW_ADMINISTRATOR = nobody@nowhere.test
-`, sp.jobLog, sp.hist, sp.name))
+%s
+`, sp.jobLog, sp.hist, sp.name, metrics))
 		spokes[i] = sp
 	}
 	// Spokes 1 and 2 share job id 1.0; spoke 3 has its own.
@@ -93,6 +100,7 @@ ALLOW_ADMINISTRATOR = nobody@nowhere.test
 		fmt.Fprintf(&hubCfg, "HTCONDORDB_FEDERATE_SPOKE_S%d_ADDRESS = %s\nHTCONDORDB_FEDERATE_SPOKE_S%d_SCHEDD = %s\n", i+1, sp.addr, i+1, sp.name)
 	}
 	hubCfg.WriteString("HTCONDORDB_FEDERATE_STATE_INTERVAL = 1\nHTCONDORDB_FEDERATE_FRESH_SECONDS = 6\nHTCONDORDB_ADVERTISE = false\n")
+	hubCfg.WriteString("HTCONDORDB_FEDERATE_TABLES = jobs history syncstatus job_metrics\n")
 	hubCfgPath := writeNodeConfig(t, hubDir, id, hubCfg.String())
 	hubAddr, hubProc := startNodeCmd(t, bin, hubDir, hubCfgPath)
 	hc := dbClient(t, hubAddr)
@@ -171,6 +179,13 @@ ALLOW_ADMINISTRATOR = nobody@nowhere.test
 		}
 		return true
 	}
+	metricsCount := func(c *dbrpc.Client, constraint string) int {
+		rows, err := c.ArchiveQuery(context.Background(), "job_metrics", constraint, 0)
+		if err != nil {
+			return -1
+		}
+		return len(rows)
+	}
 	lastReset := func(c *dbrpc.Client, schedd string) int64 {
 		if ad := sourceRow(c, schedd); ad != nil {
 			v, _ := ad.EvaluateAttrInt("LastReset")
@@ -202,6 +217,26 @@ ALLOW_ADMINISTRATOR = nobody@nowhere.test
 			}
 		}
 	}
+
+	// 1a. Job metrics. ap1's job 3.0 starts and reports usage: its samples reach the hub under
+	//     ap1's name with the owner and the structured job id. ap2 and ap3 have no job_metrics:
+	//     missing, not failing, and fresh (checked above).
+	appendFile(t, spokes[0].jobLog, "105\n103 3.0 JobStatus 2\n103 3.0 NumShadowStarts 1\n106\n"+
+		"105\n103 3.0 RemoteUserCpu 10.0\n103 3.0 MemoryUsage 100\n106\n")
+	s1 := dbClient(t, spokes[0].addr)
+	spokeMetrics := func() int { return metricsCount(s1, "true") }
+	waitUntil(t, "ap1 sampled job 3.0", 20*time.Second, func() bool { return spokeMetrics() >= 2 })
+	ap1Samples := fmt.Sprintf(`ScheddName == %q && User == "alice@test" && ClusterId == 3 && ProcId == 0 && `+
+		`GlobalJobId == "%s#3.0#1700000000" && RunInstanceID == 0 && SampleTime > 0`, spokes[0].name, spokes[0].name)
+	nSamples := spokeMetrics()
+	waitUntil(t, "ap1's samples on the hub", 20*time.Second, func() bool { return metricsCount(hc, ap1Samples) == nSamples })
+	for _, sp := range spokes[1:] {
+		ad := sourceRow(hc, sp.name)
+		if v, _ := ad.EvaluateAttrBool("JobMetricsMissing"); !v || sourceState(hc, sp.name) != "fresh" {
+			t.Errorf("%s without job_metrics: want JobMetricsMissing and fresh: %v", sp.name, ad)
+		}
+	}
+	waitUntil(t, "ap1 JobMetricsSynced", 20*time.Second, func() bool { return synced(hc, spokes[0].name, "JobMetrics") })
 
 	// 2. A job deleted while its spoke is down, then an unclean spoke restart: a new watch epoch,
 	//    so a Reset on the mutable tables. No delete event can carry the job's removal; the
@@ -279,6 +314,18 @@ ALLOW_ADMINISTRATOR = nobody@nowhere.test
 	if n := histCount(hc, "true"); n != 6 {
 		t.Fatalf("hub history = %d records, want 6 (no duplicates across the whole run)", n)
 	}
+	// ap1's spoke was killed and the hub restarted: each re-delivered ap1's samples.
+	s1 = dbClient(t, spokes[0].addr)
+	want := spokeMetrics()
+	if want < nSamples {
+		t.Fatalf("ap1's spoke holds %d samples, fewer than the %d it had", want, nSamples)
+	}
+	waitUntil(t, "ap1's samples on the hub after the restarts", 20*time.Second, func() bool {
+		return metricsCount(hc, fmt.Sprintf("ScheddName == %q", spokes[0].name)) == want
+	})
+	if n := metricsCount(hc, "true"); n != want {
+		t.Fatalf("hub job_metrics = %d samples, want %d (ap1's, no duplicates across the whole run)", n, want)
+	}
 }
 
 // hubWrite tries to write a row into the hub's jobs table as a client.
@@ -315,7 +362,7 @@ func writeQueue(t *testing.T, path, schedd string, seq int, clusters []int) {
 		k := fmt.Sprintf("%d.0", c)
 		fmt.Fprintf(&b, "101 %s Job Machine\n", k)
 		fmt.Fprintf(&b, "103 %s ClusterId %d\n103 %s ProcId 0\n103 %s JobStatus 1\n", k, c, k, k)
-		fmt.Fprintf(&b, "103 %s Owner \"alice\"\n103 %s GlobalJobId \"%s#%s#1700000000\"\n", k, k, schedd, k)
+		fmt.Fprintf(&b, "103 %s Owner \"alice\"\n103 %s User \"alice@test\"\n103 %s GlobalJobId \"%s#%s#1700000000\"\n", k, k, k, schedd, k)
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {

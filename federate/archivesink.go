@@ -12,8 +12,8 @@ import (
 	"github.com/bbockelm/htcondordb/cedarsync"
 )
 
-// archiveSink replicates one spoke's archive (history, epoch_history) into the hub's archive of the
-// same name. Unlike replicate.NewArchiveSink it does not re-append what the hub already holds:
+// archiveSink replicates one spoke's archive (history, epoch_history, job_metrics) into the hub's
+// archive of the same name. Unlike replicate.NewArchiveSink it does not re-append what the hub already holds:
 //
 //   - every record gets ScheddName overwritten from the source's identity;
 //   - from session start until Synced -- which covers both a Reset replay of the spoke's whole
@@ -32,8 +32,8 @@ import (
 //     overlap since the committed cursor (after a WatchResync, up to the spoke's watch buffer), and
 //     loading the AP's whole history for that would cost more than the probes;
 //   - during a Reset replay into a capped archive that has reached its cap, a record older than
-//     the oldest the hub still holds for this schedd (by EnteredHistoryTime, or EpochWriteDate for
-//     epochs) is skipped: the cap already dropped it, and re-appending it would make it the newest
+//     the oldest the hub still holds for this schedd (by floorAttr: EnteredHistoryTime,
+//     EpochWriteDate for epochs, SampleTime for job_metrics) is skipped: the cap already dropped it, and re-appending it would make it the newest
 //     data in the archive, evicting other APs' recent records at the next rotation -- on every
 //     spoke restart;
 //   - live-tail records are new by construction and are appended without a probe;
@@ -252,7 +252,7 @@ func (s *archiveSink) held(c replicate.Change) (bool, error) {
 
 // countHeld counts the hub's records of id for this schedd.
 func (s *archiveSink) countHeld(id recordIdentity) (int, error) {
-	seq, err := s.arch.Query(id.constraint(s.table, s.schedd))
+	seq, err := s.arch.Query(id.constraint(s.schedd))
 	if err != nil {
 		return 0, err
 	}
@@ -267,7 +267,7 @@ func (s *archiveSink) countHeld(id recordIdentity) (int, error) {
 // this catch-up has not met yet. One it has met keeps its running count: the scan would also see
 // the records the catch-up appended, and those are not "held before".
 func (s *archiveSink) loadIdentities() error {
-	seq, err := s.arch.QueryProject(scheddConstraint(s.schedd), identityAttrs)
+	seq, err := s.arch.QueryProject(scheddConstraint(s.schedd), identityAttrs(s.table))
 	if err != nil {
 		return err
 	}
@@ -291,8 +291,11 @@ func (s *archiveSink) loadIdentities() error {
 
 // floorAttr is the time attribute a replayed record is compared to the hub's retained floor by.
 func floorAttr(table string) string {
-	if table == TableEpochHistory {
+	switch table {
+	case TableEpochHistory:
 		return "EpochWriteDate"
+	case TableJobMetrics:
+		return "SampleTime"
 	}
 	return "EnteredHistoryTime"
 }

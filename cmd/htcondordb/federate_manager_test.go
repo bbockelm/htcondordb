@@ -24,11 +24,13 @@ HTCONDORDB_FEDERATE_SPOKES = ap1, ap2
 HTCONDORDB_FEDERATE_SPOKE_AP1_ADDRESS = <10.0.0.1:9620>
 HTCONDORDB_FEDERATE_SPOKE_AP1_SCHEDD = ap1.example.org
 HTCONDORDB_FEDERATE_SPOKE_AP2_ADDRESS = <10.0.0.2:9620>
-HTCONDORDB_FEDERATE_TABLES = jobs history epoch_history syncstatus
+HTCONDORDB_FEDERATE_TABLES = jobs history epoch_history job_metrics syncstatus
 HTCONDORDB_FEDERATE_RETIRE_AFTER = 2d
 HTCONDORDB_FEDERATE_FRESH_SECONDS = 30
 HTCONDORDB_FEDERATE_STATE_INTERVAL = bogus
 HTCONDORDB_HISTORY_MAX_BYTES = 10 GB
+HTCONDORDB_ARCHIVE_MAX_BYTES = 2 GB
+HTCONDORDB_JOB_METRICS_MAX_AGE = 30d
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -37,7 +39,7 @@ HTCONDORDB_HISTORY_MAX_BYTES = 10 GB
 		s.static[1].Address != "<10.0.0.2:9620>" || !s.static[0].Static {
 		t.Errorf("static spokes = %+v", s.static)
 	}
-	if strings.Join(s.tables, " ") != "jobs history epoch_history syncstatus" {
+	if strings.Join(s.tables, " ") != "jobs history epoch_history job_metrics syncstatus" {
 		t.Errorf("tables = %v", s.tables)
 	}
 	if s.retireAfter != 48*time.Hour || s.fresh != 30*time.Second || s.stateInterval != federate.DefaultStateInterval {
@@ -48,6 +50,21 @@ HTCONDORDB_HISTORY_MAX_BYTES = 10 GB
 	}
 	if s.archive.MaxBytes[federate.TableHistory] != 10_000_000_000 {
 		t.Errorf("history max bytes = %d", s.archive.MaxBytes[federate.TableHistory])
+	}
+	// job_metrics is sized as on a spoke: its own knobs, the shared archive cap by default.
+	if s.archive.MaxBytes[federate.TableJobMetrics] != 2_000_000_000 {
+		t.Errorf("job_metrics max bytes = %d, want HTCONDORDB_ARCHIVE_MAX_BYTES", s.archive.MaxBytes[federate.TableJobMetrics])
+	}
+	if s.archive.MaxAge[federate.TableJobMetrics] != 30*86400 {
+		t.Errorf("job_metrics max age = %v, want 30d", s.archive.MaxAge[federate.TableJobMetrics])
+	}
+	s, bad, _ = resolveFederationSettings(mkSyncCfg(t, "HTCONDORDB_FEDERATE_SPOKES = ap1\nHTCONDORDB_FEDERATE_SPOKE_AP1_ADDRESS = <10.0.0.1:9620>\n"+
+		"HTCONDORDB_JOB_METRICS_MAX_AGE = 30 days\nHTCONDORDB_JOB_METRICS_MAX_BYTES = 5 GB\n"))
+	if len(bad) != 1 || !strings.HasPrefix(bad[0], "HTCONDORDB_JOB_METRICS_MAX_AGE") || s.archive.MaxAge[federate.TableJobMetrics] != 0 {
+		t.Errorf("unparseable job_metrics max age: bad = %v, age = %v; want it named and no cap", bad, s.archive.MaxAge[federate.TableJobMetrics])
+	}
+	if s.archive.MaxBytes[federate.TableJobMetrics] != 5_000_000_000 {
+		t.Errorf("job_metrics max bytes = %d, want 5 GB", s.archive.MaxBytes[federate.TableJobMetrics])
 	}
 
 	if _, _, err := resolveFederationSettings(mkSyncCfg(t, "HTCONDORDB_FEDERATE_SPOKES = ap1\n")); err == nil {
@@ -119,5 +136,50 @@ func TestSyncControlRetireNotHub(t *testing.T) {
 	}
 	if msg, _ := resp.EvaluateAttrString("Error"); !strings.Contains(msg, "not a federation hub") {
 		t.Errorf("error = %q", msg)
+	}
+}
+
+// TestFederationNegativeJobMetricsMaxAge: a negative HTCONDORDB_JOB_METRICS_MAX_AGE is named as bad and
+// becomes no cap, never a cap that is passed through to the archive.
+func TestFederationNegativeJobMetricsMaxAge(t *testing.T) {
+	for _, v := range []string{"-1", "-2d"} {
+		s, bad, err := resolveFederationSettings(mkSyncCfg(t, "HTCONDORDB_FEDERATE_SPOKES = ap1\nHTCONDORDB_FEDERATE_SPOKE_AP1_ADDRESS = <10.0.0.1:9620>\n"+
+			"HTCONDORDB_JOB_METRICS_MAX_AGE = "+v+"\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(bad) != 1 || !strings.HasPrefix(bad[0], "HTCONDORDB_JOB_METRICS_MAX_AGE") || s.archive.MaxAge[federate.TableJobMetrics] != 0 {
+			t.Errorf("%s: bad = %v, age = %v; want it named and no cap", v, bad, s.archive.MaxAge[federate.TableJobMetrics])
+		}
+	}
+}
+
+// TestFederationJobMetricsStorage: the hub stores job_metrics with the spoke's
+// HTCONDORDB_JOB_METRICS_* storage knobs and their defaults -- not HTCONDORDB_ARCHIVE_SEGMENT_SIZE
+// or the history index extras.
+func TestFederationJobMetricsStorage(t *testing.T) {
+	const spokes = "HTCONDORDB_FEDERATE_SPOKES = ap1\nHTCONDORDB_FEDERATE_SPOKE_AP1_ADDRESS = <10.0.0.1:9620>\n"
+	s, bad, err := resolveFederationSettings(mkSyncCfg(t, spokes+
+		"HTCONDORDB_ARCHIVE_SEGMENT_SIZE = 67108864\nHTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS = AcctGroup\n"))
+	if err != nil || len(bad) != 0 {
+		t.Fatalf("defaults: %v %v", bad, err)
+	}
+	if st := s.archive.Storage[federate.TableJobMetrics]; st.SegmentSize != 0 || st.GroupSchemaCount != 0 ||
+		strings.Join(st.ExtraCategorical, ",") != "Owner" {
+		t.Errorf("default job_metrics storage = %+v, want the library segment size, group schemas on, Owner", st)
+	}
+	s, bad, err = resolveFederationSettings(mkSyncCfg(t, spokes+
+		"HTCONDORDB_JOB_METRICS_SEGMENT_SIZE = 16 MiB\nHTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS = Owner, ProjectName\n"+
+		"HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS = false\n"))
+	if err != nil || len(bad) != 0 {
+		t.Fatalf("set: %v %v", bad, err)
+	}
+	if st := s.archive.Storage[federate.TableJobMetrics]; st.SegmentSize != 16<<20 || st.GroupSchemaCount != -1 ||
+		strings.Join(st.ExtraCategorical, ",") != "Owner,ProjectName" {
+		t.Errorf("job_metrics storage = %+v", st)
+	}
+	_, bad, _ = resolveFederationSettings(mkSyncCfg(t, spokes+"HTCONDORDB_JOB_METRICS_SEGMENT_SIZE = 1 KiB\n"))
+	if len(bad) != 1 || !strings.HasPrefix(bad[0], "HTCONDORDB_JOB_METRICS_SEGMENT_SIZE") {
+		t.Errorf("unusable segment size: bad = %v, want it named", bad)
 	}
 }

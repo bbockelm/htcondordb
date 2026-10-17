@@ -473,6 +473,12 @@ func (s *JobSync) Poll(ctx context.Context) error {
 	case classadlog.ProbeCompressed:
 		return s.reconcileReload(ctx, "prober reported the log was compacted")
 	case classadlog.ProbeAddition:
+		// The first read of a log -- a JobSync with no saved position reads it straight away --
+		// has no generation yet; the samples it takes are stamped with curSeq, which must be the
+		// generation of the file being read, not zero (two names for one log position).
+		if !s.haveSeq && seqKnown {
+			s.curSeq = headSeq
+		}
 		aerr := s.readAndApply(ctx, false)
 		if applyErrorHook != nil {
 			aerr = applyErrorHook(aerr)

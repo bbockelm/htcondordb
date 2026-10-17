@@ -70,6 +70,13 @@ const (
 	// only -- what suppresses a re-read is the flush position, not the record's contents (see
 	// flush).
 	SampleLogSeqAttr = "LogSeq"
+	// SampleLogOffsetAttr records the byte offset, within the LogSeq generation, just past the
+	// entry that closed the sample's transaction -- the flush position of flush, which is how the
+	// sampler itself recognises a sample it already wrote. A transaction samples each job at most
+	// once, so (LogSeq, LogOffset, Key) names one sample: a federation hub dedups replayed samples
+	// by it, where (job, run, SampleTime, trigger) is not unique -- ingest-clock samples of one job
+	// read in one pass share a SampleTime.
+	SampleLogOffsetAttr = "LogOffset"
 )
 
 // DefaultJobMetricsTable is the archive table job samples are appended to.
@@ -820,6 +827,17 @@ func (m *jobMetrics) build(key string, trig sampleTrigger, job *classad.ClassAd,
 	// way to tell whose it is, and no key to repair it by in an append-only table. It is in hand
 	// here for free.
 	_ = s.Set(KeyAttr, key)
+	// The job id is the key, so an unchained row's sample still carries ClusterId and ProcId -- what
+	// a reader (and a federation hub's structured job id) selects a job by. GlobalJobId and User
+	// cannot be derived and stay absent on such a row.
+	if cluster, proc, ok := parseJobKey(key); ok {
+		if _, has := s.Lookup("ClusterId"); !has {
+			_ = s.Set("ClusterId", int64(cluster))
+		}
+		if _, has := s.Lookup("ProcId"); !has {
+			_ = s.Set("ProcId", int64(proc))
+		}
+	}
 	_ = s.Set(SampleTimeAttr, sampleTime)
 	_ = s.Set(SampleTriggerAttr, trig.String())
 	_ = s.Set(SampleLogSeqAttr, logSeq)
@@ -1196,6 +1214,7 @@ func (m *jobMetrics) flush(samples []*classad.ClassAd, pos logPos) {
 	m.mark = pos
 	m.saveMark()
 	for _, s := range samples {
+		_ = s.Set(SampleLogOffsetAttr, pos.Offset)
 		if err := m.archive.Append(s); err != nil {
 			m.mAppendFails.Add(1)
 			m.logAppendFailure(err)

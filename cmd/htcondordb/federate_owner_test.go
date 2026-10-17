@@ -46,8 +46,8 @@ func TestHubOwnsItsTables(t *testing.T) {
 	svc := newOwnerTestService(t)
 	fm := newFederationManager(t.Context(), svc.Catalog(), svc.Owners(), slog.Default())
 	defer fm.Stop()
-	hubTables := []string{"jobs", "history", "epoch_history", "syncstatus", "federation_sources"}
-	if err := fm.apply(mkSyncCfg(t, hubCfg(t.TempDir(), "HTCONDORDB_FEDERATE_TABLES = jobs history epoch_history syncstatus\n"))); err != nil {
+	hubTables := []string{"jobs", "history", "epoch_history", "job_metrics", "syncstatus", "federation_sources"}
+	if err := fm.apply(mkSyncCfg(t, hubCfg(t.TempDir(), "HTCONDORDB_FEDERATE_TABLES = jobs history epoch_history job_metrics syncstatus\n"))); err != nil {
 		t.Fatal(err)
 	}
 	for _, tb := range hubTables {
@@ -58,6 +58,7 @@ func TestHubOwnsItsTables(t *testing.T) {
 	waitTable(t, svc, "federation_sources")
 	waitTable(t, svc, "jobs")
 	waitTable(t, svc, "history")
+	waitTable(t, svc, "job_metrics")
 
 	c := writeSession(t, svc)
 	ctx := context.Background()
@@ -65,6 +66,9 @@ func TestHubOwnsItsTables(t *testing.T) {
 		if err := c.DropTable(ctx, tb); err == nil {
 			t.Errorf("a WRITE client dropped hub table %s", tb)
 		}
+	}
+	if err := c.ArchiveAppend(ctx, "job_metrics", "ScheddName = \"ap1\"\nUser = \"mallory@example.org\"\n"); err == nil {
+		t.Error("a WRITE client appended to the hub's job_metrics")
 	}
 	tx, err := c.BeginTable(ctx, "federation_sources")
 	if err != nil {
@@ -92,14 +96,18 @@ func TestHubOwnsItsTables(t *testing.T) {
 			t.Errorf("truncate jobs error has an empty sentence (%q): %q", bad, e)
 		}
 	}
+	if ok, _ := sc.handle(ctx, mkReq("truncate", "job_metrics")).EvaluateAttrBool("Ok"); ok {
+		t.Error("truncate of the hub's job_metrics succeeded")
+	}
 	note, _ := sc.handle(ctx, mkReq("owner", "federation_sources")).EvaluateAttrString("Note")
 	if !strings.Contains(note, "federation hub") || strings.Contains(note, "..") {
 		t.Errorf("owner federation_sources = %q", note)
 	}
 
-	out := daemonSession(t, svc, sc, ".rotate history\n.retention history 0 1GB\n")
-	if !strings.Contains(out, "rotated: dropped 0 segment(s)") || !strings.Contains(out, "retention set on history") {
-		t.Errorf("rotate/retention on the hub's history = %q", out)
+	out := daemonSession(t, svc, sc, ".rotate history\n.retention history 0 1GB\n.rotate job_metrics\n.retention job_metrics 0 1GB\n")
+	if strings.Count(out, "rotated: dropped 0 segment(s)") != 2 || !strings.Contains(out, "retention set on history") ||
+		!strings.Contains(out, "retention set on job_metrics") {
+		t.Errorf("rotate/retention on the hub's history and job_metrics = %q", out)
 	}
 
 	// A reconfigure dropping a table releases it; the rest stay owned throughout.

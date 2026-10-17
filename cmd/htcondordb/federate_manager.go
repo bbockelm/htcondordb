@@ -116,6 +116,17 @@ func resolveFederationSettings(cfg *config.Config) (s federationSettings, bad []
 	if segSize < 0 {
 		segSize = 0
 	}
+	// job_metrics' age cap, as on a spoke: seconds against SampleTime, unset or unparseable = none
+	// (the safe direction: an unparseable value never becomes a cap that erases the series).
+	segSizeMetrics, ok := configSegmentBytes(cfg, "HTCONDORDB_JOB_METRICS_SEGMENT_SIZE")
+	if !ok {
+		bad = append(bad, "HTCONDORDB_JOB_METRICS_SEGMENT_SIZE="+getStr(cfg, "HTCONDORDB_JOB_METRICS_SEGMENT_SIZE"))
+	}
+	maxAgeMetrics, ok := configSeconds(cfg, "HTCONDORDB_JOB_METRICS_MAX_AGE")
+	if !ok || maxAgeMetrics < 0 {
+		bad = append(bad, "HTCONDORDB_JOB_METRICS_MAX_AGE="+getStr(cfg, "HTCONDORDB_JOB_METRICS_MAX_AGE"))
+		maxAgeMetrics = 0
+	}
 	s.archive = federate.ArchiveOptions{
 		ExtraCategorical: splitAttrList(getStr(cfg, "HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS")),
 		ExtraValue:       splitAttrList(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS")),
@@ -123,7 +134,17 @@ func resolveFederationSettings(cfg *config.Config) (s federationSettings, bad []
 		MaxBytes: map[string]int64{
 			federate.TableHistory:      configBytesOr(cfg, "HTCONDORDB_HISTORY_MAX_BYTES", defMax),
 			federate.TableEpochHistory: configBytesOr(cfg, "HTCONDORDB_EPOCH_HISTORY_MAX_BYTES", defMax),
+			federate.TableJobMetrics:   configBytesOr(cfg, "HTCONDORDB_JOB_METRICS_MAX_BYTES", defMax),
 		},
+		MaxAge: map[string]float64{federate.TableJobMetrics: float64(maxAgeMetrics)},
+		// Stored as a spoke stores it (scheddSyncSettings: the HTCONDORDB_JOB_METRICS_* knobs, same
+		// defaults), not with the history knobs: its segment size and group schemas were measured
+		// for its records (docs/design/job-metrics.md §3.5).
+		Storage: map[string]federate.TableStorage{federate.TableJobMetrics: {
+			ExtraCategorical: splitAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS"), defaultArchiveCategoricalAttrs)),
+			SegmentSize:      segSizeMetrics,
+			GroupSchemaCount: groupSchemaCount(!configBoolDefaultTrueIsFalse(cfg, "HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS")),
+		}},
 	}
 
 	var sb strings.Builder

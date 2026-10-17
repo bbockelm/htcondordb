@@ -33,6 +33,10 @@ const (
 	DefaultStateInterval    = 5 * time.Second
 	DefaultFreshThreshold   = 60 * time.Second
 	DefaultRetireAfter      = 7 * 24 * time.Hour
+	// DefaultMissingTableRetry is how often a stream asks again for an optional table its spoke
+	// does not have. A table appears on a spoke only when its configuration changes, so this is a
+	// slow check rather than an error backoff.
+	DefaultMissingTableRetry = 5 * time.Minute
 )
 
 // Source states, as federation_sources reports them.
@@ -67,6 +71,10 @@ type Config struct {
 	FlushInterval    time.Duration // cedarsync.DefaultFlushInterval when <= 0
 	FreshThreshold   time.Duration // staleness at or under this is fresh
 	RetireAfter      time.Duration // unseen (or unmatched) this long => rows deleted
+
+	// MissingTableRetry is how often a stream asks again for an optional table (see
+	// optionalTable) its spoke does not have; DefaultMissingTableRetry when <= 0.
+	MissingTableRetry time.Duration
 
 	Metrics *Metrics     // nil makes a private set
 	Logger  *slog.Logger // nil discards
@@ -148,9 +156,9 @@ func New(cfg Config) (*Hub, error) {
 	}
 	for _, t := range tables {
 		switch t {
-		case TableJobs, TableHistory, TableEpochHistory, TableSyncStatus:
+		case TableJobs, TableHistory, TableEpochHistory, TableSyncStatus, TableJobMetrics:
 		default:
-			return nil, fmt.Errorf("federate: cannot federate table %q (want jobs, history, epoch_history, syncstatus)", t)
+			return nil, fmt.Errorf("federate: cannot federate table %q (want jobs, history, epoch_history, job_metrics, syncstatus)", t)
 		}
 	}
 	h := &Hub{
@@ -522,9 +530,11 @@ func (h *Hub) startRunner(s *source, table string) error {
 	if err != nil {
 		return err
 	}
-	r, err := cedarsync.NewRunner(h.cfg.Dial(s.spokeAddress), cedarsync.Config{
-		Source: table, Src: schedd, FlushInterval: h.cfg.FlushInterval,
-	}, sink, h.log)
+	ccfg := cedarsync.Config{Source: table, Src: schedd, FlushInterval: h.cfg.FlushInterval}
+	if optionalTable(table) {
+		ccfg.MissingRetry = orDur(h.cfg.MissingTableRetry, DefaultMissingTableRetry)
+	}
+	r, err := cedarsync.NewRunner(h.cfg.Dial(s.spokeAddress), ccfg, sink, h.log)
 	if err != nil {
 		return err
 	}
@@ -963,8 +973,30 @@ func tablePrefix(table string) string {
 		return "EpochHistory"
 	case TableSyncStatus:
 		return "SyncStatus"
+	case TableJobMetrics:
+		return "JobMetrics"
 	}
 	return table
+}
+
+// optionalTable reports whether a spoke may legitimately lack table: job_metrics exists only with
+// HTCONDORDB_JOB_METRICS on, epoch_history only with an epoch history file to sync. A spoke without
+// one is reported as <Table>Missing, not as a failing stream. Every spoke running schedd sync has
+// jobs, history and syncstatus, so a missing one is an ordinary fault.
+func optionalTable(table string) bool {
+	return table == TableJobMetrics || table == TableEpochHistory
+}
+
+// missingTableError is <Table>LastError for a spoke that has no such table.
+func missingTableError(table string) string {
+	msg := "the spoke has no " + table + " table"
+	switch table {
+	case TableJobMetrics:
+		msg += " (HTCONDORDB_JOB_METRICS is not enabled on it)"
+	case TableEpochHistory:
+		msg += " (it does not sync an epoch history file)"
+	}
+	return msg
 }
 
 // sourceRowRefresh bounds how often a federation_sources row is rewritten for its volatile fields
@@ -1016,7 +1048,13 @@ func (h *Hub) writeSourceRow(s *source, statuses map[string]cedarsync.Status, st
 			// missing from this table means "gone at the AP" only while this is true.
 			ad.InsertAttrBool(p+"Synced", st.Synced)
 			putTime(p+"SyncedAt", st.SyncedAt)
-			if st.LastError != "" {
+			switch {
+			case st.SourceMissing:
+				// Not a failure: the spoke does not keep this (optional) table. Asked again
+				// periodically, so it streams once the spoke turns it on.
+				ad.InsertAttrBool(p+"Missing", true)
+				ad.InsertAttrString(p+"LastError", missingTableError(t))
+			case st.LastError != "":
 				// The error, not its time: a stream retrying against a down spoke fails anew
 				// every backoff, and only a different error is news.
 				ad.InsertAttrString(p+"LastError", st.LastError)

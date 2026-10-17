@@ -45,11 +45,23 @@ type Config struct {
 	// FlushInterval is how often a sink implementing Flusher is flushed while a session runs.
 	// <= 0 means DefaultFlushInterval. Ignored for a sink that does not implement Flusher.
 	FlushInterval time.Duration
+	// MissingRetry, if > 0, makes a Source the source htcondordb does not have a reported state
+	// rather than a failure (see ErrSourceMissing): the Runner sets Status.SourceMissing and asks
+	// again every MissingRetry instead of at the error backoff. For a table the source keeps only
+	// when configured to. <= 0 treats a missing Source as any other session error.
+	MissingRetry time.Duration
 }
 
 // DefaultFlushInterval is the flush cadence for a Flusher sink, matching ha/leaderfollower's
 // cursor flush: a restart replays at most about this much.
 const DefaultFlushInterval = time.Second
+
+// ErrSourceMissing reports that the source htcondordb has no table or archive named Config.Source:
+// it answered the watch with "no such table". With Config.MissingRetry set, that is not a fault of
+// the stream -- the source does not keep that (optional) table -- so the Runner reports it in
+// Status.SourceMissing and asks again every MissingRetry, warning once, rather than backing off and
+// warning on every attempt.
+var ErrSourceMissing = errors.New("cedarsync: the source has no such table")
 
 // Flusher is implemented by a sink that buffers applied changes and makes them durable -- with the
 // resume cursor, and only after them -- in batches. The Runner calls Flush every FlushInterval
@@ -90,6 +102,10 @@ type Status struct {
 	LastEvent     time.Time // when the last event was applied
 	LastError     string    // the last session error, "" if none since the last clean session
 	LastErrorTime time.Time
+	// SourceMissing is true while the last attempt found that the source has no such table
+	// (ErrSourceMissing; LastError says so too), with Config.MissingRetry set. Cleared when a
+	// session opens or an attempt fails for another reason.
+	SourceMissing bool
 	// Synced is true while the current session has reached Synced -- the end of its catch-up (a
 	// Reset replay, applied in full including the sink's reconcile, or a resume's overlap) -- and
 	// nothing has sent it back into catch-up since: false from the moment a session opens, on a
@@ -169,9 +185,25 @@ func (r *Runner) Run(ctx context.Context) error {
 			return nil
 		case errors.Is(err, errStreamClosed):
 			backoff, fails = initialBackoff, 0 // clean reconnect (made progress)
+		case errors.Is(err, ErrSourceMissing):
+			fails++
+			was := r.Status().SourceMissing
+			r.setStatus(func(s *Status) { s.LastError, s.LastErrorTime, s.SourceMissing = err.Error(), time.Now(), true })
+			if !was {
+				r.log.Warn("cedarsync: the source has no such table; asking again periodically",
+					"src", r.cfg.Src, "table", r.cfg.Source, "every", r.cfg.MissingRetry.String())
+			}
+			if r.cfg.MaxConsecutiveFailures > 0 && fails >= r.cfg.MaxConsecutiveFailures {
+				return fmt.Errorf("cedarsync: giving up after %d consecutive failures: %w", fails, err)
+			}
+			if !sleep(ctx, r.cfg.MissingRetry) {
+				return nil
+			}
+			backoff = initialBackoff
+			continue
 		default:
 			fails++
-			r.setStatus(func(s *Status) { s.LastError, s.LastErrorTime = err.Error(), time.Now() })
+			r.setStatus(func(s *Status) { s.LastError, s.LastErrorTime, s.SourceMissing = err.Error(), time.Now(), false })
 			r.log.Warn("cedarsync: session error; reconnecting", "src", r.cfg.Src, "table", r.cfg.Source, "err", err)
 			if r.cfg.MaxConsecutiveFailures > 0 && fails >= r.cfg.MaxConsecutiveFailures {
 				return fmt.Errorf("cedarsync: giving up after %d consecutive failures: %w", fails, err)
@@ -187,6 +219,13 @@ func (r *Runner) Run(ctx context.Context) error {
 	return nil
 }
 
+// isNoSuchTable reports whether err is the source's refusal to watch a table it does not have.
+// dbrpc has no typed error for it; the server's message is fixed ("no such table: <name>").
+func isNoSuchTable(err error) bool {
+	var se *dbrpc.ServerError
+	return errors.As(err, &se) && strings.HasPrefix(se.Msg, "no such table")
+}
+
 // session runs one watch connection: it maps each event to a Change, applies the client-side
 // constraint, and feeds the sink (which checkpoints its resume cursor on WatchSynced, or on Flush
 // for a Flusher).
@@ -199,11 +238,17 @@ func (r *Runner) session(ctx context.Context) (err error) {
 
 	events, stop, wireForm, err := watchfeed.Watch(ctx, c, r.cfg.Source, r.sink.Cursor())
 	if err != nil {
+		if r.cfg.MissingRetry > 0 && isNoSuchTable(err) {
+			return fmt.Errorf("%w: %s", ErrSourceMissing, r.cfg.Source)
+		}
 		return err
 	}
 	defer stop()
 	r.log.Debug("cedarsync: change feed open", "src", r.cfg.Src, "wire", wireForm)
-	r.setStatus(func(s *Status) { s.Connected, s.LastConnected, s.Synced = true, time.Now(), false; s.Sessions++ })
+	r.setStatus(func(s *Status) {
+		s.Connected, s.LastConnected, s.Synced, s.SourceMissing = true, time.Now(), false, false
+		s.Sessions++
+	})
 
 	flusher, _ := r.sink.(Flusher)
 	sa, _ := r.sink.(SessionAware)
