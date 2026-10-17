@@ -348,10 +348,20 @@ reconfig; on one that is not a hub they stay at zero or absent.
 - **Spoke chaining gaps are inherited.** The hub has no cluster ads to repair partial job rows from.
 - **Replays are correct, not cheap.** Every spoke restart replays its mutable tables (`jobs`,
   `syncstatus`: their watch epochs are per process). An archive (`history`, `epoch_history`,
-  `job_metrics`) keeps
-  its epoch across a clean spoke restart and resumes; a spoke that crashed or was killed replays it
-  too. The hub writes almost nothing for an unchanged spoke, but a history replay still streams and
-  checks the spoke's whole retained history.
+  `job_metrics`) keeps its epoch across a clean spoke restart and resumes; a spoke that crashed or
+  was killed replays it too. The hub writes almost nothing for an unchanged spoke, but an archive
+  replay still streams and checks the spoke's whole retained archive.
+
+  Past its first 256 records, an archive replay checks against an in-memory set of every identity
+  the hub holds for that AP, kept until the replay ends: memory and a scan proportional to the AP's
+  held records. `job_metrics` is where this is large, since it holds a record per running job per
+  shadow update. Measured (`BenchmarkJobMetricsIdentitySet`, Apple M2 Pro, 1M held samples): about
+  56 bytes of heap and 2.3 µs of scan per held sample. An AP with 10,000 running jobs sampled 4
+  times an hour and 30 days retained holds about 29M samples, so an unclean restart of its spoke
+  costs the hub about 1.6 GB and a 70-second scan before the replay can continue. Each AP replaying
+  at once holds its own set, so size the hub's memory for the APs that can crash together (a site
+  power event takes them all), or bound `job_metrics` with `HTCONDORDB_JOB_METRICS_MAX_AGE` /
+  `_MAX_BYTES`. The set is bounded by the AP's held records, not by the number of replays.
 - **Archive ingest pays one msync per record.** classad's archive has no non-durable append and no
   batch sync, so the hub cannot defer durability to the once-per-flush point it uses for tables.
 - **Absent sources keep their last state.** `absent` says the collector does not list the AP; the
