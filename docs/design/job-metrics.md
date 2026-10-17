@@ -191,8 +191,8 @@ archive record has no key to collide, and `job_metrics` needs no synthetic `Samp
 a key to address rows for `UPDATE`/`DELETE`) and does not apply here.
 
 What *is* needed is a way to recognize a sample the archive already holds, because a restart
-re-applies part of the log and appends are not idempotent. §4.2 uses an identity *constraint*,
-the same "identity as a query, not as a key" approach the epoch tailer already uses.
+re-applies part of the log and appends are not idempotent. §4.2 recognizes it by the log
+position it came from.
 
 ### 3.2 Record shape
 
@@ -201,13 +201,15 @@ Flat, scalar-only, same attribute set every time — the ideal shape for the col
 
 ```
 # identity
-ClusterId, ProcId, GlobalJobId,
+Key,                                     # the job's jobs-table key ("cluster.proc"), always
+ClusterId, ProcId, GlobalJobId,          # ClusterId/ProcId from Key on a row never chained
 RunInstanceID,                           # = NumShadowStarts - 1; joins epoch_history
 Owner, User, RemoteHost,
 <admin-configured extras>                # AccountingGroup, ProjectName, chirp attrs, ...
 
 # provenance
 LogSeq,                                  # the job_queue.log generation (op-107 sequence number)
+LogOffset,                               # byte offset past the commit's closing entry (§4.2)
 
 # time axis
 SampleTime,                              # StatsLastUpdateTimeStarter (starter clock)
@@ -479,6 +481,12 @@ in §10 recorded that the exact coordinate would be "strictly better" and that t
 cost was why it was skipped. That cost was three lines
 ([golang-htcondor#512](https://github.com/bbockelm/golang-htcondor/pull/512) adds
 `Parser.CurrentOffset`), and it was much smaller than the bug.
+
+The position goes on the record too (`LogSeq`, `LogOffset`). A transaction samples each job at
+most once, so `(LogSeq, LogOffset, Key)` names one sample, which is what a
+[federation hub](../federation.md) dedups a replayed sample by: it sees only stored records, and
+`(job, run, SampleTime, trigger)` is not unique on them -- ingest-clock samples of one job read in
+one pass share a `SampleTime`.
 
 A different generation is never comparable — a compaction restarts offsets — so it counts as new,
 and a reconcile reload forgets the mark outright. Getting that backwards would suppress real
