@@ -33,6 +33,10 @@ const (
 	DefaultStateInterval    = 5 * time.Second
 	DefaultFreshThreshold   = 60 * time.Second
 	DefaultRetireAfter      = 7 * 24 * time.Hour
+	// DefaultMissingTableRetry is how often a stream asks again for an optional table its spoke
+	// does not have. A table appears on a spoke only when its configuration changes, so this is a
+	// slow check rather than an error backoff.
+	DefaultMissingTableRetry = 5 * time.Minute
 )
 
 // Source states, as federation_sources reports them.
@@ -68,9 +72,8 @@ type Config struct {
 	FreshThreshold   time.Duration // staleness at or under this is fresh
 	RetireAfter      time.Duration // unseen (or unmatched) this long => rows deleted
 
-	// MissingTableRetry is how often a stream asks again for a table its spoke does not have
-	// (cedarsync.DefaultMissingRetry when <= 0): an optional table such as job_metrics, which a
-	// spoke has only with HTCONDORDB_JOB_METRICS on.
+	// MissingTableRetry is how often a stream asks again for an optional table (see
+	// optionalTable) its spoke does not have; DefaultMissingTableRetry when <= 0.
 	MissingTableRetry time.Duration
 
 	Metrics *Metrics     // nil makes a private set
@@ -527,9 +530,11 @@ func (h *Hub) startRunner(s *source, table string) error {
 	if err != nil {
 		return err
 	}
-	r, err := cedarsync.NewRunner(h.cfg.Dial(s.spokeAddress), cedarsync.Config{
-		Source: table, Src: schedd, FlushInterval: h.cfg.FlushInterval, MissingRetry: h.cfg.MissingTableRetry,
-	}, sink, h.log)
+	ccfg := cedarsync.Config{Source: table, Src: schedd, FlushInterval: h.cfg.FlushInterval}
+	if optionalTable(table) {
+		ccfg.MissingRetry = orDur(h.cfg.MissingTableRetry, DefaultMissingTableRetry)
+	}
+	r, err := cedarsync.NewRunner(h.cfg.Dial(s.spokeAddress), ccfg, sink, h.log)
 	if err != nil {
 		return err
 	}
@@ -972,6 +977,14 @@ func tablePrefix(table string) string {
 		return "JobMetrics"
 	}
 	return table
+}
+
+// optionalTable reports whether a spoke may legitimately lack table: job_metrics exists only with
+// HTCONDORDB_JOB_METRICS on, epoch_history only with an epoch history file to sync. A spoke without
+// one is reported as <Table>Missing, not as a failing stream. Every spoke running schedd sync has
+// jobs, history and syncstatus, so a missing one is an ordinary fault.
+func optionalTable(table string) bool {
+	return table == TableJobMetrics || table == TableEpochHistory
 }
 
 // missingTableError is <Table>LastError for a spoke that has no such table.

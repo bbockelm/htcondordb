@@ -260,24 +260,30 @@ The flag is computed from the stream's live state and written at the next state 
 ## Optional tables
 
 `job_metrics` and `epoch_history` exist on a spoke only when it is configured to keep them. A spoke
-without one answers the hub's watch with "no such table"; that is not a stream failure. The AP's
-`federation_sources` row then carries, for that table:
+without one answers the hub's watch with "no such table"; for these two tables that is not a stream
+failure. The AP's `federation_sources` row then carries, for that table (`JobMetrics*` or
+`EpochHistory*`):
 
 | Attribute | Value |
 |---|---|
-| `<Table>Missing` | `true` (absent once the stream has connected) |
+| `<Table>Missing` | `true`; absent once the stream connects, or when an attempt fails for another reason (the spoke unreachable, say), which is then reported as an ordinary fault |
 | `<Table>Connected`, `<Table>Synced` | `false` |
 | `<Table>SyncedAt` | absent, unless this hub's stream for the table reached Synced earlier |
-| `<Table>LastError` | `the spoke has no job_metrics table (HTCONDORDB_JOB_METRICS is not enabled on it)` (for `epoch_history`: `... (it does not sync an epoch history file)`) |
+| `<Table>LastError` | `the spoke has no job_metrics table (HTCONDORDB_JOB_METRICS is not enabled on it)` (for `epoch_history`: `the spoke has no epoch_history table (it does not sync an epoch history file)`) |
 | `<Table>Rows` | the AP's rows the hub already holds, if any |
 
 Nothing else about the AP changes: its other streams run, and `State` is unaffected (archive
-streams never hold a source back from `fresh`). The hub asks again every 5 minutes, logging once
-when a table goes missing, so a spoke that turns `HTCONDORDB_JOB_METRICS` on starts streaming
-within that time with no hub restart. Read "this AP has no job metrics" as
-`JobMetricsMissing =?= true`; `JobMetricsConnected` false without it is an ordinary stream fault,
-with `JobMetricsLastError` saying what. A spoke that turned job metrics off after having them keeps its table: it
-reads as connected and caught up, with no new samples.
+streams never hold a source back from `fresh`). The hub asks again every 5 minutes, with one
+warning when the table goes missing rather than one per attempt, so a spoke that turns
+`HTCONDORDB_JOB_METRICS` on starts streaming within that time with no hub restart. Read "this AP
+has no job metrics" as `JobMetricsMissing =?= true`; `JobMetricsConnected` false without it is an
+ordinary stream fault, with `JobMetricsLastError` saying what. A spoke that turned job metrics off
+after having them keeps its table: it reads as connected and caught up, with no new samples.
+
+`jobs`, `history` and `syncstatus` are not optional: every spoke running schedd sync has them. A
+spoke answering "no such table" for one is broken, and that stream fails like any other -- the
+server's error in `<Table>LastError`, retried at the error backoff, a warning per attempt, no
+`<Table>Missing` -- and a failing `jobs` or `syncstatus` stream keeps the source from `fresh`.
 
 ## Membership is sticky
 
@@ -286,8 +292,8 @@ reads as connected and caught up, with no new samples.
 and the last live stream), `LastCollectorSeen`, `LastContact`, `LastReset`, `RetiringSince`,
 `SpokeAddress`, `SpokeName`, `Static`, and per table `<Table>Connected`, `<Table>Synced`,
 `<Table>SyncedAt` (see [Catch-up and absence](#catch-up-and-absence)), `<Table>LastError`,
-`<Table>Missing` (see [Optional tables](#optional-tables)), `<Table>Rows` (where an index can
-count them). `<Table>` is `Jobs`, `History`, `EpochHistory`, `JobMetrics` or `SyncStatus`.
+`<Table>Missing` (`JobMetrics` and `EpochHistory` only; see [Optional tables](#optional-tables)),
+`<Table>Rows` (where an index can count them). `<Table>` is `Jobs`, `History`, `EpochHistory`, `JobMetrics` or `SyncStatus`.
 
 A row is rewritten at the next state pass whenever anything but its clock-driven fields changes --
 `State`, `Reason`, a stream connecting, failing or reaching Synced, a row count.

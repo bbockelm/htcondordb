@@ -2,6 +2,7 @@ package federate
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,7 +69,7 @@ func TestSpokeWithoutJobMetrics(t *testing.T) {
 	cat := openCatalog(t, t.TempDir())
 	t.Cleanup(func() { _ = cat.Close() })
 	hub := startHub(t, Config{Catalog: cat, Discovery: disc, Dial: dial, CursorDir: t.TempDir(),
-		Tables:        []string{TableJobs, TableHistory, TableSyncStatus, TableJobMetrics},
+		Tables:        []string{TableJobs, TableHistory, TableSyncStatus, TableJobMetrics, TableEpochHistory},
 		FlushInterval: 20 * time.Millisecond, FreshThreshold: 60 * time.Second, MissingTableRetry: 300 * time.Millisecond})
 	defer hub.stop(t)
 
@@ -109,6 +110,12 @@ func TestSpokeWithoutJobMetrics(t *testing.T) {
 	if e, _ := row.EvaluateAttrString("JobMetricsLastError"); e != missingTableError(TableJobMetrics) {
 		t.Errorf("ap2 JobMetricsLastError = %q, want %q", e, missingTableError(TableJobMetrics))
 	}
+	// Neither spoke syncs an epoch history file: the other optional table, reported the same way.
+	waitFor(t, "epoch_history reported missing on both", func() bool {
+		v1, _ := sourceRowAttrBool(cat, "ap1", "EpochHistoryMissing")
+		v2, _ := sourceRowAttrBool(cat, "ap2", "EpochHistoryMissing")
+		return v1 && v2
+	})
 	if _, ok := row.Lookup("JobMetricsSyncedAt"); ok {
 		t.Error("ap2 has a JobMetricsSyncedAt for a table it never had")
 	}
@@ -141,5 +148,39 @@ func TestSpokeWithoutJobMetrics(t *testing.T) {
 	}
 	if n := countArchive(t, jm, `ScheddName == "ap1"`); n != 2 {
 		t.Errorf("ap1 samples = %d after ap2's arrived, want 2", n)
+	}
+}
+
+// TestSpokeMissingRequiredTableIsAFault: every spoke running schedd sync has jobs, so a spoke
+// without it is broken, not unconfigured: an ordinary stream fault -- no JobsMissing, the server's
+// error in JobsLastError -- and the source is not fresh.
+func TestSpokeMissingRequiredTableIsAFault(t *testing.T) {
+	a := newTestSpoke(t)
+	a.mu.Lock()
+	err := a.cat.DropTable(TableJobs)
+	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	disc := &Discovery{Static: []Spoke{{Schedd: "ap1", Address: "A"}}}
+	hub := startHub(t, Config{Catalog: cat, Discovery: disc, Dial: func(string) cedarsync.Dial { return a.dial },
+		Tables: []string{TableJobs, TableSyncStatus}, FlushInterval: 20 * time.Millisecond, MissingTableRetry: 100 * time.Millisecond})
+	defer hub.stop(t)
+	waitFor(t, "ap1's jobs stream failing", func() bool {
+		row, ok := sourceRow(cat, "ap1")
+		if !ok {
+			return false
+		}
+		e, _ := row.EvaluateAttrString("JobsLastError")
+		return strings.Contains(e, "no such table")
+	})
+	row, _ := sourceRow(cat, "ap1")
+	if _, ok := row.Lookup("JobsMissing"); ok {
+		t.Error("a spoke without jobs is reported as JobsMissing, as if jobs were optional")
+	}
+	if st, _ := row.EvaluateAttrString("State"); st == StateFresh {
+		t.Error("a source whose jobs stream cannot open is fresh")
 	}
 }
