@@ -317,9 +317,9 @@ func TestRetiringWhenConstraintStopsMatching(t *testing.T) {
 	waitFor(t, "ap1 retiring again", func() bool { return sourceState(cat, "ap1") == StateRetiring })
 	clock.advance(time.Hour + time.Second)
 	waitFor(t, "ap1 deleted", func() bool { _, ok := sourceRow(cat, "ap1"); return !ok })
-	if n := scheddRows(t, cat, TableJobs, "ap1"); n != 0 {
-		t.Errorf("retired source kept %d jobs rows", n)
-	}
+	// retire deletes the federation_sources row before the data rows (see retire), so the
+	// jobs rows go just after the row this waited for.
+	waitFor(t, "ap1's jobs rows deleted", func() bool { return scheddRows(t, cat, TableJobs, "ap1") == 0 })
 	if sourceState(cat, "ap2") == "" {
 		t.Error("ap2 disappeared")
 	}
