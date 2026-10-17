@@ -1,8 +1,10 @@
 package federate
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -422,5 +424,58 @@ func TestJobMetricsNamesMatchSpoke(t *testing.T) {
 	}
 	if floorAttr(TableJobMetrics) != scheddsync.SampleTimeAttr {
 		t.Errorf("job_metrics floor attribute = %q", floorAttr(TableJobMetrics))
+	}
+}
+
+// TestHubJobMetricsStorage: job_metrics is stored with its own storage settings (the spoke's
+// HTCONDORDB_JOB_METRICS_* knobs), not the archive-wide ones history uses -- its segment size and
+// group schemas were measured for its records -- and the hub's own indexes are added either way.
+func TestHubJobMetricsStorage(t *testing.T) {
+	dir := t.TempDir()
+	cat := openCatalog(t, dir)
+	defer func() { _ = cat.Close() }()
+	var wg sync.WaitGroup
+	ht, err := ensureTables(cat, []string{TableHistory, TableJobMetrics}, ArchiveOptions{
+		ExtraCategorical: []string{"AcctGroup"},
+		SegmentSize:      1 << 20,
+		Storage: map[string]TableStorage{TableJobMetrics: {
+			ExtraCategorical: []string{"ProjectName"}, SegmentSize: 1 << 17, GroupSchemaCount: -1,
+		}},
+	}, discard, &wg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	jmCats, _ := ht.archives[TableJobMetrics].IndexedAttrs()
+	histCats, _ := ht.archives[TableHistory].IndexedAttrs()
+	if !hasFold(jmCats, "ProjectName") || hasFold(jmCats, "AcctGroup") || !hasFold(jmCats, "User") {
+		t.Errorf("job_metrics categorical = %v, want its own extras plus the hub's", jmCats)
+	}
+	if !hasFold(histCats, "AcctGroup") || hasFold(histCats, "ProjectName") {
+		t.Errorf("history categorical = %v, want the archive-wide extras", histCats)
+	}
+	cfgOf := func(table string) map[string]any {
+		t.Helper()
+		paths, _ := filepath.Glob(filepath.Join(dir, "*", table, "archiveconfig.json"))
+		more, _ := filepath.Glob(filepath.Join(dir, table, "archiveconfig.json"))
+		paths = append(paths, more...)
+		if len(paths) != 1 {
+			t.Fatalf("archiveconfig.json for %s: %v", table, paths)
+		}
+		b, err := os.ReadFile(paths[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	if jm := cfgOf(TableJobMetrics); jm["SegmentSize"] != float64(1<<17) || jm["GroupSchemaCount"] != float64(-1) {
+		t.Errorf("job_metrics created with SegmentSize %v GroupSchemaCount %v, want %d and -1", jm["SegmentSize"], jm["GroupSchemaCount"], 1<<17)
+	}
+	if h := cfgOf(TableHistory); h["SegmentSize"] != float64(1<<20) {
+		t.Errorf("history created with SegmentSize %v, want %d", h["SegmentSize"], 1<<20)
 	}
 }

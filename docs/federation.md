@@ -77,7 +77,12 @@ The hub's archives take the same tuning knobs as schedd sync's: `HTCONDORDB_ARCH
 `HTCONDORDB_JOB_METRICS_MAX_BYTES` (each per-table cap defaults to `HTCONDORDB_ARCHIVE_MAX_BYTES`),
 `HTCONDORDB_JOB_METRICS_MAX_AGE` (seconds or a suffix such as `30d`, against `SampleTime`; unset or
 unparseable is no age cap), `HTCONDORDB_ARCHIVE_SEGMENT_SIZE`, and extra index attributes in
-`HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS` / `HTCONDORDB_ARCHIVE_VALUE_ATTRS`. A hub's history grows
+`HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS` / `HTCONDORDB_ARCHIVE_VALUE_ATTRS`. `job_metrics` is stored
+as a spoke stores it, with the spoke's knobs and defaults instead of those three:
+`HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` (default: the library's), `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS`
+(default `Owner`) and `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` (default on); see
+[job metrics §3.5](design/job-metrics.md#35-indexes-zone-maps-retention). The segment size and group
+schemas apply when the archive is created. The hub's own indexes are added in every case. A hub's history grows
 with the sum of every AP's completions, and its job_metrics with every AP's running jobs;
 **set a size cap**. A hub needs a persistent database
 (`HTCONDORDB_DIR` or `SPOOL`): archives and resume cursors live on disk.

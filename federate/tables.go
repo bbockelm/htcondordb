@@ -62,6 +62,29 @@ type ArchiveOptions struct {
 	// job_metrics), keyed by table name; 0 = no age cap. A table absent from the map keeps
 	// whatever age cap it has.
 	MaxAge map[string]float64
+	// Storage replaces ExtraCategorical, ExtraValue and SegmentSize for the tables it names, so an
+	// archive can be stored as its spoke stores it (job_metrics takes the spoke's
+	// HTCONDORDB_JOB_METRICS_* knobs, not the history ones).
+	Storage map[string]TableStorage
+}
+
+// TableStorage is one archive's storage settings (see ArchiveOptions.Storage). The hub's own
+// indexes are always added to the extras.
+type TableStorage struct {
+	ExtraCategorical []string
+	ExtraValue       []string
+	// SegmentSize and GroupSchemaCount apply only when the archive is created: 0 is the library
+	// default; a negative GroupSchemaCount builds no group schemas.
+	SegmentSize      int
+	GroupSchemaCount int
+}
+
+// storage is table's storage settings.
+func (o ArchiveOptions) storage(table string) TableStorage {
+	if st, ok := o.Storage[table]; ok {
+		return st
+	}
+	return TableStorage{ExtraCategorical: o.ExtraCategorical, ExtraValue: o.ExtraValue, SegmentSize: o.SegmentSize}
 }
 
 // hubTables are the hub's table handles.
@@ -84,13 +107,15 @@ func ensureTables(cat *db.Catalog, tables []string, opts ArchiveOptions, log *sl
 	for _, t := range tables {
 		switch {
 		case isArchiveTable(t):
-			vals := union(archiveValue, opts.ExtraValue)
+			st := opts.storage(t)
+			vals := union(archiveValue, st.ExtraValue)
 			// An attribute may carry one kind of index, not both (the store panics on overlap).
-			cats := slices.DeleteFunc(union(archiveCategorical, opts.ExtraCategorical), func(c string) bool {
+			cats := slices.DeleteFunc(union(archiveCategorical, st.ExtraCategorical), func(c string) bool {
 				return slices.ContainsFunc(vals, func(v string) bool { return strings.EqualFold(c, v) })
 			})
 			a, err := cat.CreateArchiveTable(t, db.ArchiveConfig{
-				SegmentSize: opts.SegmentSize, CategoricalAttrs: cats, ValueAttrs: vals, ZoneAttrs: archiveZones(t),
+				SegmentSize: st.SegmentSize, CategoricalAttrs: cats, ValueAttrs: vals, ZoneAttrs: archiveZones(t),
+				GroupSchemaCount: st.GroupSchemaCount,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("federate: creating archive %s: %w", t, err)
