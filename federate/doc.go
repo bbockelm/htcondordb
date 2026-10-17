@@ -9,7 +9,9 @@
 // commit the cursor only at Synced, and stamp the source only when the row does not already claim
 // one. See tableSink and archiveSink.
 //
-// Tables. jobs and syncstatus are mutable; history and epoch_history are archives; the hub's own
+// Tables. jobs and syncstatus are mutable; history, epoch_history and job_metrics are archives
+// (job_metrics and epoch_history are optional on a spoke: a spoke without one is reported in
+// federation_sources as <Table>Missing and does not affect the source's state); the hub's own
 // federation_sources is mutable, one row per schedd, keyed by the lowercased schedd name (schedd
 // names are case-insensitive, as in HTCondor) and persisted. Every replicated row carries
 // ScheddName, overwritten from the spoke's validated identity. Mutable-table keys are produced by

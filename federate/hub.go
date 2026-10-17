@@ -68,6 +68,11 @@ type Config struct {
 	FreshThreshold   time.Duration // staleness at or under this is fresh
 	RetireAfter      time.Duration // unseen (or unmatched) this long => rows deleted
 
+	// MissingTableRetry is how often a stream asks again for a table its spoke does not have
+	// (cedarsync.DefaultMissingRetry when <= 0): an optional table such as job_metrics, which a
+	// spoke has only with HTCONDORDB_JOB_METRICS on.
+	MissingTableRetry time.Duration
+
 	Metrics *Metrics     // nil makes a private set
 	Logger  *slog.Logger // nil discards
 	Now     func() time.Time
@@ -148,9 +153,9 @@ func New(cfg Config) (*Hub, error) {
 	}
 	for _, t := range tables {
 		switch t {
-		case TableJobs, TableHistory, TableEpochHistory, TableSyncStatus:
+		case TableJobs, TableHistory, TableEpochHistory, TableSyncStatus, TableJobMetrics:
 		default:
-			return nil, fmt.Errorf("federate: cannot federate table %q (want jobs, history, epoch_history, syncstatus)", t)
+			return nil, fmt.Errorf("federate: cannot federate table %q (want jobs, history, epoch_history, job_metrics, syncstatus)", t)
 		}
 	}
 	h := &Hub{
@@ -523,7 +528,7 @@ func (h *Hub) startRunner(s *source, table string) error {
 		return err
 	}
 	r, err := cedarsync.NewRunner(h.cfg.Dial(s.spokeAddress), cedarsync.Config{
-		Source: table, Src: schedd, FlushInterval: h.cfg.FlushInterval,
+		Source: table, Src: schedd, FlushInterval: h.cfg.FlushInterval, MissingRetry: h.cfg.MissingTableRetry,
 	}, sink, h.log)
 	if err != nil {
 		return err
@@ -963,8 +968,22 @@ func tablePrefix(table string) string {
 		return "EpochHistory"
 	case TableSyncStatus:
 		return "SyncStatus"
+	case TableJobMetrics:
+		return "JobMetrics"
 	}
 	return table
+}
+
+// missingTableError is <Table>LastError for a spoke that has no such table.
+func missingTableError(table string) string {
+	msg := "the spoke has no " + table + " table"
+	switch table {
+	case TableJobMetrics:
+		msg += " (HTCONDORDB_JOB_METRICS is not enabled on it)"
+	case TableEpochHistory:
+		msg += " (it does not sync an epoch history file)"
+	}
+	return msg
 }
 
 // sourceRowRefresh bounds how often a federation_sources row is rewritten for its volatile fields
@@ -1016,7 +1035,13 @@ func (h *Hub) writeSourceRow(s *source, statuses map[string]cedarsync.Status, st
 			// missing from this table means "gone at the AP" only while this is true.
 			ad.InsertAttrBool(p+"Synced", st.Synced)
 			putTime(p+"SyncedAt", st.SyncedAt)
-			if st.LastError != "" {
+			switch {
+			case st.SourceMissing:
+				// Not a failure: the spoke does not keep this (optional) table. Asked again
+				// periodically, so it streams once the spoke turns it on.
+				ad.InsertAttrBool(p+"Missing", true)
+				ad.InsertAttrString(p+"LastError", missingTableError(t))
+			case st.LastError != "":
 				// The error, not its time: a stream retrying against a down spoke fails anew
 				// every backoff, and only a different error is news.
 				ad.InsertAttrString(p+"LastError", st.LastError)

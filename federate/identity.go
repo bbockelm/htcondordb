@@ -3,6 +3,7 @@ package federate
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -18,6 +19,9 @@ const (
 	TableEpochHistory = "epoch_history"
 	TableSyncStatus   = "syncstatus"
 	TableSources      = "federation_sources"
+	// TableJobMetrics is the spokes' job resource-usage sample archive (scheddsync's
+	// DefaultJobMetricsTable), on a spoke only when HTCONDORDB_JOB_METRICS is on.
+	TableJobMetrics = "job_metrics"
 )
 
 // DefaultTables is what a hub federates when HTCONDORDB_FEDERATE_TABLES is unset.
@@ -48,88 +52,166 @@ func HubKey(schedd, sourceKey string) string {
 	return strconv.Itoa(len(schedd)) + ":" + schedd + ":" + sourceKey
 }
 
-// recordIdentity is an archive record's dedup identity.
+// recordIdentity is an archive record's dedup identity: the values of its table's identity parts
+// (identitySpecs).
 //
 //   - history: GlobalJobId. The schedd composes it from its name, the job id and the queue date,
 //     so it is unique per job.
 //   - epoch_history: GlobalJobId + RunInstanceID + EpochAdType -- a job has a record per run
 //     attempt, and a run instance can emit both a SPAWN and an EPOCH ad. A missing EpochAdType
 //     reads as "", as scheddsync's own epoch dedup treats it.
+//   - job_metrics: Key + RunInstanceID + SampleTime + SampleTrigger + LogSeq + LogOffset. The
+//     spoke's sampler names a sample by the job_queue.log position of the commit it came from
+//     (LogSeq, LogOffset) and the job (Key, the spoke's always-present "cluster.proc" -- scoped to
+//     the AP by ScheddName here); a commit samples each job at most once. The run, SampleTime and
+//     trigger add nothing to that, but they are what tells two samples apart on a record from a
+//     spoke too old to write LogOffset. Without the position the rest is not unique (ingest-clock
+//     samples of one job read in one pass share a SampleTime), and it is no help on its own in a
+//     resume's overlap: a sample re-delivered and a new one with the same identity would both be
+//     matched against the one the hub holds.
 //
-// An identity is not unique: one run instance writes a CHECKPOINT record per checkpoint and a
-// COMMON record per common-files group. The archive sink therefore dedups by count (see
-// archiveSink), never by presence alone.
+// An identity is not unique: one run instance writes a CHECKPOINT epoch record per checkpoint and a
+// COMMON record per common-files group, and a spoke whose log was replaced under an unchanged
+// sequence number can repeat a job_metrics position. The archive sink therefore dedups by count
+// (see archiveSink), never by presence alone.
 type recordIdentity struct {
-	gid string
-	run int64
-	typ string
+	spec []idPart
+	vals []idVal
 }
 
-// identityAttrs are the attributes recordIdentity is built from.
-var identityAttrs = []string{"GlobalJobId", "RunInstanceID", "EpochAdType"}
+// idPart is one attribute of an identity. An optional string reads as "" when absent; an optional
+// integer is matched as absent.
+type idPart struct {
+	attr     string
+	integer  bool
+	required bool
+}
 
-// archiveIdentity extracts a record's identity for table, or ok=false when the record lacks the
-// attributes it needs (such a record is appended without a check, and counted).
+type idVal struct {
+	set bool
+	s   string
+	i   int64
+}
+
+// identitySpecs are the identity parts of each federated archive.
+var identitySpecs = map[string][]idPart{
+	TableHistory: {{attr: "GlobalJobId", required: true}},
+	TableEpochHistory: {
+		{attr: "GlobalJobId", required: true},
+		{attr: "RunInstanceID", integer: true, required: true},
+		{attr: "EpochAdType"},
+	},
+	TableJobMetrics: {
+		{attr: "Key", required: true},
+		{attr: "RunInstanceID", integer: true, required: true},
+		{attr: "SampleTime", integer: true, required: true},
+		{attr: "SampleTrigger"},
+		{attr: "LogSeq", integer: true},
+		{attr: "LogOffset", integer: true},
+	},
+}
+
+// identityAttrs are the attributes table's identity is built from, in identitySpecs order.
+func identityAttrs(table string) []string {
+	spec := identitySpecs[table]
+	out := make([]string, len(spec))
+	for i, p := range spec {
+		out[i] = p.attr
+	}
+	return out
+}
+
+// archiveIdentity extracts a record's identity for table, or ok=false when the record lacks an
+// attribute it needs (such a record is appended without a check, and counted).
 func archiveIdentity(table string, ad *classad.ClassAd) (recordIdentity, bool) {
-	gid, ok := ad.EvaluateAttrString("GlobalJobId")
-	if !ok || gid == "" {
-		return recordIdentity{}, false
+	spec := identitySpecs[table]
+	id := recordIdentity{spec: spec, vals: make([]idVal, len(spec))}
+	for i, p := range spec {
+		v := &id.vals[i]
+		if p.integer {
+			v.i, v.set = ad.EvaluateAttrInt(p.attr)
+		} else {
+			v.s, v.set = ad.EvaluateAttrString(p.attr)
+			v.set = v.set && v.s != ""
+		}
+		if !v.set && p.required {
+			return recordIdentity{}, false
+		}
 	}
-	if table != TableEpochHistory {
-		return recordIdentity{gid: gid}, true
-	}
-	run, ok := ad.EvaluateAttrInt("RunInstanceID")
-	if !ok {
-		return recordIdentity{}, false
-	}
-	typ, _ := ad.EvaluateAttrString("EpochAdType")
-	return recordIdentity{gid: gid, run: run, typ: typ}, true
+	return id, len(spec) > 0
 }
 
-// identityFromValues is archiveIdentity over a projection of identityAttrs.
+// identityFromValues is archiveIdentity over a projection of identityAttrs(table).
 func identityFromValues(table string, vals []classad.Value) (recordIdentity, bool) {
-	if len(vals) < len(identityAttrs) {
+	spec := identitySpecs[table]
+	if len(vals) < len(spec) || len(spec) == 0 {
 		return recordIdentity{}, false
 	}
-	gid, err := vals[0].StringValue()
-	if err != nil || gid == "" {
-		return recordIdentity{}, false
+	id := recordIdentity{spec: spec, vals: make([]idVal, len(spec))}
+	for i, p := range spec {
+		v := &id.vals[i]
+		var err error
+		if p.integer {
+			v.i, err = vals[i].IntValue()
+		} else {
+			v.s, err = vals[i].StringValue()
+			if err == nil && v.s == "" {
+				err = errEmpty
+			}
+		}
+		v.set = err == nil
+		if !v.set && p.required {
+			return recordIdentity{}, false
+		}
 	}
-	if table != TableEpochHistory {
-		return recordIdentity{gid: gid}, true
-	}
-	run, err := vals[1].IntValue()
-	if err != nil {
-		return recordIdentity{}, false
-	}
-	typ, _ := vals[2].StringValue()
-	return recordIdentity{gid: gid, run: run, typ: typ}, true
+	return id, true
 }
+
+var errEmpty = errors.New("empty")
 
 // constraint is the exact probe for id within schedd's rows. Scoping to ScheddName means a record
 // forged by one spoke can never suppress another's.
-func (id recordIdentity) constraint(table, schedd string) string {
-	c := fmt.Sprintf("%s == %s && GlobalJobId == %s", ScheddNameAttr, stringLit(schedd), stringLit(id.gid))
-	if table == TableEpochHistory {
-		typ := "EpochAdType == " + stringLit(id.typ)
-		if id.typ == "" {
-			typ = `(EpochAdType is undefined || EpochAdType == "")`
+func (id recordIdentity) constraint(schedd string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s == %s", ScheddNameAttr, stringLit(schedd))
+	for i, p := range id.spec {
+		v := id.vals[i]
+		switch {
+		case p.integer && v.set:
+			fmt.Fprintf(&b, " && %s == %d", p.attr, v.i)
+		case p.integer:
+			fmt.Fprintf(&b, " && %s is undefined", p.attr)
+		case v.set:
+			fmt.Fprintf(&b, " && %s == %s", p.attr, stringLit(v.s))
+		default:
+			fmt.Fprintf(&b, ` && (%s is undefined || %s == "")`, p.attr, p.attr)
 		}
-		c += fmt.Sprintf(" && RunInstanceID == %d && %s", id.run, typ)
 	}
-	return c
+	return b.String()
 }
 
 // digest is a 128-bit hash of the identity, for the in-memory set a large catch-up uses. At a
 // million records the chance of any collision is around 1e-27.
 func (id recordIdentity) digest() [16]byte {
 	h := sha256.New()
-	_, _ = io.WriteString(h, strings.ToLower(id.gid)) // ClassAd == on strings ignores case
 	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], uint64(id.run))
-	h.Write([]byte{0})
-	h.Write(b[:])
-	_, _ = io.WriteString(h, strings.ToLower(id.typ))
+	for i, p := range id.spec {
+		v := id.vals[i]
+		switch {
+		case p.integer && v.set:
+			binary.LittleEndian.PutUint64(b[:], uint64(v.i))
+			h.Write([]byte{1})
+			h.Write(b[:])
+		case p.integer:
+			h.Write([]byte{0})
+		default:
+			// ClassAd == on strings ignores case. Length-prefixed, so parts cannot run together.
+			s := strings.ToLower(v.s)
+			binary.LittleEndian.PutUint64(b[:], uint64(len(s)))
+			h.Write(b[:])
+			_, _ = io.WriteString(h, s)
+		}
+	}
 	var out [16]byte
 	copy(out[:], h.Sum(nil))
 	return out
@@ -164,5 +246,5 @@ func stringLit(s string) string {
 
 // isArchiveTable reports whether a federated table is append-only on the spoke.
 func isArchiveTable(table string) bool {
-	return table == TableHistory || table == TableEpochHistory
+	return table == TableHistory || table == TableEpochHistory || table == TableJobMetrics
 }

@@ -20,7 +20,21 @@ var (
 	archiveValue       = []string{"ClusterId"}
 	historyZones       = []string{"CompletionDate", "EnteredHistoryTime"}
 	epochZones         = []string{"EpochWriteDate", "EnteredHistoryTime"}
+	// SampleTime is what every metrics read ranges over, and what an age cap measures against
+	// (MaxAgeAttr must be zone-mapped).
+	jobMetricsZones = []string{"SampleTime"}
 )
+
+// archiveZones is the zone-map set of a federated archive.
+func archiveZones(table string) []string {
+	switch table {
+	case TableEpochHistory:
+		return epochZones
+	case TableJobMetrics:
+		return jobMetricsZones
+	}
+	return historyZones
+}
 
 // HubTables are the tables a hub federating tables (DefaultTables when empty) writes in process:
 // each federated table plus federation_sources. The daemon registers them as owned, so no remote
@@ -44,6 +58,10 @@ type ArchiveOptions struct {
 	// periodic archive maintenance drops the oldest whole segments past it. Hub archives grow with
 	// the sum of every AP's completions, so a production hub should set this.
 	MaxBytes map[string]int64
+	// MaxAge caps an archive by age, in seconds against its floorAttr (SampleTime for
+	// job_metrics), keyed by table name; 0 = no age cap. A table absent from the map keeps
+	// whatever age cap it has.
+	MaxAge map[string]float64
 }
 
 // hubTables are the hub's table handles.
@@ -71,12 +89,8 @@ func ensureTables(cat *db.Catalog, tables []string, opts ArchiveOptions, log *sl
 			cats := slices.DeleteFunc(union(archiveCategorical, opts.ExtraCategorical), func(c string) bool {
 				return slices.ContainsFunc(vals, func(v string) bool { return strings.EqualFold(c, v) })
 			})
-			zones := historyZones
-			if t == TableEpochHistory {
-				zones = epochZones
-			}
 			a, err := cat.CreateArchiveTable(t, db.ArchiveConfig{
-				SegmentSize: opts.SegmentSize, CategoricalAttrs: cats, ValueAttrs: vals, ZoneAttrs: zones,
+				SegmentSize: opts.SegmentSize, CategoricalAttrs: cats, ValueAttrs: vals, ZoneAttrs: archiveZones(t),
 			})
 			if err != nil {
 				return nil, fmt.Errorf("federate: creating archive %s: %w", t, err)
@@ -98,6 +112,9 @@ func ensureTables(cat *db.Catalog, tables []string, opts ArchiveOptions, log *sl
 					log.Error("federate: setting archive size limit", "archive", t, "max_bytes", maxBytes, "err", err)
 				}
 			}
+			if maxAge, ok := opts.MaxAge[t]; ok {
+				setMaxAge(a, t, maxAge, log)
+			}
 			ht.archives[t] = a
 		default:
 			d, err := cat.CreateTable(t)
@@ -113,6 +130,22 @@ func ensureTables(cat *db.Catalog, tables []string, opts ArchiveOptions, log *sl
 		}
 	}
 	return ht, nil
+}
+
+// setMaxAge sets a's age cap to maxAge seconds against table's floorAttr, if it differs.
+func setMaxAge(a *db.ArchiveTable, table string, maxAge float64, log *slog.Logger) {
+	r := a.Retention()
+	attr := floorAttr(table)
+	if r.MaxAge == maxAge && (maxAge == 0 || r.MaxAgeAttr == attr) {
+		return
+	}
+	r.MaxAge = maxAge
+	if maxAge > 0 {
+		r.MaxAgeAttr = attr
+	}
+	if err := a.SetRetention(r); err != nil {
+		log.Error("federate: setting archive age limit", "archive", table, "max_age_seconds", maxAge, "err", err)
+	}
 }
 
 func missingIndexes(have func() ([]string, []string), wantCat, wantVal []string) (addCat, addVal []string) {
