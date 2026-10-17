@@ -48,9 +48,11 @@ func newMetricsSink(t *testing.T, a *db.ArchiveTable, schedd string, store repli
 
 // TestJobMetricsIdentity: a sample's identity is its job, run, SampleTime, trigger and log
 // position. Two samples equal in all but LogOffset -- ingest-clock samples of one job read in one
-// pass -- are different samples; a record from a spoke too old to write LogOffset still has an
-// identity; one without Key, RunInstanceID or SampleTime has none. The projected form (the
-// identity set a long replay loads) agrees with the record form.
+// pass -- are different samples, and so are two equal in all but LogSeq (a compaction restarts
+// offsets under a new generation); a record from a spoke too old to write LogOffset still has an
+// identity, distinct from an otherwise identical record that has one; one without Key,
+// RunInstanceID or SampleTime has none. The projected form (the identity set a long replay loads)
+// agrees with the record form.
 func TestJobMetricsIdentity(t *testing.T) {
 	a := sample(t, "ap1", 1, 1_700_000_100, 400)
 	b := sample(t, "ap1", 1, 1_700_000_100, 520)
@@ -65,9 +67,20 @@ func TestJobMetricsIdentity(t *testing.T) {
 	if again, _ := archiveIdentity(TableJobMetrics, sample(t, "ap1", 1, 1_700_000_100, 400)); again.digest() != ia.digest() {
 		t.Error("the same sample has two identities")
 	}
-	old := parseAd(t, `Key = "1.0"; RunInstanceID = 0; SampleTime = 5; SampleTrigger = "update"; LogSeq = 3`)
-	if _, ok := archiveIdentity(TableJobMetrics, old); !ok {
+	gen := sample(t, "ap1", 1, 1_700_000_100, 400)
+	gen.InsertAttr("LogSeq", 4)
+	if ig, _ := archiveIdentity(TableJobMetrics, gen); ig.digest() == ia.digest() {
+		t.Error("samples from different log generations share an identity")
+	}
+	// a without LogOffset: the same sample, from a spoke too old to write it.
+	old := sample(t, "ap1", 1, 1_700_000_100, 400)
+	old.Delete("LogOffset")
+	iold, ok := archiveIdentity(TableJobMetrics, old)
+	if !ok {
 		t.Error("a sample without LogOffset (an older spoke) has no identity")
+	}
+	if iold.digest() == ia.digest() {
+		t.Error("a sample without LogOffset shares an identity with one that has it")
 	}
 	for _, drop := range []string{"Key", "RunInstanceID", "SampleTime"} {
 		ad := sample(t, "ap1", 1, 5, 1)
@@ -98,7 +111,6 @@ func TestJobMetricsIdentity(t *testing.T) {
 		}
 		got[id.digest()] = true
 	}
-	iold, _ := archiveIdentity(TableJobMetrics, old)
 	if !got[ia.digest()] || !got[iold.digest()] || len(got) != 2 {
 		t.Errorf("projected identities do not match the records' (%d distinct)", len(got))
 	}
@@ -412,7 +424,9 @@ func TestHubJobMetricsSchema(t *testing.T) {
 }
 
 // TestJobMetricsNamesMatchSpoke: the hub names the spoke's table and the sample attributes its
-// identity is built from by literal; they must be the spoke's.
+// identity is built from by literal; they must be the spoke's. This pins spelling only: what each
+// part does is tested by behaviour (TestJobMetricsIdentity, TestJobMetricsOverlapKeepsNewSample for
+// LogOffset, TestJobMetricsOverlapNewGenerationSample for LogSeq).
 func TestJobMetricsNamesMatchSpoke(t *testing.T) {
 	if TableJobMetrics != scheddsync.DefaultJobMetricsTable {
 		t.Errorf("TableJobMetrics = %q, spoke writes %q", TableJobMetrics, scheddsync.DefaultJobMetricsTable)
