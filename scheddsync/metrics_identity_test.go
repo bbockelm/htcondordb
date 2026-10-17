@@ -21,18 +21,20 @@ func TestJobMetricsSamplePosition(t *testing.T) {
 	pinClock(t, base+50)
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "job_queue.log")
-	writeFile(t, logPath, "107 3 CreationTimestamp 1700000000\n"+submitted)
+	// Taken on the first poll, which reads the log before the generation was ever recorded, and on
+	// a later one.
+	writeFile(t, logPath, "107 3 CreationTimestamp 1700000000\n"+submitted+spawned(1)+usageOnly(100)+usageOnly(200))
 	s, arch := newSampledSync(t, logPath, JobMetricsConfig{})
-	if err := s.Poll(context.Background()); err != nil { // the first pass learns the generation
+	if err := s.Poll(context.Background()); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
-	appendFile(t, logPath, spawned(1)+usageOnly(100)+usageOnly(200))
+	appendFile(t, logPath, usageOnly(300))
 	if err := s.Poll(context.Background()); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 	got := samples(t, arch)
-	if len(got) != 3 {
-		t.Fatalf("%d samples, want 3 (spawn + two updates)", len(got))
+	if len(got) != 4 {
+		t.Fatalf("%d samples, want 4 (spawn + three updates)", len(got))
 	}
 	a, b := got[1], got[2]
 	for _, attr := range []string{SampleTimeAttr, RunInstanceAttr} {
@@ -109,6 +111,30 @@ func TestJobMetricsSampleCarriesUser(t *testing.T) {
 		}
 		if c, p := num(t, ad, "ClusterId"), num(t, ad, "ProcId"); c != 1 || p != 0 {
 			t.Errorf("sample %d job id = %v.%v, want 1.0", i, c, p)
+		}
+	}
+}
+
+// TestJobMetricsFirstPollLogSeq: a JobSync with no position store reads the log straight away on its
+// first poll. Samples taken in that pass must carry the log's generation (op-107 = 3), not 0: curSeq
+// is only assigned after the pass, so the first pass's samples are stamped LogSeq = 0 and every
+// later pass's samples LogSeq = 3 -- two names for one position.
+func TestJobMetricsFirstPollLogSeq(t *testing.T) {
+	pinClock(t, base+50)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "job_queue.log")
+	writeFile(t, logPath, "107 3 CreationTimestamp 1700000000\n"+submitted+spawned(1))
+	s, arch := newSampledSync(t, logPath, JobMetricsConfig{})
+	if err := s.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	got := samples(t, arch)
+	if len(got) == 0 {
+		t.Fatal("no sample on the first poll")
+	}
+	for i, ad := range got {
+		if seq := num(t, ad, SampleLogSeqAttr); seq != 3 {
+			t.Errorf("first-poll sample %d LogSeq = %v, want 3 (the log's generation)", i, seq)
 		}
 	}
 }
