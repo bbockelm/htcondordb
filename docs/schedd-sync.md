@@ -37,29 +37,27 @@ Mirror a local schedd's queue and history into a queryable database. Run
 htcondordb on the **same host as the schedd**, under `condor_master`, so it
 inherits the condor config and drops to the condor user.
 
-1. **Build** the daemon and shell (see [Install](../README.md#install)):
+1. **Install** the RPM from the latest release (see [Install](../README.md#install)).
+   It puts the daemon at `/usr/sbin/htcondordb`, the shell `htcondordb-cli` on
+   your `PATH`, and its configuration in `/etc/condor/config.d/50-htcondordb.conf`.
 
-   ```sh
-   make build      # -> bin/htcondordb and bin/htcondordb-cli
-   ```
-
-2. **Configure.** Add to the HTCondor config the master reads (e.g. a file in
-   `/etc/condor/config.d/`). The `HTCONDORDB_*` file paths default to the
-   schedd's own `$(JOB_QUEUE_LOG)` / `$(HISTORY)`, so on the schedd host this is
-   the whole minimum:
+2. **Configure.** In `/etc/condor/config.d/50-htcondordb.conf`, uncomment the
+   lines that start the daemon and turn on sync (`HTCONDORDB_SYNC_SCHEDD` tails
+   `job_queue.log` into `jobs` and `history` into `history`). The
+   `HTCONDORDB_*` file paths default to the schedd's own `$(JOB_QUEUE_LOG)` /
+   `$(HISTORY)`, so on the schedd host this is the whole minimum:
 
    ```conf
-   HTCONDORDB     = /path/to/bin/htcondordb   # absolute path to the built binary
-   DAEMON_LIST    = $(DAEMON_LIST), HTCONDORDB
-   DC_DAEMON_LIST = +HTCONDORDB               # register it as a DaemonCore daemon
+   DAEMON_LIST     = $(DAEMON_LIST), HTCONDORDB
+   DC_DAEMON_LIST  = $(DC_DAEMON_LIST) +HTCONDORDB
 
-   HTCONDORDB_SYNC_SCHEDD = true              # tail job_queue.log -> jobs, history -> history
+   HTCONDORDB_SYNC_SCHEDD = true
    ```
 
    `DC_DAEMON_LIST` is required for any non-stock daemon: without it the master
    won't treat htcondordb as a DaemonCore daemon (no address file, no
-   ready/keepalive), even though `DAEMON_LIST` starts it. The leading `+`
-   appends to the built-in list.
+   ready/keepalive), even though `DAEMON_LIST` starts it. The `+` appends to
+   the built-in list.
 
    If the schedd's files aren't at the standard `$(JOB_QUEUE_LOG)` /
    `$(HISTORY)` locations, point the tailers explicitly (they read local files,
@@ -83,10 +81,10 @@ inherits the condor config and drops to the condor user.
    `jobs`, completed jobs in `history`:
 
    ```sh
-   bin/htcondordb-cli -e "SELECT COUNT(*) FROM jobs"
-   bin/htcondordb-cli -e "SELECT Owner, COUNT(*) FROM jobs GROUP BY Owner ORDER BY COUNT(*) DESC"
-   bin/htcondordb-cli -e "SELECT ClusterId, ProcId, JobStatus FROM jobs WHERE Owner == \"alice\""
-   bin/htcondordb-cli -e "SELECT COUNT(*) FROM history WHERE CompletionDate > 1700000000"
+   htcondordb-cli -e "SELECT COUNT(*) FROM jobs"
+   htcondordb-cli -e "SELECT Owner, COUNT(*) FROM jobs GROUP BY Owner ORDER BY COUNT(*) DESC"
+   htcondordb-cli -e "SELECT ClusterId, ProcId, JobStatus FROM jobs WHERE Owner == \"alice\""
+   htcondordb-cli -e "SELECT COUNT(*) FROM history WHERE CompletionDate > 1700000000"
    ```
 
    `htcondordb-cli` with no arguments opens the interactive shell and auto-locates
@@ -145,8 +143,10 @@ The archives grow without bound by default. To cap them from the HTCondor config
 manages it via configuration management rather than per-database commands), set a byte ceiling:
 
 ```conf
-HTCONDORDB_ARCHIVE_MAX_BYTES = 20 GB           # applies to both history and epoch_history
-HTCONDORDB_EPOCH_HISTORY_MAX_BYTES = 5 GB      # optional per-table override
+# applies to both history and epoch_history
+HTCONDORDB_ARCHIVE_MAX_BYTES = 20 GB
+# optional per-table override
+HTCONDORDB_EPOCH_HISTORY_MAX_BYTES = 5 GB
 ```
 
 The periodic retention sweep (`HTCONDORDB_ARCHIVE_ROTATE_INTERVAL`) drops the oldest whole
@@ -221,8 +221,10 @@ the job queue, and the live-jobs tailer is already parsing every one of those co
 ```conf
 HTCONDORDB_SYNC_SCHEDD    = true
 HTCONDORDB_JOB_METRICS    = true
-HTCONDORDB_JOB_METRICS_MAX_AGE = 30d           # keep 30 days
-HTCONDORDB_JOB_METRICS_ATTRS   = ProjectName   # extra grouping dimension
+# keep 30 days
+HTCONDORDB_JOB_METRICS_MAX_AGE = 30d
+# extra grouping dimension
+HTCONDORDB_JOB_METRICS_ATTRS   = ProjectName
 ```
 
 ```sql
