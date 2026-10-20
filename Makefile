@@ -20,6 +20,10 @@ PYTHON ?= python3
 
 # Architecture for the containerized manylinux build: amd64 or arm64.
 WHEEL_ARCH ?= amd64
+# Go minor for the containerised wheel builds; the newest patch is resolved at
+# build time, the same version CI's setup-go installs for '1.27'.
+GO_MINOR ?= 1.27
+GO_MINOR_RE = $(subst .,\.,$(GO_MINOR))
 GO    ?= go
 
 # Shared-library suffix for the ./capi client (dlopen'd by the Python driver in python/).
@@ -76,7 +80,7 @@ wheel-macos: ## Build the universal2 macOS wheel (both architectures in one bina
 	@ls -la python/dist/*.whl
 
 wheel-linux: ## Build a manylinux_2_28 wheel in a container (the shipping artifact)
-	./python/build-manylinux.sh $(WHEEL_ARCH)
+	GO_MINOR=$(GO_MINOR) ./python/build-manylinux.sh $(WHEEL_ARCH)
 
 wheel-validate: ## Install the built Linux wheel in a clean container and run real SQL through it
 	$(GOENV) $(GO) build -o python/dist/htcondordb-linux ./cmd/htcondordb 2>/dev/null || \
@@ -84,7 +88,9 @@ wheel-validate: ## Install the built Linux wheel in a clean container and run re
 			-v "$$(go env GOMODCACHE)":/gomodcache:ro -w /src \
 			-e GOMODCACHE=/gomodcache -e GOCACHE=/tmp/gocache -e GOFLAGS=-mod=mod \
 			-e GOWORK=off -e GOPROXY=off quay.io/pypa/manylinux_2_28_x86_64 bash -eu -c \
-			'curl -sSL https://go.dev/dl/go1.25.7.linux-$(WHEEL_ARCH).tar.gz | tar -C /usr/local -xz; \
+			'GO_VERSION=$$(curl -fsSL "https://go.dev/dl/?mode=json&include=all" | grep -oE "\"go$(GO_MINOR_RE)(\\.[0-9]+)?\"" | tr -d "\"" | sed "s/^go//" | sort -V | tail -n 1); \
+			 test -n "$$GO_VERSION"; \
+			 curl -sSL "https://go.dev/dl/go$${GO_VERSION}.linux-$(WHEEL_ARCH).tar.gz" | tar -C /usr/local -xz; \
 			 PATH=/usr/local/go/bin:$$PATH go build -o /src/python/dist/htcondordb-linux ./cmd/htcondordb; \
 			 chmod 0755 /src/python/dist/htcondordb-linux'
 	docker run --rm --platform linux/$(WHEEL_ARCH) -v "$(CURDIR)":/src \
