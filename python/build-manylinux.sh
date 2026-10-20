@@ -21,7 +21,10 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GOMODCACHE="$(cd "$REPO_ROOT" && go env GOMODCACHE)"
-GO_VERSION="${GO_VERSION:-1.25.7}"
+# Go toolchain for the build: the newest stable patch of GO_MINOR, resolved
+# inside the container; set GO_VERSION to pin an exact release instead.
+GO_MINOR="${GO_MINOR:-1.27}"
+GO_VERSION="${GO_VERSION:-}"
 IMAGE="quay.io/pypa/manylinux_2_28_${IMAGE_ARCH}"
 
 if [ ! -d "$GOMODCACHE" ]; then
@@ -44,9 +47,17 @@ docker run --rm \
 	-e GOFLAGS=-mod=mod \
 	-e GOWORK=off \
 	-e GOPROXY=off \
+	-e GO_MINOR="$GO_MINOR" \
 	-e GO_VERSION="$GO_VERSION" \
 	"$IMAGE" \
 	bash -eu -o pipefail -c '
+		if [ -z "$GO_VERSION" ]; then
+			GO_MINOR_RE=$(printf "%s" "$GO_MINOR" | sed "s/\./\\\\./g")
+			GO_VERSION=$(curl -fsSL "https://go.dev/dl/?mode=json&include=all" \
+				| grep -oE "\"go${GO_MINOR_RE}(\\.[0-9]+)?\"" | tr -d "\"" | sed "s/^go//" | sort -V | tail -n 1)
+		fi
+		test -n "$GO_VERSION"
+		echo "==> Go ${GO_VERSION}"
 		curl -sSL "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz" | tar -C /usr/local -xz
 		export PATH=/usr/local/go/bin:$PATH
 		go version

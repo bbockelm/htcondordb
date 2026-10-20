@@ -27,3 +27,40 @@ updates:
           - "*"
     commit-message:
       prefix: "ci(deps)"
+
+  # Go modules, except the modules developed alongside this repo (classad,
+  # cedar, golang-htcondor): those are bumped as a set, by hand, when a
+  # matching change lands on both sides, so they are ignored here. Security
+  # updates ignore this list by GitHub's own rules, so an advisory against one
+  # of them still arrives as a PR.
+  #
+  # Every module is listed: grafana/ replaces the root with ../, so a shared
+  # dependency bumped in one leaves the other's go.sum stale.
+  - package-ecosystem: "gomod"
+    directories:
+      - "/"
+      - "/opensearchsync"
+      - "/kafkasync"
+      - "/archivedropbox"
+      - "/grafana"
+    schedule:
+      interval: "weekly"
+    groups:
+      go-minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "github.com/PelicanPlatform/classad*"
+      - dependency-name: "github.com/bbockelm/cedar"
+      - dependency-name: "github.com/bbockelm/golang-htcondor*"
+    commit-message:
+      prefix: "deps"
+
+  # The golang:<minor> builder image for the Grafana plugin E2E test. The tag
+  # tracks the minor's newest patch on its own; Dependabot moves it to the
+  # next minor.
+  - package-ecosystem: "docker"
+    directory: "/grafana/e2e"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci(deps)"
