@@ -244,19 +244,31 @@ func run() error {
 		log.Info(logging.DestinationGeneral, "delta records disabled (HTCONDORDB_DELTA_MAX < 0)")
 	}
 
+	// HTCONDORDB_ARCHIVE_INDEX_MIN_DEMAND is the query count at which the maintenance pass
+	// adds an index to an archive (history) table. Unset (0) takes the built-in default; a
+	// negative value turns archive index auto-tune off. Separate from the mutable tables'
+	// threshold because an archive index is backfilled by decompressing history -- see
+	// server.Config.ArchiveIndexMinDemand.
+	archiveIndexMinDemand := int64(configInt(cfg, "HTCONDORDB_ARCHIVE_INDEX_MIN_DEMAND"))
+	if archiveIndexMinDemand < 0 {
+		log.Info(logging.DestinationGeneral,
+			"archive index auto-tune disabled (HTCONDORDB_ARCHIVE_INDEX_MIN_DEMAND < 0)")
+	}
+
 	svc, err := server.New(server.Config{
-		OnPhase:         boot.record,
-		OnTableOpen:     boot.recordTableOpen,
-		OnSealMigration: boot.recordSealMigration,
-		Dir:             dbDir,
-		Authorize:       authorize,
-		ForceReadOnly:   ha.forceReadOnly,
-		Logger:          d.Slog(),
-		LogQueries:      logQueries,
-		MemoryTables:    memoryTables,
-		PoolKeys:        poolKeys,
-		EncryptedAttrs:  encAttrs,
-		DeltaMax:        deltaMax,
+		OnPhase:               boot.record,
+		OnTableOpen:           boot.recordTableOpen,
+		OnSealMigration:       boot.recordSealMigration,
+		Dir:                   dbDir,
+		Authorize:             authorize,
+		ForceReadOnly:         ha.forceReadOnly,
+		Logger:                d.Slog(),
+		LogQueries:            logQueries,
+		MemoryTables:          memoryTables,
+		PoolKeys:              poolKeys,
+		EncryptedAttrs:        encAttrs,
+		DeltaMax:              deltaMax,
+		ArchiveIndexMinDemand: archiveIndexMinDemand,
 	})
 	if err != nil {
 		return err
