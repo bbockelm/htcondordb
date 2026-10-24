@@ -63,9 +63,15 @@ func TestArchiveAddIndexReported(t *testing.T) {
 	}
 }
 
-// TestArchiveHotExplains checks that .hot on an archive says so plainly rather than
-// re-printing the index view.
-func TestArchiveHotExplains(t *testing.T) {
+// TestArchiveHotShowsTheSet: an archive HAS a hot set -- it is reported over opDiag like any
+// other table's, and it can now be refreshed from query demand. .hot used to answer "it has
+// no hot set", which sent an operator looking for a knob that was there all along.
+//
+// The output must also say how fast a change spreads, because the hot header is per record:
+// a refreshed set governs records appended from then on, and already-sealed ones pick it up
+// only as maintenance merges their segments. Without those lines, someone who runs
+// .refreshhot and then times an old query cannot tell a working feature from a broken one.
+func TestArchiveHotShowsTheSet(t *testing.T) {
 	e, cleanup := newArchiveExec(t)
 	defer cleanup()
 	s := &session{exec: e}
@@ -74,8 +80,34 @@ func TestArchiveHotExplains(t *testing.T) {
 	if !s.runDiagMeta(&buf, ".hot", "history") {
 		t.Fatal(".hot not handled")
 	}
-	if out := buf.String(); !strings.Contains(out, "no hot set") {
-		t.Errorf(".hot history = %q, want an explanation that archives have no hot set", out)
+	out := buf.String()
+	if strings.Contains(out, "no hot set") {
+		t.Errorf(".hot history still claims an archive has no hot set:\n%s", out)
+	}
+	if !strings.Contains(out, "hot attributes:") {
+		t.Errorf(".hot history = %q, want the archive's hot attributes", out)
+	}
+	if !strings.Contains(out, "appended from now on") || !strings.Contains(out, "sealed segments") ||
+		!strings.Contains(out, "merges them") {
+		t.Errorf(".hot history = %q, want it to say how far and how fast the set reaches", out)
+	}
+}
+
+// TestArchiveRefreshHotAccepted: .refreshhot reaches an archive. The admin path used to
+// reject the hot verbs on an archive outright, so the command failed rather than tuning.
+func TestArchiveRefreshHotAccepted(t *testing.T) {
+	e, cleanup := newArchiveExec(t)
+	defer cleanup()
+	s := &session{exec: e, table: "history"}
+
+	var buf bytes.Buffer
+	s.runDiagMeta(&buf, ".refreshhot", "")
+	out := buf.String()
+	if strings.Contains(out, "error") || strings.Contains(out, "unknown admin action") {
+		t.Fatalf(".refreshhot on an archive: %s", out)
+	}
+	if !strings.Contains(out, "refreshed hot set") {
+		t.Errorf(".refreshhot history = %q, want it to report the refreshed set", out)
 	}
 }
 
