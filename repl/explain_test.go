@@ -72,3 +72,52 @@ func TestExplainRejectsNonSelect(t *testing.T) {
 	}
 	_ = fmt.Sprint
 }
+
+// TestExplainAnalyzeBucketedTier pins the property the bucketed EXPLAIN ANALYZE was missing: a
+// bucketed aggregate the archive answers out of its per-segment indexes and one that falls to a
+// per-record scan must RENDER DIFFERENTLY. The two differ by orders of magnitude in wall time on a
+// real history table while printing the same plan line (both say "columnar aggregate on the
+// archive"), and before the bucketed path asked for the stats trailer the slow one printed strictly
+// less than the fast one -- no numbers at all, which reads as "nothing to see here".
+//
+// The pair is the same query with and without a WHERE: the index path can attribute whole segments
+// to a (categorical, bucketed-numeric) group tuple only for an unconstrained COUNT(*), since a
+// constraint cannot be proven to hold for an entire segment, so adding a filter forces the scan.
+func TestExplainAnalyzeBucketedTier(t *testing.T) {
+	const days, perDay = 4, 60
+	e, cleanup, _ := archiveExecBucketed(t, days, perDay)
+	defer cleanup()
+
+	const sel = `SELECT Owner, time_bucket(CompletionDate, '1d') AS day, COUNT(*) FROM history `
+	const grp = `GROUP BY Owner, time_bucket(CompletionDate, '1d')`
+	fast := explainText(t, e, "EXPLAIN ANALYZE "+sel+grp)
+	slow := explainText(t, e, "EXPLAIN ANALYZE "+sel+`WHERE JobStatus == 4 `+grp)
+
+	// The regression this guards against: the bucketed path calling the stats-free opcode, so the
+	// report falls back to the apology line and carries no breakdown at all.
+	for name, out := range map[string]string{"unconstrained": fast, "constrained": slow} {
+		if strings.Contains(out, "no per-segment scan breakdown") {
+			t.Errorf("%s bucketed aggregate reported no scan breakdown:\n%s", name, out)
+		}
+		if !strings.Contains(out, "scan: segments scanned=") {
+			t.Errorf("%s bucketed aggregate is missing the scan line:\n%s", name, out)
+		}
+	}
+	if !strings.Contains(fast, "answered by: index / columnar accelerator") {
+		t.Errorf("the unconstrained bucketed aggregate should be answered without reading records:\n%s", fast)
+	}
+	if !strings.Contains(fast, "records visited=0") {
+		t.Errorf("the unconstrained bucketed aggregate read records:\n%s", fast)
+	}
+	if !strings.Contains(slow, "answered by: record scan") {
+		t.Errorf("the constrained bucketed aggregate should report the record scan that answered it:\n%s", slow)
+	}
+	// Not just "nonzero": the scan reads every retained record, which is the cost the report exists
+	// to make visible.
+	if want := fmt.Sprintf("records visited=%d", days*perDay); !strings.Contains(slow, want) {
+		t.Errorf("the constrained bucketed aggregate should report %q:\n%s", want, slow)
+	}
+	if fast == slow {
+		t.Errorf("the fast and slow bucketed aggregates rendered identically:\n%s", fast)
+	}
+}
