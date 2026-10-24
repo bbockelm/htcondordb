@@ -126,3 +126,39 @@ func TestSchemaShowsRequiredWhy(t *testing.T) {
 		t.Errorf("schema display should say the other fields cleared the presence floor:\n%s", got)
 	}
 }
+
+// TestSchemaRequireOnBothTableTypes: `.schema require` has to work on an archive too. The schema
+// commands shipped mutable-table-only once before, and `.schema rebuild history` failed as an
+// unknown admin action while every test passed -- because the fixture could not reach an archive.
+func TestSchemaRequireOnBothTableTypes(t *testing.T) {
+	sess, cat, out, cleanup := catalogSchemaSession(t, 3000)
+	defer cleanup()
+
+	for _, table := range []string{"jobs", "history"} {
+		sess.table = table
+		out.Reset()
+		sess.schemaCmd(out, "require add WallClock")
+		if got := out.String(); !strings.Contains(got, "schema.rebuild") {
+			t.Errorf("%s: add did not name the rebuild:\n%s", table, got)
+		}
+		out.Reset()
+		sess.schemaCmd(out, "require "+table)
+		if got := out.String(); !strings.Contains(got, "required schema attributes") {
+			t.Errorf("%s: listing did not render:\n%s", table, got)
+		}
+	}
+	jobs, ok := cat.Table("jobs")
+	if !ok {
+		t.Fatal("jobs table missing")
+	}
+	if got := jobs.SchemaRequireAttrs(); len(got) != 1 || got[0] != "wallclock" {
+		t.Errorf("jobs required set = %v, want [wallclock]", got)
+	}
+	a, ok := cat.ArchiveTable("history")
+	if !ok {
+		t.Fatal("history archive missing")
+	}
+	if got := a.SchemaRequireAttrs(); len(got) != 1 || got[0] != "wallclock" {
+		t.Errorf("history required set = %v, want [wallclock]", got)
+	}
+}
