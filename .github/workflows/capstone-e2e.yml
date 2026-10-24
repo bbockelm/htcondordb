@@ -14,6 +14,12 @@ jobs:
   capstone:
     name: Capstone E2E (condor -> htcondordb -> kafka)
     runs-on: ubuntu-latest
+    # Build and run everything here with the columnar SIMD engine compiled in, the way the
+    # shipped binaries are built (see the Makefile). Without it the engine's raw-column branches
+    # are removed from the binary, so this job would exercise code the deployed daemon does not
+    # run -- and would still pass, since the scalar fallback returns the same answers.
+    env:
+      GOEXPERIMENT: simd
     steps:
       - name: Checkout htcondordb
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

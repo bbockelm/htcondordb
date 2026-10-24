@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/bbockelm/golang-htcondor/logging"
 )
 
@@ -272,4 +273,23 @@ func buildIdentity() (self string, classad string) {
 		}
 	}
 	return self, "unknown"
+}
+
+// simdEngineStatus reports whether the columnar SIMD engine is live in THIS process, for the
+// -version output and the startup line.
+//
+// Both halves of "live" matter and neither is visible from outside. The engine compiles only
+// under GOEXPERIMENT=simd; built without it, the compiler deletes every raw-column branch of the
+// vector executor. On amd64 it then also has to pass a runtime CPU check, so a simd build on a
+// host without the vector extension runs the scalar path anyway. Either way every answer stays
+// correct and only the speed changes -- which is exactly why losing the engine is invisible
+// unless the daemon says so.
+//
+// vm.RawColumnUseful is the executor's own gate, so asking it answers both halves at once. The
+// 4-byte unsigned column is just a width every engine supports; it is a probe, not a preference.
+func simdEngineStatus() string {
+	if vm.RawColumnUseful(4, true) {
+		return "active"
+	}
+	return "not active"
 }

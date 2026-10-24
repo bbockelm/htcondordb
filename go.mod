@@ -2,6 +2,19 @@ module github.com/bbockelm/htcondordb
 
 go 1.26.0
 
+// The columnar SIMD engine in classad/collections/vm is built under
+// GOEXPERIMENT=simd, and its arm64 half needs simd/archsimd from Go 1.27 (the
+// amd64 half compiles on 1.26). Building this module with the experiment on an
+// older toolchain fails inside the dependency with "undefined: archsimd.*", so
+// the toolchain is guaranteed here rather than left to whatever the host has.
+//
+// This is a MINIMUM, not a pin: with GOTOOLCHAIN=auto (the default) Go uses the
+// newer of the local toolchain and this line, so a host on 1.27.5 stays on
+// 1.27.5 and picks up security patches without an edit here. `go` still accepts
+// the module at the 1.26.0 language floor above, and a `toolchain` line is
+// ignored in a dependency, so consumers of this module keep their own floor.
+toolchain go1.27.0
+
 require (
 	github.com/PelicanPlatform/classad v0.31.6
 	github.com/PelicanPlatform/classad/changefeed v0.31.6

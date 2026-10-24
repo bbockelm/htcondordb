@@ -2,6 +2,12 @@ module github.com/bbockelm/htcondordb/archivedropbox
 
 go 1.26.0
 
+// The packaged builds (Makefile rpm-build, release.yml) build this module with
+// GOEXPERIMENT=simd alongside the daemon, and classad/collections/vm's arm64
+// engine needs simd/archsimd from Go 1.27 -- on an older toolchain the build
+// fails inside that dependency. Minimum, not a pin: see the note in ../go.mod.
+toolchain go1.27.0
+
 require (
 	github.com/PelicanPlatform/classad v0.29.12
 	github.com/PelicanPlatform/classad/db v0.29.12

@@ -28,10 +28,12 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           check-latest: true
-          # Install the latest 1.25.x (matching every other workflow), not the root go.mod's
-          # exact directive: the release also builds the exporter modules, and opensearchsync
-          # requires go >= 1.25.9 (opensearch-go/v4 v4.7.x sets that), so pinning to the root's
-          # 1.25.7 failed the build under GOTOOLCHAIN=local.
+          # A floating minor (matching every other workflow), not the root go.mod's `go`
+          # directive: the release also builds the exporter modules, which have their own
+          # floors, and setup-go sets GOTOOLCHAIN=local, so an installed toolchain older than
+          # anything the build needs fails here rather than being silently upgraded. 1.27 is
+          # also what the columnar SIMD engine's arm64 half requires -- the same minimum the
+          # go.mod `toolchain` lines state.
           go-version: '1.27'
 
       - name: Build release archives (linux/darwin, amd64/arm64)
@@ -41,6 +43,14 @@ jobs:
           # Fetch the bbockelm/PelicanPlatform module tags directly from GitHub (bypass the
           # module proxy + checksum DB) so a just-pushed dependency tag resolves immediately.
           GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+          # Compile the columnar SIMD engine in classad/collections/vm into the shipped
+          # binaries. This step runs `go build` directly rather than through the Makefile, so
+          # the Makefile's GOEXPERIMENT default does not reach it and has to be repeated here.
+          # Dropping it does not fail anything: the engine's off-build simply removes the
+          # raw-column branches and the release ships a slower daemon, silently. The engine's
+          # arm64 half needs Go 1.27, which the go.mod `toolchain` lines require.
+          # Applies to the exporter builds in the loop below as well -- same shell.
+          GOEXPERIMENT: simd
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME}"
@@ -59,8 +69,10 @@ jobs:
             # release install silently skipped every configured exporter ("not found: skip"),
             # working only for people who built from source into a shared bin dir. Each is its own
             # module, so each is built from its own directory; all three are pure Go, so the same
-            # CGO_ENABLED=0 cross build applies. No -X main.version: these have no version var,
-            # and a silently-ignored linker flag is worse than none.
+            # CGO_ENABLED=0 cross build applies -- as does this step's GOEXPERIMENT, since these
+            # run in the same shell and each exporter links classad/collections/vm too. No
+            # -X main.version: these have no version var, and a silently-ignored linker flag is
+            # worse than none.
             for exp in kafkasync opensearchsync archivedropbox; do
               (cd "${exp}" && GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w" \
                 -o "${GITHUB_WORKSPACE}/${stage}/" "./cmd/${exp}")
@@ -81,6 +93,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           (cd .github/tools && GOWORK=off go build -o "$RUNNER_TEMP/bin/nfpm" github.com/goreleaser/nfpm/v2/cmd/nfpm)
 
+      # No GOEXPERIMENT here on purpose: `make rpm` goes through the Makefile, whose
+      # GOEXPERIMENT default (simd) covers the daemon, the CLI and the exporter launchers.
       - name: Build RPMs (amd64, arm64)
         env:
           GOFLAGS: -mod=mod
