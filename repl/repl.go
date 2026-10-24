@@ -346,6 +346,7 @@ Diagnostics (current table, or an explicit one where noted):
   .schema fit [table]   whether that schema still fits the data (per-field escape rates)
   .schema groups [table] committed secondary schemas + their churn history (READ)
   .schema groups sample [table] candidate secondary schemas from a fresh sample (needs DAEMON)
+  .schema require [table] attributes required in the schema whatever their presence rate
   .slow [table] [n]     costliest query shapes, ranked by total time (all tables by
                         default); each shape lists the slowest actual queries that
                         match it, which need DAEMON to see
@@ -365,6 +366,8 @@ CompletionDate); with none, the current table:
   .refreshhot [-all] [<sampleMax> <topN>]      recompute the hot set
   .analyze [table|-all] [<topN>]               self-tune now: hot set + indexes + histograms
   .rewrite [table|-all]                        re-encode all ads with the hot set
+  .schema require add|drop <attr>...           require/unrequire a schema attribute on the
+                                               current table (then .schema rebuild)
   .schema rebuild [table] [<max> <topN>]       re-derive the columnar schema and rebuild
                                                every sealed segment's block (heavy)
   .compact [table|-all]                        reclaim dead space
