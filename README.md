@@ -100,7 +100,10 @@ The full language — tables, indexes, aggregates, `MATCH`, output formats, and 
 
 ## Building from source
 
-Requires Go 1.26 or newer.
+The module's language floor is Go 1.26, but its `toolchain` directive requires
+1.27: that is what the columnar SIMD engine's arm64 half needs. With the default
+`GOTOOLCHAIN=auto` the right toolchain is fetched for you; a newer one already
+installed is used as-is.
 
 ```sh
 make build     # -> bin/htcondordb (daemon) and bin/htcondordb-cli (shell)
@@ -113,8 +116,24 @@ The Makefile sets the module-graph environment the build needs; to run `go`
 directly, export the same:
 
 ```sh
-GOWORK=off GOFLAGS=-mod=mod GOPRIVATE=github.com/bbockelm,github.com/PelicanPlatform GOPROXY=direct
+GOWORK=off GOFLAGS=-mod=mod GOPRIVATE=github.com/bbockelm,github.com/PelicanPlatform GOPROXY=direct GOEXPERIMENT=simd
 ```
+
+`GOEXPERIMENT=simd` compiles the columnar SIMD engine. Leaving it out is not an
+error and changes no answer — the executor falls back to scalar comparisons and
+queries over columnar data just get slower — so the built daemon says which it
+is:
+
+```sh
+bin/htcondordb -version
+# htcondordb v0.21.4
+# columnar SIMD engine: active
+```
+
+The same line appears in the `htcondordb starting` log entry (`columnar_simd`).
+On amd64 it also reflects a runtime CPU check, so a simd build on a host without
+the vector extension correctly reports `not active`. `make GOEXPERIMENT= build`
+produces that scalar build deliberately, for bisecting a suspected engine bug.
 
 htcondordb is built on:
 

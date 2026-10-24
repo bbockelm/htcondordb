@@ -2,6 +2,11 @@ module github.com/bbockelm/htcondordb/grafana
 
 go 1.26.5
 
+// Tracks the root module's toolchain line (repo convention: this module
+// requires the root one and must build with the same Go). Minimum, not a pin --
+// see the note in ../go.mod.
+toolchain go1.27.0
+
 require (
 	github.com/PelicanPlatform/classad v0.31.6
 	github.com/PelicanPlatform/classad/dbrpc v0.31.6

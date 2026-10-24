@@ -68,6 +68,7 @@ func run() error {
 
 	if *showVersion {
 		fmt.Println("htcondordb", version)
+		fmt.Println("columnar SIMD engine:", simdEngineStatus())
 		return nil
 	}
 
@@ -548,7 +549,7 @@ func run() error {
 
 	selfVer, classadVer := buildIdentity()
 	log.Info(logging.DestinationGeneral, "htcondordb starting",
-		"version", selfVer, "classad", classadVer,
+		"version", selfVer, "classad", classadVer, "columnar_simd", simdEngineStatus(),
 		"listen", ln.Addr().String(), "address", advertisedAddr(d, ln),
 		"db_dir", databaseDir(d, cfg), "under_master", d.UnderMaster(),
 		"ha_mode", ha.mode, "role", ha.role, "read_only", ha.forceReadOnly)

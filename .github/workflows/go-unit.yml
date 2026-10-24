@@ -23,11 +23,31 @@ permissions:
 
 jobs:
   test:
-    name: Unit tests (Go, no HTCondor)
+    name: Unit tests (Go, ${{ matrix.name }}, no HTCondor)
     runs-on: ubuntu-latest
+    # Both configurations ship, so both are tested.
+    #
+    # The shipped binaries are built with GOEXPERIMENT=simd (see the Makefile), which compiles
+    # the columnar SIMD engine in classad/collections/vm. Testing only without it would leave
+    # every columnar comparison in production on a path no test ever executed -- and nothing
+    # would say so, because the off-build is not an error: it just deletes the raw-column
+    # branches and keeps returning the same answers more slowly.
+    #
+    # The scalar entry is not dead code either. The engine makes a runtime CPU check, so an
+    # amd64 host without AVX2 runs the scalar path out of a simd-built binary. That is the
+    # configuration this second entry covers.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: simd
+            goexperiment: simd
+          - name: scalar
+            goexperiment: ''
     env:
       GOFLAGS: -mod=mod
       GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+      GOEXPERIMENT: ${{ matrix.goexperiment }}
     steps:
       - name: Checkout htcondordb
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

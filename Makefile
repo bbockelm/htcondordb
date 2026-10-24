@@ -11,11 +11,24 @@ BIN_DIR ?= bin
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X main.version=$(VERSION)
 
+# The columnar SIMD engine in classad/collections/vm compiles only under
+# GOEXPERIMENT=simd. Without it the package's off-build sets rawSupported=false
+# and the compiler deletes every raw-column branch of the vector executor, so the
+# binary still returns correct answers -- just the slow way, with nothing in the
+# output to say so. Hence: on by default wherever we produce a binary.
+#
+# `?=` so `make GOEXPERIMENT= <target>` builds the scalar path instead, which is
+# what you want when bisecting a suspected compiler or engine bug (it is also the
+# path that runs in production on an amd64 host without AVX2, since the engine
+# makes a runtime CPU check). The engine needs Go 1.27 on arm64; the root go.mod
+# `toolchain` line guarantees it.
+GOEXPERIMENT ?= simd
+
 # Sibling modules are private and resolved directly (replaces point at local
 # checkouts); GOWORK=off keeps a stray workspace file from overriding them.
 GOENV := GOWORK=off GOFLAGS=-mod=mod \
          GOPRIVATE=github.com/bbockelm,github.com/PelicanPlatform \
-         GOPROXY=direct
+         GOPROXY=direct GOEXPERIMENT=$(GOEXPERIMENT)
 PYTHON ?= python3
 
 # Architecture for the containerized manylinux build: amd64 or arm64.
@@ -150,7 +163,8 @@ rpm-build: ## Cross-build every packaged binary into $(PKG_STAGE) for PKG_ARCH
 		-ldflags '-s -w $(LDFLAGS)' -o $(PKG_STAGE)/ ./cmd/htcondordb ./cmd/htcondordb-cli
 	@for exp in $(EXPORTERS); do \
 		echo "Building $$exp..."; \
-		(cd $$exp && GOOS=linux GOARCH=$(PKG_ARCH) CGO_ENABLED=0 GOWORK=off $(GO) build -trimpath \
+		(cd $$exp && GOOS=linux GOARCH=$(PKG_ARCH) CGO_ENABLED=0 GOWORK=off \
+			GOEXPERIMENT=$(GOEXPERIMENT) $(GO) build -trimpath \
 			-ldflags '-s -w' -o $(CURDIR)/$(PKG_STAGE)/ ./cmd/$$exp) || exit 1; \
 	done
 	@ls -1 $(PKG_STAGE)
