@@ -128,6 +128,20 @@ loadable plugin (point Grafana's `plugins` path at it, or zip it). Unsigned plug
 for local use. CI (`.github/workflows/grafana-plugin.yml`) runs exactly these
 steps for all platforms and uploads the combined bundle as an artifact.
 
+### npm dependencies
+
+`@grafana/*`, `react` and `react-dom` are webpack *externals*: the host Grafana
+supplies them at runtime, so they are compile-time only and none of them (nor
+anything they pull in) ends up in `dist/module.js`. They are therefore pinned to
+the **oldest** Grafana the plugin supports — `grafanaDependency` in
+`src/plugin.json`, currently `>=10.4.0` — so the code cannot compile against an
+API the host does not have. Raising them is a decision to drop older Grafana
+releases, not a dependency refresh.
+
+That makes an advisory against a transitive npm package a build-host concern, not
+a shipped-artifact one. Resolve it with an entry in the `overrides` block of
+`package.json` rather than by bumping the `@grafana/*` major.
+
 ## End-to-end test
 
 `e2e/` contains browser-level tests (Playwright + `@grafana/plugin-e2e`) that run
