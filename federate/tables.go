@@ -62,6 +62,11 @@ type ArchiveOptions struct {
 	// job_metrics), keyed by table name; 0 = no age cap. A table absent from the map keeps
 	// whatever age cap it has.
 	MaxAge map[string]float64
+	// SchemaRequireAttrs names the attributes the columnar schema must carry whatever their
+	// presence rate (HTCONDORDB_SCHEMA_REQUIRE_ATTRS). A hub's history holds the same job ads as
+	// a spoke's and is the larger of the two, so the attributes a job only acquires by running
+	// are kept out of its schema by the same presence floor, for the same reason.
+	SchemaRequireAttrs []string
 	// Storage replaces ExtraCategorical, ExtraValue and SegmentSize for the tables it names, so an
 	// archive can be stored as its spoke stores it (job_metrics takes the spoke's
 	// HTCONDORDB_JOB_METRICS_* knobs, not the history ones).
@@ -113,9 +118,16 @@ func ensureTables(cat *db.Catalog, tables []string, opts ArchiveOptions, log *sl
 			cats := slices.DeleteFunc(union(archiveCategorical, st.ExtraCategorical), func(c string) bool {
 				return slices.ContainsFunc(vals, func(v string) bool { return strings.EqualFold(c, v) })
 			})
+			// job_metrics is excluded: the sampler writes a fixed attribute set on every sample,
+			// so its fields clear the presence floor by construction.
+			var require []string
+			if t != TableJobMetrics {
+				require = opts.SchemaRequireAttrs
+			}
 			a, err := cat.CreateArchiveTable(t, db.ArchiveConfig{
 				SegmentSize: st.SegmentSize, CategoricalAttrs: cats, ValueAttrs: vals, ZoneAttrs: archiveZones(t),
-				GroupSchemaCount: st.GroupSchemaCount,
+				GroupSchemaCount:   st.GroupSchemaCount,
+				SchemaRequireAttrs: require,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("federate: creating archive %s: %w", t, err)
@@ -129,6 +141,16 @@ func ensureTables(cat *db.Catalog, tables []string, opts ArchiveOptions, log *sl
 					log.Info("federate: backfilling archive indexes", "archive", t, "categorical", addCat, "value", addVal)
 					a.AddIndex(addCat, addVal)
 				}()
+			}
+			// As for the indexes: archiveconfig.json is authoritative on reopen, so the configured
+			// set has to be re-asserted onto an archive that already exists. Nothing is rebuilt --
+			// re-deriving the schema re-encodes one columnar block per sealed segment, which a
+			// hub's history makes expensive; `.schema rebuild history` is how an operator pays it.
+			if changed, err := a.SetSchemaRequireAttrs(require); err != nil {
+				log.Error("federate: setting required schema attributes", "archive", t, "err", err)
+			} else if changed {
+				log.Info("federate: required schema attributes set", "archive", t, "attrs", require,
+					"note", "run `.schema rebuild "+t+"` to re-derive the schema")
 			}
 			if maxBytes := opts.MaxBytes[t]; a.Retention().MaxBytes != maxBytes {
 				r := a.Retention()
