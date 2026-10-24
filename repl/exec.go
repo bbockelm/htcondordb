@@ -1173,6 +1173,7 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 			// count here is the signature of an aggregate over an attribute the columnar accelerator
 			// does not cover (a MAX/MIN/etc. that fell to a per-record scan).
 			lines = append(lines, "  (server-side aggregate: only the result crosses the wire)")
+			lines = append(lines, aggregateTierLine(tr.scan))
 			lines = append(lines, scanStatsLines(tr)...)
 		} else {
 			lines = append(lines, "  (server-side aggregate: only the result crosses the wire; no per-segment scan breakdown on this path)")
@@ -1183,6 +1184,23 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 		res.Rows = append(res.Rows, []string{l})
 	}
 	return res, nil
+}
+
+// aggregateTierLine names which server-side tier actually answered an aggregate. It is INFERRED
+// from the scan breakdown, not reported by the server: the index and columnar fast paths answer out
+// of per-segment structures without opening a segment or reading a record, so they leave the whole
+// trailer zero, while the fall-through projected scan fills it in. The inference is needed because
+// the plan line above names the opcode the CLIENT chose, which is the same for both -- two
+// aggregates orders of magnitude apart in wall time print the same "columnar aggregate on the
+// archive" -- and "every number is zero" is not something a reader should have to know how to
+// decode. An all-zero trailer can also mean a constraint proven to match nothing, which likewise
+// read no records, so the wording claims only that.
+func aggregateTierLine(s collections.ScanStats) string {
+	if s.SegmentsTotal == 0 && s.RecordsVisited == 0 {
+		return "  answered by: index / columnar accelerator (no segment opened, no record read)"
+	}
+	return fmt.Sprintf("  answered by: record scan (%d record(s) read, %d reassembled) -- the accelerator "+
+		"did not cover this aggregate", s.RecordsVisited, s.RecordsReassembled)
 }
 
 // scanStatsLines renders the server-side scan breakdown for an EXPLAIN ANALYZE of a
@@ -1619,11 +1637,22 @@ func (e *Executor) execArchiveAggregate(st *Statement, groupBy []string) (*Resul
 // breakdown); ErrArchiveAggregateUnsupported propagates so execArchiveAggregate drops to the
 // client-side fetch-and-reduce path.
 func (e *Executor) archiveAggregateRows(table, where string, groupBy []string, aggs []dbrpc.AggSpec) ([]dbrpc.AggRow, error) {
+	groups := make([]dbrpc.GroupCol, len(groupBy))
+	for i, g := range groupBy {
+		groups[i] = dbrpc.GroupCol{Attr: g}
+	}
+	return e.archiveAggregateColRows(table, where, groups, aggs)
+}
+
+// archiveAggregateColRows is archiveAggregateRows over group columns that may carry a bucket
+// width. Both the plain and the bucketed archive aggregate come through here so a time_bucket
+// GROUP BY gets the same EXPLAIN ANALYZE breakdown as an unbucketed one: the stats op carries the
+// wide frame (bucket widths and per-aggregate filters) already, so there is no shape it cannot
+// serve, and routing the bucketed query around it was the reason the slow bucketed aggregate --
+// the one that falls to a per-record scan and takes minutes -- reported no numbers at all while
+// the fast one did.
+func (e *Executor) archiveAggregateColRows(table, where string, groups []dbrpc.GroupCol, aggs []dbrpc.AggSpec) ([]dbrpc.AggRow, error) {
 	if e.explain != nil {
-		groups := make([]dbrpc.GroupCol, len(groupBy))
-		for i, g := range groupBy {
-			groups[i] = dbrpc.GroupCol{Attr: g}
-		}
 		var stats collections.ScanStats
 		rows, err := e.c.ArchiveAggregateStats(e.opCtx(), table, where, groups, aggs, &stats)
 		if err == nil {
@@ -1635,7 +1664,7 @@ func (e *Executor) archiveAggregateRows(table, where string, groupBy []string, a
 			return nil, err
 		}
 	}
-	return e.c.ArchiveAggregate(e.opCtx(), table, where, groupBy, aggs)
+	return e.c.ArchiveAggregateBucketed(e.opCtx(), table, where, groups, aggs)
 }
 
 // archiveRowCount returns the number of rows in an append-only history table via the
@@ -1833,10 +1862,14 @@ func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
 		groups = append(groups, dbrpc.GroupCol{Attr: it.Col, BucketWidth: it.BucketWidth})
 	}
 	// Archives and mutable tables have separate aggregate opcodes; both carry group bucket
-	// widths, so the only difference here is which one to call.
+	// widths, so the only difference here is which one to call. The archive goes through
+	// archiveAggregateColRows so that under EXPLAIN ANALYZE it asks for the scan breakdown --
+	// without it a bucketed aggregate reported nothing, which read as "fast" for exactly the
+	// query that falls to the per-record scan. The mutable table has no stats-carrying bucketed
+	// opcode to ask for, so it still reports no breakdown.
 	var rows []dbrpc.AggRow
 	if e.isArchive(st.Table) {
-		rows, err = e.c.ArchiveAggregateBucketed(e.opCtx(), st.Table, constraint(st.Where), groups, aggs)
+		rows, err = e.archiveAggregateColRows(st.Table, constraint(st.Where), groups, aggs)
 	} else {
 		rows, err = e.c.AggregateBucketedTable(e.opCtx(), st.Table, constraint(st.Where), groups, aggs)
 	}
