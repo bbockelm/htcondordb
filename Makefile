@@ -44,7 +44,7 @@ GO    ?= go
 LIB_EXT ?= $(if $(filter Darwin,$(shell uname -s)),dylib,so)
 LIB     := $(BIN_DIR)/libhtcondordb_client.$(LIB_EXT)
 
-.PHONY: all build daemon cli lib lib-check-linux archive python-test wheel wheel-macos wheel-linux wheel-validate wheel-clean test vet tidy clean version rpm rpm-build exporters
+.PHONY: all build daemon cli pgo-profile lib lib-check-linux archive python-test wheel wheel-macos wheel-linux wheel-validate wheel-clean test vet tidy clean version rpm rpm-build exporters
 
 all: build
 
@@ -134,6 +134,21 @@ tidy: ## Reconcile go.mod / go.sum (both modules)
 
 clean: ## Remove built binaries
 	rm -rf $(BIN_DIR)
+
+# --- Profile-guided optimization -----------------------------------------
+#
+# cmd/htcondordb/default.pgo is applied to the daemon by every `go build` (the
+# default -pgo=auto); see docs/pgo.md. This target replaces it with CPU profiles
+# captured from running daemons' pprof endpoints (HTCONDORDB_ENABLE_PPROF):
+#   make pgo-profile PGO_URL="http://ap1:9630 http://ap2:9630" PGO_SECONDS=60 PGO_COUNT=3
+
+PGO_URL     ?=
+PGO_SECONDS ?= 60
+PGO_COUNT   ?= 1
+
+pgo-profile: ## Capture and merge cmd/htcondordb/default.pgo from PGO_URL's pprof endpoint(s)
+	@test -n "$(PGO_URL)" || { echo "set PGO_URL to one or more daemon pprof base URLs"; exit 2; }
+	GOWORK=off packaging/pgo-capture.sh -s $(PGO_SECONDS) -n $(PGO_COUNT) $(PGO_URL)
 
 # --- RPM packaging -------------------------------------------------------
 #

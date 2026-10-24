@@ -16,6 +16,8 @@ quickstart. These pages cover the details:
   catalog: discovery, sticky membership, per-AP freshness.
 - **[High availability](ha.md)** — `standalone`, `leader-follower`, and raft-based
   `consistent` modes.
+- **[Profile-guided optimization](pgo.md)** — the daemon's PGO profile and how to
+  refresh it from a production daemon.
 
 ## Design notes
 
