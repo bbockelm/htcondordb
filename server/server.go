@@ -162,6 +162,11 @@ type Config struct {
 	// Maintenance overrides the maintenance pass options. The zero value uses sensible
 	// defaults (hot-set refresh + dictionary retrain + a 10%-of-data index budget).
 	Maintenance *db.MaintainOptions
+	// ArchiveIndexMinDemand overrides the query count at which the maintenance pass adds a
+	// demand-driven index to an ARCHIVE (history) table. 0 takes
+	// defaultArchiveIndexMinDemand; a NEGATIVE value turns archive index auto-tune off.
+	// Applied on top of Maintenance when that is also supplied.
+	ArchiveIndexMinDemand int64
 }
 
 // Service is the htcondordb database service. It serves a catalog of named
@@ -173,6 +178,9 @@ type Service struct {
 	authorize    Authorizer
 	forceReadOn  bool
 	logQueries   bool
+	// maintainOpts is the resolved maintenance configuration the background loop was
+	// started with (zero when maintenance is disabled).
+	maintainOpts db.MaintainOptions
 	log          *slog.Logger
 	stopReaper   func() // stops the idle-transaction reaper; set in New
 
@@ -252,10 +260,8 @@ func New(cfg Config) (*Service, error) {
 	// Background self-tuning (index auto-tune + hot-set refresh + dictionary retrain),
 	// unless disabled. Stopped by Close (via rpc.Close).
 	if !cfg.DisableMaintenance {
-		opts := defaultMaintainOptions()
-		if cfg.Maintenance != nil {
-			opts = *cfg.Maintenance
-		}
+		opts := resolveMaintainOptions(cfg)
+		svc.maintainOpts = opts
 		svc.rpc.StartMaintenance(cfg.MaintenanceInterval, opts)
 	}
 	// Reap transactions abandoned on still-open connections (a client whose context was
@@ -279,6 +285,23 @@ func New(cfg Config) (*Service, error) {
 // reads every sealed record of the whole history once -- real, but a one-time cost that buys
 // 25-65x on the queries a history table is actually asked, and paying it silently once beats
 // leaving the accelerator dark forever.
+// resolveMaintainOptions is the maintenance configuration the service actually runs:
+// defaultMaintainOptions, replaced wholesale by cfg.Maintenance when one is supplied, with
+// the individual knobs applied on top.
+func resolveMaintainOptions(cfg Config) db.MaintainOptions {
+	opts := defaultMaintainOptions()
+	if cfg.Maintenance != nil {
+		opts = *cfg.Maintenance
+	}
+	if cfg.ArchiveIndexMinDemand != 0 {
+		opts.ArchiveIndexMinDemand = cfg.ArchiveIndexMinDemand
+	}
+	if opts.ArchiveIndexMinDemand < 0 {
+		opts.ArchiveIndexMinDemand = 0 // negative means off, which classad spells as zero
+	}
+	return opts
+}
+
 func defaultMaintainOptions() db.MaintainOptions {
 	const hotTopN = 32
 	return db.MaintainOptions{
@@ -287,9 +310,31 @@ func defaultMaintainOptions() db.MaintainOptions {
 		ArchiveSchemaScanHotTopN: hotTopN,
 		Retrain:                  true,
 		MinIndexDemand:           10,
+		ArchiveIndexMinDemand:    defaultArchiveIndexMinDemand,
 		IndexBudgetHighFrac:      0.10,
 	}
 }
+
+// defaultArchiveIndexMinDemand is the probe count at which an archive earns an index.
+// classad leaves the option at 0, which switches archive index auto-tune off entirely, so
+// until this was set the archive's demand counters were collected and checkpointed every
+// pass and then never acted on.
+//
+// Ten times the mutable MinIndexDemand, because the two costs are not comparable. A mutable
+// index is built from live data already in memory; an archive index is backfilled by
+// decompressing history -- bounded by ArchiveConfig.IndexBackfillBytes, 1 GiB by default
+// (~128 segments, a few seconds), and the tuner refuses to run at all on an archive whose
+// backfill is explicitly unbounded. Auto-DROP stays force-disabled for archives, so a wrong
+// add is also a permanent one; the threshold is what has to carry the caution.
+//
+// 100 against the 7-day demand half-life asks for a sustained read pattern rather than one
+// operator's afternoon of ad-hoc history queries. Anything a dashboard, the web UI or a
+// recurring report filters on clears it within a day; a one-off investigation does not get
+// near it and ages out.
+//
+// A conservative non-zero number beats leaving the feature dark: the failure mode of too
+// high is the status quo -- an archive that scans what it could have pruned.
+const defaultArchiveIndexMinDemand = 100
 
 // Catalog returns the table catalog.
 func (s *Service) Catalog() *db.Catalog { return s.cat }
