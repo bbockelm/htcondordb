@@ -226,6 +226,9 @@ func run() error {
 	// read-only: writes go to the leader.
 	boot.mark("ha-detect")
 	logQueries := configBool(cfg, "HTCONDORDB_LOG_QUERIES")
+	// Query aggregation is on unless explicitly turned off, so `.slow` answers without an
+	// operator having had to predict they would want it.
+	noQueryStats := configBoolDefaultTrueIsFalse(cfg, "HTCONDORDB_QUERY_STATS")
 	memoryTables := splitAttrs(getStr(cfg, "HTCONDORDB_MEMORY_TABLES"))
 	// Take an exclusive lock on the database directory before opening it, so a second daemon
 	// pointed at the same dir (e.g. a restart that overlaps the old process, or a misconfigured
@@ -265,6 +268,7 @@ func run() error {
 		ForceReadOnly:         ha.forceReadOnly,
 		Logger:                d.Slog(),
 		LogQueries:            logQueries,
+		DisableQueryStats:     noQueryStats,
 		MemoryTables:          memoryTables,
 		PoolKeys:              poolKeys,
 		EncryptedAttrs:        encAttrs,
@@ -288,6 +292,9 @@ func run() error {
 	}()
 	if logQueries {
 		log.Info(logging.DestinationGeneral, "per-query logging enabled (HTCONDORDB_LOG_QUERIES)")
+	}
+	if noQueryStats {
+		log.Info(logging.DestinationGeneral, "query aggregation disabled (HTCONDORDB_QUERY_STATS = false); .slow will report nothing")
 	}
 	if len(memoryTables) > 0 {
 		log.Info(logging.DestinationGeneral, "in-memory (non-persistent) tables configured",

@@ -686,6 +686,19 @@ func (e *Executor) Diagnostics(table string) (*dbrpc.Diagnostics, error) {
 	return e.c.DiagnosticsTable(e.opCtx(), table)
 }
 
+// QueryStats returns the daemon's aggregated query report: every query it has served
+// bucketed by shape and ranked by total time (.slow). table filters to one table ("" =
+// all). Exemplars come back only on a DAEMON-authorized connection.
+func (e *Executor) QueryStats(table string) (*dbrpc.QueryStatsReport, error) {
+	return e.c.QueryStats(e.opCtx(), table)
+}
+
+// ResetQueryStats clears the aggregation window, returning the report as it stood
+// before (.slow reset). DAEMON-authorized.
+func (e *Executor) ResetQueryStats(table string) (*dbrpc.QueryStatsReport, error) {
+	return e.c.ResetQueryStats(e.opCtx(), table)
+}
+
 // Explain reports how a table would execute a constraint query (.explain).
 func (e *Executor) Explain(table, constraint string) (*db.QueryExplain, error) {
 	return e.c.ExplainTable(e.opCtx(), table, constraint)

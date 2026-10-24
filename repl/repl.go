@@ -346,6 +346,10 @@ Diagnostics (current table, or an explicit one where noted):
   .schema fit [table]   whether that schema still fits the data (per-field escape rates)
   .schema groups [table] committed secondary schemas + their churn history (READ)
   .schema groups sample [table] candidate secondary schemas from a fresh sample (needs DAEMON)
+  .slow [table] [n]     costliest query shapes, ranked by total time (all tables by
+                        default); each shape lists the slowest actual queries that
+                        match it, which need DAEMON to see
+  .slow reset [table]   clear the aggregation window (needs DAEMON)
   .suggest [table]      index add/drop suggestions from observed demand
   .suggest -i [table]   review suggestions interactively and apply the accepted ones
   .explain <expr>       how the current table's planner would run a constraint
