@@ -67,10 +67,10 @@ func TestArchiveAddIndexReported(t *testing.T) {
 // other table's, and it can now be refreshed from query demand. .hot used to answer "it has
 // no hot set", which sent an operator looking for a knob that was there all along.
 //
-// The output must also say how far a change reaches, because the hot header is per record:
-// a refreshed set applies to records appended from then on, and already-sealed segments keep
-// theirs. Without that line, someone who runs .refreshhot and then times an old query cannot
-// tell a working feature from a broken one.
+// The output must also say how fast a change spreads, because the hot header is per record:
+// a refreshed set governs records appended from then on, and already-sealed ones pick it up
+// only as maintenance merges their segments. Without those lines, someone who runs
+// .refreshhot and then times an old query cannot tell a working feature from a broken one.
 func TestArchiveHotShowsTheSet(t *testing.T) {
 	e, cleanup := newArchiveExec(t)
 	defer cleanup()
@@ -87,8 +87,9 @@ func TestArchiveHotShowsTheSet(t *testing.T) {
 	if !strings.Contains(out, "hot attributes:") {
 		t.Errorf(".hot history = %q, want the archive's hot attributes", out)
 	}
-	if !strings.Contains(out, "appended from now on") || !strings.Contains(out, "sealed segments") {
-		t.Errorf(".hot history = %q, want it to say the set reaches new records only", out)
+	if !strings.Contains(out, "appended from now on") || !strings.Contains(out, "sealed segments") ||
+		!strings.Contains(out, "merges them") {
+		t.Errorf(".hot history = %q, want it to say how far and how fast the set reaches", out)
 	}
 }
 
