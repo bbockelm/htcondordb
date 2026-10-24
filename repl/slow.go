@@ -41,6 +41,10 @@ func (s *session) slow(console io.Writer, arg string) {
 	if len(toks) > 0 {
 		n, err := strconv.Atoi(toks[0])
 		if err != nil || n <= 0 {
+			// The argument was neither a known table nor a count. Naming it matters: the
+			// most likely cause is a table that does not exist, and a bare usage line
+			// would leave that looking like a syntax mistake.
+			fmt.Fprintf(console, "%q is not a known table or a positive count\n", toks[0])
 			fmt.Fprintln(console, "usage: .slow [table] [n]   |   .slow reset [table]")
 			return
 		}

@@ -48,22 +48,33 @@ func newSlowExec(t *testing.T, opts dbrpc.ServeOptions) (*Executor, func()) {
 	return e, func() { c.Close(); s.Close(); cat.Close() }
 }
 
-// runSlow runs `.slow <arg>` and returns what it printed, waiting for the daemon-side
-// recording (which happens after the query's last frame) to catch up.
-func runSlow(t *testing.T, s *session, arg string, wantShapes int) string {
+// runSlow runs `.slow <arg>` until its output contains every one of wants, then returns it.
+//
+// It polls on the EXPECTED TEXT rather than on a shape count: recording happens on the
+// daemon after a query's last frame, so a report taken too early can hold one shape of
+// the three queries that were issued. A test that waited only for "some shape" would
+// then assert against a half-recorded window and fail intermittently.
+func runSlow(t *testing.T, s *session, arg string, wants ...string) string {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		var buf bytes.Buffer
 		if !s.runDiagMeta(&buf, ".slow", arg) {
 			t.Fatal(".slow was not handled by runDiagMeta")
 		}
 		out := buf.String()
-		if strings.Count(out, "\n#") >= wantShapes {
+		missing := ""
+		for _, w := range wants {
+			if !strings.Contains(out, w) {
+				missing = w
+				break
+			}
+		}
+		if missing == "" {
 			return out
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf(".slow never reported %d shape(s) within 3s; last output:\n%s", wantShapes, out)
+			t.Fatalf(".slow never printed %q within 5s; last output:\n%s", missing, out)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -82,7 +93,7 @@ func TestSlowReportsShapesAndExemplars(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	out := runSlow(t, sess, "", 1)
+	out := runSlow(t, sess, "", "count 3")
 
 	if !strings.Contains(out, "count 3") {
 		t.Errorf("the three time-literal variants did not aggregate into one shape:\n%s", out)
@@ -124,7 +135,7 @@ func TestSlowSeparatesShapes(t *testing.T) {
 	if _, err := e.ExecString(`SELECT Owner FROM jobs WHERE Owner == "alice"`); err != nil {
 		t.Fatal(err)
 	}
-	out := runSlow(t, sess, "", 2)
+	out := runSlow(t, sess, "", "(owner == ?)", "(completiondate >= ?)")
 	if !strings.Contains(out, "completiondate") || !strings.Contains(out, "owner") {
 		t.Errorf("expected both shapes listed separately:\n%s", out)
 	}
@@ -144,7 +155,7 @@ func TestSlowHidesExemplarsFromReader(t *testing.T) {
 	if _, err := e.ExecString(`SELECT Owner FROM jobs WHERE Owner == "alice"`); err != nil {
 		t.Fatal(err)
 	}
-	out := runSlow(t, sess, "", 1)
+	out := runSlow(t, sess, "", "(owner == ?)")
 	if strings.Contains(out, "slowest:") || strings.Contains(out, `"alice"`) {
 		t.Errorf("a READ session was shown exemplars:\n%s", out)
 	}
@@ -164,7 +175,7 @@ func TestSlowTableFilter(t *testing.T) {
 	if _, err := e.ExecString(`SELECT Owner FROM jobs WHERE Owner == "alice"`); err != nil {
 		t.Fatal(err)
 	}
-	out := runSlow(t, sess, "jobs", 1)
+	out := runSlow(t, sess, "jobs", "(owner == ?)")
 	if !strings.Contains(out, "query shapes (jobs)") {
 		t.Errorf("the table filter is not reflected in the header:\n%s", out)
 	}
@@ -199,5 +210,20 @@ func TestSlowRendersUnprunedScan(t *testing.T) {
 	}
 	if !strings.Contains(out, "every attribute of every matched ad") {
 		t.Errorf("an unprojected read is not called out:\n%s", out)
+	}
+}
+
+// TestSlowRejectsUnknownArgument names what was wrong rather than printing a bare usage
+// line: an argument that is neither a table nor a count is most often a table that does
+// not exist, which reads as a syntax mistake otherwise.
+func TestSlowRejectsUnknownArgument(t *testing.T) {
+	e, cleanup := newSlowExec(t, dbrpc.ServeOptions{Privileged: true})
+	defer cleanup()
+	sess := &session{exec: e, table: "jobs"}
+	var buf bytes.Buffer
+	sess.runDiagMeta(&buf, ".slow", "nosuchtable")
+	out := buf.String()
+	if !strings.Contains(out, `"nosuchtable" is not a known table`) {
+		t.Errorf("the bad argument is not named:\n%s", out)
 	}
 }
