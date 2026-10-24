@@ -46,6 +46,10 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		} else {
 			s.withDiag(console, t, s.showHot)
 		}
+	case ".slow":
+		// Deliberately NOT scoped to the current table by default: the question is about
+		// the daemon, not about whichever table the session last .use'd.
+		s.slow(console, arg)
 	case ".suggest":
 		s.suggest(console, arg)
 	case ".explain":
