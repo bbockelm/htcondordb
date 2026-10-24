@@ -204,10 +204,12 @@ const defaultArchiveCategoricalAttrs = "Owner"
 //
 // MemoryUsage is deliberately NOT here. The shadow copies through whatever the starter sent, and
 // what it sends is frequently an EXPRESSION rather than a number, so the attribute has no
-// dominant literal value. Requiring it would be refused by the library (and reported), but the
-// reason is worth stating where someone would otherwise add it back: a column that is escaped in
-// every record is worse than no column, because the fast count paths read a held expression as
-// UNDEFINED and return wrong counts rather than merely being slow.
+// dominant literal value. The library refuses it (and reports the refusal), but the reason is
+// worth stating where someone would otherwise add it back: a column escaped in every record is
+// strictly worse than no column. The value is read from the record either way, every record pays
+// an escape bit and the layout for a slot nothing occupies, and a numeric column of escaped
+// expressions makes the vectorized count hand the query back per record -- a block-at-a-time scan
+// turned into a row-at-a-time one.
 const defaultSchemaRequireAttrs = "ResidentSetSize, ProportionalSetSize, CurrentResidentSetSize, " +
 	"ImageSize, DiskUsage, RemoteWallClockTime, CommittedTime, RemoteUserCpu, RemoteSysCpu, " +
 	"BytesSent, BytesRecvd"

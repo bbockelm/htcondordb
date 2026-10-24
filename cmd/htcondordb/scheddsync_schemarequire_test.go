@@ -26,8 +26,9 @@ func TestSchemaRequireDefaults(t *testing.T) {
 	}
 	// MemoryUsage is frequently an EXPRESSION in a job ad (the shadow passes through whatever the
 	// starter sent), so it has no dominant literal value. A slot for it would escape in every
-	// record, and the fast count paths read a held expression as UNDEFINED -- wrong counts, not
-	// just slow ones. The library refuses it; this keeps it from being added back by habit.
+	// record: read from the record anyway, paid for in every record, and -- being numeric -- it
+	// would make the vectorized count hand the query back row by row. The library refuses it;
+	// this keeps it from being added back by habit.
 	if slices.ContainsFunc(got, func(n string) bool { return strings.EqualFold(n, "MemoryUsage") }) {
 		t.Error("MemoryUsage is in the default required set; it is expression-valued and a slot " +
 			"for it would be escaped in every record")
