@@ -158,6 +158,8 @@ query planner — and manage them:
 .indexes              configured categorical/value indexes + demand suggestions
 .hot                  hot attributes (front-loaded in each ad's hot header)
 .suggest              index add/drop suggestions from observed query demand
+.slow [table] [n]     costliest query shapes, ranked by total time
+.slow reset [table]   clear the aggregation window (needs DAEMON)
 .explain <expr>       how the planner would run a ClassAd constraint
 
 .addindex value|categorical <attr>[, ...]   create an index (needs WRITE)
@@ -190,6 +192,53 @@ estimate** — how many ads the index expects to visit (from the segment indexes
 per-value stats), so you can see which conjunct actually prunes. (It appears once
 the relevant segments have built indexes; a brand-new/tiny store may not have
 stats yet.)
+
+### `.slow` — which queries cost
+
+`.slow` answers "what are my slowest queries?". The daemon buckets every query
+it serves by **shape** — the opcode, the table, a fingerprint of the constraint,
+and whether a LIMIT was sent — and ranks the buckets by **total** time, because
+the query worth fixing is usually a cheap one run constantly rather than one
+slow outlier.
+
+The fingerprint is the constraint with its literals replaced by `?` and its
+attribute names lowercased, taken from the parsed and constant-folded
+expression. So `CompletionDate >= 1761300000` and `CompletionDate >= 1729764000`
+are one shape, and so are `owner == "a"`, `Owner == "b"` and
+`Owner == "a" || Owner == "b" || Owner == "c"`.
+
+Each shape also carries the **slowest actual queries** that matched it. That is
+the point of keeping both: in this engine the literal decides the work — a
+one-hour window prunes to a couple of sealed segments on their zone maps while a
+one-year window reads every one of them, and the two are the same shape. The
+bucket says which pattern costs; the exemplar gives you the constraint to paste
+into `.explain`.
+
+```
+htcondordb> .slow
+query shapes (all tables): 18204 queries aggregated over 4h12m, 23 shape(s) tracked
+  ordered by TOTAL time -- a cheap query run constantly outranks one slow outlier
+
+#1  QueryRawWire jobs   count 8421   total 12m4s   mean 86ms   max 1.4s   rows 2101340
+    where: (completiondate >= ? && owner == ?)
+    projection: none -- every attribute of every matched ad crossed the wire
+    segments: 101052 scanned, 0 pruned (0% skipped) over 8421 measured instance(s)
+    slowest: 1.4s  rows 18420  user alice@example  segments 12/12 scanned  at 09:40:11
+      CompletionDate >= 1761300000 && Owner == "alice"
+```
+
+Two of those lines are what make the report diagnostic rather than descriptive:
+`projection:` says whether the client pulled whole ads instead of projecting
+server-side, and `segments:` says how much of the scan was skipped — which
+separates "slow because the window is big" from "slow because nothing pruned".
+
+Shapes carry no literals and no identities, so any reader may see them.
+Exemplars quote the real constraint and name the user who ran it, so they
+require DAEMON, as does `.slow reset`.
+
+Aggregation is on by default and writes nothing to the log; set
+`HTCONDORDB_QUERY_STATS = false` to turn it off. It is independent of
+`HTCONDORDB_LOG_QUERIES`, which logs every query individually.
 
 Index suggestions come from the store's own demand tracker (it records which
 attributes queries filter on) and a sample of live ads, so `.suggest` recommends

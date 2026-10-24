@@ -86,6 +86,20 @@ type Config struct {
 	// count) instead of pushing a projection/limit down.
 	LogQueries bool
 
+	// DisableQueryStats turns off the server's query aggregation, which is otherwise on:
+	// every served query is bucketed by its shape (op, table, constraint fingerprint,
+	// whether a LIMIT was sent) with the slowest instances of each kept as exemplars, and
+	// the REPL's `.slow` reads the result. Unlike LogQueries it writes nothing to the log
+	// and costs a bounded amount of memory, so it is on by default -- "what are my
+	// slowest queries?" should be answerable without having first turned something on.
+	// Disable it on a daemon where the per-query constraint parse is not wanted.
+	DisableQueryStats bool
+
+	// QueryStats overrides the aggregation's bounds (shape cap, exemplars kept, the
+	// minimum duration recorded). Ignored when DisableQueryStats is set; the zero value
+	// takes the library defaults.
+	QueryStats dbrpc.QueryStatsOptions
+
 	// DefaultTable is the table ensured to exist at startup and targeted by
 	// clients that do not name a table. Defaults to "ads".
 	DefaultTable string
@@ -256,6 +270,11 @@ func New(cfg Config) (*Service, error) {
 		log:          log,
 		owners:       NewTableOwners(),
 	}
+	// Query aggregation: on unless the caller turned it off. It is what answers "what are
+	// my slowest queries?", which until now nothing could.
+	if !cfg.DisableQueryStats {
+		svc.rpc.EnableQueryStats(cfg.QueryStats)
+	}
 	step("rpc-server")
 	// Background self-tuning (index auto-tune + hot-set refresh + dictionary retrain),
 	// unless disabled. Stopped by Close (via rpc.Close).
@@ -367,6 +386,10 @@ func (s *Service) RegisterOn(srv *cedarserver.Server) {
 func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error {
 	level := s.effectiveLevel(c)
 	opts := s.ServeOptions(level, peerSession(c))
+	// Names the connection for diagnostics only: it is what a per-query log line and a
+	// slow-query exemplar report as the user who ran the expensive query. Authorization
+	// is already decided by level.
+	opts.Peer = peerUser(c)
 	if hook := s.queryLogHook(peerUser(c), c.RemoteAddr); hook != nil {
 		opts.QueryLog = hook
 	}
