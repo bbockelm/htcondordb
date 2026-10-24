@@ -51,16 +51,23 @@ func (f fakeSource) History(_ context.Context, sd ScheddRef, _, since string, li
 }
 
 type fakeWriter struct {
-	appended map[string][]*classad.ClassAd // table -> records
-	seen     map[string]map[string]bool    // table -> set of GlobalJobId
+	appended  map[string][]*classad.ClassAd // table -> records
+	seen      map[string]map[string]bool    // table -> set of GlobalJobId
+	unflushed map[string]int                // table -> appends since its last Flush
 }
 
 func newFakeWriter() *fakeWriter {
-	return &fakeWriter{appended: map[string][]*classad.ClassAd{}, seen: map[string]map[string]bool{}}
+	return &fakeWriter{appended: map[string][]*classad.ClassAd{}, seen: map[string]map[string]bool{}, unflushed: map[string]int{}}
+}
+
+func (w *fakeWriter) Flush(_ context.Context, table string) error {
+	w.unflushed[table] = 0
+	return nil
 }
 
 func (w *fakeWriter) Append(_ context.Context, table string, ad *classad.ClassAd) error {
 	w.appended[table] = append(w.appended[table], ad)
+	w.unflushed[table]++
 	if w.seen[table] == nil {
 		w.seen[table] = map[string]bool{}
 	}
@@ -274,5 +281,41 @@ func TestNoNewRecordsLeavesCursor(t *testing.T) {
 	}
 	if v, _ := cur.Get("j1", "schedA"); v != "1.0" {
 		t.Errorf("cursor changed to %q, want unchanged 1.0", v)
+	}
+}
+
+// flushCheckingCursors fails the test if a cursor is persisted while the writer holds
+// appends that no Flush has made durable: a crash then would leave the cursor ahead of
+// the archive, and the records between them would never be imported.
+type flushCheckingCursors struct {
+	fakeCursors
+	t     *testing.T
+	w     *fakeWriter
+	table string
+	sets  int
+}
+
+func (c *flushCheckingCursors) Set(job, schedd, cur string) error {
+	if n := c.w.unflushed[c.table]; n != 0 {
+		c.t.Errorf("cursor %q persisted with %d appends not yet flushed", cur, n)
+	}
+	c.sets++
+	return c.fakeCursors.Set(job, schedd, cur)
+}
+
+func TestCursorPersistedOnlyAfterFlush(t *testing.T) {
+	disc := fakeDiscovery{schedds: []ScheddRef{{Name: "schedA", Address: "<a>"}, {Name: "schedB", Address: "<b>"}}}
+	src := fakeSource{hist: map[string][]*classad.ClassAd{
+		"schedA": {histAd(1, 0, "schedA"), histAd(2, 0, "schedA")},
+		"schedB": {histAd(7, 0, "schedB"), histAd(8, 0, "schedB"), histAd(9, 0, "schedB")},
+	}}
+	w := newFakeWriter()
+	cur := &flushCheckingCursors{fakeCursors: fakeCursors{}, t: t, w: w, table: "history"}
+	im := newImporter(disc, src, w, cur)
+	if _, err := im.RunJob(context.Background(), Job{Name: "j1", Pool: "p", Table: "history"}); err != nil {
+		t.Fatal(err)
+	}
+	if cur.sets != 2 {
+		t.Fatalf("persisted %d cursors, want 2", cur.sets)
 	}
 }

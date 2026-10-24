@@ -92,20 +92,12 @@ func newArchiveSink(arch *db.ArchiveTable, table, schedd string, store replicate
 	return s, nil
 }
 
-// archiveSync returns the durability step Flush runs before it commits a cursor.
-//
-// In classad v0.30.11 there is nothing to call: db.ArchiveTable.Append is already durable when it
-// returns -- collections.Archive.Append -> Collection.Put -> shard.applyOne/applyBatch, which run
-// shard.syncFor (an msync of the pages written) before returning -- and db.ArchiveTable exposes
-// neither a Sync/Flush nor a non-durable append (collections.Archive.Flush is a no-op). So the
-// ordering "data durable, then cursor" holds, at the price of one msync per appended record.
-//
-// TODO(classad): add db.ArchiveTable.AppendNondurable and db.ArchiveTable.Sync() (msync every
-// shard's dirty pages); then append nondurably and return arch.Sync here, so a catch-up pays one
-// msync per flush instead of one per record.
-func archiveSync(_ *db.ArchiveTable) func() error {
-	return func() error { return nil }
-}
+// archiveSync returns the durability step Flush runs before it commits a cursor. Appends are
+// deferred (db.ArchiveTable.AppendDeferred), so this is what makes them durable: the archive's
+// Flush returns once every append before it is on disk. Committing the cursor only after it
+// keeps the cursor from getting ahead of the archive across a crash, and a catch-up pays one
+// sync per flush instead of one per record.
+func archiveSync(arch *db.ArchiveTable) func() error { return arch.Flush }
 
 // probeBudget is how many records of a Reset replay are checked by exact query before the sink
 // loads the identity set instead.
@@ -174,7 +166,7 @@ func (s *archiveSink) apply(c replicate.Change) error {
 				break
 			}
 		}
-		if err := s.arch.Append(c.Ad); err != nil {
+		if err := s.arch.AppendDeferred(c.Ad); err != nil {
 			return err
 		}
 		s.appended = true

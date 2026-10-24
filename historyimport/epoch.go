@@ -117,6 +117,9 @@ func (im *Importer) importEpochSchedd(ctx context.Context, j Job, sd ScheddRef) 
 		for k := range boundary {
 			keys = append(keys, k)
 		}
+		if ferr := im.W.Flush(ctx, j.Table); ferr != nil {
+			return imported, fmt.Errorf("flush: %w", ferr)
+		}
 		if serr := im.Cur.Set(j.Name, sd.Name, encodeEpochCursor(epochCursor{T: maxT, Keys: keys})); serr != nil {
 			return imported, fmt.Errorf("persist cursor: %w", serr)
 		}

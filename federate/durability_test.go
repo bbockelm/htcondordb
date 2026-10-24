@@ -240,10 +240,9 @@ func TestTableCommitIsDurable(t *testing.T) {
 	}
 }
 
-// TestArchiveAppendIsDurable: the archive sink commits a cursor with no sync step of its own
-// (archiveSync is a no-op), which is correct only because each Append is durable when it returns.
-// The archive's own sync counter must advance with every append.
-func TestArchiveAppendIsDurable(t *testing.T) {
+// TestArchiveFlushSyncsAppends: the archive sink appends deferred and makes the appends durable in
+// its flush, before it commits the cursor -- one sync for all of them rather than one per append.
+func TestArchiveFlushSyncsAppends(t *testing.T) {
 	cat := openCatalog(t, t.TempDir())
 	t.Cleanup(func() { _ = cat.Close() })
 	hist := hubArchive(t, cat, TableHistory)
@@ -254,9 +253,18 @@ func TestArchiveAppendIsDurable(t *testing.T) {
 	const n = 5
 	for i := 1; i <= n; i++ {
 		apply(t, s, liveChange(upsert("r", histRecord(t, "ap1", i)), "c"+itoa(i)))
-		if got := hist.OpStats().Sync.Count - before; got < int64(i) {
-			t.Fatalf("after %d appends the archive has synced %d times: an append returned before it was durable", i, got)
-		}
+	}
+	if got := hist.OpStats().Sync.Count - before; got != 0 {
+		t.Errorf("%d appends synced the archive %d times before a flush, want 0", n, got)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := hist.OpStats().Sync.Count - before; got < 1 {
+		t.Fatalf("the flush did not sync the archive: the cursor was committed over appends a crash could lose")
+	}
+	if cur := string(s.Cursor()); cur != "c"+itoa(n) {
+		t.Errorf("cursor after the flush = %q, want %q", cur, "c"+itoa(n))
 	}
 }
 
