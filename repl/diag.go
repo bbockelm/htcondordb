@@ -41,8 +41,7 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.schemaCmd(console, arg)
 	case ".hot":
 		if t := s.tableArg(arg); s.exec.isArchive(t) {
-			fmt.Fprintf(console, "%s is an append-only history archive: it has no hot set.\n", t)
-			fmt.Fprintf(console, "Its per-segment hot header is fixed at creation; see .indexes %s for its indexes.\n", t)
+			s.withDiag(console, t, s.showArchiveHot)
 		} else {
 			s.withDiag(console, t, s.showHot)
 		}
@@ -507,6 +506,22 @@ func printIndexSizes(w io.Writer, sz db.IndexSizes) {
 		fmt.Fprintf(w, "  %-25s %-12s %-6s %-11s %.1f%%\n",
 			s.Attr, s.Kind, owner, humanBytes(s.Bytes), s.Frac*100)
 	}
+}
+
+// showArchiveHot renders an archive's hot set. An archive has one exactly as a mutable
+// table does; what differs is reach, so the output says so: the hot header is written per
+// record, so a refreshed set applies to records appended from then on and every segment
+// already sealed keeps the set it was written with. Without that line an operator who runs
+// .refreshhot and then measures an old query has no way to tell a working feature from a
+// broken one.
+func (s *session) showArchiveHot(w io.Writer, d *dbrpc.Diagnostics) {
+	if len(d.Hot) == 0 {
+		fmt.Fprintln(w, "hot attributes: (none; run .refreshhot to compute the hot set from a sample)")
+		return
+	}
+	fmt.Fprintf(w, "hot attributes: %s\n", orNone(d.Hot))
+	fmt.Fprintln(w, "  applies to records appended from now on; already-sealed segments keep the set")
+	fmt.Fprintln(w, "  they were written with (.rewrite re-encodes them, reading the whole history back)")
 }
 
 func (s *session) showHot(w io.Writer, d *dbrpc.Diagnostics) {
