@@ -23,6 +23,9 @@
     "react-dom": "^18.2.0",
     "tslib": "^2.6.0"
   },
+  "overrides": {
+    "moment": "^2.31.0"
+  },
   "devDependencies": {
     "@grafana/plugin-e2e": "^1.19.9",
     "@playwright/test": "^1.61.1",
