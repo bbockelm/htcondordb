@@ -122,6 +122,7 @@ Repairing the mirror goes through the sync itself (DAEMON-authorized, over
 | `HTCONDORDB_JOB_QUEUE_LOG` | `$(JOB_QUEUE_LOG)` | Schedd job-queue log to tail (live `jobs`). |
 | `HTCONDORDB_HISTORY` | `$(HISTORY)` | Schedd history file to tail (`history` archive). |
 | `HTCONDORDB_ARCHIVE_ROTATE_INTERVAL` | `3600` | Archive-table retention sweep interval (seconds; `0` disables). |
+| `HTCONDORDB_SCHEMA_REQUIRE_ATTRS` | resource-usage attributes (see [Configuration](configuration.md)) | Attributes the columnar schema must carry on `jobs`, `history` and `epoch_history` regardless of how often they appear. `none` requires nothing. Re-asserted on every start and `condor_reconfig`; it does not rebuild anything, so run `.schema rebuild <table>` to make a change take effect. |
 | `HTCONDORDB_ARCHIVE_MAX_BYTES` | — | On-disk size cap applied to both archives; oldest whole segments drop past the cap on the sweep. Accepts `10 GB` / `500MiB` / plain bytes; unset = no limit. |
 | `HTCONDORDB_HISTORY_MAX_BYTES` | inherits default | Per-table size cap for `history` (overrides the shared default; `0` uncaps). |
 | `HTCONDORDB_EPOCH_HISTORY_MAX_BYTES` | inherits default | Per-table size cap for `epoch_history`. |

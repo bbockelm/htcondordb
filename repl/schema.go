@@ -32,9 +32,13 @@ func humanSince(secs int64) string {
 //	.schema fit [table] [sampleMax]     per-field escape rates against a fresh sample
 //	.schema groups [table] [sampleMax]  candidate secondary schemas (co-occurring attributes)
 //	.schema rebuild [table] [max topN]  re-derive the schema and rebuild every columnar block
+//	.schema require [table]             attributes required in the schema regardless of presence
+//	.schema require add|drop <attr>...  change that set, on the CURRENT table
 func (s *session) schemaCmd(console io.Writer, arg string) {
 	fields := strings.Fields(arg)
 	switch {
+	case len(fields) > 0 && strings.EqualFold(fields[0], "require"):
+		s.schemaRequire(console, fields[1:])
 	case len(fields) > 0 && strings.EqualFold(fields[0], "fit"):
 		s.schemaFit(console, fields[1:])
 	case len(fields) > 0 && strings.EqualFold(fields[0], "groups"):
@@ -262,6 +266,78 @@ func (s *session) schemaRebuild(console io.Writer, args []string) {
 		return
 	}
 	s.adminTable(console, table, "schema.rebuild", rest...)
+}
+
+// schemaRequire shows or changes the required-attribute set: the attributes that enter the
+// derived columnar schema whatever their presence rate.
+//
+// The set exists because membership is decided by presence alone -- an attribute has to appear in
+// ~90% of sampled ads -- and on a job table that measures how far the jobs got, not what anyone
+// reads. ResidentSetSize is written once a job has run, so a table that also holds every job
+// removed before it ran keeps it out of the schema no matter how often it is queried.
+//
+// The listing reads at READ level from the diagnostics; add and drop are DAEMON admin actions.
+func (s *session) schemaRequire(console io.Writer, args []string) {
+	if len(args) > 0 && (strings.EqualFold(args[0], "add") || strings.EqualFold(args[0], "drop")) {
+		// No table argument: every remaining token is an attribute, so the current table is the
+		// target, as for .addhot. A leading [table] cannot work here -- `.schema require add
+		// history` is both a plausible table and a plausible attribute name, and guessing would
+		// silently apply the change to the wrong table. Use `.use <table>` first.
+		verb := strings.ToLower(args[0])
+		if len(args) == 1 {
+			fmt.Fprintf(console, "usage: .schema require %s <attr>...  (applies to the current "+
+				"table; `.use <table>` to switch)\n", verb)
+			return
+		}
+		s.adminTable(console, s.table, "schema.require."+verb, args[1:]...)
+		return
+	}
+	table, rest := s.tableAndArgs(args)
+	if len(rest) > 0 {
+		fmt.Fprintln(console, "usage: .schema require [table] | .schema require add|drop <attr>...")
+		return
+	}
+	s.withDiag(console, table, s.showRequire)
+}
+
+// showRequire renders the required set and whatever the last derivation refused.
+func (s *session) showRequire(w io.Writer, d *dbrpc.Diagnostics) {
+	ss := d.SchemaScan
+	if len(ss.Require) == 0 {
+		fmt.Fprintln(w, "no required schema attributes: every field is admitted on presence alone")
+		fmt.Fprintln(w, "  (HTCONDORDB_SCHEMA_REQUIRE_ATTRS sets the pool-wide list; `.schema require add`")
+		fmt.Fprintln(w, "   adds one to this table)")
+		return
+	}
+	fmt.Fprintf(w, "required schema attributes (%d): %s\n", len(ss.Require), strings.Join(ss.Require, ", "))
+	// Which of them are actually fields, so a name that is doing nothing is visible. A required
+	// attribute that was refused looks exactly like one that was never required otherwise.
+	inSchema := map[string]bool{}
+	for _, f := range ss.Schema {
+		if f.Required {
+			inSchema[strings.ToLower(f.Name)] = true
+		}
+	}
+	if ss.Enabled {
+		var carried []string
+		for _, n := range ss.Require {
+			if inSchema[strings.ToLower(n)] {
+				carried = append(carried, n)
+			}
+		}
+		fmt.Fprintf(w, "  %d of them are in the schema because they were required: %s\n",
+			len(carried), orNone(carried))
+	} else {
+		fmt.Fprintln(w, "  columnar accelerator is off, so none of them is a field yet")
+	}
+	if len(ss.RequireSkipped) > 0 {
+		fmt.Fprintln(w, "refused by the last derivation:")
+		for _, sk := range ss.RequireSkipped {
+			fmt.Fprintf(w, "  %-25s %s\n", sk.Name, sk.Reason)
+		}
+	}
+	fmt.Fprintln(w, "changing the set does not rebuild anything: run `.schema rebuild` to re-derive "+
+		"the schema (cost: one columnar block rebuilt per sealed segment)")
 }
 
 // tableAndArgs peels an optional leading table name off a command's arguments, the way the
