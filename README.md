@@ -112,6 +112,11 @@ make vet
 make rpm       # -> dist/htcondordb-*.rpm (needs nfpm; PKG_ARCH=amd64|arm64)
 ```
 
+The daemon is built with profile-guided optimization from
+`cmd/htcondordb/default.pgo`, which `go build` applies automatically; see
+[docs/pgo.md](docs/pgo.md) for what it does and how to refresh the profile
+(`make pgo-profile`).
+
 The Makefile sets the module-graph environment the build needs; to run `go`
 directly, export the same:
 
