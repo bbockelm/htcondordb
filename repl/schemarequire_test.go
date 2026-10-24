@@ -103,3 +103,26 @@ func TestSchemaRequireUsage(t *testing.T) {
 		t.Errorf("usage should say which table the change applies to:\n%s", got)
 	}
 }
+
+// TestSchemaShowsRequiredWhy: the main `.schema` view has to say WHY each field is there. A
+// required field that is missing from most records has a high escape rate, and without this an
+// operator reading `.schema fit` sees drift where there is only the slot they asked for.
+func TestSchemaShowsRequiredWhy(t *testing.T) {
+	sess, d, out, cleanup := schemaSession(t, 3000)
+	defer cleanup()
+
+	if _, err := d.AddSchemaRequireAttrs("WallClock"); err != nil {
+		t.Fatal(err)
+	}
+	if !d.ReschemaScan(4000, 4) {
+		t.Skip("no sealed segments to sample")
+	}
+	sess.schemaCmd(out, "")
+	got := out.String()
+	if !strings.Contains(got, "REQUIRED") {
+		t.Errorf("schema display should mark the required field:\n%s", got)
+	}
+	if !strings.Contains(got, "presence") {
+		t.Errorf("schema display should say the other fields cleared the presence floor:\n%s", got)
+	}
+}

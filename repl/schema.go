@@ -185,7 +185,8 @@ func (s *session) showSchema(w io.Writer, d *dbrpc.Diagnostics) {
 			orNone(ss.HotFields)+")")
 		return
 	}
-	fmt.Fprintln(w, "  attribute                 kind     width  tier")
+	fmt.Fprintln(w, "  attribute                 kind     width  tier  why")
+	required := 0
 	for _, f := range ss.Schema {
 		width := "-"
 		if f.Width > 0 {
@@ -199,7 +200,18 @@ func (s *session) showSchema(w io.Writer, d *dbrpc.Diagnostics) {
 		if f.Hot {
 			tier = "HOT"
 		}
-		fmt.Fprintf(w, "  %-25s %-8s %5s  %s\n", f.Name, kind, width, tier)
+		// Why the field is here at all. Most cleared the presence floor; a REQUIRED one did not
+		// and is a slot someone asked for, which is what you need to know before judging its
+		// escape rate in `.schema fit` -- a high one there is the price of the request, not drift.
+		why := "presence"
+		if f.Required {
+			why = "REQUIRED"
+			required++
+		}
+		fmt.Fprintf(w, "  %-25s %-8s %5s  %-4s  %s\n", f.Name, kind, width, tier, why)
+	}
+	if required > 0 || len(ss.Require) > 0 {
+		fmt.Fprintf(w, "  %d field(s) required regardless of presence — see `.schema require`\n", required)
 	}
 	// Secondary (group) schemas capture clusters of co-occurring attributes that fall outside the
 	// base schema. They are committed only after the same cluster recurs across several maintenance
