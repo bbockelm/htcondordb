@@ -187,6 +187,33 @@ func (m *scheddSyncManager) runGuardedTailer(ctx context.Context, name string, r
 // (the backfill decompresses every record once).
 const defaultArchiveCategoricalAttrs = "Owner"
 
+// defaultSchemaRequireAttrs are the attributes required in the columnar schema when
+// HTCONDORDB_SCHEMA_REQUIRE_ATTRS is unset.
+//
+// A columnar field is otherwise admitted on PRESENCE: an attribute has to appear in ~90% of
+// sampled ads. That is the right rule for a population of like records and the wrong one for a
+// job table, because a job ad's shape is a function of how far the job got. Everything below is
+// written by the shadow or the starter, so it exists only once a job has RUN -- and the same
+// table holds every job that was idle, held or removed before it ever ran. DiskUsage and
+// ImageSize clear the floor on their own (they are set at submit), so requiring them changes
+// nothing and is listed anyway, because the set is meant to read as "the resource-usage
+// attributes", not as a list of the ones that happened to need help this year.
+//
+// These are the attributes dashboards and `condor_history` summaries read: without a slot they
+// sit in the cold tail, where every read of one decompresses the record.
+//
+// MemoryUsage is deliberately NOT here. The shadow copies through whatever the starter sent, and
+// what it sends is frequently an EXPRESSION rather than a number, so the attribute has no
+// dominant literal value. The library refuses it (and reports the refusal), but the reason is
+// worth stating where someone would otherwise add it back: a column escaped in every record is
+// strictly worse than no column. The value is read from the record either way, every record pays
+// an escape bit and the layout for a slot nothing occupies, and a numeric column of escaped
+// expressions makes the vectorized count hand the query back per record -- a block-at-a-time scan
+// turned into a row-at-a-time one.
+const defaultSchemaRequireAttrs = "ResidentSetSize, ProportionalSetSize, CurrentResidentSetSize, " +
+	"ImageSize, DiskUsage, RemoteWallClockTime, CommittedTime, RemoteUserCpu, RemoteSysCpu, " +
+	"BytesSent, BytesRecvd"
+
 // scheddSyncSettings is the resolved, comparable configuration of the tailers. Every field
 // must stay comparable -- apply() reconciles by struct equality -- so attribute lists are
 // carried as their canonical config strings and split at the point of use.
@@ -219,6 +246,11 @@ type scheddSyncSettings struct {
 	archiveRowGroupBytes int
 	archiveCatAttrs      string
 	archiveValAttrs      string
+	// schemaRequireAttrs names the attributes the columnar schema must carry whatever their
+	// presence rate (HTCONDORDB_SCHEMA_REQUIRE_ATTRS). Applied to the jobs table and to the
+	// history and epoch archives. Carried as its canonical config string so the settings struct
+	// stays comparable for apply()'s reconcile-by-equality.
+	schemaRequireAttrs string
 	// historyMaxBytes / epochMaxBytes cap the on-disk size (sealed-segment bytes) of the history
 	// and epoch_history archive tables. The periodic archive-maintenance pass drops the oldest
 	// whole segments until the table is under its cap. 0 = no limit. Configured from HTCondor
@@ -352,6 +384,7 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 		// creation.
 		archiveRowGroupBytes: configInt(cfg, "HTCONDORDB_ARCHIVE_ROW_GROUP_BYTES"),
 		archiveCatAttrs:      canonicalAttrList(catAttrs),
+		schemaRequireAttrs:   resolveSchemaRequireAttrs(cfg),
 		archiveValAttrs:      canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS"), "ClusterId")),
 		// Space limits: a shared default (HTCONDORDB_ARCHIVE_MAX_BYTES) applied to both archives,
 		// with per-table overrides. An explicit per-table value wins even when it is 0 (that table
@@ -575,6 +608,26 @@ func canonicalAttrList(s string) string {
 	return strings.Join(splitAttrList(s), ",")
 }
 
+// resolveSchemaRequireAttrs reads HTCONDORDB_SCHEMA_REQUIRE_ATTRS. Unset takes the defaults; the
+// literal "none" requires nothing.
+//
+// "none" exists because this list is not free in the way an index list is. An index costs its own
+// storage; a required field costs bytes in EVERY record, including the ones that do not have the
+// attribute, which on a table full of never-ran jobs is most of them. A site that has measured
+// its own mix and prefers the presence floor absolute needs a way to say so, and leaving the knob
+// empty cannot mean that -- every other attribute knob here reads empty as "unset, take the
+// default", and one of them meaning the opposite is how a config change becomes a surprise.
+func resolveSchemaRequireAttrs(cfg *config.Config) string {
+	raw := strings.TrimSpace(getStr(cfg, "HTCONDORDB_SCHEMA_REQUIRE_ATTRS"))
+	switch {
+	case raw == "":
+		return canonicalAttrList(defaultSchemaRequireAttrs)
+	case strings.EqualFold(raw, "none"):
+		return ""
+	}
+	return canonicalAttrList(raw)
+}
+
 // reconcileArchiveIndexes brings an existing history archive's index set up to the
 // configured one, in the background. It only ever ADDS: an attribute that was indexed but
 // is no longer configured is left alone, so a index added by hand (via the repl) is not
@@ -612,6 +665,34 @@ func (m *scheddSyncManager) applyArchiveRowGroupBytes(t *db.ArchiveTable, name s
 	m.logger.Info("schedd-sync: archive row-group budget set", "archive", name,
 		"bytes", s.archiveRowGroupBytes, "was", was,
 		"note", "applies to segments sealed from now on; existing segments keep their layout")
+}
+
+// applySchemaRequire puts the configured required-attribute set onto a table: the attributes the
+// columnar schema must carry whatever their presence rate.
+//
+// It does NOT rebuild anything. Every sealed segment's columnar block was built against the
+// current schema, so a changed set takes effect at the next re-derivation -- `.schema rebuild`,
+// which re-encodes one block per sealed segment and on a mature history archive means reading the
+// whole thing back through the decompressor. Starting that from a config reload would turn a
+// condor_reconfig into hours of unannounced I/O, so the change is recorded and the operator is
+// told, in the log line, what to run.
+//
+// Re-asserted on every start and reconfig, which is how a puppet-managed fleet drives it. The
+// re-assert replaces only the configured tier: an attribute someone added by hand with
+// `.schema require add` is kept.
+func (m *scheddSyncManager) applySchemaRequire(name string, want []string, set func([]string) (bool, error)) {
+	changed, err := set(want)
+	if err != nil {
+		m.logger.Error("schedd-sync: setting required schema attributes", "table", name,
+			"attrs", want, "err", err)
+		return
+	}
+	if !changed {
+		return
+	}
+	m.logger.Info("schedd-sync: required schema attributes set", "table", name, "attrs", want,
+		"note", "run `.schema rebuild "+name+"` to re-derive the schema; until then the existing "+
+			"columnar blocks are unchanged")
 }
 
 // applyArchiveMaxBytes puts the configured on-disk size cap onto an archive's retention. The
@@ -896,6 +977,9 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating jobs table: %w", err)
 		}
+		// Only the jobs table: the required attributes are a job's resource usage, and the other
+		// tables this log flattens into (users, clusters, jobsets, the header) do not carry them.
+		m.applySchemaRequire("jobs", splitAttrList(s.schemaRequireAttrs), jobs.SetSchemaRequireAttrs)
 		users, err := m.svc.Catalog().CreateTable("users")
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating users table: %w", err)
@@ -981,7 +1065,8 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			// Zone-map both the job's completion time and htcondordb's ingest time
 			// (EnteredHistoryTime, stamped per record), so range queries on either prune whole
 			// segments instead of scanning -- e.g. "jobs that entered history in the last 24h".
-			ZoneAttrs: []string{"CompletionDate", scheddsync.EnteredHistoryAttr},
+			ZoneAttrs:          []string{"CompletionDate", scheddsync.EnteredHistoryAttr},
+			SchemaRequireAttrs: splitAttrList(s.schemaRequireAttrs),
 		})
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating history archive: %w", err)
@@ -996,6 +1081,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		m.reconcileArchiveIndexes(ctx, hist, "history",
 			splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
 		m.applyArchiveRowGroupBytes(hist, "history", s)
+		m.applySchemaRequire("history", splitAttrList(s.schemaRequireAttrs), hist.SetSchemaRequireAttrs)
 		m.applyArchiveMaxBytes(hist, "history", s.historyMaxBytes)
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
 			Filename:        s.histFile,
@@ -1025,7 +1111,8 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			// Zone-map the epoch write time and htcondordb's ingest time so range
 			// queries on either prune whole segments. Epoch records carry no
 			// CompletionDate (a run instance is not a completed job).
-			ZoneAttrs: []string{scheddsync.EpochWriteDateAttr, scheddsync.EnteredHistoryAttr},
+			ZoneAttrs:          []string{scheddsync.EpochWriteDateAttr, scheddsync.EnteredHistoryAttr},
+			SchemaRequireAttrs: splitAttrList(s.schemaRequireAttrs),
 		})
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating epoch archive: %w", err)
@@ -1033,6 +1120,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		m.reconcileArchiveIndexes(ctx, ep, "epoch_history",
 			splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
 		m.applyArchiveRowGroupBytes(ep, "epoch_history", s)
+		m.applySchemaRequire("epoch_history", splitAttrList(s.schemaRequireAttrs), ep.SetSchemaRequireAttrs)
 		m.applyArchiveMaxBytes(ep, "epoch_history", s.epochMaxBytes)
 		es := scheddsync.NewJobEpochSync(ep, scheddsync.HistorySyncConfig{
 			Filename:        s.epochFile,
