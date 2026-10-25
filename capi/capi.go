@@ -69,7 +69,11 @@ type conn struct {
 	// addr is the address actually connected to, which is not necessarily the one the
 	// caller passed: an empty address is resolved from the ambient configuration, and a
 	// caller reporting "connected to ..." needs the answer rather than the blank.
-	addr   string
+	addr string
+	// cfg is the configuration the session was built from, kept so a caller that
+	// needs a second exchange with the same daemon (the queue client's sync-health
+	// probe) reuses the security policy instead of re-reading CONDOR_CONFIG.
+	cfg    *config.Config
 	cl     *cedarclient.HTCondorClient
 	dbc    *dbrpc.Client
 	ex     *repl.Executor
@@ -95,14 +99,20 @@ func resolveAddr(cfg *config.Config, addr string) (string, error) {
 	return locate.Daemon(cfg)
 }
 
-func openConn(addr string) (*conn, error) {
+func openConn(addr string) (*conn, error) { return openConnAs(addr, "TOOL") }
+
+// openConnAs is openConn under a named HTCondor subsystem. A daemon embedding this
+// library (the schedd, via the queue entry points) must authenticate under its own
+// subsystem so that SCHEDD.SEC_CLIENT_* and its daemon credentials apply; a
+// command-line client stays TOOL.
+func openConnAs(addr, subsys string) (*conn, error) {
 	// Silence the transport's slog output unless the caller asked for it; see logging.go.
 	configureLogging()
 
-	// Run as subsystem TOOL (like C++ command-line clients) so operator config scoped with
-	// a TOOL. prefix (e.g. TOOL.SEC_CLIENT_AUTHENTICATION_METHODS) is honored; a bare
-	// config.New() leaves the subsystem empty and disables <SUBSYS>.PARAM resolution.
-	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "TOOL"})
+	// Run as the caller's subsystem (TOOL for command-line clients) so operator config
+	// scoped with a TOOL. prefix (e.g. TOOL.SEC_CLIENT_AUTHENTICATION_METHODS) is honored;
+	// a bare config.New() leaves the subsystem empty and disables <SUBSYS>.PARAM resolution.
+	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: subsys})
 	if err != nil {
 		// Name what failed: an unadorned "open /path: no such file" from a connect() call
 		// reads like the driver's own problem rather than a misdirected CONDOR_CONFIG.
@@ -142,6 +152,7 @@ func openConn(addr string) (*conn, error) {
 	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()))
 	return &conn{
 		addr:   addr,
+		cfg:    cfg,
 		cl:     cl,
 		dbc:    dbc,
 		ex:     repl.NewExecutor(dbc, repl.ExecConfig{}),
