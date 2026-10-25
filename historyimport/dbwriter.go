@@ -73,6 +73,9 @@ func (d *DBWriter) Append(ctx context.Context, table string, ad *classad.ClassAd
 	return d.Client.ArchiveAppend(ctx, table, ad.MarshalOld())
 }
 
+// Flush is a no-op: the server makes each ArchiveAppend durable before acknowledging it.
+func (d *DBWriter) Flush(context.Context, string) error { return nil }
+
 // Has reports whether the table already holds a record with this GlobalJobId.
 func (d *DBWriter) Has(ctx context.Context, table, gid string) (bool, error) {
 	if err := d.ensure(ctx, table); err != nil {

@@ -327,6 +327,9 @@ func (s *HistorySync) Poll(ctx context.Context) error {
 		s.warnedNoFile = false // re-arm so a later disappearance is reported again
 	}
 	err := s.drainToEOF()
+	if ferr := s.flushArchive(); err == nil {
+		err = ferr
+	}
 	s.lastArchiveCount = s.archive.Count()
 	return err
 }
@@ -717,9 +720,24 @@ func (s *HistorySync) appendRecord(rec []byte) {
 	if _, ok := ad.Lookup(EnteredHistoryAttr); !ok {
 		_ = ad.Set(EnteredHistoryAttr, s.enteredHistoryTime(ad))
 	}
-	if err := s.archive.Append(ad); err != nil {
+	// Deferred: the record is durable at the next flushArchive, which runs before any
+	// position covering it is persisted.
+	if err := s.archive.AppendDeferred(ad); err != nil {
 		s.log.Warn("history: append failed", "err", err.Error())
 	}
+}
+
+// flushArchive makes every record appended so far durable. It runs before a position is
+// persisted, so after a crash the saved position is never ahead of what the archive
+// holds (recovery resumes from it and would otherwise skip the lost records), and at the
+// end of every poll, so records from a drain that saved no position still reach disk,
+// and the archive's watchers, within one poll.
+func (s *HistorySync) flushArchive() error {
+	if err := s.archive.Flush(); err != nil {
+		s.log.Warn("history: flushing the archive failed", "err", err.Error())
+		return err
+	}
+	return nil
 }
 
 // enteredHistoryTime returns the Unix time (seconds) the job entered the history file: the
@@ -756,8 +774,12 @@ func (s *HistorySync) alreadyArchived(ad *classad.ClassAd) bool {
 }
 
 // checkpoint durably records how far into the current file we have consumed complete records.
+// The records are flushed first; if that fails the position is not saved.
 func (s *HistorySync) checkpoint() {
 	if s.store == nil || s.fi == nil {
+		return
+	}
+	if s.flushArchive() != nil {
 		return
 	}
 	pos := historyPos{File: identityFromInfo(s.fi), Offset: s.offset - int64(len(s.partial))}

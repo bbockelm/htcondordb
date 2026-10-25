@@ -50,7 +50,11 @@ type Source interface {
 // Writer appends stamped records to a table and reports whether one is already
 // present (by GlobalJobId), the latter used only during recovery dedup.
 type Writer interface {
+	// Append adds a record. It need not be durable until Flush returns.
 	Append(ctx context.Context, table string, ad *classad.ClassAd) error
+	// Flush returns once every record appended to table is durable. The importer calls
+	// it before persisting a cursor, so a cursor never gets ahead of the archive.
+	Flush(ctx context.Context, table string) error
 	Has(ctx context.Context, table, globalJobID string) (bool, error)
 }
 
@@ -219,6 +223,9 @@ func (im *Importer) importSchedd(ctx context.Context, j Job, sd ScheddRef) (int,
 	}
 
 	if newest != "" && newest != since {
+		if ferr := im.W.Flush(ctx, j.Table); ferr != nil {
+			return imported, fmt.Errorf("flush: %w", ferr)
+		}
 		if serr := im.Cur.Set(j.Name, sd.Name, newest); serr != nil {
 			return imported, fmt.Errorf("persist cursor: %w", serr)
 		}

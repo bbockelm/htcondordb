@@ -152,13 +152,22 @@ func (a *ArchiveWriter) table(name string) (*db.ArchiveTable, error) {
 	return a.Cat.CreateArchiveTable(name, archiveConfig())
 }
 
-// Append adds a record to the table.
+// Append adds a record to the table. It is durable once Flush returns.
 func (a *ArchiveWriter) Append(_ context.Context, table string, ad *classad.ClassAd) error {
 	t, err := a.table(table)
 	if err != nil {
 		return err
 	}
-	return t.Append(ad)
+	return t.AppendDeferred(ad)
+}
+
+// Flush makes every record appended to the table durable.
+func (a *ArchiveWriter) Flush(_ context.Context, table string) error {
+	t, ok := a.Cat.ArchiveTable(table)
+	if !ok {
+		return nil // never appended to: nothing to flush
+	}
+	return t.Flush()
 }
 
 // Has reports whether the table already holds a record with this GlobalJobId.
