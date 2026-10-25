@@ -119,15 +119,8 @@ func run() error {
 		// Name the phase that dominated a slow open (classad #214). When every sidecar adopts
 		// cleanly the adoption line above stays silent, so a slow reopen would otherwise show only
 		// as one elapsed number; this breaks it into phases. Thresholded so a fast open is quiet.
-		if t := dg.Timing; openTimingTotal(t) >= time.Second {
-			ms := func(d time.Duration) string { return d.Round(time.Millisecond).String() }
-			log.Info(logging.DestinationGeneral, "table open phase timing",
-				"dir", dg.Dir, "sealed", dg.SealedSegments,
-				"mapSegments", ms(t.MapSegments), "dirRestore", ms(t.DirRestore), "dirRebuilt", t.DirRebuilt,
-				"publishDict", ms(t.PublishDict), "publishColumns", ms(t.PublishColumns),
-				"loadSidecars", ms(t.LoadSidecars), "zoneRecompute", ms(t.ZoneRecompute),
-				"reindex", ms(t.Reindex), "rebuildOrdered", ms(t.RebuildOrdered),
-				"adoptSchema", ms(t.AdoptSchema), "loadDicts", ms(t.LoadDicts), "loadDemand", ms(t.LoadDemand))
+		if openTimingTotal(dg.Timing) >= time.Second {
+			log.Info(logging.DestinationGeneral, "table open phase timing", openTimingFields(dg)...)
 		}
 	}
 
@@ -562,6 +555,43 @@ func run() error {
 		"ha_mode", ha.mode, "role", ha.role, "read_only", ha.forceReadOnly)
 
 	return d.Serve(ctx, ln, srv.Serve)
+}
+
+// openTimingFields is the key/value list of the "table open phase timing" line.
+//
+// Beside the phase durations it carries the zone-map recompute COUNTS, because the duration alone
+// cannot say whether a slow restart will recur. A segment whose sidecar lacks a zone map is decoded
+// at open to rebuild one, and the result is written back so the next open adopts it: when every
+// recomputed segment was upgraded the cost was one-time, and when some were not (the write-back
+// failed, or was never attempted) the same decode happens on every start. zoneRecomputeOutlook
+// names which, so the line answers the question an operator reading it actually has.
+func openTimingFields(dg collections.OpenIndexDiag) []any {
+	t := dg.Timing
+	ms := func(d time.Duration) string { return d.Round(time.Millisecond).String() }
+	return []any{
+		"dir", dg.Dir, "sealed", dg.SealedSegments,
+		"mapSegments", ms(t.MapSegments), "dirRestore", ms(t.DirRestore), "dirRebuilt", t.DirRebuilt,
+		"publishDict", ms(t.PublishDict), "publishColumns", ms(t.PublishColumns),
+		"loadSidecars", ms(t.LoadSidecars), "zoneRecompute", ms(t.ZoneRecompute),
+		"zoneRecomputed", t.ZoneRecomputed, "zoneUpgraded", t.ZoneUpgraded,
+		"zoneUpgradeFailed", t.ZoneUpgradeFailed, "zoneRecomputeOutlook", zoneRecomputeOutlook(t),
+		"reindex", ms(t.Reindex), "rebuildOrdered", ms(t.RebuildOrdered),
+		"adoptSchema", ms(t.AdoptSchema), "loadDicts", ms(t.LoadDicts), "loadDemand", ms(t.LoadDemand),
+	}
+}
+
+// zoneRecomputeOutlook classifies an open's zone-map recompute: "none" when no segment needed one,
+// "one-time" when every recomputed segment had its zone map written back (the next open adopts
+// them), and "recurring" when any was not -- those segments are decoded again on every start.
+func zoneRecomputeOutlook(t collections.OpenTiming) string {
+	switch {
+	case t.ZoneRecomputed == 0:
+		return "none"
+	case t.ZoneUpgradeFailed == 0 && t.ZoneUpgraded >= t.ZoneRecomputed:
+		return "one-time"
+	default:
+		return "recurring"
+	}
 }
 
 // openTimingTotal sums an open's sequential phases into a rough wall-clock, for the "is this open

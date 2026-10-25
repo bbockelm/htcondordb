@@ -130,7 +130,7 @@ func resolveFederationSettings(cfg *config.Config) (s federationSettings, bad []
 	s.archive = federate.ArchiveOptions{
 		ExtraCategorical:   splitAttrList(getStr(cfg, "HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS")),
 		ExtraValue:         splitAttrList(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS")),
-		SchemaRequireAttrs: splitAttrList(resolveSchemaRequireAttrs(cfg)),
+		SchemaRequireAttrs: splitAttrList(resolveSchemaRequireAttrs(cfg, "")),
 		SegmentSize:        segSize,
 		MaxBytes: map[string]int64{
 			federate.TableHistory:      configBytesOr(cfg, "HTCONDORDB_HISTORY_MAX_BYTES", defMax),

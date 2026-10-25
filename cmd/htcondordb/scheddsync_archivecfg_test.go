@@ -16,19 +16,63 @@ const syncOn = "HTCONDORDB_SYNC_SCHEDD = true\nSPOOL = /var/spool/condor\nHTCOND
 
 // TestArchiveConfigDefaults pins the defaults the history archive is created with. Segment
 // size is deliberately left to the library (small segments keep the unindexed tail short,
-// and segment count is a merge problem, not a seal-size one), while the categorical index
-// is not: an archive with no categorical index cannot answer a GROUP BY from its indexes at
-// any segment size.
+// and segment count is a merge problem, not a seal-size one), while the index set is not: the
+// reads every list page and dashboard issue have to be indexed from the start, not once demand
+// has accumulated (an index added later reaches only the archive's backfill horizon).
 func TestArchiveConfigDefaults(t *testing.T) {
 	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
 	if s.archiveSegSize != 0 {
 		t.Errorf("archiveSegSize = %d, want 0 (library default)", s.archiveSegSize)
 	}
-	if s.archiveCatAttrs != "Owner" {
-		t.Errorf("archiveCatAttrs = %q, want %q", s.archiveCatAttrs, "Owner")
+	if s.archiveCatAttrs != "" || s.archiveValAttrs != "" {
+		t.Errorf("configured additions = %q / %q, want none when the knobs are unset",
+			s.archiveCatAttrs, s.archiveValAttrs)
 	}
-	if s.archiveValAttrs != "ClusterId" {
-		t.Errorf("archiveValAttrs = %q, want %q", s.archiveValAttrs, "ClusterId")
+	for _, tc := range []struct {
+		table          string
+		cat, val       []string
+		wantCat, wantV []string
+	}{
+		{"history", nil, nil, []string{"Owner"}, []string{"ClusterId", "ProcId", "JobStatus", "CompletionDate", "QDate"}},
+		{"epoch_history", nil, nil, []string{"Owner"}, []string{"ClusterId", "ProcId"}},
+		{"jobs", nil, nil, []string{"Owner"}, []string{"ClusterId", "JobStatus", "EnteredCurrentStatus"}},
+	} {
+		var c, v []string
+		switch tc.table {
+		case "history":
+			c, v = s.historyIndexSet()
+		case "epoch_history":
+			c, v = s.epochHistoryIndexSet()
+		case "jobs":
+			c, v = s.jobsIndexSet()
+		}
+		if !slices.Equal(c, tc.wantCat) || !slices.Equal(v, tc.wantV) {
+			t.Errorf("%s index set = %v / %v, want %v / %v", tc.table, c, v, tc.wantCat, tc.wantV)
+		}
+	}
+}
+
+// TestArchiveIndexKnobsAdd: the index knobs ADD to the built-in set. A site that set one to add a
+// grouping dimension must keep every built-in index, and an attribute the knob names with the
+// other kind takes the configured kind (an attribute carries one kind of index, not both).
+func TestArchiveIndexKnobsAdd(t *testing.T) {
+	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn+
+		"HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS = AccountingGroup, JobStatus\n"+
+		"HTCONDORDB_ARCHIVE_VALUE_ATTRS = RequestMemory\n"))
+	c, v := s.historyIndexSet()
+	if want := []string{"Owner", "AccountingGroup", "JobStatus"}; !slices.Equal(c, want) {
+		t.Errorf("history categorical = %v, want %v", c, want)
+	}
+	if want := []string{"ClusterId", "ProcId", "CompletionDate", "QDate", "RequestMemory"}; !slices.Equal(v, want) {
+		t.Errorf("history value = %v, want %v (JobStatus moved to categorical by the knob)", v, want)
+	}
+	// The same additions reach epoch_history, on top of its own built-in set.
+	c, v = s.epochHistoryIndexSet()
+	if want := []string{"Owner", "AccountingGroup", "JobStatus"}; !slices.Equal(c, want) {
+		t.Errorf("epoch_history categorical = %v, want %v", c, want)
+	}
+	if want := []string{"ClusterId", "ProcId", "RequestMemory"}; !slices.Equal(v, want) {
+		t.Errorf("epoch_history value = %v, want %v", v, want)
 	}
 }
 
@@ -97,8 +141,8 @@ func TestReconcileArchiveIndexesAdds(t *testing.T) {
 	// The backfill runs in its own goroutine (so it cannot stall daemon startup) but is
 	// registered on wg, which the manager joins on stop; the test joins it the same way.
 	var wg sync.WaitGroup
-	m.reconcileArchiveIndexes(context.Background(), hist, "history",
-		splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
+	histCat, histVal := s.historyIndexSet()
+	m.reconcileArchiveIndexes(context.Background(), hist, "history", histCat, histVal, &wg)
 	wg.Wait()
 
 	if c, _ := hist.IndexedAttrs(); !slices.Contains(c, "Owner") {
@@ -129,8 +173,8 @@ func TestReconcileArchiveIndexesNeverDrops(t *testing.T) {
 	// Config names only Owner; AccountingGroup was added out of band.
 	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
 	var wg sync.WaitGroup
-	m.reconcileArchiveIndexes(context.Background(), hist, "history",
-		splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
+	histCat, histVal := s.historyIndexSet()
+	m.reconcileArchiveIndexes(context.Background(), hist, "history", histCat, histVal, &wg)
 	wg.Wait() // join the backfill (adding the ClusterId value index) before asserting
 
 	c, _ := hist.IndexedAttrs()
@@ -169,8 +213,8 @@ func TestReconcileArchiveIndexesSurvivesRestart(t *testing.T) {
 	// persisted index. Polling IndexedAttrs instead raced the persist step (IndexedAttrs flips
 	// after the reindex, before saveIndexConfig) and flaked.
 	var wg sync.WaitGroup
-	m.reconcileArchiveIndexes(context.Background(), hist, "history",
-		splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
+	histCat, histVal := s.historyIndexSet()
+	m.reconcileArchiveIndexes(context.Background(), hist, "history", histCat, histVal, &wg)
 	wg.Wait()
 	if c, _ := hist.IndexedAttrs(); !slices.Contains(c, "Owner") {
 		t.Fatalf("Owner was not backfilled; categorical = %v", c)

@@ -1328,8 +1328,14 @@ func (m *jobMetrics) status() MetricsStatus {
 // table is created with. SampleTime must be zone-mapped both because every dashboard query filters
 // on it (so a time range prunes whole segments instead of scanning) and because age-based
 // retention measures against a zone-mapped attribute.
+//
+// The read that matters most is one job's series -- `ClusterId == N && ProcId == M`, on every job
+// page -- so both halves of the job id are value-indexed. ClusterId alone narrows to a cluster,
+// which on a large submission is thousands of procs times their samples; ProcId is what turns
+// that into one job's rows. It is cheap: a small integer repeated across every cluster.
+// Owner is the scope every non-admin read is ANDed with.
 var (
 	JobMetricsZoneAttrs        = []string{SampleTimeAttr, "ClusterId"}
-	JobMetricsValueAttrs       = []string{"ClusterId"}
+	JobMetricsValueAttrs       = []string{"ClusterId", "ProcId"}
 	JobMetricsCategoricalAttrs = []string{"Owner"}
 )
