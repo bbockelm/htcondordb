@@ -176,7 +176,7 @@ func (r *Replicator) session(parent context.Context) error {
 		}()
 	}
 
-	tables, err := client.Tables(ctx)
+	tables, err := mutableTables(ctx, client)
 	if err != nil {
 		return err
 	}
@@ -193,7 +193,7 @@ func (r *Replicator) session(parent context.Context) error {
 			wg.Wait()
 			return sessionErr(errOnce, parent)
 		case <-ticker.C:
-			more, terr := client.Tables(ctx)
+			more, terr := mutableTables(ctx, client)
 			if terr != nil {
 				cancel()
 				wg.Wait()
@@ -204,6 +204,44 @@ func (r *Replicator) session(parent context.Context) error {
 			}
 		}
 	}
+}
+
+// mutableTables is the leader's table listing with its append-only archives removed.
+//
+// Replication writes every discovered name through Catalog.CreateTable and applies watch
+// events to it as a mutable table. An archive cannot be replicated that way: on a follower
+// that has the same archive, CreateTable fails and takes the whole session down into a
+// reconnect loop; on one that does not, it silently creates a mutable table of that name
+// and fills it with history, after which the real archive can never be created. A daemon
+// that lists archives alongside tables is therefore not a signal to replicate them.
+func mutableTables(ctx context.Context, client *dbrpc.Client) ([]string, error) {
+	tables, err := client.Tables(ctx)
+	if err != nil {
+		return nil, err
+	}
+	archives, err := client.ArchiveTables(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return withoutArchives(tables, archives), nil
+}
+
+// withoutArchives is tables minus the names in archives.
+func withoutArchives(tables, archives []string) []string {
+	if len(archives) == 0 {
+		return tables
+	}
+	skip := make(map[string]bool, len(archives))
+	for _, n := range archives {
+		skip[n] = true
+	}
+	out := tables[:0:0]
+	for _, n := range tables {
+		if !skip[n] {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func sessionErr(errOnce chan error, parent context.Context) error {

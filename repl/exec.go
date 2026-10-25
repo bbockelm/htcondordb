@@ -743,13 +743,31 @@ func (e *Executor) Tables() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Include append-only history tables so `.tables` and completion surface them -- they are a
-	// distinct namespace the regular table list omits, and are otherwise invisible.
+	// Include append-only history tables so `.tables` and completion surface them. A
+	// current daemon already lists them here; one from before it did not, and against
+	// that one they are otherwise invisible. Union rather than concatenate, so the names
+	// a current daemon already returned are not listed a second time.
 	archives, aerr := e.c.ArchiveTables(e.opCtx())
-	if aerr == nil {
-		tables = append(tables, archives...)
+	if aerr != nil {
+		return tables, nil
 	}
-	return tables, nil
+	return unionNames(tables, archives), nil
+}
+
+// unionNames appends the archive names the table listing did not already carry. Appending
+// both lists unconditionally listed every archive twice once the daemon started returning
+// them itself.
+func unionNames(tables, archives []string) []string {
+	seen := make(map[string]bool, len(tables))
+	for _, n := range tables {
+		seen[n] = true
+	}
+	for _, n := range archives {
+		if !seen[n] {
+			tables = append(tables, n)
+		}
+	}
+	return tables
 }
 
 // tableExists reports whether name is a known table -- a mutable table or an append-only
