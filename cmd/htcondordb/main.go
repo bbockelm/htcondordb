@@ -36,6 +36,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
+	"github.com/dustin/go-humanize"
 
 	"github.com/bbockelm/htcondordb/command"
 	"github.com/bbockelm/htcondordb/dbad"
@@ -252,6 +253,8 @@ func run() error {
 			"archive index auto-tune disabled (HTCONDORDB_ARCHIVE_INDEX_MIN_DEMAND < 0)")
 	}
 
+	archiveIndexBackfillBytes := archiveIndexBackfillBudget(cfg, log)
+
 	svc, err := server.New(server.Config{
 		OnPhase:               boot.record,
 		OnTableOpen:           boot.recordTableOpen,
@@ -267,6 +270,8 @@ func run() error {
 		EncryptedAttrs:        encAttrs,
 		DeltaMax:              deltaMax,
 		ArchiveIndexMinDemand: archiveIndexMinDemand,
+
+		ArchiveIndexBackfillBytes: archiveIndexBackfillBytes,
 	})
 	if err != nil {
 		return err
@@ -730,4 +735,29 @@ func writeAddressFile(d *daemon.Daemon, cfg *config.Config, ln net.Listener) str
 		return ""
 	}
 	return path
+}
+
+// archiveIndexBackfillBudget reads HTCONDORDB_ARCHIVE_INDEX_BACKFILL_BYTES, the per-pass budget
+// the maintenance pass spends carrying the index set to archive segments that predate an
+// index, translated to server.Config.ArchiveIndexBackfillBytes: unset takes the library
+// default (0), a size ("512 MiB", "1g", plain bytes) sets the budget, and 0 turns the backfill
+// off (negative, as classad spells it). An unparseable value logs and takes the default rather
+// than turning the backfill off: a typo should not silently leave history unindexed.
+func archiveIndexBackfillBudget(cfg *config.Config, log *logging.Logger) int64 {
+	const key = "HTCONDORDB_ARCHIVE_INDEX_BACKFILL_BYTES"
+	s := strings.TrimSpace(getStr(cfg, key))
+	if s == "" {
+		return 0
+	}
+	n, err := humanize.ParseBytes(s)
+	if err != nil {
+		log.Warn(logging.DestinationGeneral, "unparseable archive index backfill budget; using the default",
+			"key", key, "value", s, "err", err.Error())
+		return 0
+	}
+	if n == 0 {
+		log.Info(logging.DestinationGeneral, "archive index backfill disabled ("+key+" = 0)")
+		return -1
+	}
+	return int64(n)
 }

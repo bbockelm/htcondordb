@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -202,5 +203,50 @@ func TestBehindTrackerIntegratesTimeBehind(t *testing.T) {
 	}
 	if got := b.total[up]; got != 0 {
 		t.Errorf("caught-up source accumulated %v s, want 0", got)
+	}
+}
+
+// TestHandlerExposesIndexBackfill: an index added to an archive reaches only its newest
+// segments at once, and the rest are the maintenance backfill's work. The gauge must report
+// that remainder, and the backfill's own timing must appear among the op stats.
+func TestHandlerExposesIndexBackfill(t *testing.T) {
+	cat, err := db.OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cat.Close() }()
+	hist, err := cat.CreateArchiveTable("history", db.ArchiveConfig{
+		SegmentSize: 1 << 12, ValueAttrs: []string{"ClusterId"}, IndexBackfillBytes: 8 << 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 600; i++ {
+		if err := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nCompletionDate = %d\nPad = %q",
+			i, 1000+i, strings.Repeat("p", 40))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hist.AddIndex(nil, []string{"CompletionDate"})
+	pending, _ := hist.IndexBackfillPending()
+	if pending == 0 {
+		t.Fatal("fixture: nothing left beyond the horizon")
+	}
+
+	scrape := func() string {
+		rec := httptest.NewRecorder()
+		Handler(t.Context(), cat, nil, nil, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+		return rec.Body.String()
+	}
+	if want := fmt.Sprintf(`htcondordb_index_backfill_pending_segments{table="history"} %d`, pending); !strings.Contains(scrape(), want) {
+		t.Errorf("metrics output is missing %s", want)
+	}
+	hist.BackfillIndexes(0)
+	body := scrape()
+	if want := `htcondordb_index_backfill_pending_segments{table="history"} 0`; !strings.Contains(body, want) {
+		t.Errorf("metrics output is missing %s after the backfill", want)
+	}
+	if want := fmt.Sprintf(`htcondordb_op_ops_total{op="index_backfill",table="history"} %d`, pending); !strings.Contains(body, want) {
+		t.Errorf("metrics output is missing %s", want)
 	}
 }
