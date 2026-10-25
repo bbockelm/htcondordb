@@ -179,13 +179,25 @@ func (m *scheddSyncManager) runGuardedTailer(ctx context.Context, name string, r
 	}
 }
 
-// defaultArchiveCategoricalAttrs are the history archive's categorical (string equality)
-// indexes when HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS is unset. Owner is the one grouping
-// dimension every pool has. Sites that group by AccountingGroup, ProjectName, or a custom
-// attribute should name them too: an unindexed GROUP BY is a full scan of every segment the
-// zone maps cannot prune, and the cost of adding an index later grows with the archive
-// (the backfill decompresses every record once).
+// defaultArchiveCategoricalAttrs is the federation hub's job_metrics categorical index list when
+// HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS is unset (see federate_manager.go). The schedd-sync
+// tables take their built-in sets from scheddsync_indexes.go instead, and read that knob as
+// additions to them.
 const defaultArchiveCategoricalAttrs = "Owner"
+
+// defaultHistorySchemaRequireAttrs are required in the history archive's columnar schema on top
+// of defaultSchemaRequireAttrs when HTCONDORDB_SCHEMA_REQUIRE_ATTRS is unset.
+//
+// CompletionDate is what history is most often bounded and aggregated by -- the recent list, the
+// goodput panel, MIN/COUNT over a window -- and without a columnar slot every one of those reads
+// rebuilds each record to find it: on a production history of 5.26M jobs, MIN(CompletionDate)
+// took 2m22s and a COUNT bounded by it 35s. It is not in the shared list because the other tables
+// it applies to would pay a slot for nothing: an epoch record has no CompletionDate, and in the
+// live queue only the few completed-but-not-yet-removed jobs do.
+//
+// The other attributes history is filtered on are set on every record (QDate, ClusterId, ProcId,
+// JobStatus, Owner at submit; EnteredHistoryTime at ingest), so presence alone admits them.
+const defaultHistorySchemaRequireAttrs = "CompletionDate"
 
 // defaultSchemaRequireAttrs are the attributes required in the columnar schema when
 // HTCONDORDB_SCHEMA_REQUIRE_ATTRS is unset.
@@ -247,10 +259,12 @@ type scheddSyncSettings struct {
 	archiveCatAttrs      string
 	archiveValAttrs      string
 	// schemaRequireAttrs names the attributes the columnar schema must carry whatever their
-	// presence rate (HTCONDORDB_SCHEMA_REQUIRE_ATTRS). Applied to the jobs table and to the
-	// history and epoch archives. Carried as its canonical config string so the settings struct
+	// presence rate (HTCONDORDB_SCHEMA_REQUIRE_ATTRS). Applied to the jobs table and the epoch
+	// archive; historySchemaRequireAttrs is the history archive's, which by default adds
+	// defaultHistorySchemaRequireAttrs. Carried as canonical config strings so the settings struct
 	// stays comparable for apply()'s reconcile-by-equality.
-	schemaRequireAttrs string
+	schemaRequireAttrs        string
+	historySchemaRequireAttrs string
 	// historyMaxBytes / epochMaxBytes cap the on-disk size (sealed-segment bytes) of the history
 	// and epoch_history archive tables. The periodic archive-maintenance pass drops the oldest
 	// whole segments until the table is under its cap. 0 = no limit. Configured from HTCondor
@@ -325,10 +339,6 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 	if segSize < 0 {
 		segSize = 0
 	}
-	catAttrs := getStr(cfg, "HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS")
-	if strings.TrimSpace(catAttrs) == "" {
-		catAttrs = defaultArchiveCategoricalAttrs
-	}
 	// Shared default size cap for both archives; per-table knobs override it below.
 	defArchiveMaxBytes := configBytes(cfg, "HTCONDORDB_ARCHIVE_MAX_BYTES")
 
@@ -383,9 +393,12 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 		// applyArchiveRowGroupBytes -- so it is worth reading on every start rather than only at
 		// creation.
 		archiveRowGroupBytes: configInt(cfg, "HTCONDORDB_ARCHIVE_ROW_GROUP_BYTES"),
-		archiveCatAttrs:      canonicalAttrList(catAttrs),
-		schemaRequireAttrs:   resolveSchemaRequireAttrs(cfg),
-		archiveValAttrs:      canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS"), "ClusterId")),
+		// Additions to each archive's built-in index set (see tableIndexSet.with); unset adds
+		// nothing.
+		archiveCatAttrs:           canonicalAttrList(getStr(cfg, "HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS")),
+		archiveValAttrs:           canonicalAttrList(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS")),
+		schemaRequireAttrs:        resolveSchemaRequireAttrs(cfg, ""),
+		historySchemaRequireAttrs: resolveSchemaRequireAttrs(cfg, defaultHistorySchemaRequireAttrs),
 		// Space limits: a shared default (HTCONDORDB_ARCHIVE_MAX_BYTES) applied to both archives,
 		// with per-table overrides. An explicit per-table value wins even when it is 0 (that table
 		// is uncapped while the default caps the other); an unset per-table knob inherits the
@@ -400,7 +413,7 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 		// real volume decision an admin should make rather than inherit.
 		metricsEnabled:  configBool(cfg, "HTCONDORDB_JOB_METRICS"),
 		metricsAttrs:    canonicalAttrList(getStr(cfg, "HTCONDORDB_JOB_METRICS_ATTRS")),
-		metricsCatAttrs: canonicalAttrList(firstNonEmpty(getStr(cfg, "HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS"), defaultArchiveCategoricalAttrs)),
+		metricsCatAttrs: canonicalAttrList(getStr(cfg, "HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS")),
 		metricsSegSize:  segSizeMetrics,
 		// A throttle, not a filter: it only ever drops a sample carrying no transition (see
 		// jobMetrics.build). A bare number is seconds; a duration suffix is accepted.
@@ -608,8 +621,10 @@ func canonicalAttrList(s string) string {
 	return strings.Join(splitAttrList(s), ",")
 }
 
-// resolveSchemaRequireAttrs reads HTCONDORDB_SCHEMA_REQUIRE_ATTRS. Unset takes the defaults; the
-// literal "none" requires nothing.
+// resolveSchemaRequireAttrs reads HTCONDORDB_SCHEMA_REQUIRE_ATTRS. Unset takes the defaults plus
+// tableDefaults (a table's own additions to the shared list); the literal "none" requires nothing.
+// A configured list REPLACES both -- unlike the index knobs, which add -- because a required field
+// costs bytes in every record and a site must be able to say exactly what it pays for.
 //
 // "none" exists because this list is not free in the way an index list is. An index costs its own
 // storage; a required field costs bytes in EVERY record, including the ones that do not have the
@@ -617,11 +632,11 @@ func canonicalAttrList(s string) string {
 // its own mix and prefers the presence floor absolute needs a way to say so, and leaving the knob
 // empty cannot mean that -- every other attribute knob here reads empty as "unset, take the
 // default", and one of them meaning the opposite is how a config change becomes a surprise.
-func resolveSchemaRequireAttrs(cfg *config.Config) string {
+func resolveSchemaRequireAttrs(cfg *config.Config, tableDefaults string) string {
 	raw := strings.TrimSpace(getStr(cfg, "HTCONDORDB_SCHEMA_REQUIRE_ATTRS"))
 	switch {
 	case raw == "":
-		return canonicalAttrList(defaultSchemaRequireAttrs)
+		return canonicalAttrList(defaultSchemaRequireAttrs + "," + tableDefaults)
 	case strings.EqualFold(raw, "none"):
 		return ""
 	}
@@ -763,22 +778,18 @@ func (m *scheddSyncManager) applyArchiveMaxAge(t *db.ArchiveTable, name string, 
 // SIGKILL, which is crash-free (the OS reclaims the mapping; the backfill is idempotent and
 // retried next start). ctx is checked before the goroutine starts, so a stop before the backfill
 // begins skips it; once AddIndex is running only the join can end it cleanly.
+//
+// An attribute the auto-tuner already indexed is re-added as configured (see indexAdditions), so
+// the trimmer can no longer drop it.
+//
+// After the additions it reports how much of the archive each wanted index actually covers. An
+// index added to an existing archive is backfilled only as far as the archive's backfill horizon
+// (1 GiB by default), and the same is true of one the auto-tuner added long ago: older segments
+// keep the sidecar they were sealed with and are scanned in full for that attribute, while the
+// index set lists it either way. The warning is how that shows up anywhere but `.explain`.
 func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, arch *db.ArchiveTable, name string, wantCat, wantVal []string, wg *sync.WaitGroup) {
 	haveCat, haveVal := arch.IndexedAttrs()
-	missing := func(want []string, have []string) []string {
-		var out []string
-		for _, w := range want {
-			if !slices.ContainsFunc(have, func(h string) bool { return strings.EqualFold(h, w) }) {
-				out = append(out, w)
-			}
-		}
-		return out
-	}
-	addCat := missing(wantCat, haveCat)
-	addVal := missing(wantVal, haveVal)
-	if len(addCat) == 0 && len(addVal) == 0 {
-		return
-	}
+	addCat, addVal := indexAdditions(haveCat, haveVal, arch.AutoIndexNames(), wantCat, wantVal)
 	if ctx.Err() != nil {
 		return
 	}
@@ -788,16 +799,39 @@ func (m *scheddSyncManager) reconcileArchiveIndexes(ctx context.Context, arch *d
 		if archiveBackfillHook != nil {
 			archiveBackfillHook()
 		}
-		stale, sealed := arch.StaleIndexSegments()
-		m.logger.Info("schedd-sync: backfilling archive indexes", "archive", name,
-			"categorical", addCat, "value", addVal, "segments", sealed, "stale_before", stale)
-		if !arch.AddIndex(addCat, addVal) {
-			return
+		if len(addCat) > 0 || len(addVal) > 0 {
+			stale, sealed := arch.StaleIndexSegments()
+			m.logger.Info("schedd-sync: backfilling archive indexes", "archive", name,
+				"categorical", addCat, "value", addVal, "segments", sealed, "stale_before", stale)
+			if arch.AddIndex(addCat, addVal) {
+				stale, sealed = arch.StaleIndexSegments()
+				m.logger.Info("schedd-sync: archive index backfill finished", "archive", name,
+					"categorical", addCat, "value", addVal, "segments", sealed, "stale_after", stale,
+					"left_by_horizon", arch.StaleIndexSegmentsByPolicy())
+			}
 		}
-		stale, sealed = arch.StaleIndexSegments()
-		m.logger.Info("schedd-sync: archive index backfill finished", "archive", name,
-			"categorical", addCat, "value", addVal, "segments", sealed, "stale_after", stale)
+		m.reportArchiveIndexCoverage(arch, name, append(slices.Clone(wantCat), wantVal...))
 	}()
+}
+
+// reportArchiveIndexCoverage warns when a wanted index leaves segments unindexed. Silent when
+// every segment is covered, which is the steady state of an archive created with the index.
+func (m *scheddSyncManager) reportArchiveIndexCoverage(arch *db.ArchiveTable, name string, attrs []string) {
+	cov := archiveIndexCoverage(arch, attrs)
+	var gaps []string
+	for _, a := range attrs {
+		if n := cov[a]; n > 0 {
+			gaps = append(gaps, fmt.Sprintf("%s=%d", a, n))
+		}
+	}
+	if len(gaps) == 0 {
+		return
+	}
+	_, sealed := arch.StaleIndexSegments()
+	m.logger.Warn("schedd-sync: archive indexes do not cover every segment", "archive", name,
+		"unindexed_segments", strings.Join(gaps, ","), "sealed_segments", sealed,
+		"note", "segments sealed before an index was added and outside the backfill horizon are "+
+			"scanned in full for that attribute; `.explain` shows the per-query breakdown")
 }
 
 // splitAttrList splits a comma- and/or space-separated attribute list, dropping empties.
@@ -980,6 +1014,10 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// Only the jobs table: the required attributes are a job's resource usage, and the other
 		// tables this log flattens into (users, clusters, jobsets, the header) do not carry them.
 		m.applySchemaRequire("jobs", splitAttrList(s.schemaRequireAttrs), jobs.SetSchemaRequireAttrs)
+		// A mutable table takes no index configuration at creation, so the built-in set goes on
+		// through the same add-only reconciliation whether the table is new or not.
+		jobsCat, jobsVal := s.jobsIndexSet()
+		m.reconcileTableIndexes(ctx, jobs, "jobs", jobsCat, jobsVal, &wg)
 		users, err := m.svc.Catalog().CreateTable("users")
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating users table: %w", err)
@@ -1010,11 +1048,12 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// the sample taken from it.
 		metricsCfg := metricsConfigFor(s, m.logger, syncStore("jobmetrics.pos"))
 		if s.metricsEnabled {
+			jmCat, jmVal := s.jobMetricsIndexSet()
 			jm, merr := m.svc.Catalog().CreateArchiveTable(scheddsync.DefaultJobMetricsTable, db.ArchiveConfig{
 				SegmentSize:      s.metricsSegSize,
 				RowGroupBytes:    s.archiveRowGroupBytes,
-				CategoricalAttrs: splitAttrList(s.metricsCatAttrs),
-				ValueAttrs:       scheddsync.JobMetricsValueAttrs,
+				CategoricalAttrs: jmCat,
+				ValueAttrs:       jmVal,
 				// SampleTime carries the whole read pattern: every dashboard query filters on it,
 				// so zone-mapping it prunes whole segments instead of scanning, and age-based
 				// retention measures against a zone-mapped attribute.
@@ -1030,8 +1069,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			// dimension to HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS on an existing archive got a
 			// silent no-op -- and the docs told them it would cost a backfill, implying it worked.
 			// It now costs a backfill, in the background, exactly as for history.
-			m.reconcileArchiveIndexes(ctx, jm, scheddsync.DefaultJobMetricsTable,
-				splitAttrList(s.metricsCatAttrs), scheddsync.JobMetricsValueAttrs, &wg)
+			m.reconcileArchiveIndexes(ctx, jm, scheddsync.DefaultJobMetricsTable, jmCat, jmVal, &wg)
 			m.applyArchiveRowGroupBytes(jm, scheddsync.DefaultJobMetricsTable, s)
 			m.applyArchiveMaxBytes(jm, scheddsync.DefaultJobMetricsTable, s.metricsMaxBytes)
 			m.applyArchiveMaxAge(jm, scheddsync.DefaultJobMetricsTable, s.metricsMaxAge)
@@ -1057,16 +1095,17 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			"tables", "jobs,users,jobsets,clusters,header,clusterprivate,logmeta")
 	}
 	if s.histFile != "" {
+		histCat, histVal := s.historyIndexSet()
 		hist, err := m.svc.Catalog().CreateArchiveTable("history", db.ArchiveConfig{
 			SegmentSize:      s.archiveSegSize,
 			RowGroupBytes:    s.archiveRowGroupBytes,
-			CategoricalAttrs: splitAttrList(s.archiveCatAttrs),
-			ValueAttrs:       splitAttrList(s.archiveValAttrs),
+			CategoricalAttrs: histCat,
+			ValueAttrs:       histVal,
 			// Zone-map both the job's completion time and htcondordb's ingest time
 			// (EnteredHistoryTime, stamped per record), so range queries on either prune whole
 			// segments instead of scanning -- e.g. "jobs that entered history in the last 24h".
 			ZoneAttrs:          []string{"CompletionDate", scheddsync.EnteredHistoryAttr},
-			SchemaRequireAttrs: splitAttrList(s.schemaRequireAttrs),
+			SchemaRequireAttrs: splitAttrList(s.historySchemaRequireAttrs),
 		})
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating history archive: %w", err)
@@ -1078,10 +1117,9 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		// and hours on a mature one, and must not hold up daemon startup. AddIndex is correct
 		// immediately (segments full-scan for the new attribute until their sidecars are
 		// rebuilt), so serving during the backfill is safe.
-		m.reconcileArchiveIndexes(ctx, hist, "history",
-			splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
+		m.reconcileArchiveIndexes(ctx, hist, "history", histCat, histVal, &wg)
 		m.applyArchiveRowGroupBytes(hist, "history", s)
-		m.applySchemaRequire("history", splitAttrList(s.schemaRequireAttrs), hist.SetSchemaRequireAttrs)
+		m.applySchemaRequire("history", splitAttrList(s.historySchemaRequireAttrs), hist.SetSchemaRequireAttrs)
 		m.applyArchiveMaxBytes(hist, "history", s.historyMaxBytes)
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
 			Filename:        s.histFile,
@@ -1103,11 +1141,12 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		m.logger.Info("schedd-sync: tailing history file", "file", s.histFile, "archive", "history")
 	}
 	if s.epochFile != "" {
+		epCat, epVal := s.epochHistoryIndexSet()
 		ep, err := m.svc.Catalog().CreateArchiveTable("epoch_history", db.ArchiveConfig{
 			SegmentSize:      s.archiveSegSize,
 			RowGroupBytes:    s.archiveRowGroupBytes,
-			CategoricalAttrs: splitAttrList(s.archiveCatAttrs),
-			ValueAttrs:       splitAttrList(s.archiveValAttrs),
+			CategoricalAttrs: epCat,
+			ValueAttrs:       epVal,
 			// Zone-map the epoch write time and htcondordb's ingest time so range
 			// queries on either prune whole segments. Epoch records carry no
 			// CompletionDate (a run instance is not a completed job).
@@ -1117,8 +1156,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating epoch archive: %w", err)
 		}
-		m.reconcileArchiveIndexes(ctx, ep, "epoch_history",
-			splitAttrList(s.archiveCatAttrs), splitAttrList(s.archiveValAttrs), &wg)
+		m.reconcileArchiveIndexes(ctx, ep, "epoch_history", epCat, epVal, &wg)
 		m.applyArchiveRowGroupBytes(ep, "epoch_history", s)
 		m.applySchemaRequire("epoch_history", splitAttrList(s.schemaRequireAttrs), ep.SetSchemaRequireAttrs)
 		m.applyArchiveMaxBytes(ep, "epoch_history", s.epochMaxBytes)

@@ -671,6 +671,18 @@ func (s *session) explain(console io.Writer, arg string) {
 	fmt.Fprintf(console, "index-usable: %d of %d probe(s)\n", ex.IndexUsable, len(ex.Probes))
 	fmt.Fprintf(console, "parallelism:  %d worker(s) over %d shard(s)\n", ex.Parallelism, ex.Shards)
 	fmt.Fprintf(console, "ads:          %d\n", ex.TotalAds)
+	// The per-segment breakdown is what tells a working index from one that exists on paper: an
+	// archive index added after most of its segments were sealed is "usable" by every probe line
+	// below while hundreds of segments carry no postings for it and are read in full. Only an
+	// indexed plan fills these in, so a scan prints no segment line rather than a row of zeros.
+	if n := ex.IndexSegments + ex.IndexSkippedSegments + ex.UnindexedSegments; n > 0 {
+		fmt.Fprintf(console, "segments:     %d of %d answer from the index, %d ruled out by it, %d unindexed (scanned in full)\n",
+			ex.IndexSegments, n, ex.IndexSkippedSegments, ex.UnindexedSegments)
+		fmt.Fprintf(console, "candidates:   ~%d record(s) from the indexed segments\n", ex.EstCandidates)
+	}
+	if ex.Reason != "" {
+		fmt.Fprintf(console, "reason:       %s\n", ex.Reason)
+	}
 	if len(ex.Probes) > 0 {
 		fmt.Fprintln(console, "probes:")
 		for _, p := range ex.Probes {

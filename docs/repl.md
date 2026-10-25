@@ -182,10 +182,21 @@ wire-native:  true
 index-usable: 1 of 2 probe(s)
 parallelism:  4 worker(s) over 8 shard(s)
 ads:          120000
+segments:     6 of 8 answer from the index, 1 ruled out by it, 1 unindexed (scanned in full)
+candidates:   ~45600 record(s) from the indexed segments
+reason:       index probe on Cpus: 6 of 8 segments answer from postings, ~45600 candidate records; 1 segments ruled out by their index; 1 segments have no index on it and are scanned in full
 probes:
   Cpus                 >=   INDEX  (value)  est ~38.0% (~45600 of 120000)
   Owner                ==   scan   (not indexed)
 ```
+
+For an indexed plan the `segments:` line says how many segments actually carry
+the index. An attribute can be listed as indexed while most segments have no
+postings for it: an index added to an existing archive is carried back only as
+far as the archive's backfill horizon (1 GiB by default), and every older
+segment keeps the index it was sealed with. Those segments are counted as
+`unindexed` and read in full. `reason:` is the planner's one-line account of the
+plan, including why it chose a scan.
 
 For an index-usable probe, `.explain` also shows the planner's **selectivity
 estimate** — how many ads the index expects to visit (from the segment indexes'

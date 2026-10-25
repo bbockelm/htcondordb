@@ -122,13 +122,14 @@ Repairing the mirror goes through the sync itself (DAEMON-authorized, over
 | `HTCONDORDB_JOB_QUEUE_LOG` | `$(JOB_QUEUE_LOG)` | Schedd job-queue log to tail (live `jobs`). |
 | `HTCONDORDB_HISTORY` | `$(HISTORY)` | Schedd history file to tail (`history` archive). |
 | `HTCONDORDB_ARCHIVE_ROTATE_INTERVAL` | `3600` | Archive-table retention sweep interval (seconds; `0` disables). |
-| `HTCONDORDB_SCHEMA_REQUIRE_ATTRS` | resource-usage attributes (see [Configuration](configuration.md)) | Attributes the columnar schema must carry on `jobs`, `history` and `epoch_history` regardless of how often they appear. `none` requires nothing. Re-asserted on every start and `condor_reconfig`; it does not rebuild anything, so run `.schema rebuild <table>` to make a change take effect. |
+| `HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS` / `HTCONDORDB_ARCHIVE_VALUE_ATTRS` | — | Indexes on `history` and `epoch_history` in addition to the [built-in set](#built-in-indexes). |
+| `HTCONDORDB_SCHEMA_REQUIRE_ATTRS` | resource-usage attributes (see [Configuration](configuration.md)) | Attributes the columnar schema must carry on `jobs`, `history` and `epoch_history` regardless of how often they appear. When unset, `history` also requires `CompletionDate`; a configured list replaces the defaults. `none` requires nothing. Re-asserted on every start and `condor_reconfig`; it does not rebuild anything, so run `.schema rebuild <table>` to make a change take effect. |
 | `HTCONDORDB_ARCHIVE_MAX_BYTES` | — | On-disk size cap applied to both archives; oldest whole segments drop past the cap on the sweep. Accepts `10 GB` / `500MiB` / plain bytes; unset = no limit. |
 | `HTCONDORDB_HISTORY_MAX_BYTES` | inherits default | Per-table size cap for `history` (overrides the shared default; `0` uncaps). |
 | `HTCONDORDB_EPOCH_HISTORY_MAX_BYTES` | inherits default | Per-table size cap for `epoch_history`. |
 | `HTCONDORDB_JOB_METRICS` | `false` | Sample running jobs' resource usage into the `job_metrics` archive. |
 | `HTCONDORDB_JOB_METRICS_ATTRS` | — | Additional job attributes to record on every sample (e.g. `ProjectName`, a chirp-published metric). |
-| `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | `Owner` | Attributes to give a categorical index (an unindexed `GROUP BY` is a full scan). Applies to an existing archive: a newly-named one is backfilled in the background. |
+| `HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS` | — | Categorical indexes on `job_metrics` in addition to the [built-in set](#built-in-indexes) (an unindexed `GROUP BY` is a full scan). Applies to an existing archive: a newly-named one is backfilled in the background. |
 | `HTCONDORDB_JOB_METRICS_MIN_INTERVAL` | `0` | Throttles redundant samples per job (bare number = seconds, or `5m`). Never drops a state change or a run endpoint. |
 | `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default | Segment size (create-time only), e.g. `8 MiB`. Measured best as-is; see [Sizing](#sizing). |
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | inherits default | Per-table size cap for `job_metrics`. |
@@ -137,6 +138,39 @@ Repairing the mirror goes through the sync itself (DAEMON-authorized, over
 | `HTCONDORDB_MIRRORED_SCHEDD_NAME` | the schedd's own `Name` | Which schedd this mirror claims (`MirroredScheddName`). See [Naming the mirrored schedd](#naming-the-mirrored-schedd). |
 | `HTCONDORDB_MIRRORED_SCHEDD_ADDRESS_FILE` | `SCHEDD_ADDRESS_FILE` | The mirrored schedd's address file: its address (`MirroredScheddAddress`) and, from HTCondor 25.x, its `Name`. Set it for a schedd other than the host's primary one. |
 | `HTCONDORDB_SYNCSTATUS_INTERVAL` | `5` | Whole seconds between `syncstatus` heartbeat rows. A sub-second value (`500ms`) is rejected (logged) and the default used. |
+
+### Built-in indexes
+
+Every table the sync creates is indexed for the reads the web API, `condor_history`
+and the dashboards issue, without waiting for demand-driven auto-indexing:
+
+| Table | Categorical | Value | Zone-mapped |
+|-------|-------------|-------|-------------|
+| `history` | `Owner` | `ClusterId`, `ProcId`, `JobStatus`, `CompletionDate`, `QDate` | `CompletionDate`, `EnteredHistoryTime` (+ the value indexes) |
+| `epoch_history` | `Owner` | `ClusterId`, `ProcId` | `EpochWriteDate`, `EnteredHistoryTime` (+ the value indexes) |
+| `job_metrics` | `Owner` | `ClusterId`, `ProcId` | `SampleTime`, `ClusterId` (+ the value indexes) |
+| `jobs` | `Owner` | `ClusterId`, `JobStatus`, `EnteredCurrentStatus` | — |
+
+`EnteredHistoryTime` has a zone map but no value index: the sync stamps it at
+ingest, so it rises with append order and the zone map already narrows any range
+on it to the segments that hold it. On `history` the set costs about 86 bytes of
+index per record (on disk and page cache, not heap) against about 12 for
+`ClusterId` + `Owner`.
+
+The set is applied when a table is created and re-asserted on every start and
+`condor_reconfig`, so an existing table gains whatever it lacks; the
+`*_CATEGORICAL_ATTRS` / `*_VALUE_ATTRS` knobs add to it rather than replace it.
+Reconciliation only adds: an index created by hand, or by the auto-tuner, is
+never dropped, and the auto-tuner keeps adding indexes on top. An index the
+auto-tuner created that the built-in set names is re-recorded as configured, so
+the tuner's memory-budget trimmer can no longer drop it.
+
+An index added to an archive that already has data is backfilled only as far as
+the archive's backfill horizon (the newest 1 GiB). Older sealed segments keep the
+index they were sealed with and are read in full for the new attribute. When that
+leaves segments uncovered, the start-up log says so per attribute
+(`archive indexes do not cover every segment`, with `unindexed_segments`), and
+`.explain` in the [REPL](repl.md) shows the same count for a given query.
 
 ### Bounding disk usage
 

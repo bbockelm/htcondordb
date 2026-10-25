@@ -26,8 +26,11 @@ func TestJobMetricsDefaults(t *testing.T) {
 	if s.metricsSegSize != 0 {
 		t.Errorf("metricsSegSize = %d, want 0 (library default)", s.metricsSegSize)
 	}
-	if s.metricsCatAttrs != "Owner" {
-		t.Errorf("metricsCatAttrs = %q, want Owner", s.metricsCatAttrs)
+	if s.metricsCatAttrs != "" {
+		t.Errorf("metricsCatAttrs = %q, want empty (the knob adds to the built-in set)", s.metricsCatAttrs)
+	}
+	if c, v := s.jobMetricsIndexSet(); !slices.Equal(c, []string{"Owner"}) || !slices.Equal(v, []string{"ClusterId", "ProcId"}) {
+		t.Errorf("job_metrics index set = %v / %v, want [Owner] / [ClusterId ProcId]", c, v)
 	}
 	if s.metricsAttrs != "" {
 		t.Errorf("metricsAttrs = %q, want empty", s.metricsAttrs)
