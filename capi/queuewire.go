@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // recordHeaderLen is the per-ad length prefix inside a chunk.
@@ -62,6 +63,12 @@ type adRecordBuilder struct {
 	// projection for counting's sake: the query has to see them, and the client
 	// did not ask for them.
 	suppress map[string]bool
+
+	// wireProj is the projection applied by appendWireRecord, which receives whole
+	// ads: the wire-row stream cannot expand a projection to the attributes its
+	// expressions reference, so a projected query asks for everything and filters
+	// here. nil on the text path and for a query with no projection.
+	wireProj *wireProjector
 
 	// serverTime, when non-empty, is appended to every ad as one more expression.
 	// HTCondor's PUT_CLASSAD_SERVER_TIME does the same, so a client can compute
@@ -148,14 +155,33 @@ func (b *adRecordBuilder) appendRecord(dst []byte, row string) []byte {
 		n++
 	}
 
-	// The two trailing type strings. HTCondor always sends them empty and carries
-	// the real MyType/TargetType as ordinary attributes in the body (which is how
-	// they arrive here, as lines), so matching it means two empty strings.
-	dst = append(dst, 0, 0)
+	return endRecord(dst, start, n)
+}
 
+// endRecord closes a record begun at offset start in dst with n expressions
+// already appended: the two trailing type strings, then the two headers that had
+// to wait for the body's length and count.
+//
+// HTCondor always sends the type strings empty and carries the real
+// MyType/TargetType as ordinary attributes in the body (which is how they arrive
+// here), so matching it means two empty strings.
+func endRecord(dst []byte, start, n int) []byte {
+	dst = append(dst, 0, 0)
 	binary.BigEndian.PutUint64(dst[start+recordHeaderLen:], uint64(n))
 	binary.LittleEndian.PutUint32(dst[start:], uint32(len(dst)-start-recordHeaderLen))
 	return dst
+}
+
+// suppressedName is the suppress test for raw name bytes. The set holds at most
+// the two counting attributes, so a scan beats folding the name into a string to
+// look it up.
+func (b *adRecordBuilder) suppressedName(name []byte) bool {
+	for s := range b.suppress {
+		if wire.FoldEqualBytes(name, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // attrNameOf returns the attribute name of an old-ClassAd assignment line, or ""

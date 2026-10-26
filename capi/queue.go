@@ -448,11 +448,11 @@ func hcdb_queue_probe(h C.uintptr_t) {
 //
 // It returns before any row is read. constraint is a ClassAd expression (a query
 // ad's Requirements). projection is a comma-separated attribute list, or empty for
-// every attribute; it is applied at the database, including the attributes the
-// projected expressions themselves reference, so what comes back evaluates
-// self-contained the way HTCondor's own projected results do. limit caps the ads
-// (<= 0 for no cap). flags is a bitwise OR of HCDB_QUEUE_SERVER_TIME,
-// HCDB_QUEUE_COUNTS and HCDB_QUEUE_NO_ADS.
+// every attribute; what comes back also carries the attributes the projected
+// expressions themselves reference, so it evaluates self-contained the way
+// HTCondor's own projected results do. limit caps the ads (<= 0 for no cap).
+// flags is a bitwise OR of HCDB_QUEUE_SERVER_TIME, HCDB_QUEUE_COUNTS and
+// HCDB_QUEUE_NO_ADS.
 //
 // Collect the result with hcdb_queue_next; release it with hcdb_queue_free, which
 // is required even for a query that ran to completion.
@@ -517,6 +517,11 @@ func hcdb_queue_beginImpl(h C.uintptr_t, constraint, projection *C.char, limit C
 	return C.uintptr_t(handle)
 }
 
+// forceTextRows makes stream take the text fallback against a database that does
+// offer wire rows, so one test can run the same query down both paths and compare
+// the bytes they produce. Nothing in the library ever sets it.
+var forceTextRows = false
+
 // stream reads the matching rows, hands the ads over as wire-framed chunks, and
 // tallies the per-(universe, status) counts behind the summary ad as it goes.
 //
@@ -534,6 +539,7 @@ func (r *queueRequest) stream(ctx context.Context, dbc *dbrpc.Client, table, con
 	ads := 0
 	counts := map[[2]int]int64{}
 	sendErr := error(nil)
+	rowErr := error(nil)
 
 	flush := func() bool {
 		if len(buf) == 0 {
@@ -550,8 +556,9 @@ func (r *queueRequest) stream(ctx context.Context, dbc *dbrpc.Client, table, con
 		ads = 0
 		return true
 	}
-	row := func(text string) bool {
-		buf = b.appendRecord(buf, text)
+	// tally is the shared tail of both row forms: the ad is already in buf, and
+	// what is left is the bookkeeping and the handoff.
+	tally := func() bool {
 		ads++
 		if wantCounts && b.haveStatus {
 			counts[[2]int{b.universe, b.status}]++
@@ -561,19 +568,55 @@ func (r *queueRequest) stream(ctx context.Context, dbc *dbrpc.Client, table, con
 		}
 		return true
 	}
-
-	// The reference-chasing projection is the one that matches HTCondor: putClassAd
-	// expands a projection to the attributes the projected expressions refer to, so
-	// a client asking for Requirements can still evaluate it. A database too old
-	// for that opcode falls back to projecting here, over every attribute of every
-	// ad -- correct for literal-valued attributes, and the reason to upgrade.
-	err := dbc.QueryRawProjectRefsStream(ctx, table, constraint, attrs, limit, row)
-	if errors.Is(err, dbrpc.ErrProjectRefsUnsupported) {
-		b.projection = lowerSet(attrs)
-		b.suppress = nil // the local projection already excludes what we added
+	row := func(text string) bool {
+		buf = b.appendRecord(buf, text)
+		return tally()
+	}
+	wireRow := func(w []byte) bool {
+		var ok bool
+		buf, ok = b.appendWireRecord(buf, w)
+		if !ok {
+			rowErr = errUnreadableWireRow
+			return false
+		}
+		return tally()
+	}
+	reset := func() {
 		buf, ads = buf[:0], 0
 		clear(counts)
-		err = dbc.QueryRawTableStream(ctx, table, constraint, limit, row)
+	}
+
+	// The wire-row stream first: the database ships the ad's structure rather than
+	// its text, and ships many ads per frame rather than one, which is most of the
+	// cost of relaying a job queue. It is not always available (an older database,
+	// or a table that cannot produce self-contained rows), and it says so before
+	// the first row, so the text streams below remain the fallback.
+	wireAttrs, wireProj := wireRequest(attrs, b)
+	b.wireProj = wireProj
+	err := error(dbrpc.ErrRawWireUnsupported)
+	if !forceTextRows {
+		err = dbc.QueryRawWireStream(ctx, table, constraint, wireAttrs, limit, true, wireRow)
+	}
+	if errors.Is(err, dbrpc.ErrRawWireUnsupported) {
+		b.wireProj = nil
+		reset()
+
+		// The reference-chasing projection is the one that matches HTCondor:
+		// putClassAd expands a projection to the attributes the projected expressions
+		// refer to, so a client asking for Requirements can still evaluate it. A
+		// database too old for that opcode falls back to projecting here, over every
+		// attribute of every ad -- correct for literal-valued attributes, and the
+		// reason to upgrade.
+		err = dbc.QueryRawProjectRefsStream(ctx, table, constraint, attrs, limit, row)
+		if errors.Is(err, dbrpc.ErrProjectRefsUnsupported) {
+			b.projection = lowerSet(attrs)
+			reset()
+			err = dbc.QueryRawTableStream(ctx, table, constraint, limit, row)
+		}
+	}
+	if rowErr != nil {
+		r.fail(rowErr)
+		return
 	}
 	if err != nil {
 		r.fail(err)
