@@ -78,7 +78,7 @@ func (p *poolDialer) dial() (*conn, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &conn{addr: p.addr, ctx: ctx, cancel: cancel}
-	c.dbc = dbrpc.NewClient(c.watchTransport(dbrpc.NewStreamConn(nc)))
+	c.attach(dbrpc.NewStreamConn(nc)) // the production wiring, so the watch is covered
 	p.mu.Lock()
 	p.socks[c] = nc
 	p.mu.Unlock()

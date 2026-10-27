@@ -90,6 +90,15 @@ type conn struct {
 	dead atomic.Bool
 }
 
+// attach builds the connection's dbrpc client over mc. Every caller goes through
+// here rather than calling dbrpc.NewClient directly, so the transport watch below
+// cannot be wired into one construction path and forgotten in another -- a test
+// that built its own client was the only thing exercising the watch, so removing
+// it from the production path broke nothing.
+func (c *conn) attach(mc dbrpc.MsgConn) {
+	c.dbc = dbrpc.NewClient(c.watchTransport(mc))
+}
+
 // watchTransport wraps the dbrpc transport so the connection notices its own death:
 // any read failure flips dead and cancels the connection's context, which fails the
 // queries already streaming on it instead of truncating them, and tells the pool to
@@ -206,7 +215,7 @@ func openConnAs(addr, subsys string) (*conn, error) {
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	c.dbc = dbrpc.NewClient(c.watchTransport(dbrpc.NewCedarConn(ctx, cl.GetStream())))
+	c.attach(dbrpc.NewCedarConn(ctx, cl.GetStream()))
 	c.ex = repl.NewExecutor(c.dbc, repl.ExecConfig{})
 	return c, nil
 }
