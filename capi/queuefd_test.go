@@ -546,3 +546,35 @@ func exchange(t *testing.T, buffered *fdConn, from, to *stream.Stream, msg []byt
 		t.Fatalf("got %q, sent %q", got, msg)
 	}
 }
+
+// A blob the writer cannot make sense of must stop the query before anything is
+// written, so the caller still owns an untouched socket and can answer another
+// way. Silently writing the response in the clear on an encrypted session would
+// be the alternative, and the client would read noise.
+func TestSinkRefusesAnUnusableCryptoState(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		blob []byte
+	}{
+		{"wrong magic", append([]byte("XXXX"), make([]byte, 120)...)},
+		{"truncated", []byte("CDRX\x00\x01")},
+		{"empty-but-present", []byte{0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+			if err != nil {
+				t.Fatalf("socketpair: %v", err)
+			}
+			defer func() { _ = syscall.Close(fds[1]) }()
+			s, err := newFDSink(fds[0], tc.blob)
+			if err == nil {
+				s.close()
+				t.Fatal("a writer accepted a crypto state it cannot have understood")
+			}
+			if s.encrypted() {
+				t.Error("a writer that refused the state still thinks it is encrypting")
+			}
+			s.close()
+		})
+	}
+}
