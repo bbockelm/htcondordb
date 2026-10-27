@@ -507,7 +507,9 @@ func hcdb_queue_beginImpl(h C.uintptr_t, constraint, projection *C.char, limit C
 	cons := C.GoString(constraint)
 	wantAds := (flags & hcdbQueueNoAds) == 0
 
-	b := &adRecordBuilder{emit: wantAds, cedarFrame: sink != nil}
+	// An unencrypted session takes the frames straight from the builder; an
+	// encrypted one has to re-frame each ad anyway, so there it builds records.
+	b := &adRecordBuilder{emit: wantAds, cedarFrame: sink != nil && !sink.encrypted()}
 	if wantAds {
 		if (flags & hcdbQueueServerTime) != 0 {
 			b.serverTime = serverTimeExpr(time.Now().Unix())
@@ -530,7 +532,7 @@ func hcdb_queue_beginImpl(h C.uintptr_t, constraint, projection *C.char, limit C
 		// Give the socket up before announcing the result, so that by the time the
 		// caller is told the response is finished, nothing here can write to it.
 		if r.sink != nil {
-			r.sink.close()
+			r.fail(r.sink.finish())
 		}
 		r.closed.Store(true)
 		if !r.detached.Load() {
@@ -574,7 +576,7 @@ func (r *queueRequest) stream(ctx context.Context, dbc *dbrpc.Client, table, con
 			// These bytes are already the client's frames, so they go out from this
 			// goroutine. Nothing is queued for the caller's event loop, which is the
 			// whole point of the hcdb_queue_begin_fd path.
-			if err := r.sink.write(ctx, buf); err != nil {
+			if err := r.sink.writeChunk(ctx, buf); err != nil {
 				sendErr = err
 				return false
 			}

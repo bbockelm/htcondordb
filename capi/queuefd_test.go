@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -14,6 +16,8 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/bbockelm/cedar/message"
+	"github.com/bbockelm/cedar/stream"
 )
 
 // decodeCedarFrames splits a response the writer produced into one message per
@@ -74,6 +78,16 @@ func adExprs(t *testing.T, payload []byte) []string {
 	return strs[:count]
 }
 
+// newPlainSink is a response writer for a session in the clear.
+func newPlainSink(t *testing.T, fd int) *fdSink {
+	t.Helper()
+	s, err := newFDSink(fd, nil)
+	if err != nil {
+		t.Fatalf("building the response writer: %v", err)
+	}
+	return s
+}
+
 // socketPair is the client's socket, split in two: the descriptor handed to the
 // writer, and a reader standing in for condor_q.
 func socketPair(t *testing.T) (writerFD int, client *os.File) {
@@ -93,7 +107,7 @@ func runSink(t *testing.T, cl *dbrpc.Client, constraint string, attrs []string, 
 	b *adRecordBuilder) (raw []byte, r *queueRequest) {
 	t.Helper()
 	fd, client := socketPair(t)
-	sink := &fdSink{fd: fd}
+	sink := newPlainSink(t, fd)
 	r = &queueRequest{
 		client: &queueClient{notifyFD: -1},
 		chunks: make(chan queueChunk, 16),
@@ -145,7 +159,7 @@ func TestSinkWritesCedarFramedAds(t *testing.T) {
 	if got := r.written.Load(); got != 3 {
 		t.Errorf("the request reports %d ads written, want 3", got)
 	}
-	if r.sink.dirty.Load() {
+	if r.sink.conn.dirty.Load() {
 		t.Error("a response that completed left the socket marked unusable")
 	}
 	for _, m := range msgs {
@@ -208,7 +222,7 @@ func TestSinkReportsAWriteFailure(t *testing.T) {
 	cl := newTestServer(t, ads)
 
 	fd, client := socketPair(t)
-	sink := &fdSink{fd: fd}
+	sink := newPlainSink(t, fd)
 	r := &queueRequest{
 		client: &queueClient{notifyFD: -1},
 		chunks: make(chan queueChunk, 16),
@@ -234,13 +248,13 @@ func TestSinkReportsAWriteFailure(t *testing.T) {
 // descriptor for the same connection and is about to report the failure on it.
 func TestSinkAbortLeavesTheSocketOpen(t *testing.T) {
 	fd, client := socketPair(t)
-	sink := &fdSink{fd: fd}
+	sink := newPlainSink(t, fd)
 	sink.abort()
 
-	if err := sink.write(context.Background(), []byte("unsent")); !errors.Is(err, errWriterStopped) {
+	if err := sink.writeChunk(context.Background(), []byte("unsent")); !errors.Is(err, errWriterStopped) {
 		t.Fatalf("a stopped writer returned %v, want errWriterStopped", err)
 	}
-	if sink.dirty.Load() {
+	if sink.conn.dirty.Load() {
 		t.Error("stopping before any byte went out marked the socket unusable")
 	}
 	// The caller's end is still a working socket.
@@ -268,14 +282,14 @@ func TestSinkWritesThroughANonBlockingSocket(t *testing.T) {
 	}
 	client := os.NewFile(uintptr(fds[1]), "client")
 	defer func() { _ = client.Close() }()
-	sink := &fdSink{fd: fds[0]}
+	sink := newPlainSink(t, fds[0])
 	defer sink.close()
 
 	// More than any socket buffer, so the write must wait for the reader at least
 	// once rather than completing in one call.
 	payload := bytes.Repeat([]byte("z"), 4<<20)
 	done := make(chan error, 1)
-	go func() { done <- sink.write(context.Background(), payload) }()
+	go func() { done <- sink.writeChunk(context.Background(), payload) }()
 
 	got := 0
 	buf := make([]byte, 64<<10)
@@ -289,7 +303,7 @@ func TestSinkWritesThroughANonBlockingSocket(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("writing through a non-blocking socket: %v", err)
 	}
-	if sink.dirty.Load() {
+	if sink.conn.dirty.Load() {
 		t.Error("a complete write marked the socket unusable")
 	}
 }
@@ -338,8 +352,8 @@ func TestSinkCloseLeavesTheConnectionUp(t *testing.T) {
 	client := os.NewFile(uintptr(fds[1]), "client")
 	defer func() { _ = client.Close() }()
 
-	sink := &fdSink{fd: dup}
-	if err := sink.write(context.Background(), []byte("ads")); err != nil {
+	sink := newPlainSink(t, dup)
+	if err := sink.writeChunk(context.Background(), []byte("ads")); err != nil {
 		t.Fatalf("writing the ads: %v", err)
 	}
 	sink.close()
@@ -356,5 +370,179 @@ func TestSinkCloseLeavesTheConnectionUp(t *testing.T) {
 	}
 	if string(buf[:n]) != "ads|summary" {
 		t.Fatalf("the client saw %q, want the writer's bytes then the caller's", buf[:n])
+	}
+}
+
+// The encrypted path, end to end against the CEDAR implementation itself: an
+// established AES-GCM session is handed to the writer mid-stream, the writer
+// puts the ads on it, the session's final position comes back, and the caller
+// continues the same session with its own last message -- which is exactly what
+// the schedd does with the summary ad.
+func TestSinkResumesAndHandsBackAnEncryptedSession(t *testing.T) {
+	ads := map[string]string{}
+	for i := range 25 {
+		ads[fmt.Sprintf("%d.0", i)] = fmt.Sprintf(
+			"ClusterId = %d\nProcId = 0\nOwner = \"u%d\"\nJobStatus = %d\nJobUniverse = 5\nPad = \"%s\"",
+			i, i%3, (i%5)+1, strings.Repeat("p", i*11))
+	}
+	cl := newTestServer(t, ads)
+	want, _ := runStream(t, cl, "true", nil, -1, &adRecordBuilder{emit: true})
+
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	server := &fdConn{fd: fds[0]}
+	defer func() { _ = server.Close() }()
+	clientFile := os.NewFile(uintptr(fds[1]), "client")
+	clientConn, err := net.FileConn(clientFile)
+	if err != nil {
+		t.Fatalf("wrapping the client socket: %v", err)
+	}
+	_ = clientFile.Close()
+	defer func() { _ = clientConn.Close() }()
+
+	srv := stream.NewStream(server)
+	cli := stream.NewStream(clientConn)
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	if err := srv.SetSymmetricKey(key); err != nil {
+		t.Fatalf("server key: %v", err)
+	}
+	if err := cli.SetSymmetricKey(key); err != nil {
+		t.Fatalf("client key: %v", err)
+	}
+	// Both directions past counter zero and past the handshake-digest frame,
+	// which is where a schedd's session stands when a query arrives on it.
+	exchange(t, server, srv, cli, []byte("server hello"))
+	exchange(t, nil, cli, srv, []byte("client hello"))
+
+	blob, err := srv.ExportCryptoState()
+	if err != nil {
+		t.Fatalf("exporting the session: %v", err)
+	}
+
+	dup, err := syscall.Dup(fds[0])
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	sink, err := newFDSink(dup, blob)
+	if err != nil {
+		t.Fatalf("resuming the session in the writer: %v", err)
+	}
+	if !sink.encrypted() {
+		t.Fatal("a writer given a crypto-state blob is not encrypting")
+	}
+	r := &queueRequest{
+		client: &queueClient{notifyFD: -1},
+		chunks: make(chan queueChunk, 16),
+		sink:   sink,
+	}
+
+	// Read the response on the client while the writer produces it.
+	type result struct {
+		exprs [][]string
+		last  string
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		var out result
+		for range len(want) {
+			m := message.NewMessageFromStream(cli)
+			text, rerr := m.GetClassAdRaw(context.Background())
+			if rerr != nil {
+				out.err = rerr
+				done <- out
+				return
+			}
+			var one []string
+			for _, line := range strings.Split(text, "\n") {
+				if line != "" {
+					one = append(one, line)
+				}
+			}
+			out.exprs = append(out.exprs, one)
+		}
+		tail, rerr := cli.ReceiveCompleteMessage(context.Background())
+		out.last, out.err = string(tail), rerr
+		done <- out
+	}()
+
+	r.wg.Add(1)
+	r.stream(context.Background(), cl, dbrpc.DefaultTable, "true", nil, -1,
+		&adRecordBuilder{emit: true}, true)
+	if err := sink.finish(); err != nil {
+		t.Fatalf("finishing the response: %v", err)
+	}
+	if r.err != nil {
+		t.Fatalf("the response failed: %v", r.err)
+	}
+	if len(sink.final) == 0 {
+		t.Fatal("a finished encrypted response left no session to resume")
+	}
+
+	// The caller continues the same session with its own last message, which is
+	// only possible if the position handed back is right.
+	resumed, err := stream.NewStreamWithCryptoState(server, sink.final)
+	if err != nil {
+		t.Fatalf("resuming the session in the caller: %v", err)
+	}
+	if err := resumed.SendMessage(context.Background(), []byte("summary ad")); err != nil {
+		t.Fatalf("sending the caller's last message: %v", err)
+	}
+	if err := server.Flush(); err != nil {
+		t.Fatalf("flushing the caller's last message: %v", err)
+	}
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("the client could not read the response: %v", got.err)
+	}
+	if len(got.exprs) != len(want) {
+		t.Fatalf("the client read %d ads, want %d", len(got.exprs), len(want))
+	}
+	for i := range want {
+		// GetClassAdRaw appends MyType/TargetType lines of its own; compare the
+		// expressions the writer sent, which are the leading ones.
+		if len(got.exprs[i]) < len(want[i]) {
+			t.Fatalf("ad %d: client read %d expressions, want at least %d", i, len(got.exprs[i]), len(want[i]))
+		}
+		for j := range want[i] {
+			if got.exprs[i][j] != want[i][j] {
+				t.Fatalf("ad %d expression %d: client read %q, chunked path gave %q",
+					i, j, got.exprs[i][j], want[i][j])
+			}
+		}
+	}
+	if got.last != "summary ad" {
+		t.Fatalf("after the hand-back the client read %q, want the caller's own message", got.last)
+	}
+}
+
+// exchange sends one message and checks it arrives, to move a session past
+// counter zero the way a real handshake does. buffered, when set, is the
+// sender's fdConn, whose writes do not reach the socket until they are flushed.
+func exchange(t *testing.T, buffered *fdConn, from, to *stream.Stream, msg []byte) {
+	t.Helper()
+	errc := make(chan error, 1)
+	go func() {
+		err := from.SendMessage(context.Background(), msg)
+		if err == nil && buffered != nil {
+			err = buffered.Flush()
+		}
+		errc <- err
+	}()
+	got, err := to.ReceiveFrame(context.Background())
+	if err != nil {
+		t.Fatalf("receiving: %v", err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("sending: %v", err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("got %q, sent %q", got, msg)
 	}
 }
