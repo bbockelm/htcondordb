@@ -167,6 +167,9 @@ func openConn(addr string) (*conn, error) { return openConnAs(addr, "TOOL") }
 func openConnAs(addr, subsys string) (*conn, error) {
 	// Silence the transport's slog output unless the caller asked for it; see logging.go.
 	configureLogging()
+	// And open the profiler if the host asked for one; see pprof.go. Both are deferred to
+	// the first connection for the same reason: hcdb_setenv may have supplied the knob.
+	configurePprof()
 
 	// Run as the caller's subsystem (TOOL for command-line clients) so operator config
 	// scoped with a TOOL. prefix (e.g. TOOL.SEC_CLIENT_AUTHENTICATION_METHODS) is honored;
