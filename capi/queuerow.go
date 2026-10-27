@@ -221,8 +221,7 @@ func (b *adRecordBuilder) appendWireRecord(dst []byte, row []byte) ([]byte, bool
 
 	start := len(dst)
 	if b.emit {
-		dst = append(dst, 0, 0, 0, 0)             // payload length, filled in at the end
-		dst = append(dst, 0, 0, 0, 0, 0, 0, 0, 0) // expression count, likewise
+		dst = b.startRecord(dst)
 	}
 	if b.wireProj != nil {
 		b.wireProj.reset()
@@ -312,7 +311,7 @@ func (b *adRecordBuilder) appendWireRecord(dst []byte, row []byte) ([]byte, bool
 		dst = append(dst, 0)
 		n++
 	}
-	dst = endRecord(dst, start, n)
+	dst = b.endRecord(dst, start, n)
 	return dst, true
 }
 
