@@ -21,6 +21,7 @@ client in the tree resolves through `locate.Daemon`, and the daemon publishes to
 | `HTCONDORDB_DIR` | `$(SPOOL)/htcondordb` | On-disk database directory. |
 | `HTCONDORDB_ADDRESS_FILE` | `$(LOG)/.htcondordb_address` | Where the command address is published, and where clients look for it. Also read from the environment. |
 | `HTCONDORDB_HOST` | — | Client fallback when no address file is readable. Also read from the environment. |
+| `HTCONDORDB_QUEUE_POOL_SIZE` | `4` | **Client side** — read from the configuration of the daemon that embeds the C queue client (the schedd answering `condor_q` from a mirror), not from this daemon's. How many dbrpc sessions concurrent queries may spread over. One session is one socket and one decode loop, so simultaneous full dumps queue behind each other; sessions are dialled only when queries actually contend, and closed again after two minutes idle. Raise it on a submit host that serves many simultaneous queries against a well-provisioned mirror; `1` restores a single shared session. The gain is in the first few connections — the database's own scan is already parallel internally — so a large value mostly buys descriptors. |
 | `HTCONDORDB_HA_MODE` | `standalone` | `standalone` / `leader-follower` / `consistent`. See [HA](ha.md). |
 | `HTCONDORDB_ROLE` | `leader` | Leader-follower role. |
 | `HTCONDORDB_LEADER` | — | Leader address (follower). |

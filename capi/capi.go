@@ -35,6 +35,7 @@ import (
 	"runtime/cgo"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -80,6 +81,55 @@ type conn struct {
 	mu     sync.Mutex
 	ctx    context.Context
 	cancel context.CancelFunc
+	// dead is set the moment the transport under dbc fails, by watchTransport.
+	// dbrpc cannot tell a caller apart from the inside: when the read loop dies it
+	// CLOSES each in-flight stream's channel, which is byte for byte what the end
+	// of a result looks like, so a query that lost its connection half way through
+	// returns a short answer and no error. Watching the transport from out here is
+	// the only place the difference is visible.
+	dead atomic.Bool
+}
+
+// watchTransport wraps the dbrpc transport so the connection notices its own death:
+// any read failure flips dead and cancels the connection's context, which fails the
+// queries already streaming on it instead of truncating them, and tells the pool to
+// stop handing it out.
+func (c *conn) watchTransport(mc dbrpc.MsgConn) dbrpc.MsgConn {
+	return &watchedConn{MsgConn: mc, c: c}
+}
+
+type watchedConn struct {
+	dbrpc.MsgConn
+	c *conn
+}
+
+func (w *watchedConn) ReadMsg() ([]byte, error) {
+	b, err := w.MsgConn.ReadMsg()
+	if err != nil {
+		// Before returning: dbrpc's read loop fails every pending call as soon as it
+		// sees this error, and a request racing that wants the flag already set.
+		w.c.dead.Store(true)
+		w.c.cancel()
+	}
+	return b, err
+}
+
+// closeConn tears a session down: the dbrpc mux, the CEDAR session under it, and the
+// context that bounds their I/O. Every field is optional -- a connection assembled
+// without CEDAR (a test harness over a plain socket) has no cl -- so each is guarded.
+func closeConn(c *conn) {
+	if c == nil {
+		return
+	}
+	if c.dbc != nil {
+		_ = c.dbc.Close()
+	}
+	if c.cl != nil {
+		_ = c.cl.Close()
+	}
+	if c.cancel != nil {
+		c.cancel()
+	}
 }
 
 // openConn dials and authenticates a session, returning the error so callers that can
@@ -149,16 +199,16 @@ func openConnAs(addr, subsys string) (*conn, error) {
 		}
 		return nil, err
 	}
-	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()))
-	return &conn{
+	c := &conn{
 		addr:   addr,
 		cfg:    cfg,
 		cl:     cl,
-		dbc:    dbc,
-		ex:     repl.NewExecutor(dbc, repl.ExecConfig{}),
 		ctx:    ctx,
 		cancel: cancel,
-	}, nil
+	}
+	c.dbc = dbrpc.NewClient(c.watchTransport(dbrpc.NewCedarConn(ctx, cl.GetStream())))
+	c.ex = repl.NewExecutor(c.dbc, repl.ExecConfig{})
+	return c, nil
 }
 
 // Opens an authenticated dbrpc session to the htcondordb daemon at addr (a sinful or
