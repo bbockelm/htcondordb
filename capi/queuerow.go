@@ -72,7 +72,7 @@ func wireRequest(attrs []string, b *adRecordBuilder) (request []string, proj *wi
 	if len(b.suppress) > 0 {
 		wanted = make([]string, 0, len(attrs))
 		for _, a := range attrs {
-			if !b.suppress[strings.ToLower(a)] {
+			if !b.suppressed(strings.ToLower(a)) {
 				wanted = append(wanted, a)
 			}
 		}

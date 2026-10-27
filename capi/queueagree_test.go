@@ -254,7 +254,7 @@ func runAgreementCases(t *testing.T, cl *dbrpc.Client, only string) {
 			newBuilder := tc.builder
 			if len(attrs) > 0 && tc.builder().emit {
 				// What hcdb_queue_begin does for a counted query with a projection.
-				var suppress map[string]bool
+				var suppress []string
 				attrs, suppress = withCountingAttrs(attrs)
 				inner := tc.builder
 				newBuilder = func() *adRecordBuilder {

@@ -96,7 +96,9 @@ func liveSink(tb testing.TB, c *conn, constraint string, attrs []string, counts 
 	b := &adRecordBuilder{emit: true, cedarFrame: true}
 	req := attrs
 	if counts {
-		req, b.suppress = withCountingAttrs(attrs)
+		var suppress []string
+		req, suppress = withCountingAttrs(attrs)
+		b.suppress = suppress
 	}
 	start := time.Now()
 	r.wg.Add(1)
@@ -119,7 +121,9 @@ func liveChunks(tb testing.TB, c *conn, constraint string, attrs []string, count
 	b := &adRecordBuilder{emit: true}
 	req := attrs
 	if counts {
-		req, b.suppress = withCountingAttrs(attrs)
+		var suppress []string
+		req, suppress = withCountingAttrs(attrs)
+		b.suppress = suppress
 	}
 	start := time.Now()
 	r.wg.Add(1)
