@@ -37,6 +37,38 @@ if "HTCONDORDB_LIBRARY" not in os.environ:
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 
+# The running test daemon, set by daemon_address: the Popen handle and the file its output
+# goes to, so any fixture can tell whether it is still there and what it last said.
+_daemon: dict[str, object] = {}
+
+
+def _daemon_output() -> str:
+    """What the daemon has written so far, or "" if there is nothing to read."""
+    path = _daemon.get("output")
+    if not isinstance(path, Path):
+        return ""
+    try:
+        return path.read_text()
+    except OSError:  # pragma: no cover - only if the temp dir went away
+        return ""
+
+
+def _daemon_death() -> str:
+    """A report of the daemon's death, or "" while it is still running."""
+    process = _daemon.get("process")
+    if not isinstance(process, subprocess.Popen) or process.poll() is None:
+        return ""
+    # The first lines only: a Go fatal error dumps every goroutine, and it is the opening
+    # of that dump -- the fault and the stack that took it -- that names the bug.
+    output = _daemon_output()
+    head = "\n".join(output.splitlines()[:40])
+    return (
+        f"the htcondordb test daemon died during the session (exit status "
+        f"{process.returncode}); every test after this one would fail to connect.\n"
+        f"Its output began:\n{head}"
+    )
+
+
 def _free_port() -> int:
     """Reserve a port by binding and releasing it.
 
@@ -116,20 +148,28 @@ def daemon_address(tmp_path_factory) -> str:
     for knob in ("HTCONDORDB_ADDRESS_FILE", "HTCONDORDB_HOST"):
         env.pop(knob, None)
         os.environ.pop(knob, None)
+    # To a file, not a pipe. Nothing reads the daemon's output while the session runs, so a
+    # pipe holds it until the test process exits and then throws it away: a daemon that dies
+    # mid-session (it writes the reason -- a Go fatal error and its stack -- to stderr as it
+    # goes) leaves no trace at all, and every later test reports only "connection refused".
+    # A file keeps the reason where _daemon_death can quote it.
+    daemon_output = root / "daemon.out"
+    output_sink = daemon_output.open("w")
     process = subprocess.Popen(
         [str(daemon_bin), "-listen", f"127.0.0.1:{port}"],
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=output_sink,
         stderr=subprocess.STDOUT,
         text=True,
     )
+    _daemon["process"] = process
+    _daemon["output"] = daemon_output
 
     address = ""
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            output = process.stdout.read() if process.stdout else ""
-            pytest.skip(f"htcondordb daemon exited early:\n{output}")
+            pytest.skip(f"htcondordb daemon exited early:\n{_daemon_output()}")
         if address_file.exists():
             address = address_file.read_text().strip()
             if address:
@@ -146,11 +186,29 @@ def daemon_address(tmp_path_factory) -> str:
 
     yield address
 
-    process.terminate()
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:  # pragma: no cover - only on a wedged daemon
-        process.kill()
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - only on a wedged daemon
+            process.kill()
+    _daemon.clear()
+    output_sink.close()
+
+
+@pytest.fixture(autouse=True)
+def _daemon_is_alive():
+    """Stop the run at the test that follows the daemon's death, saying why.
+
+    One daemon serves the whole session, so when it dies every remaining test fails
+    identically at connect() with "connection refused" -- 60 reports of the symptom and
+    none of the cause, which is in the daemon's own output. Check before each test and
+    quote it instead.
+    """
+    death = _daemon_death()
+    if death:
+        pytest.fail(death, pytrace=False)
+    yield
 
 
 @pytest.fixture
