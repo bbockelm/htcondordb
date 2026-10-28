@@ -237,6 +237,9 @@ func run() error {
 	// HTCONDORDB_DELTA_MAX bounds delta-record chains; unset (0) takes the library default, which
 	// is ENABLED. Negative turns delta records off for new writes -- see server.Config.DeltaMax
 	// for why turning them off is not the same as never having had them.
+	// HTCONDORDB_QUERY_PARALLELISM: 0 (unset) takes the library's auto policy, 1 serializes
+	// scans, N>=2 caps workers per query. Worth reaching for when a profile shows the scan's
+	// fan-out costing more than the records it is dividing up.
 	deltaMax := configInt(cfg, "HTCONDORDB_DELTA_MAX")
 	if deltaMax < 0 {
 		log.Info(logging.DestinationGeneral, "delta records disabled (HTCONDORDB_DELTA_MAX < 0)")
@@ -269,6 +272,7 @@ func run() error {
 		PoolKeys:              poolKeys,
 		EncryptedAttrs:        encAttrs,
 		DeltaMax:              deltaMax,
+		QueryParallelism:      configInt(cfg, "HTCONDORDB_QUERY_PARALLELISM"),
 		ArchiveIndexMinDemand: archiveIndexMinDemand,
 
 		ArchiveIndexBackfillBytes: archiveIndexBackfillBytes,

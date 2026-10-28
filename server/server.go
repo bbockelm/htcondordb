@@ -125,6 +125,11 @@ type Config struct {
 	// first wants this to exist.
 	DeltaMax int
 
+	// QueryParallelism is db.CatalogConfig.QueryParallelism: 0 auto, 1 serial, N>=2 a
+	// per-query worker cap. Exposed because the fan-out is not unconditionally a win --
+	// when the per-record work is small, the scheduling of it can cost more than the scan.
+	QueryParallelism int
+
 	// PoolKeys enables encryption at rest: every table's master key is wrapped under
 	// these HTCondor pool/signing keys (any one opens the DB; a rotated-in key is added
 	// on the next start). Built from htcondor.LoadSigningKeys. Empty disables encryption.
@@ -242,12 +247,13 @@ func New(cfg Config) (*Service, error) {
 	}
 
 	cat, err := db.OpenCatalogConfig(db.CatalogConfig{
-		Dir:             cfg.Dir,
-		DeltaMax:        cfg.DeltaMax,
-		PoolKeys:        cfg.PoolKeys,
-		EncryptedAttrs:  cfg.EncryptedAttrs,
-		OnOpenStep:      cfg.OnTableOpen,
-		OnSealMigration: cfg.OnSealMigration,
+		Dir:              cfg.Dir,
+		DeltaMax:         cfg.DeltaMax,
+		PoolKeys:         cfg.PoolKeys,
+		EncryptedAttrs:   cfg.EncryptedAttrs,
+		OnOpenStep:       cfg.OnTableOpen,
+		OnSealMigration:  cfg.OnSealMigration,
+		QueryParallelism: cfg.QueryParallelism,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("server: opening catalog: %w", err)
