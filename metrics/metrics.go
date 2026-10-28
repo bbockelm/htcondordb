@@ -62,6 +62,10 @@ type catalogCollector struct {
 	// not one of cat.Tables().
 	staleIndex *prometheus.Desc
 	mappings   *prometheus.Desc
+	// backfill is the archive segments whose index lacks an indexed attribute -- the work the
+	// maintenance pass's index backfill has left. It falls as passes run and jumps when an
+	// index is added; a value that never falls means the backfill is off or failing.
+	backfill *prometheus.Desc
 }
 
 func newCatalogCollector(cat *db.Catalog) *catalogCollector {
@@ -82,13 +86,15 @@ func newCatalogCollector(cat *db.Catalog) *catalogCollector {
 		segments: prometheus.NewDesc(namespace+"_segments",
 			"Number of arena segments, by table.", tbl, nil),
 		opSeconds: prometheus.NewDesc(namespace+"_op_seconds_total",
-			"Cumulative wall time spent in each store stall point (shard write lock wait/hold, segment allocation, durability sync, compaction/retrain/reindex, snapshot lock hold and the wait behind it), by table and op.", tblOp, nil),
+			"Cumulative wall time spent in each store stall point (shard write lock wait/hold, segment allocation, durability sync, compaction/retrain/reindex/index backfill, snapshot lock hold and the wait behind it), by table and op.", tblOp, nil),
 		opOps: prometheus.NewDesc(namespace+"_op_ops_total",
 			"Cumulative number of times each store stall point ran, by table and op. Divide op_seconds_total by this for mean latency.", tblOp, nil),
 		staleIndex: prometheus.NewDesc(namespace+"_stale_index_segments",
 			"Sealed segments whose index was built under a superseded configuration and awaits rebuild, by table. Normally zero; a persistent non-zero value means a reindex is failing or never runs.", tbl, nil),
 		mappings: prometheus.NewDesc(namespace+"_estimated_mmaps",
 			"Estimated memory mappings a table holds: one per sealed segment plus one per sidecar. Compare against vm.max_map_count (65530 by default, shared process-wide across every table) -- exhausting it prevents the daemon from STARTING, not merely from querying.", tbl, nil),
+		backfill: prometheus.NewDesc(namespace+"_index_backfill_pending_segments",
+			"Sealed archive segments whose index lacks postings for an indexed attribute and so scan in full on it, by table. Rises when an index is added and falls as the maintenance backfill reaches older segments.", tbl, nil),
 		opMax: prometheus.NewDesc(namespace+"_op_max_seconds",
 			"Longest single occurrence of each store stall point (worst-case latency since start), by table and op. The mean (op_seconds_total/op_ops_total) hides tail stalls; this surfaces them.", tblOp, nil),
 	}
@@ -106,6 +112,7 @@ func (c *catalogCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.opMax
 	ch <- c.staleIndex
 	ch <- c.mappings
+	ch <- c.backfill
 }
 
 func (c *catalogCollector) Collect(ch chan<- prometheus.Metric) {
@@ -152,6 +159,8 @@ func (c *catalogCollector) Collect(ch chan<- prometheus.Metric) {
 		// One mapping per sealed segment, plus one per sidecar once a query touches it.
 		// Reported as the ceiling case, since that is the number that runs out.
 		gauge(c.mappings, float64(sealed*2))
+		pending, _ := a.IndexBackfillPending()
+		gauge(c.backfill, float64(pending))
 
 		c.collectOpStats(ch, name, a.OpStats())
 	}
@@ -184,6 +193,7 @@ func opStatList(o db.OpStats) []struct {
 		{"compact", o.Compact},
 		{"retrain", o.Retrain},
 		{"reindex", o.Reindex},
+		{"index_backfill", o.IndexBackfill},
 		{"snapshot_lock", o.SnapshotLock},
 		{"snapshot_lock_wait", o.SnapshotLockWait},
 	}

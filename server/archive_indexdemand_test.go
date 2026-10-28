@@ -74,3 +74,34 @@ func TestArchiveIndexMinDemandReachesTheRunningService(t *testing.T) {
 		t.Errorf("running service's ArchiveIndexMinDemand = %d, want the configured 55", got)
 	}
 }
+
+// TestArchiveIndexBackfillBytesConfigured: the backfill budget reaches the maintenance options
+// the service runs with, including over a supplied Maintenance, and is left at the library's
+// zero (its default) when unset.
+func TestArchiveIndexBackfillBytesConfigured(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		want int64
+	}{
+		{"unset leaves the library default", Config{}, 0},
+		{"override", Config{ArchiveIndexBackfillBytes: 64 << 20}, 64 << 20},
+		{"negative is off", Config{ArchiveIndexBackfillBytes: -1}, -1},
+		{
+			"applied over a supplied Maintenance",
+			Config{Maintenance: &db.MaintainOptions{ArchiveIndexBackfillBytes: 5}, ArchiveIndexBackfillBytes: 7},
+			7,
+		},
+		{
+			"a supplied Maintenance alone is respected",
+			Config{Maintenance: &db.MaintainOptions{ArchiveIndexBackfillBytes: 5}},
+			5,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveMaintainOptions(tc.cfg).ArchiveIndexBackfillBytes; got != tc.want {
+				t.Errorf("ArchiveIndexBackfillBytes = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

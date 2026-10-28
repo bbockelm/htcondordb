@@ -155,7 +155,9 @@ and the dashboards issue, without waiting for demand-driven auto-indexing:
 ingest, so it rises with append order and the zone map already narrows any range
 on it to the segments that hold it. On `history` the set costs about 86 bytes of
 index per record (on disk and page cache, not heap) against about 12 for
-`ClusterId` + `Owner`.
+`ClusterId` + `Owner`. The sync overwrites any `EnteredHistoryTime` already on a
+record: HTCondor never sets it, and the schedd lets a user set it at submit or
+with `condor_qedit`.
 
 The set is applied when a table is created and re-asserted on every start and
 `condor_reconfig`, so an existing table gains whatever it lacks; the

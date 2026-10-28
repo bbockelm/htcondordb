@@ -181,6 +181,12 @@ type Config struct {
 	// defaultArchiveIndexMinDemand; a NEGATIVE value turns archive index auto-tune off.
 	// Applied on top of Maintenance when that is also supplied.
 	ArchiveIndexMinDemand int64
+	// ArchiveIndexBackfillBytes is the per-pass budget, in stored segment bytes, with which the
+	// maintenance pass carries the index set to archive segments sealed before an index was
+	// added and beyond the backfill horizon. 0 takes the library default
+	// (db.DefaultArchiveIndexBackfillBytes); a NEGATIVE value turns the backfill off. Applied
+	// on top of Maintenance when that is also supplied.
+	ArchiveIndexBackfillBytes int64
 }
 
 // Service is the htcondordb database service. It serves a catalog of named
@@ -317,6 +323,9 @@ func resolveMaintainOptions(cfg Config) db.MaintainOptions {
 	}
 	if opts.ArchiveIndexMinDemand < 0 {
 		opts.ArchiveIndexMinDemand = 0 // negative means off, which classad spells as zero
+	}
+	if cfg.ArchiveIndexBackfillBytes != 0 {
+		opts.ArchiveIndexBackfillBytes = cfg.ArchiveIndexBackfillBytes // same spelling as classad
 	}
 	return opts
 }

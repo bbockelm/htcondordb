@@ -187,12 +187,6 @@ func benchShapes() []benchShape {
 	return out
 }
 
-func closeConn(c *conn) {
-	_ = c.dbc.Close()
-	_ = c.cl.Close()
-	c.cancel()
-}
-
 // benchTable is the mirrored job table to read, defaulting to the one the
 // schedd's client asks for.
 func benchTable() string {
