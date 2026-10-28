@@ -21,7 +21,8 @@ import (
 // job entered the schedd's history file -- its terminal-status transition (EnteredCurrentStatus),
 // falling back to CompletionDate, then the ingest clock (see enteredHistoryTime). This is the
 // job's own "when did it leave the queue into history" time, not when htcondordb read it, so
-// it survives a backlog drain or re-sync. It is a zone-mapped index on the archive (see the
+// it survives a backlog drain or re-sync. It is always overwritten on ingest, since the
+// schedd lets a user set any non-system attribute. It is a zone-mapped index on the archive (see the
 // ArchiveConfig in cmd/htcondordb), so a time-range query such as
 // `WHERE EnteredHistoryTime > <now-86400>` prunes whole segments instead of scanning.
 const EnteredHistoryAttr = "EnteredHistoryTime"
@@ -715,11 +716,12 @@ func (s *HistorySync) appendRecord(rec []byte) {
 		s.dedup = false // first record the archive lacks: caught up, everything after is new
 	}
 	// Stamp when the job entered the history file so "when did this enter history" is
-	// queryable and indexed. Set only if absent, so we never clobber a value already on the
-	// record and a re-scan that finds the record present keeps its original time.
-	if _, ok := ad.Lookup(EnteredHistoryAttr); !ok {
-		_ = ad.Set(EnteredHistoryAttr, s.enteredHistoryTime(ad))
-	}
+	// queryable and indexed. Always overwrite: HTCondor never writes this attribute and the
+	// schedd does not protect it, so any value already on the record came from the user
+	// (`+EnteredHistoryTime = 0` at submit, or condor_qedit) and would let a job misplace
+	// itself in every time-windowed history query and break the zone map's ordering. The
+	// value is derived from the record, so re-reading the same record stamps the same time.
+	_ = ad.Set(EnteredHistoryAttr, s.enteredHistoryTime(ad))
 	// Deferred: the record is durable at the next flushArchive, which runs before any
 	// position covering it is persisted.
 	if err := s.archive.AppendDeferred(ad); err != nil {
