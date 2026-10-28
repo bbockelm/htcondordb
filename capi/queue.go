@@ -16,9 +16,13 @@
 //     parses an ad, builds one, or unparses one.
 //
 // Liveness is continuous and separate from any query: a supervisor goroutine
-// keeps the session up and re-reads the daemon's sync-health ad on an interval,
+// keeps a session up and re-reads the daemon's sync-health ad on an interval,
 // so the caller's "may I use the database for this query?" is a lock-free read of
 // a cached verdict rather than a round trip.
+//
+// Queries are spread over a small pool of sessions rather than sharing one, since
+// one session is one socket and one decode loop and a job-queue dump is megabytes
+// of ads; see queuepool.go.
 package main
 
 /*
@@ -45,6 +49,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/bbockelm/golang-htcondor/config"
 
 	"github.com/bbockelm/htcondordb/dbstatus"
 )
@@ -118,8 +123,29 @@ type queueClient struct {
 
 	notifyFD int
 
-	mu   sync.Mutex
-	conn *conn // nil when no session is up
+	// dialFn and probeFn are the two places this talks to the outside world, named
+	// so a test can supply its own; both are nil in the shipping path. See dial()
+	// and probe().
+	dialFn  func() (*conn, error)
+	probeFn func(context.Context, *config.Config, string) (*classad.ClassAd, error)
+
+	mu sync.Mutex
+	// pool is the set of live sessions, empty when none is up. The head is the
+	// supervisor's; the rest are grown on demand and reaped when idle. See
+	// queuepool.go.
+	pool    []*poolConn
+	poolCap int
+	poolGen uint64 // bumped on teardown, so an in-flight dial knows it is obsolete
+	dialing int    // growth dials in flight
+	// Growth pacing, shared by every goroutine that may dial for the pool.
+	growAfter   time.Time
+	growBackoff time.Duration
+	// cfg and connAddr are what the health probe needs: it is a separate CEDAR
+	// command and cannot ride a pooled session, so it reuses the security policy and
+	// the resolved address of whichever session established them first, rather than
+	// re-reading CONDOR_CONFIG or depending on a particular pool member being alive.
+	cfg      *config.Config
+	connAddr string
 
 	state  atomic.Int32
 	detail atomic.Pointer[string]
@@ -128,7 +154,7 @@ type queueClient struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
 
-	// Dial pacing, touched only by the supervisor goroutine.
+	// Dial pacing for the pool's first connection, touched only by the supervisor.
 	lastDial time.Time
 	backoff  time.Duration
 }
@@ -140,23 +166,21 @@ func (q *queueClient) setState(s int32, format string, args ...any) {
 	q.state.Store(s)
 }
 
-// session returns the live session, or nil.
-func (q *queueClient) session() *conn {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.conn
-}
-
-// drop tears down the session so the next supervisor cycle redials.
+// drop tears every session down so the next supervisor cycle redials.
+//
+// Queries still streaming go with them: each request's context descends from its
+// connection's, so closing cancels them. That is deliberate and unchanged -- the
+// reason to drop is that we no longer believe the database is answering, and a
+// half-delivered job queue is worse than a reported failure.
 func (q *queueClient) drop() {
 	q.mu.Lock()
-	c := q.conn
-	q.conn = nil
+	pool := q.pool
+	q.pool = nil
+	// Any dial already in flight is for a pool that no longer exists.
+	q.poolGen++
 	q.mu.Unlock()
-	if c != nil {
-		_ = c.dbc.Close()
-		_ = c.cl.Close()
-		c.cancel()
+	for _, pc := range pool {
+		closeConn(pc.c)
 	}
 }
 
@@ -189,37 +213,78 @@ func (q *queueClient) run(ctx context.Context, interval time.Duration) {
 // moment: a daemon that nudges on every failed query must not turn into a dial
 // per query against a database that is down.
 func (q *queueClient) cycle(ctx context.Context) {
-	c := q.session()
-	if c == nil {
-		if !q.lastDial.IsZero() && time.Since(q.lastDial) < q.backoff {
-			return // too soon to try again; the verdict stands
-		}
-		q.lastDial = time.Now()
-		q.setState(hcdbQueueConnecting, "connecting to the database")
-		nc, err := openConnAs(q.addr, q.subsys)
-		if err != nil {
-			q.backoff = min(q.backoff*2, reconnectCeiling)
-			q.setState(hcdbQueueDown, "connecting to the database: %v", err)
-			return
-		}
-		q.backoff = reconnectFloor
-		q.mu.Lock()
-		q.conn = nc
-		q.mu.Unlock()
-		c = nc
+	cfg, addr, ok := q.ensureSession()
+	if !ok {
+		return // ensureSession has already set the verdict
 	}
 
-	ad, err := dbstatus.Query(ctx, c.cfg, c.addr)
+	ad, err := q.probe(ctx, cfg, addr)
 	if err != nil {
-		// A failed status read on a session we believe is up is most often the
-		// session itself having died; drop it so a later cycle redials rather than
-		// serving queries over a socket nobody has proven works.
+		// A failed status read while we believe sessions are up is most often the
+		// daemon itself having gone; drop them so a later cycle redials rather than
+		// serving queries over sockets nobody has proven work.
 		q.drop()
-		q.setState(hcdbQueueDown, "reading sync health from %s: %v", c.addr, err)
+		q.setState(hcdbQueueDown, "reading sync health from %s: %v", addr, err)
 		return
 	}
 	state, why := q.judge(ad)
 	q.setState(state, "%s", why)
+	q.reapIdle(time.Now())
+}
+
+// ensureSession makes sure the pool holds at least one connection, and reports the
+// configuration and address the health probe should use.
+//
+// This is the only place the pool's floor is dialled, and it keeps the pacing the
+// single-session client had: one dial attempt per backoff window, measured against
+// the clock. Growth above the floor is a separate path with its own pacing, and it
+// runs only while the verdict is Ready -- so a database that is down is dialled by
+// this one goroutine at this one rate, pool or no pool.
+func (q *queueClient) ensureSession() (*config.Config, string, bool) {
+	q.mu.Lock()
+	q.evictDeadLocked()
+	have := len(q.pool)
+	cfg, addr := q.cfg, q.connAddr
+	q.mu.Unlock()
+	if have > 0 {
+		return cfg, addr, true
+	}
+
+	if !q.lastDial.IsZero() && time.Since(q.lastDial) < q.backoff {
+		return nil, "", false // too soon to try again; the verdict stands
+	}
+	q.lastDial = time.Now()
+	q.setState(hcdbQueueConnecting, "connecting to the database")
+	nc, err := q.dial()
+	if err != nil {
+		q.backoff = min(q.backoff*2, reconnectCeiling)
+		q.setState(hcdbQueueDown, "connecting to the database: %v", err)
+		return nil, "", false
+	}
+	q.backoff = reconnectFloor
+
+	q.mu.Lock()
+	q.cfg, q.connAddr = nc.cfg, nc.addr
+	// The cap comes from the configuration this session was built from, so it is
+	// known only once something has connected. Nothing grows before that anyway.
+	q.poolCap = queuePoolSize(nc.cfg)
+	q.pool = append(q.pool, &poolConn{c: nc, idleSince: time.Now()})
+	q.mu.Unlock()
+	return nc.cfg, nc.addr, true
+}
+
+// probe reads the daemon's sync-health ad.
+//
+// It gets its own short-lived connection rather than borrowing one from the pool,
+// and not by choice: the health ad answers a different CEDAR command than a dbrpc
+// session speaks, so there is no pooled connection it could ride. That turns out to
+// be the behaviour we want anyway -- the probe must be able to say "the daemon is
+// there" while every pooled socket is busy with a full dump, or dead.
+func (q *queueClient) probe(ctx context.Context, cfg *config.Config, addr string) (*classad.ClassAd, error) {
+	if q.probeFn != nil {
+		return q.probeFn(ctx, cfg, addr)
+	}
+	return dbstatus.Query(ctx, cfg, addr)
 }
 
 // judge decides whether the mirror behind this database may answer a live job
@@ -302,6 +367,11 @@ type queueRequest struct {
 	chunks chan queueChunk
 	cancel context.CancelFunc
 
+	// connDead reports whether the connection this request streams on has lost its
+	// transport. nil when there is nothing to ask -- a test driving stream directly
+	// over a client it owns. See the check in stream for why it is needed.
+	connDead func() bool
+
 	mu     sync.Mutex
 	err    error
 	counts string // the (universe, status, count) triples, valid once finished
@@ -324,9 +394,10 @@ func (r *queueRequest) fail(err error) {
 // Opens a long-lived queue client against the htcondordb daemon at addr (empty =
 // located from the ambient configuration), under HTCondor subsystem subsys.
 //
-// It returns before anything is dialled: the session is established, and its
+// It returns before anything is dialled: the first session is established, and its
 // health re-checked every probe_seconds, on a goroutine. Ask hcdb_queue_state
-// whether the database may be used.
+// whether the database may be used. Concurrent queries spread over further
+// sessions, dialled as they are needed up to HTCONDORDB_QUEUE_POOL_SIZE.
 //
 // table names the mirrored job table (empty = the database's default table).
 // job_queue_log, when non-empty, is the caller's own JOB_QUEUE_LOG path, and a
@@ -470,17 +541,19 @@ func hcdb_queue_beginImpl(h C.uintptr_t, constraint, projection *C.char, limit C
 		*err = C.CString("invalid queue handle")
 		return 0
 	}
-	c := q.session()
-	if c == nil {
+	pc, release := q.acquire()
+	if pc == nil {
 		*err = C.CString("no session to the database")
 		return 0
 	}
+	c := pc.c
 
 	ctx, cancel := context.WithCancel(c.ctx)
 	r := &queueRequest{
-		client: q,
-		chunks: make(chan queueChunk, chunksInFlight),
-		cancel: cancel,
+		client:   q,
+		chunks:   make(chan queueChunk, chunksInFlight),
+		cancel:   cancel,
+		connDead: func() bool { return c.dead.Load() },
 	}
 	handle := cgo.NewHandle(r)
 	r.self = uintptr(handle)
@@ -508,6 +581,7 @@ func hcdb_queue_beginImpl(h C.uintptr_t, constraint, projection *C.char, limit C
 	go r.stream(ctx, c.dbc, q.table, cons, attrs, int(limit), b, (flags&hcdbQueueCounts) != 0)
 	go func() {
 		r.wg.Wait()
+		release()
 		close(r.chunks)
 		r.closed.Store(true)
 		q.notify(r.self)
@@ -613,6 +687,16 @@ func (r *queueRequest) stream(ctx context.Context, dbc *dbrpc.Client, table, con
 			reset()
 			err = dbc.QueryRawTableStream(ctx, table, constraint, limit, row)
 		}
+	}
+	if err == nil && r.connDead != nil && r.connDead() {
+		// A clean end and a lost connection look identical from inside dbrpc: when
+		// the read loop dies it closes the stream's channel, which is exactly what
+		// the end-of-stream terminator does, so the query returns short and happy.
+		// The connection's own transport watch is the only witness, and the answer
+		// to an ambiguous ending has to be an error -- a condor_q that reports a
+		// failure gets retried, one that silently lists nine tenths of the queue
+		// does not.
+		err = errConnLost
 	}
 	if rowErr != nil {
 		r.fail(rowErr)
@@ -749,8 +833,8 @@ func hcdb_queue_free(rh C.uintptr_t) {
 	})
 }
 
-// Stops the supervisor, closes the session and frees the handle. Outstanding
-// queries must be freed first: their contexts descend from the session's, so
+// Stops the supervisor, closes every session and frees the handle. Outstanding
+// queries must be freed first: their contexts descend from their session's, so
 // closing cancels them, but their handles are still the caller's to release.
 //
 //export hcdb_queue_close
