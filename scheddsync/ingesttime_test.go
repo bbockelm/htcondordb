@@ -10,7 +10,8 @@ import (
 
 // TestEnteredHistoryTime verifies EnteredHistoryTime is derived from the record's own
 // history-entry time -- EnteredCurrentStatus, else CompletionDate, else the ingest clock --
-// not the time htcondordb read the record, and that it is queryable as a range.
+// not the time htcondordb read the record, that a user-supplied value on the record is
+// overwritten, and that it is queryable as a range.
 func TestEnteredHistoryTime(t *testing.T) {
 	arch, cleanup := newArchive(t)
 	defer cleanup()
@@ -21,6 +22,8 @@ func TestEnteredHistoryTime(t *testing.T) {
 	//   1: CompletionDate only            -> EnteredHistoryTime = CompletionDate
 	//   2: EnteredCurrentStatus wins over CompletionDate
 	//   3: neither                        -> EnteredHistoryTime = ingest clock (fallback)
+	//   4: user set a literal (+EnteredHistoryTime at submit) -> overwritten from EnteredCurrentStatus
+	//   5: user set an expression          -> overwritten from CompletionDate
 	rec := func(cluster int, extra string) string {
 		return fmt.Sprintf("Owner = \"user%d\"\nClusterId = %d\nProcId = 0\nJobStatus = 4\n%s*** Offset = 0 ClusterId = %d ProcId = 0\n",
 			cluster, cluster, extra, cluster)
@@ -28,7 +31,9 @@ func TestEnteredHistoryTime(t *testing.T) {
 	writeFile(t, histPath,
 		rec(1, "CompletionDate = 1700000001\n")+
 			rec(2, "CompletionDate = 1700000002\nEnteredCurrentStatus = 1700000500\n")+
-			rec(3, ""))
+			rec(3, "")+
+			rec(4, "EnteredHistoryTime = 4102444800\nEnteredCurrentStatus = 1700000600\n")+
+			rec(5, "EnteredHistoryTime = CurrentTime\nCompletionDate = 1700000700\n"))
 
 	ingest := time.Unix(1_800_000_000, 0)
 	s := NewHistorySync(arch, HistorySyncConfig{Filename: histPath})
@@ -36,14 +41,16 @@ func TestEnteredHistoryTime(t *testing.T) {
 	if err := s.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if arch.Count() != 3 {
-		t.Fatalf("Count = %d, want 3", arch.Count())
+	if arch.Count() != 5 {
+		t.Fatalf("Count = %d, want 5", arch.Count())
 	}
 
 	want := map[int64]int64{
 		1: 1700000001,    // CompletionDate
 		2: 1700000500,    // EnteredCurrentStatus wins
 		3: ingest.Unix(), // fallback
+		4: 1700000600,    // user's literal overwritten
+		5: 1700000700,    // user's expression overwritten
 	}
 	seq, err := arch.Query("true")
 	if err != nil {
@@ -52,6 +59,9 @@ func TestEnteredHistoryTime(t *testing.T) {
 	seen := 0
 	for ad := range seq {
 		cid, _ := ad.EvaluateAttrInt("ClusterId")
+		if expr, ok := ad.Lookup(EnteredHistoryAttr); ok && expr.String() == "CurrentTime" {
+			t.Errorf("cluster %d: %s kept the user's expression", cid, EnteredHistoryAttr)
+		}
 		eht, ok := ad.EvaluateAttrInt(EnteredHistoryAttr)
 		if !ok {
 			t.Fatalf("cluster %d missing %s", cid, EnteredHistoryAttr)
@@ -61,12 +71,13 @@ func TestEnteredHistoryTime(t *testing.T) {
 		}
 		seen++
 	}
-	if seen != 3 {
-		t.Fatalf("queried %d records, want 3", seen)
+	if seen != 5 {
+		t.Fatalf("queried %d records, want 5", seen)
 	}
 
-	// Range query on the derived time (the "last 24h" pattern) -- the two dated records fall
-	// before the cutoff; the fallback record (ingest ~1.8e9) is after it.
+	// Range query on the derived time (the "last 24h" pattern) -- the dated records fall
+	// before the cutoff (record 4's user value, year 2100, would have matched); the fallback
+	// record (ingest ~1.8e9) is after it.
 	rseq, err := arch.Query(EnteredHistoryAttr + " > " + itoa(ingest.Unix()-86400))
 	if err != nil {
 		t.Fatal(err)
