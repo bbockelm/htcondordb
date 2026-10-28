@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"slices"
 	"testing"
 )
 
@@ -185,7 +186,7 @@ func TestWithCountingAttrs(t *testing.T) {
 	if len(req) != 4 {
 		t.Fatalf("request = %q, want the projection plus the two counting attributes", req)
 	}
-	if !suppress["jobstatus"] || !suppress["jobuniverse"] {
+	if !slices.Contains(suppress, "jobstatus") || !slices.Contains(suppress, "jobuniverse") {
 		t.Fatalf("suppress = %v, want both counting attributes", suppress)
 	}
 
@@ -195,10 +196,10 @@ func TestWithCountingAttrs(t *testing.T) {
 	if len(req) != 3 {
 		t.Fatalf("request = %q, want one attribute added", req)
 	}
-	if suppress["jobstatus"] {
+	if slices.Contains(suppress, "jobstatus") {
 		t.Errorf("an attribute the client projected was suppressed")
 	}
-	if !suppress["jobuniverse"] {
+	if !slices.Contains(suppress, "jobuniverse") {
 		t.Errorf("suppress = %v, want JobUniverse", suppress)
 	}
 

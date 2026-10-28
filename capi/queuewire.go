@@ -34,6 +34,20 @@ import (
 // recordHeaderLen is the per-ad length prefix inside a chunk.
 const recordHeaderLen = 4
 
+// A chunk can instead hold complete CEDAR message frames, which is what the
+// response writer in queuefd.go wants: the bytes it builds go to the client's
+// socket unaltered, with nothing to reframe on the way. A frame header is a
+// one-byte end flag and a four-byte big-endian payload length, exactly as
+// HTCondor's ReliSock writes it.
+const (
+	cedarHeaderLen    = 5
+	cedarPartial      = 0 // more frames follow
+	cedarEndOfMessage = 1 // last frame of this message
+	// maxFrameBody is the largest payload one frame may carry; HTCondor's
+	// ReliSock rejects a bigger one (MAX_MESSAGE_SIZE in reli_sock.cpp).
+	maxFrameBody = 1024 * 1024
+)
+
 // The two attributes a job query's summary counts are bucketed by. They are read
 // out of every row as it goes past -- the same thing the schedd does per job ad --
 // rather than asked for in a second, grouped query, because grouping by two
@@ -62,13 +76,24 @@ type adRecordBuilder struct {
 	// holds whichever of JobStatus and JobUniverse were added to the caller's
 	// projection for counting's sake: the query has to see them, and the client
 	// did not ask for them.
-	suppress map[string]bool
+	//
+	// A slice, and not the set it reads like, because the wire path tests every
+	// attribute of every ad against it -- millions of times for one condor_q --
+	// and starting a Go map iterator costs an order of magnitude more than
+	// comparing against the two names it would have yielded. Measured inside a
+	// schedd answering 20000-ad queries, ranging the map was 8.5% of everything
+	// this library did, and all but a fortieth of that was mapIterStart.
+	suppress []string
 
 	// wireProj is the projection applied by appendWireRecord, which receives whole
 	// ads: the wire-row stream cannot expand a projection to the attributes its
 	// expressions reference, so a projected query asks for everything and filters
 	// here. nil on the text path and for a query with no projection.
 	wireProj *wireProjector
+
+	// cedarFrame makes each record a complete CEDAR message frame rather than a
+	// length-delimited record for the consumer to reframe.
+	cedarFrame bool
 
 	// serverTime, when non-empty, is appended to every ad as one more expression.
 	// HTCondor's PUT_CLASSAD_SERVER_TIME does the same, so a client can compute
@@ -96,8 +121,7 @@ func (b *adRecordBuilder) appendRecord(dst []byte, row string) []byte {
 
 	start := len(dst)
 	if b.emit {
-		dst = append(dst, 0, 0, 0, 0)             // payload length, filled in at the end
-		dst = append(dst, 0, 0, 0, 0, 0, 0, 0, 0) // expression count, likewise
+		dst = b.startRecord(dst)
 	}
 
 	n := 0
@@ -136,7 +160,7 @@ func (b *adRecordBuilder) appendRecord(dst []byte, row string) []byte {
 			continue
 		}
 		lower := strings.ToLower(name)
-		if b.suppress[lower] {
+		if b.suppressed(lower) {
 			continue
 		}
 		if b.projection != nil && !b.projection[lower] && !isTypeAttr(name) {
@@ -155,7 +179,7 @@ func (b *adRecordBuilder) appendRecord(dst []byte, row string) []byte {
 		n++
 	}
 
-	return endRecord(dst, start, n)
+	return b.endRecord(dst, start, n)
 }
 
 // endRecord closes a record begun at offset start in dst with n expressions
@@ -165,19 +189,81 @@ func (b *adRecordBuilder) appendRecord(dst []byte, row string) []byte {
 // HTCondor always sends the type strings empty and carries the real
 // MyType/TargetType as ordinary attributes in the body (which is how they arrive
 // here), so matching it means two empty strings.
-func endRecord(dst []byte, start, n int) []byte {
+func (b *adRecordBuilder) endRecord(dst []byte, start, n int) []byte {
 	dst = append(dst, 0, 0)
-	binary.BigEndian.PutUint64(dst[start+recordHeaderLen:], uint64(n))
-	binary.LittleEndian.PutUint32(dst[start:], uint32(len(dst)-start-recordHeaderLen))
+	hdrLen := b.headerLen()
+	binary.BigEndian.PutUint64(dst[start+hdrLen:], uint64(n))
+	payloadLen := len(dst) - start - hdrLen
+	if !b.cedarFrame {
+		binary.LittleEndian.PutUint32(dst[start:], uint32(payloadLen))
+		return dst
+	}
+	if payloadLen > maxFrameBody {
+		return reframeOversize(dst, start)
+	}
+	binary.BigEndian.PutUint32(dst[start+1:], uint32(payloadLen))
 	return dst
+}
+
+// headerLen is the length of the per-record header this builder writes.
+func (b *adRecordBuilder) headerLen() int {
+	if b.cedarFrame {
+		return cedarHeaderLen
+	}
+	return recordHeaderLen
+}
+
+// startRecord opens a record at the end of dst: the header, zeroed, and the
+// expression count, both filled in by endRecord once the body's size is known.
+func (b *adRecordBuilder) startRecord(dst []byte) []byte {
+	if b.cedarFrame {
+		dst = append(dst, cedarEndOfMessage, 0, 0, 0, 0)
+	} else {
+		dst = append(dst, 0, 0, 0, 0)
+	}
+	return append(dst, 0, 0, 0, 0, 0, 0, 0, 0)
+}
+
+// reframeOversize rewrites the single frame beginning at start as a run of
+// partial frames and a final one, for the pathological ad whose wire form will
+// not fit in one CEDAR frame. ReliSock splits such an ad the same way when it
+// overflows its send buffer, so the receiver needs nothing it does not already
+// do. Cold path: allocating here costs nothing on any real ad.
+func reframeOversize(dst []byte, start int) []byte {
+	payload := append([]byte(nil), dst[start+cedarHeaderLen:]...)
+	out := dst[:start]
+	for off := 0; off < len(payload); off += maxFrameBody {
+		end := min(off+maxFrameBody, len(payload))
+		flag := byte(cedarPartial)
+		if end == len(payload) {
+			flag = cedarEndOfMessage
+		}
+		var h [cedarHeaderLen]byte
+		h[0] = flag
+		binary.BigEndian.PutUint32(h[1:], uint32(end-off))
+		out = append(out, h[:]...)
+		out = append(out, payload[off:end]...)
+	}
+	return out
 }
 
 // suppressedName is the suppress test for raw name bytes. The set holds at most
 // the two counting attributes, so a scan beats folding the name into a string to
 // look it up.
 func (b *adRecordBuilder) suppressedName(name []byte) bool {
-	for s := range b.suppress {
+	for _, s := range b.suppress {
 		if wire.FoldEqualBytes(name, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// suppressed is the same test for a name already folded to lower case, which is
+// the form the text path has in hand.
+func (b *adRecordBuilder) suppressed(lower string) bool {
+	for _, s := range b.suppress {
+		if s == lower {
 			return true
 		}
 	}
@@ -239,7 +325,7 @@ func lowerSet(attrs []string) map[string]bool {
 //
 // An empty projection means every attribute, so there is nothing to add and
 // nothing to drop.
-func withCountingAttrs(attrs []string) (request []string, suppress map[string]bool) {
+func withCountingAttrs(attrs []string) (request []string, suppress []string) {
 	if len(attrs) == 0 {
 		return nil, nil
 	}
@@ -248,10 +334,7 @@ func withCountingAttrs(attrs []string) (request []string, suppress map[string]bo
 	for _, extra := range []string{attrJobStatus, attrJobUniverse} {
 		if !have[strings.ToLower(extra)] {
 			request = append(request, extra)
-			if suppress == nil {
-				suppress = map[string]bool{}
-			}
-			suppress[strings.ToLower(extra)] = true
+			suppress = append(suppress, strings.ToLower(extra))
 		}
 	}
 	return request, suppress

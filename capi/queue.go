@@ -367,6 +367,15 @@ type queueRequest struct {
 	chunks chan queueChunk
 	cancel context.CancelFunc
 
+	// sink, when set, is the client's socket and this request writes its own
+	// response to it rather than queueing chunks for the caller (queuefd.go).
+	sink    *fdSink
+	written atomic.Int64 // ads put on the socket, for a sink request
+
+	// detached marks a sink request the caller has already released while its
+	// writer was still running: its handle is gone, so no completion is announced.
+	detached atomic.Bool
+
 	// connDead reports whether the connection this request streams on has lost its
 	// transport. nil when there is nothing to ask -- a test driving stream directly
 	// over a client it owns. See the check in stream for why it is needed.
@@ -531,18 +540,27 @@ func hcdb_queue_probe(h C.uintptr_t) {
 //export hcdb_queue_begin
 func hcdb_queue_begin(h C.uintptr_t, constraint, projection *C.char, limit C.longlong, flags C.int, err **C.char) C.uintptr_t {
 	return guardHandle("hcdb_queue_begin", err, func() C.uintptr_t {
-		return hcdb_queue_beginImpl(h, constraint, projection, limit, flags, err)
+		return hcdb_queue_beginImpl(h, constraint, projection, limit, flags, nil, err)
 	})
 }
 
-func hcdb_queue_beginImpl(h C.uintptr_t, constraint, projection *C.char, limit C.longlong, flags C.int, err **C.char) C.uintptr_t {
+// hcdb_queue_beginImpl serves both entry points. sink is nil for the chunked
+// one and the client's socket for hcdb_queue_begin_fd.
+func hcdb_queue_beginImpl(h C.uintptr_t, constraint, projection *C.char, limit C.longlong, flags C.int, sink *fdSink, err **C.char) C.uintptr_t {
 	q := handleQueue(h)
 	if q == nil {
+		if sink != nil {
+			sink.close()
+		}
 		*err = C.CString("invalid queue handle")
 		return 0
 	}
 	pc, release := q.acquire()
 	if pc == nil {
+		// The socket was handed to us; drop it rather than leak the descriptor.
+		if sink != nil {
+			sink.close()
+		}
 		*err = C.CString("no session to the database")
 		return 0
 	}
@@ -553,6 +571,7 @@ func hcdb_queue_beginImpl(h C.uintptr_t, constraint, projection *C.char, limit C
 		client:   q,
 		chunks:   make(chan queueChunk, chunksInFlight),
 		cancel:   cancel,
+		sink:     sink,
 		connDead: func() bool { return c.dead.Load() },
 	}
 	handle := cgo.NewHandle(r)
@@ -562,7 +581,9 @@ func hcdb_queue_beginImpl(h C.uintptr_t, constraint, projection *C.char, limit C
 	cons := C.GoString(constraint)
 	wantAds := (flags & hcdbQueueNoAds) == 0
 
-	b := &adRecordBuilder{emit: wantAds}
+	// An unencrypted session takes the frames straight from the builder; an
+	// encrypted one has to re-frame each ad anyway, so there it builds records.
+	b := &adRecordBuilder{emit: wantAds, cedarFrame: sink != nil && !sink.encrypted()}
 	if wantAds {
 		if (flags & hcdbQueueServerTime) != 0 {
 			b.serverTime = serverTimeExpr(time.Now().Unix())
@@ -583,8 +604,15 @@ func hcdb_queue_beginImpl(h C.uintptr_t, constraint, projection *C.char, limit C
 		r.wg.Wait()
 		release()
 		close(r.chunks)
+		// Give the socket up before announcing the result, so that by the time the
+		// caller is told the response is finished, nothing here can write to it.
+		if r.sink != nil {
+			r.fail(r.sink.finish())
+		}
 		r.closed.Store(true)
-		q.notify(r.self)
+		if !r.detached.Load() {
+			q.notify(r.self)
+		}
 	}()
 
 	*err = nil
@@ -617,6 +645,18 @@ func (r *queueRequest) stream(ctx context.Context, dbc *dbrpc.Client, table, con
 
 	flush := func() bool {
 		if len(buf) == 0 {
+			return true
+		}
+		if r.sink != nil {
+			// These bytes are already the client's frames, so they go out from this
+			// goroutine. Nothing is queued for the caller's event loop, which is the
+			// whole point of the hcdb_queue_begin_fd path.
+			if err := r.sink.writeChunk(ctx, buf); err != nil {
+				sendErr = err
+				return false
+			}
+			r.written.Add(int64(ads))
+			buf, ads = buf[:0], 0
 			return true
 		}
 		select {
@@ -655,9 +695,18 @@ func (r *queueRequest) stream(ctx context.Context, dbc *dbrpc.Client, table, con
 		}
 		return tally()
 	}
-	reset := func() {
+	// reset discards what has been built and starts the read again, for a
+	// fallback that declares itself before the first row. It reports false when
+	// the response has already begun going out: a restart then would replay ads
+	// the client has seen, and there is no taking them back.
+	reset := func() bool {
+		if r.sink != nil && r.written.Load() > 0 {
+			rowErr = errRestartAfterSend
+			return false
+		}
 		buf, ads = buf[:0], 0
 		clear(counts)
+		return true
 	}
 
 	// The wire-row stream first: the database ships the ad's structure rather than
@@ -671,9 +720,8 @@ func (r *queueRequest) stream(ctx context.Context, dbc *dbrpc.Client, table, con
 	if !forceTextRows {
 		err = dbc.QueryRawWireStream(ctx, table, constraint, wireAttrs, limit, true, wireRow)
 	}
-	if errors.Is(err, dbrpc.ErrRawWireUnsupported) {
+	if errors.Is(err, dbrpc.ErrRawWireUnsupported) && reset() {
 		b.wireProj = nil
-		reset()
 
 		// The reference-chasing projection is the one that matches HTCondor:
 		// putClassAd expands a projection to the attributes the projected expressions
@@ -682,9 +730,8 @@ func (r *queueRequest) stream(ctx context.Context, dbc *dbrpc.Client, table, con
 		// attribute of every ad -- correct for literal-valued attributes, and the
 		// reason to upgrade.
 		err = dbc.QueryRawProjectRefsStream(ctx, table, constraint, attrs, limit, row)
-		if errors.Is(err, dbrpc.ErrProjectRefsUnsupported) {
+		if errors.Is(err, dbrpc.ErrProjectRefsUnsupported) && reset() {
 			b.projection = lowerSet(attrs)
-			reset()
 			err = dbc.QueryRawTableStream(ctx, table, constraint, limit, row)
 		}
 	}
@@ -819,6 +866,10 @@ func hcdb_queue_free(rh C.uintptr_t) {
 	guardVoid("hcdb_queue_free", func() {
 		r := handleQueueRequest(rh)
 		if r == nil {
+			return
+		}
+		if r.sink != nil && !r.closed.Load() {
+			detachSink(r, rh)
 			return
 		}
 		r.cancel()
