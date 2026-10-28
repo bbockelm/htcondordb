@@ -279,6 +279,13 @@ func (s *session) showArchiveIndexes(w io.Writer, d *dbrpc.Diagnostics) {
 		}
 		fmt.Fprintln(w)
 	}
+	if d.BackfillPendingSegments > 0 {
+		// An index change reaches only the newest segments at once; maintenance carries it to
+		// the rest a slice per pass. Until then a query on the new attribute scans these.
+		_, _ = fmt.Fprintf(w, "index backfill: %d older segment(s) (%s) lack an indexed attribute and scan in full on it; "+
+			"maintenance covers them a slice per pass, .reindex <table> covers them now\n",
+			d.BackfillPendingSegments, humanBytes(d.BackfillPendingBytes))
+	}
 	fmt.Fprintln(w, "manage: .addindex <table> value|categorical <attr>...  |  .dropindex <table> <attr>...  |  .reindex <table>")
 	fmt.Fprintln(w, "  an index change rebuilds each segment's index sidecar in place; segment data is not rewritten")
 }
@@ -427,6 +434,7 @@ func showOpStats(w io.Writer, o db.OpStats) {
 		{"compact", o.Compact},
 		{"retrain", o.Retrain},
 		{"reindex", o.Reindex},
+		{"index backfill", o.IndexBackfill},
 		{"snapshot lock", o.SnapshotLock},
 	}
 	fmt.Fprintln(w, "operational timings (cumulative):")

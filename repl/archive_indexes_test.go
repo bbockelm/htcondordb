@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/PelicanPlatform/classad/dbrpc"
 )
 
 // TestArchiveIndexesEnumerated is the regression for ".indexes history" answering with a
@@ -118,4 +120,28 @@ func lineContaining(out, substr string) string {
 		}
 	}
 	return ""
+}
+
+// TestArchiveIndexesShowBackfill: segments that predate an index are reported with what will
+// cover them, so an operator looking at a slow query on a new index can see why and what to
+// run, rather than concluding the index does not work.
+func TestArchiveIndexesShowBackfill(t *testing.T) {
+	s := &session{}
+	var buf bytes.Buffer
+	s.showArchiveIndexes(&buf, &dbrpc.Diagnostics{
+		Archive: true, ValueIndexes: []string{"EnteredHistoryTime"},
+		SealedSegments: 793, BackfillPendingSegments: 658, BackfillPendingBytes: 5 << 30,
+	})
+	line := lineContaining(buf.String(), "index backfill")
+	for _, want := range []string{"658", "5.0 GiB", ".reindex"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("backfill line %q missing %q", line, want)
+		}
+	}
+
+	buf.Reset()
+	s.showArchiveIndexes(&buf, &dbrpc.Diagnostics{Archive: true, SealedSegments: 793})
+	if strings.Contains(buf.String(), "index backfill") {
+		t.Errorf("nothing pending, yet a backfill line:\n%s", buf.String())
+	}
 }

@@ -164,7 +164,7 @@ query planner — and manage them:
 
 .addindex value|categorical <attr>[, ...]   create an index (needs WRITE)
 .dropindex <attr>[, ...]                     drop an index
-.reindex                                     rebuild indexes
+.reindex                                     rebuild indexes (an archive: every segment)
 .addhot <attr>[, ...]                        pin hot attributes
 .refreshhot [<sampleMax> <topN>]             recompute the hot set from sampling
 ```
