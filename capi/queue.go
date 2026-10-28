@@ -714,10 +714,19 @@ func (r *queueRequest) stream(ctx context.Context, dbc *dbrpc.Client, table, con
 	// cost of relaying a job queue. It is not always available (an older database,
 	// or a table that cannot produce self-contained rows), and it says so before
 	// the first row, so the text streams below remain the fallback.
-	wireAttrs, wireProj := wireRequest(attrs, b)
+	wireAttrs, wireProj := wireRequest(attrs, b, true)
 	b.wireProj = wireProj
-	err := error(dbrpc.ErrRawWireUnsupported)
+	err := error(dbrpc.ErrRawWireRefsUnsupported)
 	if !forceTextRows {
+		err = dbc.QueryRawWireRefsStream(ctx, table, constraint, wireAttrs, limit, true, wireRow)
+	}
+	// A database with wire rows but no server-side closure: ask again for the whole
+	// ad and close it here. Checked before the general wire refusal because the
+	// reference-chasing error WRAPS it, and the two want different retries.
+	if errors.Is(err, dbrpc.ErrRawWireRefsUnsupported) && !forceTextRows {
+		wireAttrs, wireProj = wireRequest(attrs, b, false)
+		b.wireProj = wireProj
+		reset()
 		err = dbc.QueryRawWireStream(ctx, table, constraint, wireAttrs, limit, true, wireRow)
 	}
 	if errors.Is(err, dbrpc.ErrRawWireUnsupported) && reset() {

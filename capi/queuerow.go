@@ -54,19 +54,30 @@ var errUnreadableWireRow = errors.New("the database sent an ad in a wire format 
 //
 // A summary-only query reads nothing but the two attributes it counts by, and
 // there is nothing to render. An unprojected query asks for everything and keeps
-// everything. A projected one asks for everything too -- the wire-row stream has
-// no reference expansion, so the whole ad is what makes the closure computable
-// here -- and filters while rendering.
+// everything.
 //
-// The attributes added for counting are not in the projector, so the client never
-// receives them; suppress, which does that job on the text path, has nothing left
-// to drop here.
-func wireRequest(attrs []string, b *adRecordBuilder) (request []string, proj *wireProjector) {
+// A projected one depends on WHERE the reference closure is computed. When the
+// database can close the projection itself (serverChases), the request is the
+// projection and nothing has to be filtered on arrival: the rows already carry
+// the projected attributes plus the ones their expressions refer to, and the
+// extras are not merely harmless but required -- a projection is a floor, and
+// Requirements without the attributes it compares evaluates to undefined.
+// Suppressed counting attributes are still dropped, by appendWireRecord, which
+// tests them whether or not there is a projector.
+//
+// Without it the whole ad has to cross the wire, because that is what makes the
+// closure computable here, and the projector filters while rendering. That is
+// the expensive shape this exists to avoid: a five-attribute projection of a
+// forty-five-attribute job ad ships all forty-five.
+func wireRequest(attrs []string, b *adRecordBuilder, serverChases bool) (request []string, proj *wireProjector) {
 	if !b.emit {
 		return attrs, nil
 	}
 	if len(attrs) == 0 {
 		return nil, nil
+	}
+	if serverChases {
+		return attrs, nil
 	}
 	wanted := attrs
 	if len(b.suppress) > 0 {
