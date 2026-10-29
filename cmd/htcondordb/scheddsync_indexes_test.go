@@ -299,6 +299,12 @@ func TestScheddSyncCreatesTablesWithBuiltInIndexes(t *testing.T) {
 	if got := ep.SchemaRequireAttrs(); slices.Contains(got, "completiondate") {
 		t.Errorf("epoch_history requires completiondate (%v); epoch records do not carry it", got)
 	}
+	if got := ep.SchemaRequireAttrs(); !slices.Contains(got, "vacatereasoncode") {
+		t.Errorf("epoch_history required schema attributes = %v, want vacatereasoncode among them", got)
+	}
+	if got := hist.SchemaRequireAttrs(); slices.Contains(got, "vacatereasoncode") {
+		t.Errorf("history requires vacatereasoncode (%v); only the epoch archive is filtered on it", got)
+	}
 }
 
 // TestHistorySchemaRequireDefaults: history requires CompletionDate on top of the shared list when
@@ -320,5 +326,26 @@ func TestHistorySchemaRequireDefaults(t *testing.T) {
 	s, _ = resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_SCHEMA_REQUIRE_ATTRS = none\n"))
 	if s.historySchemaRequireAttrs != "" {
 		t.Errorf("`none` left history requiring %q", s.historySchemaRequireAttrs)
+	}
+}
+
+// TestEpochSchemaRequireDefaults: epoch_history requires VacateReasonCode on top of the shared
+// list when the knob is unset, and a configured list replaces both.
+func TestEpochSchemaRequireDefaults(t *testing.T) {
+	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
+	ep := splitAttrList(s.epochSchemaRequireAttrs)
+	if want := append(splitAttrList(s.schemaRequireAttrs), "VacateReasonCode"); !slices.Equal(ep, want) {
+		t.Errorf("epoch_history required = %v, want %v", ep, want)
+	}
+	if slices.Contains(splitAttrList(s.schemaRequireAttrs), "VacateReasonCode") {
+		t.Error("VacateReasonCode is in the shared required list; jobs would pay a slot for it")
+	}
+	s, _ = resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_SCHEMA_REQUIRE_ATTRS = ResidentSetSize\n"))
+	if got := splitAttrList(s.epochSchemaRequireAttrs); !slices.Equal(got, []string{"ResidentSetSize"}) {
+		t.Errorf("configured epoch_history required = %v, want [ResidentSetSize]", got)
+	}
+	s, _ = resolveScheddSyncSettings(mkSyncCfg(t, syncOn+"HTCONDORDB_SCHEMA_REQUIRE_ATTRS = none\n"))
+	if s.epochSchemaRequireAttrs != "" {
+		t.Errorf("`none` left epoch_history requiring %q", s.epochSchemaRequireAttrs)
 	}
 }
