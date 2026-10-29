@@ -199,6 +199,17 @@ const defaultArchiveCategoricalAttrs = "Owner"
 // JobStatus, Owner at submit; EnteredHistoryTime at ingest), so presence alone admits them.
 const defaultHistorySchemaRequireAttrs = "CompletionDate"
 
+// defaultEpochSchemaRequireAttrs are required in the epoch archive's columnar schema on top of
+// defaultSchemaRequireAttrs when HTCONDORDB_SCHEMA_REQUIRE_ATTRS is unset.
+//
+// VacateReasonCode is how the epoch archive is searched for runs that were stopped: "why were
+// jobs evicted or held in the last day" filters on `VacateReasonCode isnt undefined` and groups by
+// it. Only the runs that were stopped carry it -- about one epoch in ten on a production access
+// point -- so the presence floor never admits it, and the filter can then be decided for no
+// record without decompressing it: a 24h window of 140k epochs took 3.3s to return 15k. With a
+// slot, the nine in ten without it are rejected from the column.
+const defaultEpochSchemaRequireAttrs = "VacateReasonCode"
+
 // defaultSchemaRequireAttrs are the attributes required in the columnar schema when
 // HTCONDORDB_SCHEMA_REQUIRE_ATTRS is unset.
 //
@@ -259,12 +270,14 @@ type scheddSyncSettings struct {
 	archiveCatAttrs      string
 	archiveValAttrs      string
 	// schemaRequireAttrs names the attributes the columnar schema must carry whatever their
-	// presence rate (HTCONDORDB_SCHEMA_REQUIRE_ATTRS). Applied to the jobs table and the epoch
-	// archive; historySchemaRequireAttrs is the history archive's, which by default adds
-	// defaultHistorySchemaRequireAttrs. Carried as canonical config strings so the settings struct
-	// stays comparable for apply()'s reconcile-by-equality.
+	// presence rate (HTCONDORDB_SCHEMA_REQUIRE_ATTRS). Applied to the jobs table;
+	// historySchemaRequireAttrs and epochSchemaRequireAttrs are the archives', which by default
+	// add defaultHistorySchemaRequireAttrs and defaultEpochSchemaRequireAttrs. Carried as
+	// canonical config strings so the settings struct stays comparable for apply()'s
+	// reconcile-by-equality.
 	schemaRequireAttrs        string
 	historySchemaRequireAttrs string
+	epochSchemaRequireAttrs   string
 	// historyMaxBytes / epochMaxBytes cap the on-disk size (sealed-segment bytes) of the history
 	// and epoch_history archive tables. The periodic archive-maintenance pass drops the oldest
 	// whole segments until the table is under its cap. 0 = no limit. Configured from HTCondor
@@ -399,6 +412,7 @@ func resolveScheddSyncSettings(cfg *config.Config) (scheddSyncSettings, []string
 		archiveValAttrs:           canonicalAttrList(getStr(cfg, "HTCONDORDB_ARCHIVE_VALUE_ATTRS")),
 		schemaRequireAttrs:        resolveSchemaRequireAttrs(cfg, ""),
 		historySchemaRequireAttrs: resolveSchemaRequireAttrs(cfg, defaultHistorySchemaRequireAttrs),
+		epochSchemaRequireAttrs:   resolveSchemaRequireAttrs(cfg, defaultEpochSchemaRequireAttrs),
 		// Space limits: a shared default (HTCONDORDB_ARCHIVE_MAX_BYTES) applied to both archives,
 		// with per-table overrides. An explicit per-table value wins even when it is 0 (that table
 		// is uncapped while the default caps the other); an unset per-table knob inherits the
@@ -1151,14 +1165,14 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			// queries on either prune whole segments. Epoch records carry no
 			// CompletionDate (a run instance is not a completed job).
 			ZoneAttrs:          []string{scheddsync.EpochWriteDateAttr, scheddsync.EnteredHistoryAttr},
-			SchemaRequireAttrs: splitAttrList(s.schemaRequireAttrs),
+			SchemaRequireAttrs: splitAttrList(s.epochSchemaRequireAttrs),
 		})
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("schedd-sync: creating epoch archive: %w", err)
 		}
 		m.reconcileArchiveIndexes(ctx, ep, "epoch_history", epCat, epVal, &wg)
 		m.applyArchiveRowGroupBytes(ep, "epoch_history", s)
-		m.applySchemaRequire("epoch_history", splitAttrList(s.schemaRequireAttrs), ep.SetSchemaRequireAttrs)
+		m.applySchemaRequire("epoch_history", splitAttrList(s.epochSchemaRequireAttrs), ep.SetSchemaRequireAttrs)
 		m.applyArchiveMaxBytes(ep, "epoch_history", s.epochMaxBytes)
 		es := scheddsync.NewJobEpochSync(ep, scheddsync.HistorySyncConfig{
 			Filename:        s.epochFile,
