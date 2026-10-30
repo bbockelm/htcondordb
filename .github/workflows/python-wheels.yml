@@ -173,9 +173,14 @@ jobs:
   macos:
     name: macos universal2
     needs: tests
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: read
+    env:
+      # clang stamps the library with the runner's own macOS version unless told otherwise,
+      # and the wheel tag is read from the library, so a runner upgrade would silently drop
+      # every older macOS. Pin the floor the wheels have always had.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
