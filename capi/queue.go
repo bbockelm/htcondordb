@@ -136,7 +136,7 @@ type queueClient struct {
 	pool    []*poolConn
 	poolCap int
 	poolGen uint64 // bumped on teardown, so an in-flight dial knows it is obsolete
-	dialing int    // growth dials in flight
+	dialing int    // growth dials in flight; at most one, see growLocked
 	// Growth pacing, shared by every goroutine that may dial for the pool.
 	growAfter   time.Time
 	growBackoff time.Duration

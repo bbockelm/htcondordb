@@ -28,8 +28,9 @@
 //     authenticated CEDAR handshake and a file descriptor at both ends.
 //   - Dialling stays paced. The supervisor keeps the first connection up with its
 //     own clock-based backoff; growth beyond it happens only while the database is
-//     Ready, only under real contention, and stops for a backoff window after a
-//     failed dial. One database outage must not become N reconnect storms.
+//     Ready, only under real contention, one dial at a time, and stops for a backoff
+//     window after a failed dial. One database outage must not become N reconnect
+//     storms.
 package main
 
 import (
@@ -172,6 +173,15 @@ func (q *queueClient) growLocked(now time.Time) {
 		return
 	}
 	if len(q.pool)+q.dialing >= q.capLocked() {
+		return
+	}
+	if q.dialing > 0 {
+		// One growth dial at a time. The backoff is armed only when a dial fails, so
+		// while one is still out nothing yet says the daemon is gone: without this,
+		// every contended query in that window -- and a dial to a dead host can hang
+		// for a connect timeout -- would start another, up to the cap, and each of
+		// those failures would double the backoff again. Waiting for the outcome costs
+		// only ramp-up speed; no query ever waits on a dial.
 		return
 	}
 	if now.Before(q.growAfter) {
