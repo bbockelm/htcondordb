@@ -447,9 +447,9 @@ func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error 
 
 // queryLogHook returns the dbrpc per-query log callback for a connection, or nil
 // when per-query logging is disabled (HTCONDORDB_LOG_QUERIES off). When enabled it
-// logs each streamed query -- op, table, constraint, LIMIT, rows returned, and
-// duration, plus the peer identity -- through the condor logger (s.log bridges
-// slog into it). It surfaces expensive query patterns operationally, e.g. a
+// logs each streamed query -- op, table, constraint, LIMIT, rows returned,
+// duration and (for an aggregate) its grouping, plus the peer identity --
+// through the condor logger (s.log bridges slog into it). It surfaces expensive query patterns operationally, e.g. a
 // client pulling every attribute of every ad (a full scan with a large row count)
 // instead of pushing a projection or LIMIT down.
 func (s *Service) queryLogHook(user, remote string) func(dbrpc.QueryLog) {
@@ -457,10 +457,22 @@ func (s *Service) queryLogHook(user, remote string) func(dbrpc.QueryLog) {
 		return nil
 	}
 	return func(q dbrpc.QueryLog) {
-		s.log.Info("htcondordb query",
+		attrs := []any{
 			"op", q.Op, "table", q.Table, "constraint", q.Constraint,
 			"limit", q.Limit, "rows", q.Rows, "duration", q.Duration,
-			"user", user, "remote", remote)
+			"user", user, "remote", remote,
+		}
+		// An aggregate's grouping is logged beside its constraint, because the constraint
+		// alone does not say what the query asked for: `rows` counts GROUPS for one, and
+		// how it groups is what decides whether it was answered from the columns or by
+		// rebuilding every matched record.
+		if g := q.GroupingText(); g != "" {
+			attrs = append(attrs, "group_by", g)
+		}
+		if a := q.AggregatesText(); a != "" {
+			attrs = append(attrs, "aggregates", a)
+		}
+		s.log.Info("htcondordb query", attrs...)
 	}
 }
 

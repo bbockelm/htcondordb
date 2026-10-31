@@ -208,9 +208,9 @@ stats yet.)
 
 `.slow` answers "what are my slowest queries?". The daemon buckets every query
 it serves by **shape** — the opcode, the table, a fingerprint of the constraint,
-and whether a LIMIT was sent — and ranks the buckets by **total** time, because
-the query worth fixing is usually a cheap one run constantly rather than one
-slow outlier.
+whether a LIMIT was sent, and, for an aggregate, how it groups — and ranks the
+buckets by **total** time, because the query worth fixing is usually a cheap one
+run constantly rather than one slow outlier.
 
 The fingerprint is the constraint with its literals replaced by `?` and its
 attribute names lowercased, taken from the parsed and constant-folded
@@ -242,6 +242,30 @@ Two of those lines are what make the report diagnostic rather than descriptive:
 `projection:` says whether the client pulled whole ads instead of projecting
 server-side, and `segments:` says how much of the scan was skipped — which
 separates "slow because the window is big" from "slow because nothing pruned".
+
+An aggregate (a `GROUP BY`, or any query that reduces rather than returns rows)
+is reported with its grouping, because here the grouping decides the work rather
+than only the output — a single raw numeric group column is answered from the
+columnar blocks, while grouping by an expression, or by a column the accelerator
+does not cover, rebuilds every matched record:
+
+```
+#2  ArchiveAggregate history   count 288   total 6m2s   mean 1.2s   max 4.1s   groups 11520
+    where: (enteredhistorytime >= ?)
+    group by: owner, enteredhistorytime/3600   aggregates: count(*), sum(remotewallclocktime)
+    segments: 228096 scanned, 0 pruned (0% skipped) over 288 measured instance(s)
+    slowest: 4.1s  groups 40  user alice@example  segments 792/792 scanned  tier scan  at 09:41:02
+      EnteredHistoryTime >= 1761300000
+```
+
+A group column that carries a bucket width prints it after a slash
+(`enteredhistorytime/3600` is hourly), and two widths over one attribute are two
+shapes: hourly and daily differ by 24x in how many groups come back and often by
+which strategy answers. The count beside the duration is **groups**, not rows —
+twelve groups can be the product of reading every record in the table — and
+`tier` on an exemplar names the strategy that answered it (`index` and
+`columnar` read no records; `scan` rebuilt them). There is no `projection:` line,
+because an aggregate streams no ads.
 
 Shapes carry no literals and no identities, so any reader may see them.
 Exemplars quote the real constraint and name the user who ran it, so they
