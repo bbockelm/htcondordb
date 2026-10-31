@@ -172,6 +172,11 @@ type Statement struct {
 	MatchUsing    []string
 	NoPreempt     bool // MATCH ... NOPREEMPT: exclude already-claimed resources
 
+	// SetBranches are the further SELECTs of a set operation, in source order. This
+	// statement is the first branch, so a plain SELECT has none. ORDER BY and LIMIT belong
+	// to the whole operation and are held here rather than on a branch.
+	SetBranches []SetBranch
+
 	// From is the FROM clause's first table with its alias; Joins are the tables joined
 	// to it, in source order. Table still holds the first table's name, so every
 	// single-table path reads exactly as it did before joins existed. A query with no
@@ -556,7 +561,7 @@ func (p *parser) parseStatement() (*Statement, error) {
 	case p.takeKeyword("EXPLAIN"):
 		return p.parseExplain()
 	case p.takeKeyword("SELECT"):
-		return p.parseSelect()
+		return p.parseSelectWithSetOps()
 	case p.takeKeyword("INSERT"):
 		return p.parseInsert()
 	case p.takeKeyword("UPDATE"):
@@ -996,7 +1001,7 @@ func (p *parser) parseSelect() (*Statement, error) {
 	if p.takeKeyword("HAVING") {
 		having, aggs, _, err := p.captureSelectExpr(func() bool {
 			return p.atEnd() || p.isKeyword("QUALIFY") || p.isKeyword("ORDER") ||
-				p.isKeyword("LIMIT")
+				p.isKeyword("LIMIT") || p.atSetOp()
 		})
 		if err != nil {
 			return nil, fmt.Errorf("HAVING: %w", err)
@@ -1005,7 +1010,7 @@ func (p *parser) parseSelect() (*Statement, error) {
 	}
 	if p.takeKeyword("QUALIFY") {
 		qual, err := p.captureRawExpr(func() bool {
-			return p.atEnd() || p.isKeyword("ORDER") || p.isKeyword("LIMIT")
+			return p.atEnd() || p.isKeyword("ORDER") || p.isKeyword("LIMIT") || p.atSetOp()
 		})
 		if err != nil {
 			return nil, fmt.Errorf("QUALIFY: %w", err)
@@ -1523,7 +1528,7 @@ func (p *parser) parseWhere() (string, error) {
 	return p.captureRawExpr(func() bool {
 		return p.atEnd() || p.isKeyword("GROUP") || p.isKeyword("HAVING") ||
 			p.isKeyword("QUALIFY") || p.isKeyword("ORDER") || p.isKeyword("LIMIT") ||
-			p.isKeyword("SINCE")
+			p.isKeyword("SINCE") || p.atSetOp()
 	})
 }
 

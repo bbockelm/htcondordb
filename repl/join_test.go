@@ -530,13 +530,11 @@ func TestLiveAndHistoryIsNotAJoin(t *testing.T) {
 		t.Fatalf("got %d rows, want alice's 2 live jobs null-extended", len(r.Rows))
 	}
 
-	// And the set operation that WOULD answer it is refused with a message that says so.
-	_, err := e.ExecString(`SELECT Owner FROM jobs UNION ALL SELECT Owner FROM history`)
-	if err == nil {
-		t.Fatal("UNION ALL parsed")
-	}
-	if !strings.Contains(err.Error(), "UNION is not supported") {
-		t.Fatalf("error %q does not name UNION", err)
+	// The set operation that DOES answer it stacks the two tables instead of pairing them.
+	u := mustExec(t, e, `SELECT ClusterId FROM jobs WHERE Owner == "alice"
+		UNION ALL SELECT ClusterId FROM history WHERE Owner == "alice"`)
+	if len(u.Rows) != 4 {
+		t.Fatalf("got %v, want alice's 2 live clusters and her 2 completed ones", u.Rows)
 	}
 }
 

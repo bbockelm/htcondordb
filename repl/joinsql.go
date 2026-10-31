@@ -229,7 +229,7 @@ func (p *parser) atJoinCondEnd() bool {
 		p.isKeyword("QUALIFY") || p.isKeyword("ORDER") || p.isKeyword("LIMIT") ||
 		p.isKeyword("JOIN") || p.isKeyword("INNER") || p.isKeyword("LEFT") ||
 		p.isKeyword("RIGHT") || p.isKeyword("FULL") || p.isKeyword("CROSS") ||
-		p.isKeyword("NATURAL")
+		p.isKeyword("NATURAL") || p.atSetOp()
 }
 
 // clauseKeywords are the words that may follow a table name without being its alias.
@@ -256,16 +256,14 @@ func (p *parser) peekAheadKeyword(n int, kw string) bool {
 	return t.kind == tIdent && strings.EqualFold(t.text, kw)
 }
 
-// rejectSetOps gives UNION / INTERSECT / EXCEPT their own error. Without it the parser
-// reports "unexpected ALL after statement", which says nothing about what is missing --
-// and combining live and completed jobs, the obvious reason to reach for UNION here, is
-// a set operation rather than a join.
+// rejectSetOps catches a set operator trailing a statement that cannot take one (an
+// INSERT, say). Between SELECTs it never fires, because parseSelectWithSetOps has already
+// consumed it. Without this the parser would report "unexpected ALL after statement",
+// which says nothing about what is wrong.
 func (p *parser) rejectSetOps() error {
 	for _, kw := range []string{"UNION", "INTERSECT", "EXCEPT"} {
 		if p.isKeyword(kw) {
-			return fmt.Errorf("%s is not supported; run the two SELECTs separately, or "+
-				"if you meant to combine rows ACROSS tables, note that a JOIN pairs rows "+
-				"side by side rather than stacking them", kw)
+			return fmt.Errorf("%s combines SELECT statements; it cannot follow this one", kw)
 		}
 	}
 	return nil

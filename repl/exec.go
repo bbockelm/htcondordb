@@ -400,6 +400,9 @@ type Result struct {
 func (e *Executor) Exec(st *Statement) (*Result, error) {
 	switch st.Kind {
 	case StmtSelect:
+		if st.IsSetOp() {
+			return e.execSetOp(st)
+		}
 		return e.execSelect(st)
 	case StmtInsert:
 		return e.execInsert(st)
