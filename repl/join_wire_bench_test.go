@@ -51,7 +51,7 @@ type joinBenchFixture struct {
 // archive with two rows per cluster. Both are value-indexed on ClusterId, which is what
 // gives the key-batch membership constraint an index to probe rather than a predicate to
 // evaluate per record.
-func newJoinBenchFixture(b *testing.B, n int) *joinBenchFixture {
+func newJoinBenchFixture(b testing.TB, n int) *joinBenchFixture {
 	b.Helper()
 	cat, err := db.OpenCatalog(b.TempDir())
 	if err != nil {
