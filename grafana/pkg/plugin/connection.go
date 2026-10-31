@@ -19,6 +19,7 @@ import (
 	"github.com/PelicanPlatform/classad/dbrpc"
 
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/dbconn"
 	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/repl"
 )
@@ -110,6 +111,7 @@ func connect(ctx context.Context, cc connConfig) (*dbSession, error) {
 	connCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	dbconn.Discover(sec)
 	cl, err := cedarclient.ConnectAndAuthenticate(connCtx, addr, sec)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to htcondordb at %s: %w", addr, err)
@@ -119,7 +121,7 @@ func connect(ctx context.Context, cc connConfig) (*dbSession, error) {
 	// the handler returns -- that would kill a pooled session between requests).
 	// Use Background; the session ends only when cleanup() closes it (pool reset /
 	// Dispose, or the stream ending).
-	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(context.Background(), cl.GetStream()))
+	dbc := dbconn.New(context.Background(), cl)
 	return &dbSession{
 		client:  dbc,
 		cleanup: func() { _ = dbc.Close(); _ = cl.Close() },

@@ -40,6 +40,7 @@ import (
 
 	"github.com/bbockelm/htcondordb/command"
 	"github.com/bbockelm/htcondordb/dbad"
+	"github.com/bbockelm/htcondordb/dbconn"
 	"github.com/bbockelm/htcondordb/dbdir"
 	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/metrics"
@@ -144,6 +145,10 @@ func run() error {
 	if sec.Authentication == security.SecurityOptional {
 		sec.Authentication = security.SecurityPreferred
 	}
+	// Tell every client what this build's dbrpc can do, so it need not find
+	// out by being refused. Carried in the post-auth ad and kept with the
+	// session, so a resumed connection answers as the first one did.
+	dbconn.Advertise(sec)
 	srv := cedarserver.New(sec)
 
 	// Per-command ALLOW_/DENY_ authorization from the configuration. The policy
