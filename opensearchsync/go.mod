@@ -9,16 +9,16 @@ go 1.26.0
 toolchain go1.27.0
 
 require (
-	github.com/PelicanPlatform/classad v0.33.4-0.20261031164630-de3f954bc4fe
-	github.com/PelicanPlatform/classad/db v0.33.4-0.20261031164630-de3f954bc4fe
-	github.com/PelicanPlatform/classad/dbrpc v0.33.4-0.20261031164630-de3f954bc4fe
+	github.com/PelicanPlatform/classad v0.34.0
+	github.com/PelicanPlatform/classad/db v0.34.0
+	github.com/PelicanPlatform/classad/dbrpc v0.34.0
 	github.com/bbockelm/cedar v0.7.12
 	github.com/bbockelm/golang-htcondor v0.13.0
 	github.com/opensearch-project/opensearch-go/v4 v4.8.1
 )
 
 require (
-	github.com/PelicanPlatform/classad/collections v0.33.4-0.20261031164630-de3f954bc4fe // indirect
+	github.com/PelicanPlatform/classad/collections v0.34.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.29.0 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
