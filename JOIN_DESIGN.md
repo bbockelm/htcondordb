@@ -238,6 +238,85 @@ Honest limits: strings decline unless dictionary-encoded, so numeric keys
 dictionary covers it; and vectorization lives on columnar blocks, so `jobs ⋈ history`
 vectorizes on the history side — which is, fortunately, the big one.
 
+### 6.2 Measured: what the client-side join pays for the wire
+
+§8.2 measured that columnarization makes matchmaking *faster*, not slower, which removed the
+reassembly argument for the MATCH pre-filter. That result says nothing about the join,
+because it measured a different reassembly: column→row **inside** the store, in-process,
+with no client. The one a server-side join would remove is wire→`*classad.ClassAd` **on the
+client**, per row, on both sides. `repl/join_wire_bench_test.go` measures that one.
+
+Three arms share one planner, one key-batch decision and one hash join; the only difference
+is where the rows come from. `wire` fetches through a real dbrpc server; `inproc-projected`
+reads the same attributes in-process; `inproc-whole` reads whole ads in-process, which
+prices the projection separately so the wire's share is not credited with it. Medians of
+three runs of ten, both arm orders, best (warmest) median per arm:
+
+| left keys | shape | wire | in-process | wire costs |
+|---|---|---|---|---|
+| 128 | 4 attributes | 8.0 ms | 5.1 ms | 1.6x |
+| 400 | 4 attributes | 44.3 ms | 36.2 ms | 1.2x |
+| 2048 | 4 attributes | 66.4 ms | 31.0 ms | 2.1x |
+| 8192 | 4 attributes | 268 ms | 130 ms | 2.1x |
+| 128 | `SELECT *` | 16.0 ms | 6.1 ms | 2.6x |
+| 400 | `SELECT *` | 69.3 ms | 38.9 ms | 1.8x |
+| 2048 | `SELECT *` | 202 ms | 45.9 ms | 4.4x |
+| 8192 | `SELECT *` | 841 ms | 186 ms | **4.5x** |
+
+So the wire and the per-row rebuild are **2x on a narrow projection and 4.5x on `SELECT *`**,
+and the `SELECT *` factor grows with the row count while the narrow one flattens — the
+projection is what keeps the narrow case bounded, and a projection is exactly what a person
+asking for joined records does not supply.
+
+Both numbers understate it. `net.Pipe` is an in-memory pipe, so the wire arm pays
+serialization and framing but no network latency or bandwidth; and client and server share a
+process, so nothing is read cold. A real deployment adds both.
+
+Two further points do not need a measurement at all. A join is the one query shape where the
+client must materialize rows **in order to discard them** — selectivity that a server-side
+join applies before serialization, a client-side join can only apply after it. And the
+client-side join does not merely get slow at scale: `maxJoinSideRows` makes it refuse.
+
+#### Key batching is mispriced, and a client cannot price it
+
+Key batching is the client-side join's one real access-path trick, and it works better than
+expected: `orEqProbe` folds the `||` chain of equalities into a single `in` probe with no
+value cap, so with a value index on the attribute it is a genuine multi-value index probe
+rather than a per-record predicate. Against a 16,384-row right table it is worth a great
+deal, falling off steeply with the key count:
+
+| left keys | batched | unbatched | batching is |
+|---|---|---|---|
+| 32 | 1.7 ms | 87.4 ms | 50x better |
+| 128 | 12.0 ms | 88.4 ms | 7.4x better |
+| 256 | 26.8 ms | 89.8 ms | 3.3x better |
+| 400 | 47.0 ms | 94.5 ms | 2.0x better |
+| 511 | 89.6 ms | 93.3 ms | break-even |
+
+Break-even lands at almost exactly `maxJoinKeyBatch` (512), which looks like a well-chosen
+constant until the right table's size is varied too. Holding the key count at 400:
+
+| right-table rows | batched | unbatched | batching is |
+|---|---|---|---|
+| 1,024 | 42.4 ms | 10.6 ms | **4.0x WORSE** |
+| 4,096 | 41.3 ms | 26.8 ms | 1.5x worse |
+| 16,384 | 46.4 ms | 92.7 ms | 2.0x better |
+| 65,536 | 46.5 ms | 374 ms | 8.0x better |
+
+The batched arm is flat in the right table's size (it reads only the matching rows, plus a
+constraint cost set by the key count); the unbatched arm is linear in it. So break-even is a
+curve in *two* variables, and `maxJoinKeyBatch` caps only one of them. It is wrong in both
+directions: it pessimizes a small right table by up to **4x**, and on a large one it forbids
+a win that is still 8x at the cap — a production epoch table is far past 65,536 rows, where
+batching would pay well beyond 512 keys.
+
+This is the strongest form of the argument for executing the join in the store, and it is
+not about assembly cost. **The client cannot make this decision**, because the statistic it
+needs — the right side's size, and how much of it the constraint excludes — lives on the
+server. The client would have to pay a round trip to ask before it could plan, and the
+answer it got would still be a whole-table count where the server could decide per segment
+from zone maps. The cap is the honest thing to do with the information a client has.
+
 ## 7. Block-looping and zone-map block skipping
 
 This is where a join inside the store beats any join above it, and it is only reachable
@@ -424,6 +503,10 @@ will actually need costs, in rough order of what they are worth:
    the match pushdown.
 4. **Hash vs indexed nested loop vs block-nested loop**, which is only decidable with an
    estimate of how many right-side rows a left row will probe.
+5. **Whether to key-batch at all**, which §6.2 measures as a two-variable trade (key count
+   against right-table size) currently decided by a constant in one of them. This is the
+   first of these decisions with a measured cost curve, so it is the natural first customer
+   for a real estimator.
 
 **What exists.** `planFrac`, `estimateCandidates` and `conjunctSelectivity` already give
 per-side selectivity, with the independence assumption deliberately damped rather than
@@ -443,12 +526,16 @@ retrofitting:
   is computable from metadata before any data is read, and it estimates join selectivity
   directly -- no histogram, no independence assumption, no NDV. Most planners would love to
   have it. It should be a first-class input, not an afterthought to a textbook estimator.
-- **Prefer measuring the first side to estimating it.** The client-side join already fetches
-  the left side before deciding whether to key-batch the right, so that decision uses an
-  actual count rather than an estimate. Keeping that shape server-side -- decide the second
-  side's access path after the first is counted -- avoids the error that compounds worst in
-  join planning. An estimate is for choosing which side to read first; after that there is a
-  real number.
+- **Prefer measuring the first side to estimating it, but measure *both* inputs to the
+  decision.** The client-side join already fetches the left side before deciding whether to
+  key-batch the right, so it knows the key count exactly. That is half of the decision, and
+  §6.2 measures what happens to the other half: break-even depends just as much on the right
+  table's size, which the client never learns, so `maxJoinKeyBatch` caps the one variable it
+  can see and is wrong in both directions. Keeping the shape server-side -- decide the second
+  side's access path after the first is counted -- is right, and is only sufficient because
+  the server also knows the second side's size and can refine it per segment from zone maps.
+  An estimate is for choosing which side to read first; after that there are two real
+  numbers, and a planner needs both.
 
 Estimation error compounds per join, which is the standard argument for keeping N-way joins
 out until there is a real estimator, and the reason EXPLAIN must print estimated *and*
@@ -778,7 +865,12 @@ vectorized residual (§8.2) land here and land **first**: same machinery as the 
 path, but with no `TargetScope`, no composite ad and no outer-join asymmetry to get wrong.
 Measure `RecordsReassembled` before building.
 
-**Phase 3 — `opJoin` (opcode 66; 65 is the current high-water mark).** Two tables, `ON` as
+**Phase 3 — `opJoin` (opcode 66; 65 is the current high-water mark).** Justified by §6.2
+and by §7, on two grounds that the MATCH measurement of §8.2 neither supports nor
+undermines: the wire and per-row rebuild cost 2x on a narrow projection and 4.5x on
+`SELECT *`, before any network; and the access-path decisions need statistics that only the
+server holds. Block skipping is not merely slower from a client — it is unreachable, so all
+of §7 is server-only by construction rather than by preference. Two tables, `ON` as
 a ClassAd expression, executed inside the store: the join `ColumnSource` of §6.1, the block
 sweep and zone skipping of §7, wire-form row assembly, streaming only joined output rows.
 Same new-opcode-plus-`ErrXUnsupported`-fallback pattern `opTopK` and
