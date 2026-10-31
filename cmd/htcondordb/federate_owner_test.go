@@ -299,9 +299,20 @@ func TestFederationHubExitedEarly(t *testing.T) {
 	if ok, _ := resp.EvaluateAttrBool("Ok"); ok || time.Since(start) > 2*time.Second {
 		t.Fatalf("retire with no running hub: ok=%v after %v", ok, time.Since(start))
 	}
+	// Drop the archive before the restart, so the hub that the restart starts survives. A hub
+	// that fails again deregisters itself as soon as Run returns, and apply registers it while
+	// holding fm.mu, so the window in which fm.hub is set is only as long as it takes Run to
+	// fail -- reading fm.hub once after apply is a race with that, and loses it under load. What
+	// the restart depends on is the manager's state (fm.hub and fm.sig, cleared by forget), and
+	// dropping a table changes none of it.
+	if err := svc.Catalog().DropArchiveTable("jobs"); err != nil {
+		t.Fatal(err)
+	}
 	if err := fm.apply(cfg); err != nil {
 		t.Fatal(err)
 	}
+	// apply registers the hub before it returns, and this one keeps running, so this is a
+	// settled state rather than a sample of a passing one.
 	fm.mu.Lock()
 	restarted := fm.hub != nil
 	fm.mu.Unlock()
