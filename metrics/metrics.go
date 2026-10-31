@@ -20,6 +20,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/dbrpc"
 
 	"github.com/bbockelm/htcondordb/dbad"
 	"github.com/bbockelm/htcondordb/scheddsync"
@@ -598,6 +599,10 @@ func (b *behindTracker) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
+// requestPanics reads dbrpc's process-wide count of reads failed by a contained panic. A variable so a
+// test can stand in a nonzero count: nothing outside dbrpc can make a read panic.
+var requestPanics = dbrpc.RequestPanics
+
 // Handler returns an http.Handler serving Prometheus metrics for the catalog: the
 // per-table storage gauges and operational timing counters above, the materialized-view
 // gauges, the schedd-sync + exporter health gauges, plus the standard Go runtime and process
@@ -630,6 +635,16 @@ func Handler(ctx context.Context, cat *db.Catalog, sources func() []dbad.StatusS
 			Name: "htcondordb_store_corrupt_chain_links_total",
 			Help: "Bucket-chain links naming a segment the shard does not have. Nonzero indicates a segment-lifetime bug; a lookup may have missed an existing key.",
 		}, func() float64 { return float64(collections.CorruptChainLinks()) }),
+		// Reads failed because serving them panicked. The server contains a panicking read to that
+		// one request -- the client gets an internal error and every other connection keeps being
+		// served -- so the daemon staying up is no longer the signal that nothing went wrong. Each
+		// one is a bug, logged at error level with its stack; alert on any increase.
+		//
+		// Process-wide, like the counter it reads: dbrpc counts across every server in the process.
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "htcondordb_dbrpc_request_panics_total",
+			Help: "Read requests failed because serving them panicked. Each is a server bug; the daemon log holds the panic and its stack.",
+		}, func() float64 { return float64(requestPanics()) }),
 		newCatalogCollector(cat),
 		&viewCollector{cat: cat},
 		newSyncCollector(sources, exporters, importers),

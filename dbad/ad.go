@@ -60,8 +60,11 @@ type Input struct {
 	Capabilities Capabilities
 	Sources      []scheddsync.SyncStatus
 	Delta        DeltaStat
-	Exporters    []ExporterStatus
-	Importers    []ImporterStatus
+	// RequestPanics is how many read requests the process failed because serving them panicked
+	// (dbrpc.RequestPanics). Each is a server bug that the daemon survived; see the log for it.
+	RequestPanics int64
+	Exporters     []ExporterStatus
+	Importers     []ImporterStatus
 	// Mirrored names the schedd this daemon's schedd-sync mirrors. Nil when schedd-sync is off:
 	// a daemon that mirrors nothing must not claim a schedd, or a hub would pair it with one.
 	Mirrored *Mirrored
@@ -291,6 +294,7 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 	ad.InsertAttr("DeltaCompactDroppedDeltas", in.Delta.CompactDroppedDeltas)
 	ad.InsertAttr("DeltaCompactDeferred", in.Delta.CompactDeferred)
 	ad.InsertAttr("DeltaProvisionalIndexBuilds", in.Delta.ProvisionalIndexBuilds)
+	ad.InsertAttr("RequestPanics", in.RequestPanics)
 	ad.InsertAttr("TotalAds", totalAds)
 	ad.InsertAttr("TotalLiveBytes", totalLive)
 	ad.InsertAttr("TotalDeadBytes", totalDead)

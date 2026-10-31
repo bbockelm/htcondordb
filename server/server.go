@@ -282,6 +282,9 @@ func New(cfg Config) (*Service, error) {
 		log:          log,
 		owners:       NewTableOwners(),
 	}
+	// A read that panics is failed alone and reported through the server's logger; without this
+	// it goes to the process default, which only the daemon's main points at our log.
+	svc.rpc.Logger = log
 	// Query aggregation: on unless the caller turned it off. It is what answers "what are
 	// my slowest queries?", which until now nothing could.
 	if !cfg.DisableQueryStats {
