@@ -225,17 +225,27 @@ const defaultEpochSchemaRequireAttrs = "VacateReasonCode"
 // These are the attributes dashboards and `condor_history` summaries read: without a slot they
 // sit in the cold tail, where every read of one decompresses the record.
 //
-// MemoryUsage is deliberately NOT here. The shadow copies through whatever the starter sent, and
-// what it sends is frequently an EXPRESSION rather than a number, so the attribute has no
-// dominant literal value. The library refuses it (and reports the refusal), but the reason is
-// worth stating where someone would otherwise add it back: a column escaped in every record is
-// strictly worse than no column. The value is read from the record either way, every record pays
-// an escape bit and the layout for a slot nothing occupies, and a numeric column of escaped
-// expressions makes the vectorized count hand the query back per record -- a block-at-a-time scan
-// turned into a row-at-a-time one.
+// MemoryUsage is here although its value is usually an EXPRESSION: the starter writes
+// `((ResidentSetSize + 1023) / 1024)` (its MEMORY_USAGE_METRIC default) and the shadow passes it
+// through, so the attribute has no dominant literal. An expression cannot move into a column -- it
+// stays in the record and its cell is escaped -- but when it reads nothing except the record itself
+// (every attribute it names is present; no TARGET, clock or randomness), its value is computed once,
+// when the segment is columnarized, and kept beside the column. COUNT/MIN/MAX/SUM, a bucketed GROUP
+// BY and TopK read that value instead of the record, and the schema derivation counts such a cell as
+// the kind it computes to, so the field is an int column like the rest of this list. A cell that does
+// not qualify (no ResidentSetSize to compute from) is evaluated from its record, which is how every
+// read of MemoryUsage went before.
+//
+// It has to be required to get that: on a production history it is present in about three records
+// in four, under the presence floor, and a secondary (group) schema that picks it up instead carries
+// no computed values. It is in the shared list, the live jobs table included, because the slot costs
+// next to nothing where the attribute is absent: on a jobs table built from 12k real ads with 10% to
+// 60% of the jobs having run, requiring it grew the store by under 1%, and took COUNT(*) WHERE
+// MemoryUsage > 4095, MAX(MemoryUsage) and a GROUP BY on it from 200-490 ms of per-record evaluation
+// to 7-12 ms read from the columns.
 const defaultSchemaRequireAttrs = "ResidentSetSize, ProportionalSetSize, CurrentResidentSetSize, " +
-	"ImageSize, DiskUsage, RemoteWallClockTime, CommittedTime, RemoteUserCpu, RemoteSysCpu, " +
-	"BytesSent, BytesRecvd"
+	"MemoryUsage, ImageSize, DiskUsage, RemoteWallClockTime, CommittedTime, RemoteUserCpu, " +
+	"RemoteSysCpu, BytesSent, BytesRecvd"
 
 // scheddSyncSettings is the resolved, comparable configuration of the tailers. Every field
 // must stay comparable -- apply() reconciles by struct equality -- so attribute lists are
@@ -699,12 +709,18 @@ func (m *scheddSyncManager) applyArchiveRowGroupBytes(t *db.ArchiveTable, name s
 // applySchemaRequire puts the configured required-attribute set onto a table: the attributes the
 // columnar schema must carry whatever their presence rate.
 //
-// It does NOT rebuild anything. Every sealed segment's columnar block was built against the
-// current schema, so a changed set takes effect at the next re-derivation -- `.schema rebuild`,
-// which re-encodes one block per sealed segment and on a mature history archive means reading the
-// whole thing back through the decompressor. Starting that from a config reload would turn a
-// condor_reconfig into hours of unannounced I/O, so the change is recorded and the operator is
-// told, in the log line, what to run.
+// Setting the set rewrites nothing itself. The next maintenance pass re-derives the table's schema
+// and adopts it -- a required attribute that is not yet a field is reason enough -- and from then
+// on each pass rewrites up to the library's columnar segment budget (64) of sealed segments onto it.
+// Passes run every 15 minutes, or further apart when one is long: maintenance is held under 1% of
+// wall time, so a pass that took P waits at least 100*P. Rewriting a sealed 8 MiB history segment
+// measured about 0.4s, so a pass converging history and epoch_history together takes about a
+// minute and the next follows some 90 minutes later; a 5M-job history (~2400 segments) converges in
+// about 40 passes, two to three days, paid in the background rather than by the condor_reconfig
+// that changed the list. Until a table converges its segments carry two schemas, each read under
+// its own: answers stay exact, and an aggregate over the newly required attribute stays on the
+// record path until the last segment is rewritten. `.schema rebuild` adopts the new schema now
+// instead of at the next pass; the segments still converge at the same budgeted rate.
 //
 // Re-asserted on every start and reconfig, which is how a puppet-managed fleet drives it. The
 // re-assert replaces only the configured tier: an attribute someone added by hand with
@@ -720,8 +736,8 @@ func (m *scheddSyncManager) applySchemaRequire(name string, want []string, set f
 		return
 	}
 	m.logger.Info("schedd-sync: required schema attributes set", "table", name, "attrs", want,
-		"note", "run `.schema rebuild "+name+"` to re-derive the schema; until then the existing "+
-			"columnar blocks are unchanged")
+		"note", "the next maintenance pass adopts the re-derived schema; sealed segments are then "+
+			"rewritten onto it a budgeted number per pass")
 }
 
 // applyArchiveMaxBytes puts the configured on-disk size cap onto an archive's retention. The

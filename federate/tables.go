@@ -143,14 +143,15 @@ func ensureTables(cat *db.Catalog, tables []string, opts ArchiveOptions, log *sl
 				}()
 			}
 			// As for the indexes: archiveconfig.json is authoritative on reopen, so the configured
-			// set has to be re-asserted onto an archive that already exists. Nothing is rebuilt --
-			// re-deriving the schema re-encodes one columnar block per sealed segment, which a
-			// hub's history makes expensive; `.schema rebuild history` is how an operator pays it.
+			// set has to be re-asserted onto an archive that already exists. Nothing is rewritten
+			// here: the next maintenance pass adopts the re-derived schema and converges the sealed
+			// segments onto it a budgeted number per pass, in the background.
 			if changed, err := a.SetSchemaRequireAttrs(require); err != nil {
 				log.Error("federate: setting required schema attributes", "archive", t, "err", err)
 			} else if changed {
 				log.Info("federate: required schema attributes set", "archive", t, "attrs", require,
-					"note", "run `.schema rebuild "+t+"` to re-derive the schema")
+					"note", "the next maintenance pass adopts the re-derived schema; sealed segments are "+
+						"then rewritten onto it a budgeted number per pass")
 			}
 			if maxBytes := opts.MaxBytes[t]; a.Retention().MaxBytes != maxBytes {
 				r := a.Retention()

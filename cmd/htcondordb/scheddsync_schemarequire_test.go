@@ -4,7 +4,6 @@ import (
 	"io"
 	"log/slog"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -17,21 +16,12 @@ func TestSchemaRequireDefaults(t *testing.T) {
 	s, _ := resolveScheddSyncSettings(mkSyncCfg(t, syncOn))
 	got := splitAttrList(s.schemaRequireAttrs)
 	want := []string{
-		"ResidentSetSize", "ProportionalSetSize", "CurrentResidentSetSize",
+		"ResidentSetSize", "ProportionalSetSize", "CurrentResidentSetSize", "MemoryUsage",
 		"ImageSize", "DiskUsage", "RemoteWallClockTime", "CommittedTime",
 		"RemoteUserCpu", "RemoteSysCpu", "BytesSent", "BytesRecvd",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("default required attributes = %v, want %v", got, want)
-	}
-	// MemoryUsage is frequently an EXPRESSION in a job ad (the shadow passes through whatever the
-	// starter sent), so it has no dominant literal value. A slot for it would escape in every
-	// record: read from the record anyway, paid for in every record, and -- being numeric -- it
-	// would make the vectorized count hand the query back row by row. The library refuses it;
-	// this keeps it from being added back by habit.
-	if slices.ContainsFunc(got, func(n string) bool { return strings.EqualFold(n, "MemoryUsage") }) {
-		t.Error("MemoryUsage is in the default required set; it is expression-valued and a slot " +
-			"for it would be escaped in every record")
 	}
 }
 

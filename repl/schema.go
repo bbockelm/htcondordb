@@ -348,8 +348,8 @@ func (s *session) showRequire(w io.Writer, d *dbrpc.Diagnostics) {
 			fmt.Fprintf(w, "  %-25s %s\n", sk.Name, sk.Reason)
 		}
 	}
-	fmt.Fprintln(w, "changing the set does not rebuild anything: run `.schema rebuild` to re-derive "+
-		"the schema (cost: one columnar block rebuilt per sealed segment)")
+	fmt.Fprintln(w, "changing the set rewrites nothing now: the next maintenance pass adopts the re-derived "+
+		"schema and rewrites sealed segments onto it a budgeted number per pass; `.schema rebuild` adopts it at once")
 }
 
 // tableAndArgs peels an optional leading table name off a command's arguments, the way the

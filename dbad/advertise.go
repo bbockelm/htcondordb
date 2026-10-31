@@ -7,6 +7,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/dbrpc"
 
 	"github.com/bbockelm/htcondordb/scheddsync"
 )
@@ -42,19 +43,24 @@ func Augment(cat *db.Catalog, sources func() []StatusSource, exporters func() []
 			imp = importers()
 		}
 		AddAttrs(ad, Input{
-			MyAddress:    myAddress,
-			Tables:       CatalogTables(cat),
-			Capabilities: CatalogCapabilities(cat),
-			Sources:      LiveStatuses(sources),
-			Exporters:    exp,
-			Importers:    imp,
-			Delta:        CurrentDeltaStat(),
-			Mirrored:     callOrNil(o.mirrored),
-			Federation:   callOrNil(o.federation),
-			Now:          time.Now(),
+			MyAddress:     myAddress,
+			Tables:        CatalogTables(cat),
+			Capabilities:  CatalogCapabilities(cat),
+			Sources:       LiveStatuses(sources),
+			Exporters:     exp,
+			Importers:     imp,
+			Delta:         CurrentDeltaStat(),
+			RequestPanics: requestPanics(),
+			Mirrored:      callOrNil(o.mirrored),
+			Federation:    callOrNil(o.federation),
+			Now:           time.Now(),
 		})
 	}
 }
+
+// requestPanics reads dbrpc's process-wide count of reads failed by a contained panic. A variable so a
+// test can stand in a nonzero count: nothing outside dbrpc can make a read panic.
+var requestPanics = dbrpc.RequestPanics
 
 // AugmentOption adds an optional attribute source to Augment.
 type AugmentOption func(*augmentOptions)
