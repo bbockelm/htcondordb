@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 )
@@ -225,5 +226,133 @@ func TestSlowRejectsUnknownArgument(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, `"nosuchtable" is not a known table`) {
 		t.Errorf("the bad argument is not named:\n%s", out)
+	}
+}
+
+// TestSlowReportsGrouping is the end-to-end view of an aggregate: the daemon records a
+// GROUP BY, and the report names the grouping. Before this, aggregates reached neither.
+func TestSlowReportsGrouping(t *testing.T) {
+	e, cleanup := newSlowExec(t, dbrpc.ServeOptions{Privileged: true})
+	defer cleanup()
+	sess := &session{exec: e, table: "jobs"}
+
+	if _, err := e.ExecString("SELECT JobStatus, COUNT(*) FROM jobs GROUP BY JobStatus"); err != nil {
+		t.Fatal(err)
+	}
+	out := runSlow(t, sess, "", "group by:")
+
+	if !strings.Contains(out, "group by: jobstatus") {
+		t.Errorf("the grouping is not reported:\n%s", out)
+	}
+	if !strings.Contains(out, "aggregates: count(*)") {
+		t.Errorf("the aggregate functions are not reported:\n%s", out)
+	}
+	// Five JobStatus values over twenty ads: the count beside the duration is groups, and
+	// labelling it "rows" would read as a query that returned five of twenty ads cheaply.
+	if !strings.Contains(out, "groups 5") {
+		t.Errorf("the row count is not labelled as groups:\n%s", out)
+	}
+	// An aggregate streams no ads, so the projection accounting -- "every attribute of
+	// every matched ad crossed the wire" -- would be false of every aggregate shape.
+	if strings.Contains(out, "projection:") {
+		t.Errorf("an aggregate shape carries projection accounting:\n%s", out)
+	}
+}
+
+// TestSlowSeparatesGroupingsInReport is the REPL half of the shape-key change: two
+// aggregates over the same WHERE, grouped differently, are two lines.
+func TestSlowSeparatesGroupingsInReport(t *testing.T) {
+	e, cleanup := newSlowExec(t, dbrpc.ServeOptions{Privileged: true})
+	defer cleanup()
+	sess := &session{exec: e, table: "jobs"}
+
+	if _, err := e.ExecString("SELECT JobStatus, COUNT(*) FROM jobs GROUP BY JobStatus"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.ExecString("SELECT Owner, COUNT(*) FROM jobs GROUP BY Owner"); err != nil {
+		t.Fatal(err)
+	}
+	out := runSlow(t, sess, "", "group by: jobstatus", "group by: owner")
+	if strings.Contains(out, "count 2") {
+		t.Errorf("two groupings over one constraint were merged:\n%s", out)
+	}
+}
+
+// TestSlowRendersAggregateShape fixes the rendering off a synthetic report, including the
+// two cases the live fixtures above do not produce: an aggregate with no GROUP BY, and an
+// exemplar whose scan reported which tier answered.
+func TestSlowRendersAggregateShape(t *testing.T) {
+	var buf bytes.Buffer
+	showQueryStats(&buf, &dbrpc.QueryStatsReport{
+		Enabled:   true,
+		Since:     time.Now().Add(-time.Minute),
+		Exemplars: true,
+		Shapes: []dbrpc.QueryShapeStat{{
+			Op: "ArchiveAggregate", Table: "history", Shape: "(enteredhistorytime >= ?)",
+			GroupBy: "owner, enteredhistorytime/3600", Aggregates: "count(*), sum(remotewallclocktime)",
+			Count: 12, Total: 4 * time.Second, Max: time.Second, Rows: 480,
+			SegmentsScanned: 800, SegmentsPruned: 0, ScanSamples: 12,
+			Exemplars: []dbrpc.QueryExemplar{{
+				Constraint: "EnteredHistoryTime >= 1700000000",
+				Duration:   time.Second, Rows: 40,
+				Scan: collections.ScanStats{SegmentsTotal: 800, SegmentsScanned: 800, Tier: collections.TierScan},
+			}},
+		}, {
+			Op: "Aggregate", Table: "jobs", Shape: "*",
+			Aggregates: "count(*)", Count: 3, Total: time.Millisecond, Rows: 3,
+		}},
+	}, "", slowDefaultTop)
+	out := buf.String()
+
+	if !strings.Contains(out, "group by: owner, enteredhistorytime/3600") {
+		t.Errorf("the bucketed grouping is not rendered:\n%s", out)
+	}
+	if !strings.Contains(out, "aggregates: count(*), sum(remotewallclocktime)") {
+		t.Errorf("the aggregate functions are not rendered:\n%s", out)
+	}
+	if !strings.Contains(out, "groups 480") {
+		t.Errorf("the group count is not labelled:\n%s", out)
+	}
+	// The tier is the one column that separates an aggregate answered from metadata from
+	// the same aggregate rebuilding every matched record.
+	if !strings.Contains(out, "tier scan") {
+		t.Errorf("the exemplar does not report which tier answered:\n%s", out)
+	}
+	// The exemplar counts what the shape line counts, or the two lines disagree about
+	// what the same number means.
+	if !strings.Contains(out, "slowest: 1s  groups 40") {
+		t.Errorf("the exemplar's count is not labelled as groups:\n%s", out)
+	}
+	// An aggregate over the whole match says so rather than leaving the field blank.
+	if !strings.Contains(out, "(none -- one row over the whole match)") {
+		t.Errorf("an ungrouped aggregate is not described:\n%s", out)
+	}
+}
+
+// TestSlowPlainReadKeepsProjectionLine guards the other side of the aggregate branch: a
+// read of ads must keep the accounting the aggregate shapes drop, and must not grow a
+// grouping line or be relabelled.
+func TestSlowPlainReadKeepsProjectionLine(t *testing.T) {
+	var buf bytes.Buffer
+	showQueryStats(&buf, &dbrpc.QueryStatsReport{
+		Enabled: true,
+		Since:   time.Now().Add(-time.Minute),
+		Shapes: []dbrpc.QueryShapeStat{{
+			Op: "QueryRawProj", Table: "jobs", Shape: "(owner == ?)",
+			Count: 2, Total: time.Second, Rows: 40, Unprojected: 2,
+		}},
+	}, "", slowDefaultTop)
+	out := buf.String()
+	if !strings.Contains(out, "projection:") {
+		t.Errorf("a plain read lost its projection accounting:\n%s", out)
+	}
+	if strings.Contains(out, "group by:") {
+		t.Errorf("a plain read grew a grouping line:\n%s", out)
+	}
+	if !strings.Contains(out, "rows 40") {
+		t.Errorf("a plain read's rows were relabelled:\n%s", out)
+	}
+	if strings.Contains(out, "tier ") {
+		t.Errorf("an unreported tier was printed:\n%s", out)
 	}
 }

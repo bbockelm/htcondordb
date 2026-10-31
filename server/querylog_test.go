@@ -75,6 +75,36 @@ func TestQueryLogHook(t *testing.T) {
 		if attrs["rows"].Int64() != 5046 {
 			t.Errorf("log attr rows = %d, want 5046", attrs["rows"].Int64())
 		}
+		// A read carries no grouping, and an empty one must not be logged as a field: a
+		// `group_by=""` on every line reads as an aggregate that grouped by nothing.
+		if _, ok := attrs["group_by"]; ok {
+			t.Error("a plain read logged a group_by field")
+		}
+	})
+
+	// An aggregate logs how it grouped beside its constraint. Without it the line says a
+	// GROUP BY returned five rows in four seconds and nothing about what made it cost.
+	t.Run("aggregate", func(t *testing.T) {
+		cap := &capturingHandler{}
+		s := &Service{logQueries: true, log: slog.New(cap)}
+		s.queryLogHook("alice@pool", "192.0.2.1:5000")(dbrpc.QueryLog{
+			Op: "ArchiveAggregate", Table: "history", Constraint: "EnteredHistoryTime >= 1700000000",
+			Rows: 40, Duration: 4 * time.Second,
+			Groups: []dbrpc.GroupCol{{Attr: "Owner"}, {Attr: "EnteredHistoryTime", BucketWidth: 3600}},
+			Aggs:   []dbrpc.AggSpec{{Func: dbrpc.AggCount, Arg: "*"}},
+		})
+		rec, ok := cap.find("htcondordb query")
+		if !ok {
+			t.Fatal("aggregate was not logged")
+		}
+		attrs := map[string]slog.Value{}
+		rec.Attrs(func(a slog.Attr) bool { attrs[a.Key] = a.Value; return true })
+		if got, want := attrs["group_by"].String(), "owner, enteredhistorytime/3600"; got != want {
+			t.Errorf("log attr group_by = %q, want %q", got, want)
+		}
+		if got, want := attrs["aggregates"].String(), "count(*)"; got != want {
+			t.Errorf("log attr aggregates = %q, want %q", got, want)
+		}
 	})
 }
 

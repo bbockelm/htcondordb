@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/dbrpc"
 )
 
@@ -103,19 +104,60 @@ func showQueryStats(w io.Writer, rep *dbrpc.QueryStatsReport, table string, top 
 				len(rep.Shapes)-top, table, len(rep.Shapes))
 			break
 		}
-		fmt.Fprintf(w, "\n#%d  %s %s   count %d   total %s   mean %s   max %s   rows %d\n",
-			i+1, sh.Op, sh.Table, sh.Count, fmtDur(sh.Total), fmtDur(sh.Mean()), fmtDur(sh.Max), sh.Rows)
+		fmt.Fprintf(w, "\n#%d  %s %s   count %d   total %s   mean %s   max %s   %s %d\n",
+			i+1, sh.Op, sh.Table, sh.Count, fmtDur(sh.Total), fmtDur(sh.Mean()), fmtDur(sh.Max),
+			rowNoun(sh), sh.Rows)
 		fmt.Fprintf(w, "    where: %s%s\n", sh.Shape, limitNote(sh.Limited))
-		fmt.Fprintf(w, "    %s\n", projectionLine(sh))
+		if line := groupingLine(sh); line != "" {
+			fmt.Fprintf(w, "    %s\n", line)
+		}
+		// An aggregate returns no ads at all, so the projection line -- whose whole subject
+		// is how much of each ad crossed the wire -- has nothing to report about one.
+		if !isAggregate(sh) {
+			fmt.Fprintf(w, "    %s\n", projectionLine(sh))
+		}
 		fmt.Fprintf(w, "    %s\n", scanLine(sh))
 		for _, ex := range sh.Exemplars {
-			fmt.Fprintf(w, "    slowest: %s  rows %d%s%s  at %s\n",
-				fmtDur(ex.Duration), ex.Rows, exemplarWho(ex), exemplarScan(ex),
+			fmt.Fprintf(w, "    slowest: %s  %s %d%s%s  at %s\n",
+				fmtDur(ex.Duration), rowNoun(sh), ex.Rows, exemplarWho(ex), exemplarScan(ex),
 				ex.At.Local().Format("15:04:05"))
 			fmt.Fprintf(w, "      %s\n", oneLine(ex.Constraint))
 		}
 	}
 	fmt.Fprintln(w, "\nreproduce a shape with the constraint from its exemplar: .explain <constraint>")
+}
+
+// isAggregate reports whether the shape is a GROUP BY / aggregate query rather than a
+// read of ads. An aggregate over the whole match carries no grouping, so the functions
+// are what identify one.
+func isAggregate(sh dbrpc.QueryShapeStat) bool {
+	return sh.GroupBy != "" || sh.Aggregates != ""
+}
+
+// rowNoun names what the shape's row count counts. For an aggregate it is GROUPS, which
+// a report must say: twelve groups can be the product of reading every record in the
+// table, and "rows 12" next to a four-second duration reads as a cheap query behaving
+// strangely.
+func rowNoun(sh dbrpc.QueryShapeStat) string {
+	if isAggregate(sh) {
+		return "groups"
+	}
+	return "rows"
+}
+
+// groupingLine reports an aggregate's grouping and its reduced functions -- the part of
+// the shape that decides which strategy can answer it. Empty for a plain read.
+func groupingLine(sh dbrpc.QueryShapeStat) string {
+	switch {
+	case !isAggregate(sh):
+		return ""
+	case sh.GroupBy == "":
+		// Said explicitly rather than by omitting the line: "no GROUP BY" is a fact about
+		// the query, and a blank where the grouping goes reads as a report that lost it.
+		return "group by: (none -- one row over the whole match)   aggregates: " + sh.Aggregates
+	default:
+		return "group by: " + sh.GroupBy + "   aggregates: " + sh.Aggregates
+	}
 }
 
 // projectionLine reports how much of each ad the clients asked for. An unprojected read
@@ -161,10 +203,17 @@ func exemplarWho(ex dbrpc.QueryExemplar) string {
 }
 
 func exemplarScan(ex dbrpc.QueryExemplar) string {
-	if ex.Scan.SegmentsTotal == 0 {
-		return ""
+	out := ""
+	if ex.Scan.SegmentsTotal > 0 {
+		out = fmt.Sprintf("  segments %d/%d scanned", ex.Scan.SegmentsScanned, ex.Scan.SegmentsTotal)
 	}
-	return fmt.Sprintf("  segments %d/%d scanned", ex.Scan.SegmentsScanned, ex.Scan.SegmentsTotal)
+	// Which strategy answered, for the paths that report one. It is the difference
+	// between an aggregate served from segment metadata and the same aggregate rebuilding
+	// every matched record, which no other column here distinguishes.
+	if ex.Scan.Tier != collections.TierUnreported {
+		out += "  tier " + ex.Scan.Tier.String()
+	}
+	return out
 }
 
 func limitNote(limited bool) string {
