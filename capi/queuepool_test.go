@@ -206,19 +206,36 @@ func TestAcquireWithNoSessionReturnsNil(t *testing.T) {
 	}
 }
 
+// contend runs n rounds of two overlapping acquisitions: the shape that asks the pool
+// to grow.
+func contend(q *queueClient, n int) {
+	for i := 0; i < n; i++ {
+		_, a := q.acquire()
+		_, b := q.acquire()
+		a()
+		b()
+	}
+}
+
+// dialsInFlight is the pool's own count of growth dials it has started and not yet
+// heard back from. growLocked raises it before acquire returns, so unlike a counter
+// bumped inside the dial goroutine it needs no waiting to be accurate.
+func dialsInFlight(q *queueClient) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.dialing
+}
+
 func TestGrowthOnlyWhileReady(t *testing.T) {
 	addr := poolTestServer(t, map[string]string{"1.0": "ClusterId = 1"})
 	d := newPoolDialer(t, addr)
 	q := newPoolClient(t, d, 4)
 	q.setState(hcdbQueueStale, "the mirror is behind")
 
-	for i := 0; i < 20; i++ {
-		_, r1 := q.acquire()
-		_, r2 := q.acquire()
-		r1()
-		r2()
+	contend(q, 20)
+	if got := dialsInFlight(q); got != 0 {
+		t.Fatalf("%d growth dials started while the database was stale, want 0: the pool must not open sockets to a database we will not read", got)
 	}
-	time.Sleep(50 * time.Millisecond)
 	if got := d.dials.Load(); got != 1 {
 		t.Fatalf("%d dials while the database was stale, want 1: the pool must not open sockets to a database we will not read", got)
 	}
@@ -229,44 +246,70 @@ func TestGrowthPacedAfterADialFailure(t *testing.T) {
 	d := newPoolDialer(t, addr)
 	q := newPoolClient(t, d, 8)
 
-	// Every dial from here on fails, as it would against a daemon that just died.
+	// Every dial from here on fails, as it would against a daemon that just died --
+	// but only when the test says so. Until then the dial hangs, the way a connect to
+	// a host that has gone away does, which is the window in which nothing has yet
+	// told the pool the daemon is gone.
 	var dials atomic.Int64
+	gate := make(chan struct{})
+	var openGate sync.Once
+	fail := func() { openGate.Do(func() { close(gate) }) }
+	t.Cleanup(fail)
 	q.dialFn = func() (*conn, error) {
 		dials.Add(1)
+		<-gate
 		return nil, fmt.Errorf("connection refused")
 	}
 
-	// One contended acquisition starts one dial; it fails and arms the backoff.
-	_, r1 := q.acquire()
-	_, r2 := q.acquire()
-	r1()
-	r2()
+	// One contended acquisition starts one dial.
+	contend(q, 1)
+	if got := dialsInFlight(q); got != 1 {
+		t.Fatalf("%d growth dials in flight after the first contention, want 1", got)
+	}
+
+	// Hundreds of contended queries while that dial is still out must not start
+	// another: the pool does not yet know the daemon is down, and a dial per query in
+	// that window is exactly the reconnect storm the backoff exists to prevent.
+	contend(q, 500)
+	if got := dialsInFlight(q); got != 1 {
+		t.Fatalf("%d growth dials in flight while the first had not returned, want 1", got)
+	}
+
+	// The dial fails and arms the backoff. Wait for that, not for time to pass.
+	fail()
 	deadline := time.Now().Add(5 * time.Second)
-	for dials.Load() == 0 && time.Now().Before(deadline) {
+	var armedUntil time.Time
+	var backoff time.Duration
+	for {
+		q.mu.Lock()
+		inFlight := q.dialing
+		armedUntil, backoff = q.growAfter, q.growBackoff
+		q.mu.Unlock()
+		if inFlight == 0 && !armedUntil.IsZero() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the failed dial never armed the growth backoff (in flight %d, after %v)", inFlight, armedUntil)
+		}
 		time.Sleep(time.Millisecond)
 	}
-	if dials.Load() != 1 {
-		t.Fatalf("%d dials after the first contention, want 1", dials.Load())
+	// One failure is one step of backoff; a burst of parallel failures would have
+	// doubled it once each.
+	if backoff != reconnectFloor {
+		t.Fatalf("the growth backoff is %v after one failed dial, want %v", backoff, reconnectFloor)
 	}
 
 	// Hundreds of contended queries inside the backoff window must not add a single
 	// dial: a pool that redialled per query would turn one outage into a storm.
-	for i := 0; i < 500; i++ {
-		_, a := q.acquire()
-		_, b := q.acquire()
-		a()
-		b()
+	contend(q, 500)
+	if time.Now().After(armedUntil) {
+		t.Fatalf("the contended loop outlasted the %v backoff window, so it no longer tests the window", backoff)
 	}
-	time.Sleep(50 * time.Millisecond)
+	if got := dialsInFlight(q); got != 0 {
+		t.Fatalf("%d growth dials started inside the backoff window, want 0", got)
+	}
 	if got := dials.Load(); got != 1 {
-		t.Fatalf("%d dials during the backoff window, want 1", got)
-	}
-	q.mu.Lock()
-	armed := q.growAfter.After(time.Now())
-	backoff := q.growBackoff
-	q.mu.Unlock()
-	if !armed || backoff < reconnectFloor {
-		t.Fatalf("the growth backoff was not armed (after=%v backoff=%v)", armed, backoff)
+		t.Fatalf("%d dials across the failure and its backoff window, want 1", got)
 	}
 }
 
