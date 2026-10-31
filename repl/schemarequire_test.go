@@ -53,8 +53,8 @@ func TestSchemaRequireAddShowDrop(t *testing.T) {
 	if !strings.Contains(got, "because they were required") {
 		t.Errorf("listing should separate the required attributes that became fields:\n%s", got)
 	}
-	if !strings.Contains(got, ".schema rebuild") {
-		t.Errorf("listing should say a change needs a rebuild:\n%s", got)
+	if !strings.Contains(got, "next maintenance pass") {
+		t.Errorf("listing should say when a change takes effect:\n%s", got)
 	}
 
 	out.Reset()
