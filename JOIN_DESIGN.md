@@ -509,7 +509,8 @@ So the current shape is **N independent full scans-and-rankings of the resource 
 
 ### 8.2 What MATCH gets from §6.1 and §7 — with less work than the join
 
-- **The vectorized executor, with no new interface.** `rewriteForSlot` maps
+- **The vectorized executor, with no new interface** (but see the measurement below for
+  what it now has to beat). `rewriteForSlot` maps
   `TARGET.attr` → a self-scoped reference, so `slotMatchExpr`'s residual is entirely
   `NoScope` — exactly what `blockVecSource.LoadColumn` already accepts. MATCH needs no
   `TargetScope` `ColumnSource` and none of §4's alias normalization. It is the simpler
@@ -534,10 +535,36 @@ Two honest qualifications:
   empty for a mutable collection). It does get block zones, because `columnarizeSealed` is
   not gated on append-only — block zones are automatic wherever a columnar block exists.
 
-**Measure this first.** Reading a record out of a columnarized segment reassembles it from
-columns, so the hypothesis is that every index candidate on a columnarized resource table
-pays a column→row reassembly only to be rejected. `ScanStats.RecordsReassembled` already
-diagnoses exactly that; confirm it before building, rather than assuming it.
+**Measured, 2026-10-31: that hypothesis is wrong.** The reasoning was that since a record
+read out of a columnarized segment is rebuilt from its columns, every index candidate on a
+columnarized resource table pays a column→row reassembly only to be rejected. A benchmark
+over 20,000 slots (`collections/match_columnar_bench_test.go` in the classad tree) says
+otherwise:
+
+| job shape (matches / 20,000) | plain | schema scan only | columnarized |
+|---|---|---|---|
+| selective (312) | 87 ms | 81 ms | **12 ms** |
+| one string attribute (13,333) | 74 ms | 77 ms | **17 ms** |
+| accepts everything (20,000) | 73 ms | 116 ms | **44 ms** |
+
+Columnarization makes matchmaking **3–11x faster**, and by the largest margin on the job
+that rejects almost everything — the exact opposite of what a per-candidate reassembly tax
+would produce. The signature is of a form that is *cheaper to reject from*: the win is
+biggest where most candidates are thrown away, and smallest where everything matches and
+must be materialized into a ClassAd regardless.
+
+Two methodological notes, because the first attempt got this wrong in both directions.
+Columnarizing requires a derived schema installed first, so a two-arm comparison varies two
+things at once and credits the schema scan's own effect to columnarization; the middle arm
+above shows the schema scan alone is worth nothing here (and costs something when nothing is
+rejected). And the arms are run in both orders: absolute numbers move between orderings —
+`accept-all/plain` reads 73 ms one way and 223 ms the other — while the ratios hold.
+
+**What this changes.** There is no reassembly tax to remove, so §8.2's vectorized pre-filter
+cannot be justified by one. It has to earn its place against the 12 ms the columnar reject
+path already achieves on a selective match, which is a much harder target. Re-measure
+against that baseline before building it, and treat the ordering spread above as the noise
+floor any claimed improvement has to clear.
 
 ### 8.3 Matching many requests in one pass
 
