@@ -161,10 +161,60 @@ func (p *aggProjector) scope(i int, group, values []string) *classad.ClassAd {
 // bindGroup binds every group column into an evaluation scope by attribute name, so a group
 // column can appear in a projected expression or in the HAVING filter.
 func (p *aggProjector) bindGroup(ad *classad.ClassAd, group []string) {
+	// A join's group column is a dotted PATH, `h.Owner`, and an expression reads it as a
+	// select over the row's h member. Binding it as a flat attribute of that name would
+	// leave the select unresolved, so every HAVING over a grouped join would drop every
+	// group -- the silent-empty-result failure HAVING's own scope check exists to prevent.
+	// So paths are rebuilt as nested members, and a bare name binds flat as before.
+	tree := pathTree{}
 	for gi, name := range p.groupCol {
-		if name != "" {
-			setLiteral(ad, name, at(group, gi))
+		if name == "" {
+			continue
 		}
+		if !strings.Contains(name, ".") {
+			setLiteral(ad, name, at(group, gi))
+			continue
+		}
+		tree.put(strings.Split(name, "."), at(group, gi))
+	}
+	tree.materialize(ad)
+}
+
+// pathTree collects dotted group-column paths so each member ad is built once, however many
+// of its attributes are grouped. Binding them one at a time would need each nested ad read
+// back out to be extended.
+type pathTree struct {
+	leaves map[string]string
+	kids   map[string]*pathTree
+}
+
+func (t *pathTree) put(parts []string, v string) {
+	if len(parts) == 1 {
+		if t.leaves == nil {
+			t.leaves = map[string]string{}
+		}
+		t.leaves[parts[0]] = v
+		return
+	}
+	if t.kids == nil {
+		t.kids = map[string]*pathTree{}
+	}
+	k := t.kids[parts[0]]
+	if k == nil {
+		k = &pathTree{}
+		t.kids[parts[0]] = k
+	}
+	k.put(parts[1:], v)
+}
+
+func (t *pathTree) materialize(ad *classad.ClassAd) {
+	for name, v := range t.leaves {
+		setLiteral(ad, name, v)
+	}
+	for name, kid := range t.kids {
+		member := classad.New()
+		kid.materialize(member)
+		ad.InsertAttrClassAd(name, member)
 	}
 }
 
@@ -248,7 +298,14 @@ func validateHaving(st *Statement) error {
 			inScope[strings.ToLower(it.Alias)] = true
 		}
 	}
-	for _, a := range q.ReadAttrs() {
+	// Over a join a reference is a qualified PATH, and ReadAttrs reports only the leaf it
+	// selects from -- `h.Owner` reads as "h", which is in no group. So the paths are
+	// collected whole and compared against the group terms, which are written the same way.
+	refs := q.ReadAttrs()
+	if st.IsJoin() {
+		refs = joinExprRefs(st.Having)
+	}
+	for _, a := range refs {
 		la := strings.ToLower(a)
 		if strings.HasPrefix(la, strings.ToLower(aggPlaceholderPrefix)) || inScope[la] {
 			continue

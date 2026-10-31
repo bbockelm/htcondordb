@@ -45,6 +45,14 @@ func (p *parser) captureExpr(stop func() bool, lift *[]AggCall) (expr, raw strin
 			break
 		}
 		t := p.peek()
+		// An unmatched closing bracket at the top level ends the expression and is left for
+		// the caller to consume. Without this the depth counter goes negative and the stop
+		// predicate -- which only fires at depth 0 -- never fires again, so the expression
+		// runs to the end of the statement: a window's `OVER (ORDER BY j.ClusterId)` then
+		// failed with a stray-parenthesis error instead of reaching its own parser.
+		if depth == 0 && (t.kind == tPunct || t.kind == tOp) && (t.text == ")" || t.text == "}") {
+			break
+		}
 		sub, matched, terr := p.translateSQL(lift)
 		if terr != nil {
 			return "", "", terr

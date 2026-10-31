@@ -766,10 +766,11 @@ then parser, resolution, conjunct splitting (§5), hash join and key-batched loo
 strategy (c) via batched constraints, `EXPLAIN`. Works against every existing server, and
 because `hcdb_sql` and the Python DB-API both run statements through `repl.Parse`/`Exec`,
 the REPL, the C API, the Python driver, Grafana and MCP all get `JOIN` from one
-implementation. `ORDER BY` and `DISTINCT` over a join result run client-side here;
-aggregates and `GROUP BY` over a join are refused, because the aggregate argument grammar
-takes a bare attribute name that cannot say which table it means — they arrive with the
-server-side work in Phase 3. **No vectorization and no block skipping in this phase** — a
+implementation. `ORDER BY`, `DISTINCT`, `GROUP BY`, the aggregates and `HAVING` over a join
+result all run client-side here, reusing the same projector and reducers the single-table
+client-side paths use; the aggregate argument grammar was widened to accept a qualified name,
+which is refused outside a join since the store aggregates over a bare attribute. Phase 3
+pushes the grouping to the server. Window functions over a join are still refused. **No vectorization and no block skipping in this phase** — a
 client cannot see blocks. Also the repl.md fix of §8.10, which is independent of everything.
 
 **Phase 2 — the columnar machinery, proved out on MATCH.** Block-zone pruning and the

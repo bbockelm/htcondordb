@@ -300,13 +300,18 @@ func TestJoinRefusesUnsupportedForms(t *testing.T) {
 	}
 }
 
-func TestJoinRefusesAggregates(t *testing.T) {
+// Window functions over a join are still refused; aggregates and GROUP BY are not (see
+// joinagg_test.go).
+func TestJoinRefusesWindowFunctions(t *testing.T) {
 	e, cleanup := joinFixture(t)
 	defer cleanup()
 
-	if _, err := e.ExecString(`SELECT COUNT(*) FROM jobs j JOIN hist h ON j.ClusterId == h.ClusterId`); err == nil {
-		t.Fatal("accepted an aggregate over a join")
-	} else if !strings.Contains(err.Error(), "not supported yet") {
+	_, err := e.ExecString(`SELECT j.Owner, ROW_NUMBER() OVER (ORDER BY j.ClusterId) AS n
+		FROM jobs j JOIN hist h ON j.ClusterId == h.ClusterId`)
+	if err == nil {
+		t.Fatal("accepted a window function over a join")
+	}
+	if !strings.Contains(err.Error(), "not supported yet") {
 		t.Fatalf("error %q does not say the feature is missing", err)
 	}
 }
