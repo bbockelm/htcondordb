@@ -1270,6 +1270,9 @@ func roundDur(d time.Duration) string {
 // read path, whether the projection and LIMIT are pushed to the server, and whether ordering
 // happens client-side. It mirrors execSelect's routing so the report matches what will run.
 func (e *Executor) describePlan(st *Statement) []string {
+	if st.IsJoin() {
+		return e.describeJoinPlan(st)
+	}
 	kind := "table"
 	if e.isArchive(st.Table) {
 		kind = "archive"
@@ -1339,6 +1342,12 @@ func (e *Executor) describePlan(st *Statement) []string {
 }
 
 func (e *Executor) execSelect(st *Statement) (*Result, error) {
+	// A join reads two tables and its rows are composite ads, so none of the single-table
+	// pushdowns below apply to it; it plans and runs its own way (join.go).
+	if st.IsJoin() {
+		return e.execJoin(st)
+	}
+
 	// GROUP BY / aggregates -- and DISTINCT over explicit columns, which is just
 	// GROUP BY those columns -- are computed server-side (hash-map aggregation):
 	// only the grouped result crosses the wire, not every matched ad.

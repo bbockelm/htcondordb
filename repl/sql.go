@@ -1,14 +1,22 @@
 // Package repl implements a small SQL-like query language over the htcondordb
 // ClassAd store and an interactive client (REPL) for it.
 //
-// The store is a single keyed collection of ClassAds -- there are no tables to
-// join -- so the language is deliberately the join-free subset of SQL: SELECT
-// (with a WHERE filter, column projection, DISTINCT, the COUNT/SUM/AVG/MIN/MAX
-// aggregates, GROUP BY over one or more columns, HAVING, ORDER BY, and LIMIT), INSERT,
-// UPDATE, and DELETE, plus CREATE/DROP TABLE, CREATE/DROP INDEX, and MATCH
-// (matchmaking between two tables). Aggregation is evaluated server-side
-// (hash-map GROUP BY). JOIN and subqueries are intentionally unsupported and
-// rejected with a clear error; cross-table work is matchmaking, not a join.
+// The language is SELECT (with a WHERE filter, column projection, DISTINCT, the
+// COUNT/SUM/AVG/MIN/MAX aggregates, GROUP BY over one or more columns, HAVING, ORDER BY,
+// and LIMIT), INSERT, UPDATE, and DELETE, plus CREATE/DROP TABLE, CREATE/DROP INDEX,
+// INNER/LEFT/CROSS JOIN, and MATCH (matchmaking between two tables). Aggregation is
+// evaluated server-side (hash-map GROUP BY). Subqueries are unsupported and rejected with
+// a clear error.
+//
+// A JOIN reads two tables and its ON condition is a ClassAd expression, exactly as WHERE
+// is, because the row a join produces is itself a ClassAd whose members are the two sides
+// under their aliases -- so `j.ClusterId == h.ClusterId` is the ClassAd select operator
+// over a nested ad rather than new syntax, and an unmatched LEFT JOIN row simply has no
+// member for its right side, making every reference through it undefined. In a join every
+// attribute must be alias-qualified; see join.go and joinsql.go.
+//
+// JOIN is not MATCH. A join is unilateral and states its own condition; matchmaking is
+// bilateral, and takes its condition from the Requirements of the ads themselves.
 //
 // A GROUP BY term may be a computed key rather than an attribute: an expression, or the AS
 // alias of a projected one -- SELECT CASE WHEN Memory > 4096 THEN 'big' ELSE 'small' END AS
@@ -163,6 +171,13 @@ type Statement struct {
 	Key           string
 	MatchUsing    []string
 	NoPreempt     bool // MATCH ... NOPREEMPT: exclude already-claimed resources
+
+	// From is the FROM clause's first table with its alias; Joins are the tables joined
+	// to it, in source order. Table still holds the first table's name, so every
+	// single-table path reads exactly as it did before joins existed. A query with no
+	// JOIN has one From entry and no Joins.
+	From  []TableRef
+	Joins []JoinClause
 
 	// Select fields.
 	Items    []SelectItem // projection; a single {Star:true} means "*"
@@ -341,6 +356,11 @@ func Parse(input string) (*Statement, error) {
 		return nil, err
 	}
 	if !p.atEnd() {
+		// A set operator here is the common case of "trailing tokens", and deserves to say
+		// what is missing rather than that something is unexpected.
+		if serr := p.rejectSetOps(); serr != nil {
+			return nil, serr
+		}
 		return nil, fmt.Errorf("unexpected %q after statement", p.peek().text)
 	}
 	return stmt, nil
@@ -943,35 +963,16 @@ func (p *parser) parseSelect() (*Statement, error) {
 	if err := p.expectKeyword("FROM"); err != nil {
 		return nil, err
 	}
-	table, err := p.parseIdent()
+	from, err := p.parseTableRef(st)
 	if err != nil {
 		return nil, err
 	}
-	st.Table = table
-	// Optional temporal clause (SQL:2011 "FOR SYSTEM_TIME AS OF <ts>", or the shorter
-	// "AS OF <ts>"), right after the table name -- a point-in-time read.
-	if p.takeKeyword("FOR") {
-		if err := p.expectKeyword("SYSTEM_TIME"); err != nil {
-			return nil, err
-		}
-		if err := p.expectKeyword("AS"); err != nil {
-			return nil, err
-		}
-		if err := p.expectKeyword("OF"); err != nil {
-			return nil, err
-		}
-		if st.AsOf, err = p.parseStringLiteral(); err != nil {
-			return nil, err
-		}
-	} else if p.takeKeyword("AS") {
-		if err := p.expectKeyword("OF"); err != nil {
-			return nil, err
-		}
-		if st.AsOf, err = p.parseStringLiteral(); err != nil {
-			return nil, err
-		}
+	st.Table = from.Table
+	st.From = []TableRef{from}
+	if err := p.parseJoins(st); err != nil {
+		return nil, err
 	}
-	if err := p.rejectJoins(); err != nil {
+	if err := validateJoinTables(st); err != nil {
 		return nil, err
 	}
 	if p.takeKeyword("WHERE") {
@@ -1044,6 +1045,15 @@ func (p *parser) parseSelectItem() (SelectItem, error) {
 	if t := p.peek(); t.kind == tOp && t.text == "*" {
 		p.pos++
 		return SelectItem{Star: true}, nil
+	}
+	// "alias.*" -- one side of a join, whole. Col carries the alias; it is caught here
+	// because the expression path below would capture the text `j.*` and hand the ClassAd
+	// parser something it cannot read.
+	if t := p.peek(); t.kind == tIdent && p.peekAheadOp(1, ".") && p.peekAheadOp(2, "*") {
+		p.pos += 3
+		it := SelectItem{Star: true, Col: t.text}
+		it.Alias = p.parseOptionalAlias()
+		return it, nil
 	}
 	t := p.peek()
 	if t.kind != tIdent {

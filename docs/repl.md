@@ -75,10 +75,96 @@ DELETE FROM jobs WHERE JobStatus == 4;
   de-duplication); `DISTINCT *` de-duplicates whole ads.
 - **`ORDER BY`** one or more columns/aggregates, each `ASC` (default) or `DESC`;
   numeric values sort numerically, applied before `LIMIT`.
-- `JOIN` and subqueries are rejected with a clear error — cross-table work is
-  matchmaking (`MATCH`), not a join.
+- **`JOIN`** reads two tables; see [JOIN](#join--two-tables-one-row). Subqueries are
+  still rejected with a clear error.
 - **`time_bucket(attr, 'width')`** groups rows by a floored unix-epoch timestamp
   attribute for time-series output. See the [time-series design](design/time-series.md).
+
+## JOIN — two tables, one row
+
+```sql
+SELECT <items>
+FROM <table> [[AS] alias]
+  [INNER | LEFT [OUTER] | CROSS] JOIN <table> [[AS] alias] ON <classad-expr>
+[WHERE ...] [ORDER BY ...] [LIMIT n]
+```
+
+**The joined row is itself a ClassAd**, with each side under its alias:
+
+```
+[ j = [ ClusterId = 42; Owner = "alice"; ... ];
+  h = [ ClusterId = 42; ExitCode = 0;    ... ] ]
+```
+
+so `j.ClusterId == h.ClusterId` is not new syntax — it is the ClassAd select operator
+over a nested ad. **`ON` is a ClassAd expression, exactly as `WHERE` is**, which means a
+join condition can be anything the language can say, not just an equality:
+
+```sql
+SELECT j.Owner, h.ExitCode
+  FROM jobs j JOIN hist h ON j.ClusterId == h.ClusterId
+  WHERE j.Owner == "alice";
+
+-- non-equi conditions are first class:
+SELECT j.Owner, m.Name FROM jobs j JOIN machines m
+  ON j.RequestMemory <= m.Memory && j.RequestCpus <= m.Cpus;
+```
+
+Three things follow from the row being a ClassAd:
+
+- **An unmatched `LEFT JOIN` row has no member for the right side**, so every `h.X`
+  reads as `undefined` — ClassAd's own spelling of SQL's `NULL`, with no new rule.
+- **`==` propagates undefined**, so rows missing the join key match nothing, as in SQL.
+  `=?=` is the operator that does equate two undefined values (SQL's
+  `IS NOT DISTINCT FROM`).
+- **Every attribute must be alias-qualified.** `WHERE ExitCode == 0` is refused, naming
+  the aliases, rather than being read as one side and silently returning nothing. An
+  alias defaults to the table's own name, so `jobs.ClusterId` works unaliased.
+
+`SELECT *` returns every attribute of both sides, alias-qualified so like-named
+attributes stay distinct; `SELECT h.*` returns one side's.
+
+**Where the work happens.** A join runs in the client, over query operations that predate
+it, so it works against any server. What makes it affordable is that the `&&` spine of
+`ON` and `WHERE` is split: conjuncts naming one table become server-side constraints on
+that table's scan, each side fetches only the attributes the statement reads from it, and
+an equality on a bare attribute lets the right-hand scan be narrowed to the key values the
+left side actually has. `EXPLAIN` reports all of it.
+
+Outer joins push asymmetrically, which is worth knowing because it is the usual source of
+wrong join results: for a `LEFT JOIN`, `ON` conjuncts push only to the right (inner) side,
+and `WHERE` conjuncts only to the left (preserved) side. An `INNER JOIN` pushes both ways.
+
+**Not supported yet**, each refused with the reason: `RIGHT`/`FULL OUTER` (swap the tables
+and use `LEFT JOIN`), `NATURAL JOIN` and `USING` (write the condition with `ON`),
+comma-separated `FROM` lists, more than two tables, sub-selects, `UNION`/`INTERSECT`/
+`EXCEPT`, and aggregates / `GROUP BY` / window functions over a join — the aggregate
+argument grammar takes a bare attribute name, which cannot say which table it means.
+
+**Guard rails.** A join refuses rather than runs away when it would examine too many
+candidate pairs — either because the `ON` clause has no equality between the tables, so
+every row is compared with every row, or because the join key has too few distinct values
+to separate the rows. Note that a per-table row count does not bound the pair count, and
+neither does hashing: a key with one distinct value puts every row in one bucket, and that
+bucket is the cross product. There is a second cap on output rows, because the rows are
+built before `LIMIT` applies.
+
+**"Live jobs plus completed jobs" is not a join.** A job is in the queue *or* in history,
+never both, so joining `jobs` to `history` finds nothing to pair — a `LEFT JOIN` returns
+every live job with an entirely undefined right side. That question is a set union, which
+is not supported; run the two `SELECT`s separately. The genuine join over history is to a
+second archive, e.g. one row per run attempt:
+
+```sql
+-- every run attempt of each job completed in the last day
+SELECT h.ClusterId, e.RunInstanceId, e.ExitCode
+  FROM history h
+  JOIN epoch e ON h.ClusterId == e.ClusterId && h.ProcId == e.ProcId
+  WHERE h.CompletionDate > CurrentTime - 86400;
+```
+
+`JOIN` is not `MATCH`. A join is unilateral and says its own condition; matchmaking is
+bilateral and takes the condition from the ads themselves. Both are below.
 
 ## MATCH — matchmaking between two tables
 
@@ -91,15 +177,23 @@ MATCH <requestTable> TO <resourceTable>
   [USING (attr, ...)]             -- significant attrs: autocluster identical requests
   [WHERE <request-filter>]        -- which requests to matchmake
   [WHERE TARGET <resource-filter>] -- filter resources (resource side)
-  [LIMIT <k>];                    -- best k resources per request (default 1)
+  [LIMIT <k>];                    -- assign only the first k requests (default: all)
 
 -- single request:
 MATCH KEY '<key>' IN <requestTable> TO <resourceTable> [LIMIT k];
 ```
 
-For each request passing the request-side `WHERE`, it returns the top-`k`
-bilaterally-matching resources by the request's `Rank`. Output columns are
-`Request`, `Resource`, `Rank`.
+It emits **one row per request**: the best-ranked resource that no earlier request
+has already been given, or an empty resource when the request could not be placed.
+Assignment consumes resources, so two requests never receive the same one, and each
+request's candidate list is computed in full rather than truncated — a later request
+may need one ranked past every resource an earlier request claimed. `LIMIT k` bounds
+how many *requests* are assigned (the first `k` in scan order), not how many
+resources a request is offered. Output columns are `Request`, `Resource`, `Rank`.
+
+The order requests are assigned in is the store's scan order, which is **not** a
+priority order. If assignment order matters to you, treat the current behaviour as
+unspecified rather than as a guarantee.
 
 Two things make it cheap on real (repetitive) workloads:
 

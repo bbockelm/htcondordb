@@ -149,7 +149,11 @@ func TestInsertAutoKey(t *testing.T) {
 
 func TestParseRejectsUnsupported(t *testing.T) {
 	cases := []string{
-		"SELECT * FROM a JOIN b ON a.x = b.x",
+		// JOIN itself is supported now (see join_test.go); these are the join forms that
+		// are still refused, each for a reason the error states.
+		"SELECT * FROM a RIGHT JOIN b ON a.x = b.x",
+		"SELECT * FROM a NATURAL JOIN b",
+		"SELECT * FROM a JOIN b USING (x)",
 		"SELECT Owner, COUNT(*) FROM ads",     // mix without GROUP BY
 		"SELECT * FROM ads GROUP BY Owner",    // star with GROUP BY
 		"SELECT Cpus FROM ads GROUP BY Owner", // non-grouped, non-agg column
