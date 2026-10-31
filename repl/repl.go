@@ -238,7 +238,7 @@ func stripQuotes(s string) string {
 	return s
 }
 
-const helpText = `htcondordb SQL-like shell. Each table is a ClassAd collection (no joins);
+const helpText = `htcondordb SQL-like shell. Each table is a ClassAd collection;
 a row's primary key lives in the "Key" attribute.
 
   CREATE TABLE machines;   CREATE TABLE scratch MEMORY;   -- MEMORY = RAM-only, not persisted
@@ -302,7 +302,10 @@ Notes:
     term must also be selected.
   - HAVING filters groups after aggregation (WHERE filters rows before it):
     SELECT Owner, SUM(Cpus) FROM jobs GROUP BY Owner HAVING SUM(Cpus) > 100;
-  - JOIN and subqueries are not supported; matchmaking is MATCH, not a join.
+  - JOIN reads two tables; its ON clause is a ClassAd expression, like WHERE, and every
+    attribute must be alias-qualified (SELECT j.Owner FROM jobs j JOIN hist h ON
+    j.ClusterId == h.ClusterId). Subqueries are not supported. Matchmaking is MATCH,
+    which is bilateral, not a join.
   - BEGIN batches the writes of the statements up to COMMIT into one atomic apply;
     ROLLBACK discards them. Two limits, both from the store: a transaction covers
     one table (it binds to the first table written), and SELECT -- along with the
