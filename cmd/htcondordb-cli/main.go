@@ -40,6 +40,7 @@ import (
 	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/htcondordb/command"
 	"github.com/bbockelm/htcondordb/dbdir"
+	"github.com/bbockelm/htcondordb/dbpeer"
 	"github.com/bbockelm/htcondordb/ha/consistent"
 	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/repl"
@@ -421,11 +422,13 @@ func connectDB(ctx context.Context, cfg *config.Config, addr string) (*dbrpc.Cli
 
 	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer connCancel()
+	sec.WantSessionAttrs = dbrpc.ClientSessionAttrNames()
 	cl, err := cedarclient.ConnectAndAuthenticate(connCtx, addr, sec)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to %s: %w", addr, err)
 	}
-	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()))
+	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()),
+		dbrpc.WithPeerSessionAttrs(dbpeer.Attrs(cl)))
 	cleanup := func() { _ = dbc.Close(); _ = cl.Close() }
 	return dbc, cleanup, nil
 }

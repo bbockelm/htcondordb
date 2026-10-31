@@ -20,6 +20,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/htcondordb/command"
+	"github.com/bbockelm/htcondordb/dbpeer"
 	"github.com/bbockelm/htcondordb/ha/consistent"
 	"github.com/bbockelm/htcondordb/ha/leaderfollower"
 	"github.com/bbockelm/htcondordb/server"
@@ -116,13 +117,15 @@ func (h *haRuntime) startFollower(ctx context.Context, d *daemon.Daemon, cfg *co
 			return nil, err
 		}
 		sec.Command = command.DBSession
+		sec.WantSessionAttrs = dbrpc.ClientSessionAttrNames()
 		cl, err := cedarclient.ConnectAndAuthenticate(dctx, h.leaderAddr, sec)
 		if err != nil {
 			return nil, err
 		}
 		// Closing the dbrpc client closes the underlying CEDAR stream, releasing
 		// the connection; a reconnect dials afresh.
-		return dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream())), nil
+		return dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()),
+			dbrpc.WithPeerSessionAttrs(dbpeer.Attrs(cl))), nil
 	}
 
 	repl, err := leaderfollower.NewReplicator(leaderfollower.ReplicatorConfig{

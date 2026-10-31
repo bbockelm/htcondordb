@@ -9,18 +9,18 @@ go 1.26.0
 toolchain go1.27.0
 
 require (
-	github.com/PelicanPlatform/classad v0.29.12
-	github.com/PelicanPlatform/classad/db v0.29.12
-	github.com/PelicanPlatform/classad/dbrpc v0.29.12
-	github.com/bbockelm/cedar v0.7.2
+	github.com/PelicanPlatform/classad v0.33.3
+	github.com/PelicanPlatform/classad/db v0.33.3
+	github.com/PelicanPlatform/classad/dbrpc v0.33.3
+	github.com/bbockelm/cedar v0.7.12
 	github.com/bbockelm/golang-htcondor v0.13.0
 	github.com/twmb/franz-go v1.22.2
 	github.com/twmb/franz-go/pkg/kadm v1.19.0
 )
 
 require (
-	github.com/PelicanPlatform/classad/collections v0.29.12 // indirect
-	github.com/RoaringBitmap/roaring/v2 v2.19.0 // indirect
+	github.com/PelicanPlatform/classad/collections v0.33.3 // indirect
+	github.com/RoaringBitmap/roaring/v2 v2.29.0 // indirect
 	github.com/bbockelm/gosssd v0.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -39,8 +39,8 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	github.com/twmb/franz-go/pkg/kmsg v1.15.0 // indirect
-	golang.org/x/crypto v0.55.0 // indirect
-	golang.org/x/net v0.57.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )

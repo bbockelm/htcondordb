@@ -21,7 +21,7 @@ require (
 	github.com/PelicanPlatform/classad/collections v0.33.3
 	github.com/PelicanPlatform/classad/db v0.33.3
 	github.com/PelicanPlatform/classad/dbrpc v0.33.3
-	github.com/bbockelm/cedar v0.7.2
+	github.com/bbockelm/cedar v0.7.12
 	github.com/bbockelm/golang-htcondor v0.16.4-0.20260926032345-41c11247a087
 	github.com/chzyer/readline v1.5.1
 	github.com/dustin/go-humanize v1.1.0
@@ -71,8 +71,8 @@ require (
 	github.com/tidwall/btree v1.8.1 // indirect
 	go.etcd.io/bbolt v1.4.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect

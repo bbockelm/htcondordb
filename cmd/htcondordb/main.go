@@ -29,6 +29,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	htcondor "github.com/bbockelm/golang-htcondor"
@@ -144,6 +145,10 @@ func run() error {
 	if sec.Authentication == security.SecurityOptional {
 		sec.Authentication = security.SecurityPreferred
 	}
+	// Tell every client what this build's dbrpc can do, so it need not find
+	// out by being refused. Carried in the post-auth ad and kept with the
+	// session, so a resumed connection answers as the first one did.
+	sec.SessionAttrs = dbrpc.ServerSessionAttrs()
 	srv := cedarserver.New(sec)
 
 	// Per-command ALLOW_/DENY_ authorization from the configuration. The policy
