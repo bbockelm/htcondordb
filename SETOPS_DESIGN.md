@@ -102,9 +102,35 @@ is precisely
 WHERE a.k IN (SELECT b.k FROM b WHERE ...)
 ```
 
-so only the grammar is missing. MATCH wants semijoin semantics too — "does this request
-have any candidate at all?" is `EXISTS`, not a ranked match — which is a second reason this
-shape earns its place ahead of general subqueries.
+so the *execution* is already written. MATCH wants semijoin semantics too — "does this
+request have any candidate at all?" is `EXISTS`, not a ranked match — which is a second
+reason this shape earns its place ahead of general subqueries.
+
+**But "only the grammar is missing" understated it, and the sequencing changed once that was
+checked.** There is no `IN` operator at all, list form included: `WHERE Owner IN ('alice',
+'bob')` reaches the ClassAd parser verbatim and fails, and `NOT IN` was worse than
+unsupported — `NOT` translated to `!` on its own, so `Owner NOT IN ('alice')` became
+`Owner ! IN (...)` and surfaced as a syntax error pointing at the `!`. Both are now refused
+with the ClassAd spelling, `member(x, {a, b})`, which does work.
+
+The obstacle is architectural rather than a missing case. ClassAd spells membership as a
+*function*, so the left operand has to move inside a call — and by the time the expression
+capture reaches `IN`, that operand has already been written through to the output verbatim.
+`captureExpr` streams source left to right and cannot retract it. So `IN` needs one of:
+
+- a capture that can retract or defer the preceding primary term (a lookbehind over the
+  token stream to find the operand's start — an attribute, a qualified path, or a balanced
+  parenthesized group);
+- a source-to-source pre-pass over the token slice that rewrites `IN` forms before capture,
+  which is simple but has to avoid rewriting an attribute that happens to be named `in`;
+- or accepting `member()` as the only spelling and not supporting `IN` at all, which is
+  defensible given that `WHERE` is documented as a ClassAd expression rather than SQL.
+
+**So the order is: decide the `IN` spelling question first, build the list form, and only
+then `IN (SELECT ...)`** — which at that point really is just the grammar plus the value cap
+and plain-scan fallback below, because the membership execution exists. Choosing the third
+option above makes `x IN (SELECT ...)` unspellable, so that decision is not only about
+ergonomics.
 
 Two things to settle when it is built:
 

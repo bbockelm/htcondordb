@@ -59,6 +59,9 @@ DELETE FROM jobs WHERE JobStatus == 4;
 - **Indexes as DDL**: `CREATE [VALUE|CATEGORICAL] INDEX ON t (a, b)` /
   `DROP INDEX ON t (a)`. `CREATE INDEX` builds over existing rows immediately and
   persists.
+- **`IN` is not supported**, in either the list or the sub-select form: ClassAd spells
+  membership as a function, so write `member(x, {a, b})` (and `!member(...)` for `NOT IN`).
+  Both forms are refused with that pointer.
 - **`WHERE` is a ClassAd expression**, captured verbatim and evaluated by the
   store's engine — the full ClassAd language is available (`==`, `=?=`, `=!=`,
   `undefined`, `member()`, `regexp()`, `?:`, …), not a SQL dialect. String

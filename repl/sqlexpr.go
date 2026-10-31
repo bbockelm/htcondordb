@@ -130,6 +130,21 @@ func (p *parser) translateSQL(lift *[]AggCall) (out string, matched bool, err er
 		p.pos++ // NULL
 		return "is undefined", true, nil
 
+	// IN is refused rather than mistranslated. ClassAd spells membership member(x, {..}),
+	// which takes the left operand as an ARGUMENT -- and by the time this sees IN, that
+	// operand has already been written through to the output verbatim, so it cannot be
+	// moved inside a call. `NOT IN` was worse than unsupported: NOT translated to `!` on
+	// its own and the result, `Owner ! IN (...)`, reached the ClassAd parser as a syntax
+	// error pointing at the `!`. Say what to write instead.
+	case p.isKeyword("IN"), p.isKeyword("NOT") && p.peekKeywordAt(1, "IN"):
+		neg := p.isKeyword("NOT")
+		form, want := "x IN (a, b)", `member(x, {a, b})`
+		if neg {
+			form, want = "x NOT IN (a, b)", `!member(x, {a, b})`
+		}
+		return "", false, fmt.Errorf("%s is not supported; ClassAd spells membership as a "+
+			"function, so write %s", form, want)
+
 	case p.isKeyword("AND"):
 		p.pos++
 		return "&&", true, nil

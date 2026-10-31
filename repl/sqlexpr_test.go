@@ -176,3 +176,28 @@ func TestCaseErrors(t *testing.T) {
 		}
 	}
 }
+
+// IN is refused with the member() spelling rather than mistranslated. NOT IN mattered most:
+// NOT translated to `!` on its own, so `Owner NOT IN ('alice')` became `Owner ! IN (...)`
+// and surfaced as a ClassAd syntax error pointing at the `!`.
+func TestInIsRefusedWithTheClassAdSpelling(t *testing.T) {
+	for _, tc := range []struct{ query, want string }{
+		{`SELECT Owner FROM ads WHERE Owner IN ('alice', 'bob')`, `member(x, {a, b})`},
+		{`SELECT Owner FROM ads WHERE ClusterId IN (1, 2)`, `member(x, {a, b})`},
+		{`SELECT Owner FROM ads WHERE Owner NOT IN ('alice')`, `!member(x, {a, b})`},
+		{`SELECT Owner FROM ads WHERE Owner IN (SELECT Owner FROM other)`, `member(x, {a, b})`},
+	} {
+		_, err := Parse(tc.query)
+		if err == nil {
+			t.Errorf("accepted %s", tc.query)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s:\n  error %q\n  does not suggest %q", tc.query, err, tc.want)
+		}
+	}
+	// The spelling it points at has to work.
+	if _, err := Parse(`SELECT Owner FROM ads WHERE member(Owner, {"alice", "bob"})`); err != nil {
+		t.Errorf("the suggested member() form does not parse: %v", err)
+	}
+}
