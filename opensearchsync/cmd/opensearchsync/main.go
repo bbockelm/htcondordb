@@ -31,7 +31,6 @@ import (
 	"github.com/bbockelm/cedar/security"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
-	"github.com/bbockelm/htcondordb/dbconn"
 	"github.com/bbockelm/htcondordb/opensearchsync"
 )
 
@@ -137,12 +136,13 @@ func connect(ctx context.Context, cfg *config.Config, addr string) (*dbrpc.Clien
 	}
 	connCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	dbconn.Discover(sec)
+	sec.WantSessionAttrs = dbrpc.ClientSessionAttrNames()
 	cl, err := cedarclient.ConnectAndAuthenticate(connCtx, addr, sec)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to %s: %w", addr, err)
 	}
-	dbc := dbconn.New(ctx, cl)
+	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(ctx, cl.GetStream()),
+		dbrpc.WithPeerSessionAttrs(peerSessionAttrs(cl)))
 	return dbc, func() { _ = dbc.Close(); _ = cl.Close() }, nil
 }
 
@@ -353,4 +353,19 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// peerSessionAttrs is what the server advertised about its dbrpc protocol, or
+// nil for a connection that never handshook. Reaching through the negotiation
+// inline is a nil dereference on such a connection; nil here reads as a peer
+// that advertised nothing, which is what an old server looks like.
+func peerSessionAttrs(cl *cedarclient.HTCondorClient) map[string]string {
+	if cl == nil {
+		return nil
+	}
+	neg := cl.GetSecurityNegotiation()
+	if neg == nil {
+		return nil
+	}
+	return neg.SessionAttrs
 }

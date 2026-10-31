@@ -19,7 +19,6 @@ import (
 	"github.com/PelicanPlatform/classad/dbrpc"
 
 	"github.com/bbockelm/htcondordb/command"
-	"github.com/bbockelm/htcondordb/dbconn"
 	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/repl"
 )
@@ -111,7 +110,7 @@ func connect(ctx context.Context, cc connConfig) (*dbSession, error) {
 	connCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	dbconn.Discover(sec)
+	sec.WantSessionAttrs = dbrpc.ClientSessionAttrNames()
 	cl, err := cedarclient.ConnectAndAuthenticate(connCtx, addr, sec)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to htcondordb at %s: %w", addr, err)
@@ -121,7 +120,8 @@ func connect(ctx context.Context, cc connConfig) (*dbSession, error) {
 	// the handler returns -- that would kill a pooled session between requests).
 	// Use Background; the session ends only when cleanup() closes it (pool reset /
 	// Dispose, or the stream ending).
-	dbc := dbconn.New(context.Background(), cl)
+	dbc := dbrpc.NewClient(dbrpc.NewCedarConn(context.Background(), cl.GetStream()),
+		dbrpc.WithPeerSessionAttrs(peerSessionAttrs(cl)))
 	return &dbSession{
 		client:  dbc,
 		cleanup: func() { _ = dbc.Close(); _ = cl.Close() },
@@ -179,4 +179,19 @@ func (m *connManager) close() { m.reset() }
 // cached session is dead and must be reset (as opposed to a per-query SQL error).
 func isConnError(err error) bool {
 	return errors.Is(err, dbrpc.ErrConnClosed)
+}
+
+// peerSessionAttrs is what the server advertised about its dbrpc protocol, or
+// nil for a connection that never handshook. Reaching through the negotiation
+// inline is a nil dereference on such a connection; nil here reads as a peer
+// that advertised nothing, which is what an old server looks like.
+func peerSessionAttrs(cl *cedarclient.HTCondorClient) map[string]string {
+	if cl == nil {
+		return nil
+	}
+	neg := cl.GetSecurityNegotiation()
+	if neg == nil {
+		return nil
+	}
+	return neg.SessionAttrs
 }

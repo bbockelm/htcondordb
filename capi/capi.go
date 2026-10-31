@@ -44,7 +44,7 @@ import (
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/htcondordb/command"
-	"github.com/bbockelm/htcondordb/dbconn"
+	"github.com/bbockelm/htcondordb/dbpeer"
 	"github.com/bbockelm/htcondordb/locate"
 	"github.com/bbockelm/htcondordb/repl"
 
@@ -97,7 +97,7 @@ type conn struct {
 // that built its own client was the only thing exercising the watch, so removing
 // it from the production path broke nothing.
 func (c *conn) attach(mc dbrpc.MsgConn) {
-	c.dbc = dbrpc.NewClient(c.watchTransport(mc), dbconn.PeerOption(c.cl))
+	c.dbc = dbrpc.NewClient(c.watchTransport(mc), dbrpc.WithPeerSessionAttrs(dbpeer.Attrs(c.cl)))
 }
 
 // watchTransport wraps the dbrpc transport so the connection notices its own death:
@@ -204,7 +204,7 @@ func openConnAs(addr, subsys string) (*conn, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer connCancel()
-	dbconn.Discover(sec)
+	sec.WantSessionAttrs = dbrpc.ClientSessionAttrNames()
 	cl, err := cedarclient.ConnectAndAuthenticate(connCtx, addr, sec)
 	if err != nil {
 		cancel()

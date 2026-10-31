@@ -19,7 +19,7 @@ import (
 
 	"github.com/bbockelm/htcondordb/cedarsync"
 	"github.com/bbockelm/htcondordb/command"
-	"github.com/bbockelm/htcondordb/dbconn"
+	"github.com/bbockelm/htcondordb/dbpeer"
 	"github.com/bbockelm/htcondordb/server"
 )
 
@@ -219,12 +219,13 @@ func dbSessionDial(parent context.Context, cfg *config.Config, addr, who string)
 			return nil, nil, fmt.Errorf("%s: security config: %w", who, err)
 		}
 		sec.Command = command.DBSession
-		dbconn.Discover(sec)
+		sec.WantSessionAttrs = dbrpc.ClientSessionAttrNames()
 		cl, err := cedarclient.ConnectAndAuthenticate(dctx, addr, sec)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%s: connecting to %s: %w", who, addr, err)
 		}
-		c := dbconn.New(parent, cl)
+		c := dbrpc.NewClient(dbrpc.NewCedarConn(parent, cl.GetStream()),
+			dbrpc.WithPeerSessionAttrs(dbpeer.Attrs(cl)))
 		return c, func() { _ = c.Close(); _ = cl.Close() }, nil
 	}
 }
