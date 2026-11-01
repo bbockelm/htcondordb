@@ -1434,18 +1434,37 @@ source text is 48% of a read and parsing it back is 39%. Neither is work; both e
 relay renders text its consumer immediately parses. Reassembling at dbrpc records that were columnar
 two layers down is the entire 87%.
 
-**Right layer to authorize at**, and this is the constraint that most shapes the answer — but it costs
-nothing, because the split already exists. Redaction is *already* a storage-layer parameter: every
-scan takes a `redact bool`, `c.evalCtx(redact)` decides whether a sealed value opens, and private
-attributes are dropped inside the projector. dbrpc's job is only to turn a session's privilege into
-that flag. So **moving materialization down does not move policy down.** A producer deeper in the
-stack passes the same flag the text producer passes today, and `dbrpc/redacted_raw_ops_test.go` is the
-table that holds every row-returning read op to it.
+**Right layer to authorize at**, and this is the constraint that most shapes the answer. Redaction is
+*already* a storage-layer parameter: every scan takes a `redact bool`, `c.evalCtx(redact)` decides
+whether a sealed value opens, and the raw projector drops private attributes by name. dbrpc's job is
+only to turn a session's privilege into that flag. So **moving materialization down does not move
+policy down** — a producer deeper in the stack passes the same flag the text producer passes today,
+and `dbrpc/redacted_raw_ops_test.go` is the table that holds every row-returning read op to it.
 
-That test is also the warning. The paged projection op (`opQueryRawProjSeq`) ignored the session's
-privilege and served the entitled read — private attributes and opened sealed values — to any peer.
-A new read op that is not in that table is the same bug waiting to be rediscovered, which makes
-"joins the existing table" a hard requirement on anything built here rather than a nicety.
+**That was too comfortable a reading, and building the first step disproved part of it.** The
+evaluating projection (`QueryProject`) took the flag and did not honour it for private attributes. It
+relied on those values having been *sealed at write time*, which is true of a mutable collection —
+`shouldEncrypt` seals every private attribute, and a mutable table has a sealer even with no pool keys
+configured — and false of an archive, which may seal nothing. Measured on one archive, same records,
+same projection, `redact=true`: the raw projected read returned `["ClusterId = 9"]` with the private
+`ClaimId` dropped, and the evaluating projection returned its plaintext in **all** rows. The flag was
+a storage-layer parameter that two paths in the storage layer interpreted differently by table kind.
+
+Nothing shipped was exposed, because no read surface called the evaluating projection on an archive —
+there was no `ArchiveTable.QueryProjectRedacted` to call, and dbrpc's aggregate ops refuse a private
+attribute by name before the scan starts (`dbrpc/private_gate.go`, `dbrpc/aggregate.go`). That is
+defence in depth doing its job, and it is also the reason the gap survived: the RPC layer's name gate
+made the storage layer's silence invisible. Fixed where the promise is made rather than where it is
+currently covered — the redacted projection now withholds a private attribute by name, on either table
+kind, resolved once per scan.
+
+Two things follow for this design. The `redact` flag is the right mechanism but it is not
+self-enforcing, so **every new producer owes the same proof on both table kinds**, which an archive in
+the fixture is the only way to get (§13.3's opening lesson, arrived at twice now). And
+`dbrpc/redacted_raw_ops_test.go` is the warning as much as the guarantee: the paged projection op
+(`opQueryRawProjSeq`) ignored its session's privilege and served the entitled read to any peer, so a
+new read op that is not in that table is the same bug waiting to be rediscovered. "Joins the existing
+table" is a hard requirement on anything built here, not a nicety.
 
 ### 14.3 Three shapes, and which one to build
 
@@ -1518,36 +1537,95 @@ What has changed since is that the fix already exists for the *other* readers. A
 (`projPlan.closure`, set by `rawProjPlan` under `chaseRefs`) keeps the narrowed ad only when it is
 self-contained under its projected expressions' references (`adClosed`) and reassembles the record
 when it is not. `QueryRawWireRefs` and `QueryRawProjected` already use it; the evaluating projection
-never adopted it. Giving `QueryProject` a closure plan is a small change that recovers most of that
-3x with the undefined-value hazard closed by construction rather than by avoidance — and the oracle
-for it is a test already in the tree.
+never adopted it. Giving `QueryProject` a closure plan closes the undefined-value hazard by
+construction rather than by avoidance, and the oracle for it was already in the tree.
+
+**Done, and measured at 1.58x with half the allocations** (`BenchmarkQueryProjectPlan`), not the 3x a
+plan without the closure check would promise — the difference is the records that fall back plus the
+projected attributes no schema covers, which are read from the record either way. The speedup is a
+property of the projection rather than a constant, which is worth remembering before quoting it at
+the Arrow producer. On the fixture, 192 of 3000 records still reassemble, 14 of them for closure;
+without a plan all 3000 did.
+
+The green correctness tests were not enough on their own here: a plan the scan silently declined would
+leave every value right and every record reassembled, so the fast path is pinned separately by
+`RecordsReassembled` against the rows emitted, with the no-plan scan measured on the same fixture as
+the premise rather than quoted from memory.
 
 It is also the same correction this endpoint already made one layer up, when the Flight scan moved
 onto the refs-chasing projection op for exactly this reason (§13.2).
 
 Two gaps sit on the path and should be closed with it:
 
-- **`ArchiveTable` has no `QueryProjectRedacted`, and neither does `collections.Archive`.** `DB` and
-  `Collection` have one; the archive side stops at `QueryProjectStats`. A value frame over `history`
-  read by an unprivileged peer has nowhere to go, and the shape of that absence is the shape of the
-  `opQueryRawProjSeq` bug.
+- **`ArchiveTable` had no `QueryProjectRedacted`, and neither did `collections.Archive`.** `DB` and
+  `Collection` had one; the archive side stopped at `QueryProjectStats`, so a value frame over
+  `history` read by an unprivileged peer had nowhere to go. Added — and adding it is what surfaced
+  §14.2's finding, because the first thing a new redacted method needs is a test proving it redacts.
 - **Anything new joins `redacted_raw_ops_test.go`'s table**, rather than getting a test of its own
   (§14.2).
 
 ### 14.6 Build order
 
-1. The closure plan on `QueryProject`, plus the archive's missing redacted variant (§14.5). Small,
-   local to `collections`/`db`, and it makes the producer for everything below fast enough to be
-   worth exposing.
+1. ~~The closure plan on `QueryProject`, plus the archive's missing redacted variant (§14.5).~~
+   **Done.** 1.58x and half the allocations on the projected scan, the archive variant added, and a
+   private-attribute leak in the evaluating redacted projection found and fixed on the way (§14.2).
 2. Profile **evaluated** values for the type report, from the computed region where it exists
    (§14.4). This is what makes §5.1 true of the schema and not only of the encoder, and it closes
    §13.3 item 3.
-3. The typed value frame over dbrpc (§14.3b), in the redacted-ops table from its first commit.
+3. ~~The typed value frame over dbrpc (§14.3b), in the redacted-ops table from its first commit.~~
+   **Done** — `opQueryValues` in classad's dbrpc. A column is a kind, a validity bitmap, a dense
+   slice of that kind's values, and an exceptions list keyed by row; a uniform column has an empty
+   exceptions list and an all-ones bitmap, which is the shape an Arrow buffer wants. UNDEFINED and
+   ERROR stay distinct rather than collapsing to null, and a list or nested ad crosses as the
+   unparser's text with a `NonScalar` flag, because text is the only useful form of such a value
+   but it must not arrive indistinguishable from a string.
+
+   **Measured** (`BenchmarkReadShapes`, 20 000-record archive, six columns, medians of three,
+   Apple M2 Pro), against the reference-chasing text projection parsed and evaluated the way every
+   such consumer does today:
+
+   | tier | projection | text ns/row | values ns/row | | values allocs/row |
+   |---|---|---|---|---|---|
+   | record | literals | 5 783 | **1 336** | 4.3x | 8.1 |
+   | record | with an expression | 8 471 | **2 822** | 3.0x | 59 |
+   | columnar | literals | 5 667 | **1 814** | 3.1x | 15 |
+   | columnar | with an expression | 9 964 | **4 802** | 2.1x | 76 |
+
+   Less than the 7x the wire-row arm suggested, and the reason is the honest one: this op does not
+   only delete the text round trip, it MOVES the evaluation from the consumer to the server. That
+   is still the right place for it — the server has the record's reference closure — but it is work
+   the text arm's server never did.
+
+   It joined `redacted_raw_ops_test.go`'s table in the same commit, and the three mutants that
+   matter were checked to fail named tests: a column kind that always declines, a server that
+   accepts a flag bit it does not know, and a server that ignores its session's privilege.
 4. `flightsvc` reads it and appends straight to `array.Builder`. The encoder does not change; what
    reaches it stops being text.
-5. Only then revisit (a). Once 1–4 have landed, what is left of a read is the storage read itself,
+5. **The expression fallback, which the measurement above promoted ahead of everything columnar.**
+   An expression-valued attribute roughly doubles the typed read and costs it 86% of its
+   allocations (59 against 8.1 per row on the record tier). On a columnarized archive it is worse
+   than that, and the counter says exactly why: projecting `MemoryUsage` reassembled **20 000 of
+   20 000** records, against **349 of 20 000** for the same projection with a literal in its place.
+   An expression cell is escaped out of its column, so the columnar projection cannot serve it and
+   the whole record is rebuilt — for every row, because every row has one.
+
+   This is the case §14.1 was asked about, and the answer is now pointed. The evaluated value
+   already EXISTS for such a cell: the computed region holds it, beside the block, for every
+   qualifying cell of every columnarized segment. The projection path does not consult it. Teaching
+   it to is a bounded change in `collections` that would turn the worst column in a real projection
+   into the cheapest, and nothing above the storage layer has to know.
+
+6. Only then revisit (a). Once 1–5 have landed, what is left of a read is the storage read itself,
    and a columnar producer can finally be argued against a small, honest remainder rather than
    against a text path that should never have been in the measurement.
+
+**One thing this run contradicts.** §13.2 recorded the columnar accelerator as worth 1.12x on a
+materializing read. On the typed path it is worth **less than nothing** — 1 336 → 1 814 ns/row for
+literals, 2 822 → 4 802 with an expression. The accelerator is built for match-only work, where the
+answer is a count or a few group rows; a read that materializes every projected attribute of every
+matching record pays for the gather and keeps the reassembly. That is one fixture on one machine,
+but it sharpens the existing conclusion rather than softening it: the columnar producer is last on
+this list for a measured reason, and the measurement just got more hostile to it.
 
 ## 15. Parked: the one Airport-only opportunity worth remembering
 
