@@ -1086,8 +1086,9 @@ and `adbc_driver_flightsql` through gRPC.
 
 What is left is not transport. It is **breadth of SQL**, a **declared** schema rather than a
 sampled one, and getting the store's records here without a text round trip — which §13.2
-measures at 39% of a read's CPU, against 3% for the Arrow encoding everyone assumed was the
-cost. The columnar producer comes after those, and §13.2 says why in numbers.
+measures at **87% of a read's CPU**, against 3% for the Arrow encoding everyone assumed was the
+cost and under 10% for the storage read a columnar producer would accelerate. The columnar
+producer comes after those, and §13.2 says why in numbers.
 
 ### 13.1 Shipped
 
@@ -1162,9 +1163,9 @@ Apple M2 Pro:
 
 | | record tier | columnar tier | allocs/row |
 |---|---|---|---|
-| store scan + projection + render + loopback | 10 719 | **9 557** | 40 |
-| ClassAd text parse | 6 518 | **6 515** | 86 |
-| evaluate + Arrow append | 500 | **527** | 0.1 |
+| store scan + projection + **render** + loopback | 10 719 | **9 437** | 40 |
+| ClassAd text parse | 6 518 | **6 434** | 86 |
+| evaluate + Arrow append | 500 | **484** | 0.1 |
 | end-to-end over gRPC *(overlapped, not a sum)* | 15 618 | **13 773** | — |
 
 The stages are measured **in isolation**, not cumulatively, and the parse arm is the control that
@@ -1175,33 +1176,62 @@ so a "scan, then parse in the yield" arm runs the two concurrently and subtracti
 nothing. The end-to-end arm still overlaps by design; it is the number a user feels, and the
 others are the CPU it costs.
 
-Three things follow, and the first two reorder the work.
+**That first table hides its own answer, and a first reading of it got this wrong.** The top row
+is labelled "scan + projection + render + loopback" and was then reasoned about as if it were all
+*scan* — irreducible storage work — which produced a ceiling of 1.74x for ever removing the parse
+and the encode. Splitting the row apart kills that conclusion. `BenchmarkWireNativeRead` runs the
+same query through `opQueryRawWire`, which skips the text form entirely, and the wire scan costs
+**1 610 ns/row against the text projection's 9 437** — 5.9x less, over tight spreads (1.1% and
+3.0% across five runs). The render was 83% of what the scan appeared to cost.
 
-1. **The Arrow encoder is not the cost.** Evaluating every projected attribute and appending it to
-   a builder is **3.2% of the CPU and a tenth of an allocation per row** — with an
-   expression-valued column among them, deliberately, since that is the case that must evaluate
-   rather than read. So "go straight from the vector engine to Arrow" is barely about Arrow.
-2. **The cost is the text round trip: 39% of CPU and 86 allocations per row.** It exists only
-   because the store renders each record to text and this endpoint parses it back. Removing it
-   needs no vectorized engine and no columnar producer — it needs the store to hand over
-   something readable without a reparse, which is what `opQueryRawWire` already is for a mutable
-   table. That is where the next real win is, and it is blocked on one thing: the archive case.
-3. **The columnar accelerator is worth 1.12x on a materializing read**, against the multiples it
-   is worth on `COUNT` and `GROUP BY`. That is the honest reading rather than a disappointment:
-   the vectorized engine's demonstrated wins are on **match-only** work, where the answer is a
-   count or a few group rows and nothing is materialized. A readout that materializes every
-   projected attribute of every matching record is a different workload, and the ceiling for
-   deleting the parse and the encode outright is **1.74x** — the rest of a read is the scan.
+So the real attribution of a read, on the columnar tier, is:
 
-So the columnar producer is not the next thing to build, and the reason is measured rather than
-argued. Its prize is a fraction of the 58% the scan costs, after a change that is worth 42% lands
-first.
+| | ns/row | share |
+|---|---|---|
+| **render each record to text** | 7 827 | **47.9%** |
+| **ClassAd parse it back** | 6 434 | **39.3%** |
+| storage read + projection + loopback | 1 610 | 9.8% |
+| evaluate + Arrow append | 484 | 3.0% |
+
+**Render and parse are 87% of a read's CPU, and neither is work.** Both exist only because the
+relay renders text that the consumer immediately parses back.
+
+Four things follow.
+
+1. **The Arrow encoder is not the cost** — 3% of CPU and a tenth of an allocation per row, with
+   an expression-valued column among the six deliberately, since that is the case that must
+   evaluate rather than read. "Go straight from the vector engine to Arrow" is barely about
+   Arrow.
+2. **Reading values straight off the wire row is 7x.** A wire row is an inline-names ad:
+   `wire.Ad.LookupByName` finds one attribute's node bytes and `wire.LiteralValue` decodes a
+   scalar from them, so a value reaches an Arrow builder with no render and no ClassAd between.
+   Measured: **2 326 ns/row against 16 355 today, and 8 allocations a row against 88.** For a
+   projection of literal-valued attributes only, 2 043 — **8x**.
+3. **But that figure is a ceiling, not a promise.** The benchmark appends a null where a node is
+   not a literal and counts those (`fellthrough/row`); a real encoder must EVALUATE there, and on
+   this fixture `MemoryUsage` is an expression in every ad. A projection that includes an
+   expression-valued attribute pays for an evaluator on every row of it, and §5.8 says that on a
+   real AP such attributes are common in the stored form even though their evaluated kind is
+   uniform. The hybrid — literals read from the node, expressions evaluated — is the design, and
+   its real-world speedup sits between the 8x of the literals-only arm and whatever the evaluator
+   costs.
+4. **The columnar accelerator is worth 1.12x on a materializing read**, against the multiples it
+   earns on `COUNT` and `GROUP BY`. Not a disappointment: the vectorized engine's demonstrated
+   wins are on **match-only** work, where the answer is a count or a few group rows and nothing is
+   materialized. A readout that materializes every projected attribute of every matching record is
+   a different workload.
+
+So the columnar producer is still not the next thing to build, but for a better reason than the
+first reading gave: **87% of a read is a text round trip that no columnar work is needed to
+delete**, and the storage read it would actually accelerate is under 10%. Build the wire-native
+read first; whatever is left over is what the vectorized engine has to argue against.
 
 **What this does not establish.** One machine, one dataset, one read shape: six columns out of a
-34-field schema. A wider projection moves work toward the scan and the encode and away from the
-per-record parse overhead; `SELECT *` more so. And the archive here was columnarized on demand in
-one pass, with every sealed segment covered — a production table carries a backlog, and a segment
-not yet covered reads the old way.
+34-field schema. A wider projection moves work toward the scan and away from the per-record
+overheads; `SELECT *` more so. The archive here was columnarized on demand in one pass with every
+sealed segment covered, where a production table carries a backlog and an uncovered segment reads
+the old way. And the wire-native figure does not evaluate expressions, as item 3 says — it is the
+literal path's cost, measured, plus a fall-through count.
 
 **The first step was not columnar at all, and it is taken.** The scan no longer pulls whole ads
 as bracketed text: `QueryRawProjectRefsStream` applies the projection *inside* the decode walk,
@@ -1232,12 +1262,21 @@ in the same change (§13.2), and the harness now holds an archive. The lesson is
 the API: a new read surface needs an archive in its tests from the first one, or it cannot see
 this class of bug at all.
 
-1. **The text round trip, which the measurement says is the next real win.** The parse is 39% of
-   a read's CPU and 86 allocations per row (§13.2), and it is pure overhead: the store renders
-   each record to text and this endpoint parses it back. `opQueryRawWire` is the op that skips it
-   — measured at 12.8x end to end elsewhere in this tree — and it **is not served from an
-   archive**, so adopting it would re-break `history`. The archive case in classad is therefore
-   the single highest-value piece of work left in this whole design, and it is upstream.
+1. **The text round trip, which is 87% of a read.** Rendering each record to text is 48% of a
+   read's CPU and parsing it back is a further 39%, at 86 allocations per row (§13.2) — and
+   neither is work, only the cost of a relay that renders what its consumer immediately parses.
+   Reading values straight off the wire row measured **7x** end to end, 8x for a projection of
+   literal-valued attributes.
+
+   Two pieces, in order. **Upstream:** `opQueryRawWire` skips the text form and did not serve an
+   archive, so adopting it would have re-broken `history` -- classad PR #477 adds the archive
+   case, and this wants the tag. **Here:** an encoder that reads a wire node directly
+   (`wire.Ad.LookupByName` + `wire.LiteralValue`) and falls back to an evaluator for a node that
+   is not a literal. The fallback is the part with a real design question in it, because on a
+   real AP an attribute's STORED form is an expression far more often than its evaluated kind
+   suggests (§5.8) -- so how often the fallback fires decides how much of the 7x survives.
+   `BenchmarkWireNativeRead` is in the tree and skips, naming the missing op, until the
+   dependency carries it.
 2. **The schema is sampled, not declared.** §5.7's describe-table op — a per-table type map
    stored beside the columnar schema, sharing its generation counter, seeded by introspection and
    overridable by an admin — was not built. What shipped is `opAttrTypes`, returning profiles of a
@@ -1298,13 +1337,14 @@ this class of bug at all.
    records (`repl/dialect.go:91`), the endpoint 10 000, so the set of columns each believes the
    table has can differ on the same table at the same moment. One kind mapping already serves
    both (`arrowtype/sqlkinds.go`); the sample size should too.
-9. **Then the columnar producer** (§13.2, and §9.3's closing paragraph). Last, and now for a
-   measured reason rather than an argued one: the Arrow encoder is 3% of a read's CPU, the
-   columnar accelerator is worth 1.12x on a read that materializes rows, and deleting the parse
-   and the encode outright caps out at 1.74x. Its prize is a fraction of the scan, after item 1
-   has taken the 42% that does not need it. What it still wants from item 2 is the *declared*
-   schema: a producer emitting one stable Arrow schema across blocks that vectorize and blocks
-   that do not cannot derive that schema from whichever block it is looking at.
+9. **Then the columnar producer** (§13.2, and §9.3's closing paragraph). Last, and for a
+   measured reason rather than an argued one: once item 1 has deleted the text round trip, what
+   is left of a read is the storage read itself at **under 10% of today's CPU**, and the columnar
+   accelerator is worth 1.12x on a read that materializes rows. So the producer has to argue
+   against a small remainder, and it should be measured against the wire-native read rather than
+   against the text path it replaced. What it still wants from item 2 is the *declared* schema: a
+   producer emitting one stable Arrow schema across blocks that vectorize and blocks that do not
+   cannot derive that schema from whichever block it is looking at.
 
 Still deliberately not built: writes, Substrait, transactions and savepoints, key metadata,
 `XdbcTypeInfo`, `CancelFlightInfo` (§9.2), and everything in §11.

@@ -8,12 +8,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 
@@ -375,4 +379,191 @@ func benchReadStages(b *testing.B, rows int, columnar bool) {
 		}
 		perRow(b)
 	})
+}
+
+// benchLiterals is benchProjection without MemoryUsage, which this fixture stores as an
+// expression in every ad and which therefore always falls through to an evaluator.
+var benchLiterals = []string{"Owner", "ClusterId", "JobStatus", "QDate", "CpusUsage"}
+
+// BenchmarkWireNativeRead measures the read that never materializes text.
+//
+// A wire-form row is an inline-names ad: wire.Ad.LookupByName finds one attribute's node bytes
+// and wire.LiteralValue decodes a scalar from them, so a value reaches an Arrow builder with no
+// render and no ClassAd in between. Against BenchmarkReadStages this is what separates the
+// storage read from the text round trip built on top of it -- and that separation is the whole
+// reason this benchmark exists, because an earlier version of it attributed the render to the
+// scan and concluded the scan was irreducible.
+//
+// WHAT IT DOES NOT DO: evaluate. A node that is not a literal gets a null here, and the
+// fellthrough/row metric counts those. A real encoder must evaluate such a cell, so the figures
+// below are the ceiling for a projection of literal-valued attributes and not a universal
+// number -- which is why the literals-only arm is reported separately rather than instead.
+func BenchmarkWireNativeRead(b *testing.B) {
+	const rows = 20000
+	st := benchArchive(b, rows, true)
+	defer st.close()
+	ctx := context.Background()
+
+	// The wire op refuses an archive in classad up to v0.34.x, which is the gap this
+	// benchmark was written to size. Skip rather than fail, naming why, so the arm starts
+	// reporting the moment the dependency carries the archive case.
+	if err := st.client.QueryRawWireRefsStream(ctx, "history", "true", benchProjection, 1, false,
+		func([]byte) bool { return false }); err != nil {
+		b.Skipf("the wire op does not serve an archive in this classad: %v", err)
+	}
+
+	b.Run("scan", func(b *testing.B) {
+		for _, arm := range []struct {
+			name string
+			run  func() error
+		}{
+			// The text projection first, as the thing being compared against.
+			{"text-projection", func() error {
+				n := 0
+				err := st.client.QueryRawProjectRefsStream(ctx, "history", "true", benchProjection, 0,
+					func(string) bool { n++; return true })
+				if n != rows {
+					b.Fatalf("%d rows, want %d", n, rows)
+				}
+				return err
+			}},
+			{"wire", func() error {
+				n := 0
+				err := st.client.QueryRawWireRefsStream(ctx, "history", "true", benchProjection, 0, false,
+					func([]byte) bool { n++; return true })
+				if n != rows {
+					b.Fatalf("%d rows, want %d", n, rows)
+				}
+				return err
+			}},
+		} {
+			b.Run(arm.name, func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					if err := arm.run(); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(rows), "ns/row")
+			})
+		}
+	})
+
+	b.Run("extract", func(b *testing.B) {
+		for _, proj := range [][]string{benchProjection, benchLiterals} {
+			name := "with-expression-column"
+			if len(proj) == len(benchLiterals) {
+				name = "literals-only"
+			}
+			b.Run(name, func(b *testing.B) { benchWireExtract(b, st, proj, rows) })
+		}
+	})
+}
+
+func benchWireExtract(b *testing.B, st *benchStack, proj []string, rows int) {
+	ctx := context.Background()
+	_, decisions, err := st.svc.tableSchema(ctx, "history")
+	if err != nil {
+		b.Fatal(err)
+	}
+	projected, err := project(decisions, proj)
+	if err != nil {
+		b.Fatal(err)
+	}
+	schema := schemaOf(projected)
+
+	// Collected once, outside the timer, as the other stage arms are.
+	var raws [][]byte
+	if err := st.client.QueryRawWireRefsStream(ctx, "history", "true", proj, 0, false,
+		func(row []byte) bool {
+			raws = append(raws, append([]byte(nil), row...))
+			return true
+		}); err != nil {
+		b.Fatal(err)
+	}
+	if len(raws) != rows {
+		b.Fatalf("collected %d wire rows, want %d", len(raws), rows)
+	}
+
+	fell := 0
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		bld := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+		fell = 0
+		for _, raw := range raws {
+			ad := wire.Ad(raw)
+			for fi, f := range schema.Fields() {
+				node, ok := ad.LookupByName(f.Name)
+				if !ok {
+					bld.Field(fi).AppendNull()
+					continue
+				}
+				lit, ok := wire.LiteralValue(node)
+				if !ok {
+					fell++ // an expression: a real encoder evaluates here
+					bld.Field(fi).AppendNull()
+					continue
+				}
+				appendLiteral(bld.Field(fi), lit)
+			}
+		}
+		rec := bld.NewRecord()
+		if int(rec.NumRows()) != rows {
+			b.Fatalf("%d rows built, want %d", rec.NumRows(), rows)
+		}
+		rec.Release()
+		bld.Release()
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(rows), "ns/row")
+	b.ReportMetric(float64(fell)/float64(rows), "fellthrough/row")
+}
+
+// appendLiteral puts one wire literal into a builder, coercing between int and real the way
+// arrowtype.Encoder does so the comparison is like for like.
+func appendLiteral(bld array.Builder, lit wire.Literal) {
+	switch b := bld.(type) {
+	case *array.Int64Builder:
+		switch lit.Kind {
+		case wire.LitInt:
+			b.Append(lit.Int)
+		case wire.LitReal:
+			b.Append(int64(lit.Real))
+		default:
+			b.AppendNull()
+		}
+	case *array.Float64Builder:
+		switch lit.Kind {
+		case wire.LitReal:
+			b.Append(lit.Real)
+		case wire.LitInt:
+			b.Append(float64(lit.Int))
+		default:
+			b.AppendNull()
+		}
+	case *array.StringBuilder:
+		if lit.Kind == wire.LitString {
+			b.Append(lit.Str)
+		} else {
+			b.AppendNull()
+		}
+	case *array.BooleanBuilder:
+		if lit.Kind == wire.LitBool {
+			b.Append(lit.Bool)
+		} else {
+			b.AppendNull()
+		}
+	case *array.TimestampBuilder:
+		switch lit.Kind {
+		case wire.LitInt:
+			b.Append(arrow.Timestamp(lit.Int))
+		case wire.LitReal:
+			b.Append(arrow.Timestamp(int64(lit.Real)))
+		default:
+			b.AppendNull()
+		}
+	default:
+		bld.AppendNull()
+	}
 }
