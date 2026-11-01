@@ -262,6 +262,11 @@ type SelectItem struct {
 	// instead) and for a per-row expression.
 	Aggs []AggCall
 
+	// fromOrderBy marks a copy of an ORDER BY term, so a validation error can name the
+	// clause the reader wrote rather than reporting every term as a SELECT column. It is
+	// set only by the join validator, never by the parser.
+	fromOrderBy bool
+
 	// Bucket marks a time_bucket(Col, 'width') expression -- a non-aggregate
 	// grouping column that floors the epoch-seconds attribute Col to BucketWidth
 	// (see parseBucketWidth). It groups a time axis into fixed-width buckets.
@@ -1206,6 +1211,18 @@ func (p *parser) parseAggCall() (AggCall, error) {
 			return AggCall{}, fmt.Errorf("%s(...): %w", name, err)
 		}
 		arg = col
+		// A qualified name -- SUM(h.Cpus) -- is one argument, not an expression: in a join
+		// an attribute has to say which table it comes from, so the dotted form is the only
+		// way to name one. It stays a single dotted string, and validateAggArgs refuses it
+		// outside a join, where the store aggregates over a bare attribute name.
+		for p.peek().kind == tOp && p.peek().text == "." {
+			p.pos++
+			part, perr := p.parseIdent()
+			if perr != nil {
+				return AggCall{}, fmt.Errorf("%s(%s....): %w", name, arg, perr)
+			}
+			arg += "." + part
+		}
 	}
 	// The store aggregates over an ATTRIBUTE, so the argument has to be a bare name: there
 	// is no way to push `SUM(a + b)` down to it. Say so plainly rather than reporting a
@@ -1908,6 +1925,9 @@ func parseBucketWidth(s string) (int64, error) {
 // column must appear in the GROUP BY list and `*` is not allowed.
 func validateSelect(st *Statement) error {
 	if err := validateWindow(st); err != nil {
+		return err
+	}
+	if err := validateAggArgs(st); err != nil {
 		return err
 	}
 	var aggs, plains, buckets int

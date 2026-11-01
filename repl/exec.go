@@ -1710,6 +1710,34 @@ func (e *Executor) archiveAggregateColRows(table, where string, groups []dbrpc.G
 	return e.c.ArchiveAggregateBucketed(e.opCtx(), table, where, groups, aggs)
 }
 
+// cheapRowCount reports how many rows a table holds, but ONLY when the server can answer
+// from its counters rather than by reading records: the count aggregate reaches an O(1)
+// length for a mutable table and a zone-pruned count for an archive.
+//
+// ok=false means "not known cheaply", and the caller must treat it as no information rather
+// than as zero. Unlike archiveRowCount this never falls back to counting rows here: it exists
+// to inform a planning decision, and a decision that scans a whole history table to decide
+// whether to scan a whole history table is worse than not deciding at all. Any error at all
+// reports not-known, so an older server simply leaves the caller with its prior behavior.
+func (e *Executor) cheapRowCount(table string) (int, bool) {
+	aggs := []dbrpc.AggSpec{{Func: dbrpc.AggCount, Arg: "*"}}
+	var rows []dbrpc.AggRow
+	var err error
+	if e.isArchive(table) {
+		rows, err = e.c.ArchiveAggregate(e.opCtx(), table, "true", nil, aggs)
+	} else {
+		rows, err = e.c.AggregateTable(e.opCtx(), table, "true", nil, aggs)
+	}
+	if err != nil || len(rows) == 0 || len(rows[0].Values) == 0 {
+		return 0, false
+	}
+	n, cerr := strconv.Atoi(rows[0].Values[0])
+	if cerr != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 // archiveRowCount returns the number of rows in an append-only history table via the
 // server-side count aggregate (falling back to a client-side count against an older server).
 func (e *Executor) archiveRowCount(table string) (int, error) {
@@ -2042,6 +2070,21 @@ func bucketFloor(sec float64, width int64) string {
 // aggregateAds reduces one aggregate call over a group's ads (client-side, for AS OF and
 // time_bucket). It takes the call rather than the SELECT item so a bare aggregate and one
 // lifted out of an expression reduce through the same code.
+// aggArgEval returns the accessor for an aggregate's argument. A bare attribute name is
+// looked up directly; a qualified one -- `h.Cpus`, which only a join produces -- is a ClassAd
+// select over the row's member ad, so it is compiled once and evaluated per row. An argument
+// that does not compile reads as undefined, which the reducers already skip.
+func aggArgEval(arg string) func(*classad.ClassAd) classad.Value {
+	if !strings.Contains(arg, ".") {
+		return func(ad *classad.ClassAd) classad.Value { return ad.EvaluateAttr(arg) }
+	}
+	ex, err := classad.ParseExpr(arg)
+	if err != nil {
+		return func(*classad.ClassAd) classad.Value { return classad.NewUndefinedValue() }
+	}
+	return func(ad *classad.ClassAd) classad.Value { return ex.Eval(ad) }
+}
+
 func aggregateAds(it AggCall, ads []*classad.ClassAd) string {
 	// A conditional aggregate sees only its own rows. The client-side paths reduce over ads
 	// rather than projected values, so the filter is applied here -- if it were skipped the
@@ -2049,6 +2092,7 @@ func aggregateAds(it AggCall, ads []*classad.ClassAd) string {
 	if it.Filter != "" {
 		ads = filterAds(it.Filter, ads)
 	}
+	argOf := aggArgEval(it.Arg)
 	switch strings.ToUpper(it.Func) {
 	case "COUNT":
 		if it.Arg == "*" || it.Arg == "" {
@@ -2056,7 +2100,7 @@ func aggregateAds(it AggCall, ads []*classad.ClassAd) string {
 		}
 		n := 0
 		for _, ad := range ads {
-			if v := ad.EvaluateAttr(it.Arg); !v.IsUndefined() && !v.IsError() {
+			if v := argOf(ad); !v.IsUndefined() && !v.IsError() {
 				n++
 			}
 		}
@@ -2066,7 +2110,7 @@ func aggregateAds(it AggCall, ads []*classad.ClassAd) string {
 		// so all three agree on what "the same value" is. Undefined is not a value.
 		seen := map[string]struct{}{}
 		for _, ad := range ads {
-			if v := ad.EvaluateAttr(it.Arg); !v.IsUndefined() && !v.IsError() {
+			if v := argOf(ad); !v.IsUndefined() && !v.IsError() {
 				seen[valueDisplay(v)] = struct{}{}
 			}
 		}
@@ -2075,7 +2119,7 @@ func aggregateAds(it AggCall, ads []*classad.ClassAd) string {
 		var sum, min, max float64
 		n := 0
 		for _, ad := range ads {
-			f, ok := numValue(ad.EvaluateAttr(it.Arg))
+			f, ok := numValue(argOf(ad))
 			if !ok {
 				continue
 			}

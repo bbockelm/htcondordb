@@ -297,3 +297,23 @@ func (p *parser) peekAheadOp(n int, op string) bool {
 	t := p.peekAt(n)
 	return t.kind == tOp && t.text == op
 }
+
+// validateAggArgs refuses a qualified aggregate argument outside a join.
+//
+// `SUM(h.Cpus)` names the Cpus attribute of the row's h member, which only exists when a
+// join put it there. Over a single table the store aggregates over a bare attribute name
+// and has nothing to resolve a dotted path against, so the old error -- that the aggregate
+// takes an attribute name, not an expression -- is still the right one there.
+func validateAggArgs(st *Statement) error {
+	if st.IsJoin() {
+		return nil
+	}
+	for _, a := range aggCallOrder(st) {
+		if strings.Contains(a.Arg, ".") {
+			return fmt.Errorf("%s(%s) is only meaningful in a join, where an attribute has "+
+				"to say which table it comes from; over one table an aggregate takes a bare "+
+				"attribute name", a.Func, a.Arg)
+		}
+	}
+	return nil
+}

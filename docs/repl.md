@@ -59,6 +59,9 @@ DELETE FROM jobs WHERE JobStatus == 4;
 - **Indexes as DDL**: `CREATE [VALUE|CATEGORICAL] INDEX ON t (a, b)` /
   `DROP INDEX ON t (a)`. `CREATE INDEX` builds over existing rows immediately and
   persists.
+- **`IN` is not supported**, in either the list or the sub-select form: ClassAd spells
+  membership as a function, so write `member(x, {a, b})` (and `!member(...)` for `NOT IN`).
+  Both forms are refused with that pointer.
 - **`WHERE` is a ClassAd expression**, captured verbatim and evaluated by the
   store's engine — the full ClassAd language is available (`==`, `=?=`, `=!=`,
   `undefined`, `member()`, `regexp()`, `?:`, …), not a SQL dialect. String
@@ -135,11 +138,29 @@ Outer joins push asymmetrically, which is worth knowing because it is the usual 
 wrong join results: for a `LEFT JOIN`, `ON` conjuncts push only to the right (inner) side,
 and `WHERE` conjuncts only to the left (preserved) side. An `INNER JOIN` pushes both ways.
 
+**Aggregates and `GROUP BY` work over a join**, with the aggregate's argument qualified like
+any other attribute:
+
+```sql
+-- every run attempt of each owner's jobs completed in the last day
+SELECT h.Owner, COUNT(*) AS attempts,
+       COUNT(*) FILTER (WHERE e.ExitCode == 0) AS succeeded
+  FROM history h JOIN epoch e ON h.ClusterId == e.ClusterId && h.ProcId == e.ProcId
+  WHERE h.CompletionDate > CurrentTime - 86400
+  GROUP BY h.Owner
+  HAVING COUNT(*) > 1
+  ORDER BY attempts DESC;
+```
+
+The grouping runs **client-side** over the joined rows — the server's aggregate is
+single-table and has no notion of a composite row — and `EXPLAIN` says so. Over a single
+table an aggregate still takes a bare attribute name, since there is no second table for a
+qualified one to refer to.
+
 **Not supported yet**, each refused with the reason: `RIGHT`/`FULL OUTER` (swap the tables
 and use `LEFT JOIN`), `NATURAL JOIN` and `USING` (write the condition with `ON`),
-comma-separated `FROM` lists, more than two tables, sub-selects, and aggregates /
-`GROUP BY` / window functions over a join — the aggregate argument grammar takes a bare
-attribute name, which cannot say which table it means.
+comma-separated `FROM` lists, more than two tables, sub-selects, and window functions over
+a join.
 
 **Guard rails.** A join refuses rather than runs away when it would examine too many
 candidate pairs — either because the `ON` clause has no equality between the tables, so

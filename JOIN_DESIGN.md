@@ -238,6 +238,130 @@ Honest limits: strings decline unless dictionary-encoded, so numeric keys
 dictionary covers it; and vectorization lives on columnar blocks, so `jobs ⋈ history`
 vectorizes on the history side — which is, fortunately, the big one.
 
+### 6.2 Measured: what the client-side join pays for the wire
+
+§8.2 measured that columnarization makes matchmaking *faster*, not slower, which removed the
+reassembly argument for the MATCH pre-filter. That result says nothing about the join,
+because it measured a different reassembly: column→row **inside** the store, in-process,
+with no client. The one a server-side join would remove is wire→`*classad.ClassAd` **on the
+client**, per row, on both sides. `repl/join_wire_bench_test.go` measures that one.
+
+Three arms share one planner, one key-batch decision and one hash join; the only difference
+is where the rows come from. `wire` fetches through a real dbrpc server; `inproc-projected`
+reads the same attributes in-process; `inproc-whole` reads whole ads in-process, which
+prices the projection separately so the wire's share is not credited with it. Medians of
+three runs of ten, both arm orders, best (warmest) median per arm:
+
+| left keys | shape | wire | in-process | wire costs |
+|---|---|---|---|---|
+| 128 | 4 attributes | 4.2 ms | 2.0 ms | 2.10x |
+| 400 | 4 attributes | 13.4 ms | 6.2 ms | 2.16x |
+| 2048 | 4 attributes | 68.8 ms | 31.4 ms | 2.19x |
+| 8192 | 4 attributes | 280 ms | 128 ms | 2.19x |
+| 128 | `SELECT *` | 12.1 ms | 2.8 ms | 4.32x |
+| 400 | `SELECT *` | 38.7 ms | 9.0 ms | 4.30x |
+| 2048 | `SELECT *` | 199 ms | 45.6 ms | 4.37x |
+| 8192 | `SELECT *` | 833 ms | 205 ms | 4.07x |
+
+So the wire and the per-row rebuild cost a **flat ~2.2x on a narrow projection and ~4.2x on
+`SELECT *`**, and the striking thing is how flat: the factor does not move across a 64x range
+of cardinality. It is a per-row tax, exactly as the mechanism predicts, and the projection is
+what sets the rate — a projection being exactly what a person asking for joined records does
+not supply.
+
+The first version of this table showed the ratio wandering between 1.2x and 4.5x, which was
+not the wire's doing. It was the key-batch pessimization below inflating all three arms at
+128 and 400 keys and so diluting the ratio between them. Fixing that did not change what the
+wire costs; it revealed it.
+
+Both numbers understate it. `net.Pipe` is an in-memory pipe, so the wire arm pays
+serialization and framing but no network latency or bandwidth; and client and server share a
+process, so nothing is read cold. A real deployment adds both.
+
+Two further points do not need a measurement at all. A join is the one query shape where the
+client must materialize rows **in order to discard them** — selectivity that a server-side
+join applies before serialization, a client-side join can only apply after it. And the
+client-side join does not merely get slow at scale: `maxJoinSideRows` makes it refuse.
+
+#### Key batching is mispriced, and a client cannot price it
+
+Key batching is the client-side join's one real access-path trick, and it works better than
+expected: `orEqProbe` folds the `||` chain of equalities into a single `in` probe with no
+value cap, so with a value index on the attribute it is a genuine multi-value index probe
+rather than a per-record predicate. Against a 16,384-row right table it is worth a great
+deal, falling off steeply with the key count:
+
+| left keys | batched | unbatched | batching is |
+|---|---|---|---|
+| 32 | 1.7 ms | 87.4 ms | 50x better |
+| 128 | 12.0 ms | 88.4 ms | 7.4x better |
+| 256 | 26.8 ms | 89.8 ms | 3.3x better |
+| 400 | 47.0 ms | 94.5 ms | 2.0x better |
+| 511 | 89.6 ms | 93.3 ms | break-even |
+
+Break-even lands at almost exactly `maxJoinKeyBatch` (512), which looks like a well-chosen
+constant until the right table's size is varied too. Holding the key count at 400:
+
+| right-table rows | batched | unbatched | batching is |
+|---|---|---|---|
+| 1,024 | 42.4 ms | 10.6 ms | **4.0x WORSE** |
+| 4,096 | 41.3 ms | 26.8 ms | 1.5x worse |
+| 16,384 | 46.4 ms | 92.7 ms | 2.0x better |
+| 65,536 | 46.5 ms | 374 ms | 8.0x better |
+
+The batched arm is flat in the right table's size (it reads only the matching rows, plus a
+constraint cost set by the key count); the unbatched arm is linear in it. So break-even is a
+curve in *two* variables, and `maxJoinKeyBatch` caps only one of them. It is wrong in both
+directions: it pessimizes a small right table by up to **4x**, and on a large one it forbids
+a win that is still 8x at the cap — a production epoch table is far past 65,536 rows, where
+batching would pay well beyond 512 keys.
+
+This is the strongest form of the argument for executing the join in the store, and it is
+not about assembly cost. **The client cannot make this decision**, because the statistic it
+needs — the right side's size, and how much of it the constraint excludes — lives on the
+server. The client would have to pay a round trip to ask before it could plan, and the
+answer it got would still be a whole-table count where the server could decide per segment
+from zone maps. The cap was the honest thing to do with the information a client had. It need not stay that
+way, because the information is obtainable.
+
+#### Pricing it with the one number that was missing
+
+The count aggregate already reaches an O(1) length for a mutable table and a zone-pruned
+count for an archive, so the right side's size can be had for one round trip. The join now
+asks for it, and declines to batch when the right side holds fewer than `minRightRowsPerKey`
+(20, the measured break-even) rows per left-side key.
+
+It asks only when the answer can change the decision -- there is a single bare-attribute
+equality to batch on, and the right side carries no constraint of its own, which would make a
+whole-table count an overestimate of what the unbatched scan actually reads. When the count
+cannot be had cheaply the decision falls back to the key count alone, so an older server
+behaves exactly as before; the count helper never falls back to counting rows client-side,
+because a decision that scans a whole history table to decide whether to scan a whole history
+table is worse than not deciding.
+
+Measured against the same fixture, best of both arm orders:
+
+| left keys | shape | before | after | |
+|---|---|---|---|---|
+| 128 | 4 attributes | 8.0 ms | 4.2 ms | 1.89x faster |
+| 400 | 4 attributes | 44.3 ms | 13.4 ms | **3.31x faster** |
+| 400 | `SELECT *` | 69.3 ms | 38.7 ms | 1.79x faster |
+| 2048 | 4 attributes | 66.4 ms | 68.8 ms | unchanged |
+| 8192 | `SELECT *` | 841 ms | 833 ms | unchanged |
+
+The in-process arms gain more than the wire arm does (5.84x at 400 keys on the projected
+read), because the constraint's cost was being paid on top of a smaller base. And 2048 and
+8192 are unchanged, which is the signature to look for: those cardinalities were already
+declining to batch via the cap, so a fix aimed only at the wrongly-batched regime should leave
+them exactly alone, and does.
+
+**What this does not fix.** The other direction -- the cap forbidding a win still worth 8x at
+65,536 rows -- is left alone deliberately. Raising it means asking whether an `in` probe with
+thousands of values is sane server-side, which is a separate question with its own
+measurement, and conflating the two would risk a regression to chase an improvement.
+`minRightRowsPerKey` is a `var`, not a `const`: one fixture's break-even is not a law, and a
+site whose data disagrees needs somewhere to change it.
+
 ## 7. Block-looping and zone-map block skipping
 
 This is where a join inside the store beats any join above it, and it is only reachable
@@ -424,6 +548,10 @@ will actually need costs, in rough order of what they are worth:
    the match pushdown.
 4. **Hash vs indexed nested loop vs block-nested loop**, which is only decidable with an
    estimate of how many right-side rows a left row will probe.
+5. **Whether to key-batch at all**, which §6.2 measures as a two-variable trade (key count
+   against right-table size) currently decided by a constant in one of them. This is the
+   first of these decisions with a measured cost curve, so it is the natural first customer
+   for a real estimator.
 
 **What exists.** `planFrac`, `estimateCandidates` and `conjunctSelectivity` already give
 per-side selectivity, with the independence assumption deliberately damped rather than
@@ -443,12 +571,16 @@ retrofitting:
   is computable from metadata before any data is read, and it estimates join selectivity
   directly -- no histogram, no independence assumption, no NDV. Most planners would love to
   have it. It should be a first-class input, not an afterthought to a textbook estimator.
-- **Prefer measuring the first side to estimating it.** The client-side join already fetches
-  the left side before deciding whether to key-batch the right, so that decision uses an
-  actual count rather than an estimate. Keeping that shape server-side -- decide the second
-  side's access path after the first is counted -- avoids the error that compounds worst in
-  join planning. An estimate is for choosing which side to read first; after that there is a
-  real number.
+- **Prefer measuring the first side to estimating it, but measure *both* inputs to the
+  decision.** The client-side join already fetches the left side before deciding whether to
+  key-batch the right, so it knows the key count exactly. That is half of the decision, and
+  §6.2 measures what happens to the other half: break-even depends just as much on the right
+  table's size, which the client never learns, so `maxJoinKeyBatch` caps the one variable it
+  can see and is wrong in both directions. Keeping the shape server-side -- decide the second
+  side's access path after the first is counted -- is right, and is only sufficient because
+  the server also knows the second side's size and can refine it per segment from zone maps.
+  An estimate is for choosing which side to read first; after that there are two real
+  numbers, and a planner needs both.
 
 Estimation error compounds per join, which is the standard argument for keeping N-way joins
 out until there is a real estimator, and the reason EXPLAIN must print estimated *and*
@@ -509,7 +641,8 @@ So the current shape is **N independent full scans-and-rankings of the resource 
 
 ### 8.2 What MATCH gets from §6.1 and §7 — with less work than the join
 
-- **The vectorized executor, with no new interface.** `rewriteForSlot` maps
+- **The vectorized executor, with no new interface** (but see the measurement below for
+  what it now has to beat). `rewriteForSlot` maps
   `TARGET.attr` → a self-scoped reference, so `slotMatchExpr`'s residual is entirely
   `NoScope` — exactly what `blockVecSource.LoadColumn` already accepts. MATCH needs no
   `TargetScope` `ColumnSource` and none of §4's alias normalization. It is the simpler
@@ -534,10 +667,36 @@ Two honest qualifications:
   empty for a mutable collection). It does get block zones, because `columnarizeSealed` is
   not gated on append-only — block zones are automatic wherever a columnar block exists.
 
-**Measure this first.** Reading a record out of a columnarized segment reassembles it from
-columns, so the hypothesis is that every index candidate on a columnarized resource table
-pays a column→row reassembly only to be rejected. `ScanStats.RecordsReassembled` already
-diagnoses exactly that; confirm it before building, rather than assuming it.
+**Measured, 2026-10-31: that hypothesis is wrong.** The reasoning was that since a record
+read out of a columnarized segment is rebuilt from its columns, every index candidate on a
+columnarized resource table pays a column→row reassembly only to be rejected. A benchmark
+over 20,000 slots (`collections/match_columnar_bench_test.go` in the classad tree) says
+otherwise:
+
+| job shape (matches / 20,000) | plain | schema scan only | columnarized |
+|---|---|---|---|
+| selective (312) | 87 ms | 81 ms | **12 ms** |
+| one string attribute (13,333) | 74 ms | 77 ms | **17 ms** |
+| accepts everything (20,000) | 73 ms | 116 ms | **44 ms** |
+
+Columnarization makes matchmaking **3–11x faster**, and by the largest margin on the job
+that rejects almost everything — the exact opposite of what a per-candidate reassembly tax
+would produce. The signature is of a form that is *cheaper to reject from*: the win is
+biggest where most candidates are thrown away, and smallest where everything matches and
+must be materialized into a ClassAd regardless.
+
+Two methodological notes, because the first attempt got this wrong in both directions.
+Columnarizing requires a derived schema installed first, so a two-arm comparison varies two
+things at once and credits the schema scan's own effect to columnarization; the middle arm
+above shows the schema scan alone is worth nothing here (and costs something when nothing is
+rejected). And the arms are run in both orders: absolute numbers move between orderings —
+`accept-all/plain` reads 73 ms one way and 223 ms the other — while the ratios hold.
+
+**What this changes.** There is no reassembly tax to remove, so §8.2's vectorized pre-filter
+cannot be justified by one. It has to earn its place against the 12 ms the columnar reject
+path already achieves on a selective match, which is a much harder target. Re-measure
+against that baseline before building it, and treat the ordering spread above as the noise
+floor any claimed improvement has to clear.
 
 ### 8.3 Matching many requests in one pass
 
@@ -739,10 +898,11 @@ then parser, resolution, conjunct splitting (§5), hash join and key-batched loo
 strategy (c) via batched constraints, `EXPLAIN`. Works against every existing server, and
 because `hcdb_sql` and the Python DB-API both run statements through `repl.Parse`/`Exec`,
 the REPL, the C API, the Python driver, Grafana and MCP all get `JOIN` from one
-implementation. `ORDER BY` and `DISTINCT` over a join result run client-side here;
-aggregates and `GROUP BY` over a join are refused, because the aggregate argument grammar
-takes a bare attribute name that cannot say which table it means — they arrive with the
-server-side work in Phase 3. **No vectorization and no block skipping in this phase** — a
+implementation. `ORDER BY`, `DISTINCT`, `GROUP BY`, the aggregates and `HAVING` over a join
+result all run client-side here, reusing the same projector and reducers the single-table
+client-side paths use; the aggregate argument grammar was widened to accept a qualified name,
+which is refused outside a join since the store aggregates over a bare attribute. Phase 3
+pushes the grouping to the server. Window functions over a join are still refused. **No vectorization and no block skipping in this phase** — a
 client cannot see blocks. Also the repl.md fix of §8.10, which is independent of everything.
 
 **Phase 2 — the columnar machinery, proved out on MATCH.** Block-zone pruning and the
@@ -750,13 +910,46 @@ vectorized residual (§8.2) land here and land **first**: same machinery as the 
 path, but with no `TargetScope`, no composite ad and no outer-join asymmetry to get wrong.
 Measure `RecordsReassembled` before building.
 
-**Phase 3 — `opJoin` (opcode 66; 65 is the current high-water mark).** Two tables, `ON` as
-a ClassAd expression, executed inside the store: the join `ColumnSource` of §6.1, the block
-sweep and zone skipping of §7, wire-form row assembly, streaming only joined output rows.
-Same new-opcode-plus-`ErrXUnsupported`-fallback pattern `opTopK` and
-`opArchiveAggregateStats` use, so an older server degrades to Phase 1. Then aggregates over
-a join pushed server-side — `SELECT j.Owner, COUNT(*) FROM jobs j JOIN history h ON …` is
-what dashboards actually ask, and only the grouped result should cross the wire.
+**Phase 3 — `opJoin` (opcode 69).** Justified by §6.2 and by §7, on two grounds that the
+MATCH measurement of §8.2 neither supports nor undermines: the wire and per-row rebuild cost
+a flat ~2.2x on a narrow projection and ~4.2x on `SELECT *`, before any network; and the
+access-path decisions need statistics that only the server holds. Block skipping is not
+merely slower from a client — it is unreachable, so all of §7 is server-only by construction
+rather than by preference. Same new-opcode-plus-`ErrXUnsupported`-fallback pattern `opTopK`
+and `opArchiveAggregateStats` use, so an older server degrades to Phase 1.
+
+Phase 3 is being built in increments, and the first one deliberately leaves out most of
+what this section describes. What it contains, and why:
+
+- **The join runs in `db`, not in `dbrpc`.** Alongside the aggregate ladder, for the reason
+  that one already lives there: an embedded caller gets the same execution the RPC handler
+  does, rather than two implementations of the same rules. `db.Catalog.Join` takes a plan and
+  streams composite ads.
+- **The CALLER supplies the plan.** Which conjuncts went to which side, which equalities
+  drive the hash. That splitting is settled, tested and identical wherever it runs, and
+  re-deriving it server-side would be a second implementation of §5. A server-side planner
+  is a later increment, and it is what §7b is about.
+- **One side is held, not two.** The hash is built on one side and the other streamed
+  against it. A client join holds both, so this is a memory improvement independent of the
+  wire one.
+- **A view resolves to BOTH halves.** A continuous aggregate moves sealed buckets into an
+  archive, so a join reading only the backing would join against the unsealed tail — the
+  same defect the read paths had.
+- **Limits are the server's own.** A request can only ask for less. A caller must not be
+  able to ask a daemon to hold or produce an unbounded amount.
+- **A limit met mid-stream is reported after the rows.** It cannot be a refusal, because rows
+  have already been sent. It goes out as an `stErr` following them, which the streaming
+  client surfaces on a partial result — a truncated join must not read as a complete one.
+  This turned up that two of the three client stream readers dropped `stBadReq` and HUNG
+  rather than falling back, which is fixed separately and matters to every op, not just this
+  one.
+- **Not yet here:** the block sweep and zone skipping of §7, the vectorized `ColumnSource` of
+  §6.1, wire-form row assembly, and server-side planning. The first increment buys the wire
+  and the single-side materialization; those buy the rest.
+
+Then aggregates over a join pushed server-side — `SELECT j.Owner, COUNT(*) FROM jobs j JOIN
+history h ON …` is what dashboards actually ask, and only the grouped result should cross the
+wire.
 
 **Phase 4 — MATCH-specific: the ranked join.** The items that have no join analogue, in
 dependency order:
