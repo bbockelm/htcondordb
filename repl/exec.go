@@ -94,6 +94,11 @@ type Executor struct {
 	syncCtl    func(action, target string, args []string) (string, error)
 	retire     func(schedd string) error
 
+	// dialect selects how a predicate's expressions are read: as ClassAd expressions (the
+	// default and the historical behaviour) or lowered from ANSI SQL as the Flight SQL
+	// endpoint does. See dialect.go for why the two differ.
+	dialect Dialect
+
 	// wireRowsOff forces reads onto the old-ClassAd text path even where the wire-form
 	// relay would serve them. It exists so a test can run the same query over both
 	// transports and compare, and as an escape hatch if a wire row ever decodes wrong in
@@ -396,8 +401,21 @@ type Result struct {
 	Duration time.Duration
 }
 
+// SetDialect selects how predicates are read. The zero value is DialectClassAd, so an
+// Executor nobody configures behaves exactly as it did before dialects existed.
+func (e *Executor) SetDialect(d Dialect) { e.dialect = d }
+
+// Dialect reports the current predicate dialect.
+func (e *Executor) Dialect() Dialect { return e.dialect }
+
 // Exec executes one statement.
 func (e *Executor) Exec(st *Statement) (*Result, error) {
+	// Translate the predicates FIRST, so everything below -- the scan, EXPLAIN, a
+	// DELETE's selector -- works from one constraint. Lowering at each use would let the
+	// plan EXPLAIN shows differ from the one that ran.
+	if err := e.applyDialect(st); err != nil {
+		return nil, err
+	}
 	switch st.Kind {
 	case StmtSelect:
 		if st.IsSetOp() {

@@ -931,13 +931,39 @@ vocabulary it has to work with.
 
 **ADBC does not choose a dialect**; the Flight SQL endpoint is ANSI-only (§9.5). The REPL keeps
 a choice, because it is the one place both dialects are useful — ClassAd stays the default for
-everyone who already types it, and `.dialect ansi` beside `.format` (`repl/repl.go:131`) is how
-the lowering gets exercised without a gRPC stack:
+everyone who already types it, and `.dialect` beside `.format` is how the lowering gets
+exercised without a gRPC stack:
 
 ```
 .dialect classad     # today's behavior (default)
-.dialect ansi        # the W1 front end, same code path ADBC uses
+.dialect ansi        # the same lowering ADBC gets
 ```
+
+**`.dialect` is SHIPPED** (`repl/dialect.go`). Three things about it are worth recording:
+
+- **It translates at the PARSE boundary, not after it.** `Statement.Where` is documented as "the
+  translated ClassAd constraint" — by the time the executor runs, `Owner = 'alice'` is already
+  `Owner == "alice"`, and handing that to a SQL parser produces nonsense rather than an error
+  anyone can act on. The first implementation did exactly that. The parser now also keeps the
+  clause's raw text (`WhereRaw`), which is what the ANSI lowering reads. The translation happens
+  once in `Exec`, before anything else, so the scan, a DELETE's selector and **EXPLAIN** all
+  work from one constraint — an EXPLAIN that reported the untranslated plan would describe a
+  query that never ran.
+- **It recurses into wrapped statements.** EXPLAIN wraps the statement it reports on and
+  `CREATE MATERIALIZED VIEW` embeds the SELECT that defines it; both carry the predicate.
+- **A JOIN or a set operation is refused under ANSI.** A bare column could belong to either
+  table, and lowering it against the first table's types would type it from the wrong one.
+
+The column types come from `arrowtype.Columns`, the **same mapping** the Flight SQL endpoint
+uses, deliberately in one place: two surfaces lower SQL against these types, and a second copy
+would let them disagree about a column's type and so about what a query means — exactly the
+divergence the `ansi` package exists to remove. The types are derived per statement rather than
+cached, so a column added during a session is visible immediately instead of being refused as
+unknown until the REPL restarts.
+
+ANSI is **strictly less capable** in the REPL, on purpose: `WHERE Owner > 'R'` works today and
+is refused under ANSI. The dialect is a compatibility and debugging tool — the only way to see
+what an ADBC client will get without an ADBC client in hand — not an upgrade path.
 
 **Shipped so far (the `ansi` package), and the one place it departs from this section.** The
 predicate subset is lowered: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`/`OR`/`NOT`, parentheses,

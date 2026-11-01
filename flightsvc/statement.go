@@ -339,32 +339,11 @@ func templateFor(q query, decisions []arrowtype.Decision) (*ansi.Template, error
 
 // columnsOf exposes the derivation's decisions as column kinds.
 //
-// An attribute with no TYPED column is reported as present-but-untyped rather than absent, so a
-// predicate on `Requirements` is refused for the right reason -- it is a policy expression with
-// no scalar form -- instead of being reported as a column that does not exist.
+// The mapping lives in arrowtype because the REPL's ANSI dialect needs the same one, and two
+// copies would let this endpoint and the REPL disagree about a column's type -- and so about
+// what a query means.
 func columnsOf(decisions []arrowtype.Decision) ansi.Columns {
-	kinds := make(map[string]ansi.Kind, len(decisions))
-	for _, d := range decisions {
-		if d.Verdict != arrowtype.Typed {
-			kinds[d.Name] = ansi.KindUnknown
-			continue
-		}
-		switch d.Field.Type.ID() {
-		case arrow.INT64:
-			kinds[d.Name] = ansi.KindInt
-		case arrow.FLOAT64:
-			kinds[d.Name] = ansi.KindReal
-		case arrow.STRING:
-			kinds[d.Name] = ansi.KindString
-		case arrow.BOOL:
-			kinds[d.Name] = ansi.KindBool
-		case arrow.TIMESTAMP:
-			kinds[d.Name] = ansi.KindTimestamp
-		default:
-			kinds[d.Name] = ansi.KindUnknown
-		}
-	}
-	return ansi.KindsFromNames(kinds)
+	return arrowtype.Columns(decisions)
 }
 
 // schemaOf builds the Arrow schema of the typed decisions, in their given order.

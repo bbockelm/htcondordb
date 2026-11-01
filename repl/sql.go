@@ -202,6 +202,13 @@ type Statement struct {
 	// SELECT, UPDATE, DELETE.
 	Where string
 
+	// WhereRaw and TargetWhereRaw are the same clauses as the user TYPED them, before the
+	// SQL-spelling translation that produced Where. They exist for the ANSI dialect, whose
+	// job is to translate the predicate differently -- it has to see the source text, not
+	// the ClassAd expression already derived from it. Empty when there is no clause.
+	WhereRaw       string
+	TargetWhereRaw string
+
 	// Qualify is the post-window filter: a ClassAd expression over the window columns only
 	// (see validateQualify). It is SQL's QUALIFY, which exists because a window column does
 	// not exist yet when WHERE runs -- `WHERE n <= 5` over a window alias is not legal SQL,
@@ -658,11 +665,12 @@ func (p *parser) parseWatch() (*Statement, error) {
 	}
 	st.Table = table
 	if p.takeKeyword("WHERE") {
-		where, err := p.parseWhere()
+		where, raw, err := p.parseWhere()
 		if err != nil {
 			return nil, err
 		}
 		st.Where = where
+		st.WhereRaw = raw
 	}
 	if p.takeKeyword("SINCE") {
 		switch {
@@ -893,17 +901,19 @@ func (p *parser) parseMatch() (*Statement, error) {
 	// resource-side (pushed down).
 	for p.takeKeyword("WHERE") {
 		if p.takeKeyword("TARGET") {
-			expr, err := p.captureRawExpr(matchExprStop(p))
+			expr, raw, err := p.captureExpr(matchExprStop(p), nil)
 			if err != nil {
 				return nil, err
 			}
 			st.TargetWhere = expr
+			st.TargetWhereRaw = raw
 		} else {
-			expr, err := p.captureRawExpr(matchExprStop(p))
+			expr, raw, err := p.captureExpr(matchExprStop(p), nil)
 			if err != nil {
 				return nil, err
 			}
 			st.Where = expr
+			st.WhereRaw = raw
 		}
 	}
 	if p.takeKeyword("LIMIT") {
@@ -986,11 +996,12 @@ func (p *parser) parseSelect() (*Statement, error) {
 		return nil, err
 	}
 	if p.takeKeyword("WHERE") {
-		where, err := p.parseWhere()
+		where, raw, err := p.parseWhere()
 		if err != nil {
 			return nil, err
 		}
 		st.Where = where
+		st.WhereRaw = raw
 	}
 	if p.takeKeyword("GROUP") {
 		if err := p.expectKeyword("BY"); err != nil {
@@ -1508,11 +1519,12 @@ func (p *parser) parseUpdate() (*Statement, error) {
 		return nil, fmt.Errorf("UPDATE requires at least one assignment")
 	}
 	if p.takeKeyword("WHERE") {
-		where, err := p.parseWhere()
+		where, raw, err := p.parseWhere()
 		if err != nil {
 			return nil, err
 		}
 		st.Where = where
+		st.WhereRaw = raw
 	}
 	return st, nil
 }
@@ -1528,11 +1540,12 @@ func (p *parser) parseDelete() (*Statement, error) {
 	}
 	st.Table = table
 	if p.takeKeyword("WHERE") {
-		where, err := p.parseWhere()
+		where, raw, err := p.parseWhere()
 		if err != nil {
 			return nil, err
 		}
 		st.Where = where
+		st.WhereRaw = raw
 	}
 	return st, nil
 }
@@ -1541,12 +1554,17 @@ func (p *parser) parseDelete() (*Statement, error) {
 // a ClassAd expression, so the full ClassAd language is available (==, =?=, =!=,
 // undefined, member(), regexp(), ?:, ...). SINCE is a WATCH-only terminator; the other
 // statements never use it, so listing it here is harmless for them.
-func (p *parser) parseWhere() (string, error) {
-	return p.captureRawExpr(func() bool {
+// It also returns the clause's RAW text, before the SQL-spelling translation. The ANSI
+// dialect needs that: its whole job is to translate the predicate differently, so it has to
+// see what the user typed rather than the ClassAd expression this already produced.
+func (p *parser) parseWhere() (string, string, error) {
+	stop := func() bool {
 		return p.atEnd() || p.isKeyword("GROUP") || p.isKeyword("HAVING") ||
 			p.isKeyword("QUALIFY") || p.isKeyword("ORDER") || p.isKeyword("LIMIT") ||
 			p.isKeyword("SINCE") || p.atSetOp()
-	})
+	}
+	expr, raw, err := p.captureExpr(stop, nil)
+	return expr, raw, err
 }
 
 // captureRawExpr captures an expression that is NOT a SELECT item -- a WHERE clause, an
