@@ -498,9 +498,8 @@ reference engine; only `=?=`/`=!=` are case-sensitive. The segment dictionaries 
 too, so this is not skin-deep. SQL's `=` is case-sensitive. Therefore:
 
 - **Equality:** translating `=` to ClassAd `==` yields a **superset**, which a client-side
-  re-filter corrects — safe at rung 3. Better: emit `Owner == "x" && strcmp(Owner, "x") == 0`
-  so the fold term is index- and dictionary-accelerated and the exact term refines the
-  survivors. `strcmp`/`stricmp`/`versioncmp` exist (`classad/evaluator.go:1756`, `:1945`).
+  re-filter corrects — safe at rung 3. The exact form is `=?=`, which is case-sensitive AND
+  carries an exact-case index run (§9.5); a `strcmp` idiom would be invisible to the planner.
   **Verify with EXPLAIN** that match reordering puts the indexed term first; if not, that is a
   planner fix, not a reason to skip the exact term.
 - **Ordering (`<`, `>`):** fold-order and byte-order results are neither a subset nor a superset
@@ -773,29 +772,46 @@ already routes it (`collections/vm/probe.go:267`). So ANSI `Owner = 'x'` lowers 
 fold-term hint — an earlier draft of this section proposed
 `Owner == "x" && strcmp(Owner, "x") == 0`, which was solving a problem the index already solves.
 
-For the record on why the `strcmp` form is merely *worse* and not catastrophic: with the
-in-flight `OpCallFunc` work, a strict built-in compiles natively and the program stays
-`Native()`, so `strcmp` keeps the column prefilter and the vector executor. What it does not
-get is an **index probe**, because `probe.go` matches operator shapes, not function calls. So
-`=?=` wins on the index, not on everything.
+For the record on why a `strcmp` idiom would be merely *worse* and not catastrophic: with
+`OpCallFunc`, a strict built-in compiles natively and the program stays `Native()`, so it keeps
+the column prefilter and the vector executor. What it does not get is an **index probe**,
+because `probe.go` matches operator shapes, not function calls. That is also the reason not to
+reach for it elsewhere: a function call is a comparison the planner cannot see.
 
-**The actual gap is three-valued logic, and it is narrow.** `=?=` returns **false** on a type
-mismatch, so `Owner =?= "x"` with `Owner` undefined is false where SQL yields NULL. Under `AND`
-and `OR` that is unobservable for a WHERE clause (`NULL AND TRUE` and `false && true` both
-drop; `NULL OR TRUE` and `false || true` both keep). It diverges in exactly two positions:
+**The remaining gap is three-valued logic, and an opcode closes it better than a lowering
+trick.** `=?=` returns **false** on a type mismatch, so `Owner =?= "x"` with `Owner` undefined
+is false where SQL yields NULL. Under `AND` and `OR` that is unobservable for a WHERE clause
+(`NULL AND TRUE` and `false && true` both drop; `NULL OR TRUE` and `false || true` both keep).
+It diverges in exactly two positions: under `NOT`, where SQL drops a NULL row and ClassAd keeps
+it since `!false` is true; and wherever the value is *surfaced* rather than filtered on
+(`CASE WHEN`, `IS NOT TRUE`, a projected boolean).
 
-- under `NOT` — SQL drops a NULL row, ClassAd keeps it, since `!false` is true;
-- wherever the value is *surfaced* rather than filtered on (`CASE WHEN`, `IS NOT TRUE`, a
-  projected boolean).
+An earlier draft proposed a **polarity-aware lowering** -- bare `=?=` in positive position,
+a guarded `isUndefined(x) ? undefined : (x =?= lit)` under negation. That works and is the
+wrong trade: it produces two forms of every predicate, one of which loses the index, and
+polarity is exactly the kind of analysis that is correct in review and wrong inside a `CASE`
+inside a `NOT` inside an `OR`.
 
-So the lowering is **polarity-aware**, not a language change: bare `=?=` in positive position
-— which is where the index matters, the top-level conjuncts of a WHERE — and the guarded form
-`isUndefined(x) ? undefined : (x =?= lit)` only under negation or value-surfacing.
+**So equality gets an internal opcode too, and the family is uniform:** ANSI `=`, `<>`, `<`,
+`<=`, `>`, `>=` as opcodes in the AST/`vm` space, case-sensitive and NULL-propagating, with no
+surface syntax. One lowering per operator, no polarity analysis, and the semantics stated once
+in the opcode rather than encoded in an idiom. Equality maps onto the same exact-case index run
+`=?=` already uses, so it keeps the probe while carrying SQL's three-valued logic; ordering
+scans, because no fold-sorted structure can prune a byte-ordered range.
 
-**String *ordering* is unchanged.** The dictionary is fold-sorted and the exact-case run answers
-equality only, so `Owner > 'R'` lowers to `strcmp(Owner, "R") > 0` and scans. Acceptable in this
-domain (string range predicates are rare next to equality), but it should be stated and visible
-in `EXPLAIN` rather than discovered.
+**String *ordering* needs an operator, not a function.** There is no case-sensitive relational
+operator to lower to: `=?=` answers equality only, and the dictionary is fold-sorted so its
+ordering cannot serve a byte-ordered range anyway. Lowering `Owner > 'R'` to
+`strcmp(Owner, "R") > 0` would work and is the wrong shape -- `probe.go` matches operator
+SHAPES, not function calls, so an idiom pretending to be a comparison is invisible to the
+planner, and every future reader has to recognise the idiom to know what it means.
+
+So this is the second place an **internal opcode** is the answer (§9.5): a case-sensitive
+relational comparison in the AST/`vm` space, with no surface syntax. It will still scan -- no
+fold-sorted structure can prune a byte-ordered range -- but it is a comparison the planner and
+the vector executor can SEE, rather than a call they must pattern-match, and the semantics are
+stated once in the opcode instead of encoded in an idiom. Being a scan should be visible in
+`EXPLAIN` rather than discovered.
 
 **An INTERNAL opcode is the recommended direction — better than the polarity analysis above.**
 Not a grammar extension: nothing reachable from the external syntax, which would be a public
@@ -835,7 +851,7 @@ dependency and an argument for doing W2 first.
 **(4) Three-valued logic lines up; the gaps are types.** `!undefined` is undefined
 (`classad/evaluator.go:725`), `undefined == x` is undefined, and a row whose constraint is
 undefined fails it — which matches SQL dropping a NULL predicate, including through `NOT`.
-The lowering vocabulary is good: `strcmp`/`stricmp`, `substr`, `size`, `regexp`, `replace`,
+The lowering vocabulary is good: `substr`, `size`, `regexp`, `replace`,
 `strcat`, `int`/`real`/`string`, `toupper`/`tolower`, `split`/`join`, `member`, `formattime`,
 `interval`, and the Elvis operator for `COALESCE`. What has **no** faithful ClassAd form, and
 must therefore be refused rather than approximated: `DECIMAL` arithmetic (no exact decimal
