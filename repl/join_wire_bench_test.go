@@ -642,3 +642,65 @@ func BenchmarkJoinServerSideSelective(b *testing.B) {
 		fix.cleanup()
 	}
 }
+
+// How expensive is a join with NO equality to hash on?
+//
+// It is the one shape with no measurement behind it. Everything measured so far has been an
+// equi join -- the hash path -- while an equality-free ON falls to a different loop
+// entirely: every accumulated row against every row of the next table, tuple at a time,
+// with both sides materialized. That loop is the fallback for every non-equi join and every
+// CROSS JOIN, and it is also where block-level zone skipping would have to live, because it
+// is the only loop that ever holds a (left block, right block) pair.
+//
+// So before deciding whether to block it, this measures what it spends, against the hash
+// path over the same data. The arms are:
+//
+//   - equi: hashed. Examines n pairs.
+//   - band: a range join, which is what a real non-equi join usually is. Examines n*2n
+//     pairs and keeps a handful per left row.
+//   - expanding: nearly every pair survives, so the loop pays for output as well as for
+//     candidates. Capped at a smaller n, because n*2n surviving pairs reaches the
+//     output-row limit before the pair limit.
+//
+// The band arm's predicate is a band and not an impossibility on purpose: an arm that keeps
+// zero rows measures only rejection, and reads as "selective" while being degenerate.
+func BenchmarkJoinNonEqui(b *testing.B) {
+	shapes := []struct {
+		name, sql string
+		maxN      int
+	}{
+		{"equi", `SELECT h.ClusterId, e.ExitCode FROM history h
+			JOIN epoch e ON h.ClusterId == e.ClusterId`, 1 << 30},
+		{"band", `SELECT h.ClusterId, e.ExitCode FROM history h
+			JOIN epoch e ON h.ClusterId > e.ClusterId && h.ClusterId < e.ClusterId + 5`, 1 << 30},
+		{"expanding", `SELECT h.ClusterId, e.ExitCode FROM history h
+			JOIN epoch e ON h.ClusterId > e.ClusterId - 100000`, 256},
+	}
+	for _, n := range []int{256, 1024} {
+		fix := newJoinBenchFixture(b, n)
+		for _, shape := range shapes {
+			if n > shape.maxN {
+				continue
+			}
+			res, err := fix.exec.ExecString(shape.sql)
+			if err != nil {
+				b.Fatalf("n=%d %s: %v", n, shape.name, err)
+			}
+			rows := len(res.Rows)
+			if rows == 0 {
+				b.Fatalf("n=%d %s kept no rows; the arm measures only rejection", n, shape.name)
+			}
+			b.Run(fmt.Sprintf("n=%d/%s", n, shape.name), func(b *testing.B) {
+				// Reported so a reader can see what each arm was actually doing: the equi
+				// arm examines n pairs where the others examine n*2n.
+				b.ReportMetric(float64(rows), "rows")
+				for i := 0; i < b.N; i++ {
+					if _, err := fix.exec.ExecString(shape.sql); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+		fix.cleanup()
+	}
+}
