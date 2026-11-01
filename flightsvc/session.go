@@ -35,14 +35,21 @@ import (
 
 // Authenticator turns a connection's gRPC metadata into a mapped HTCondor identity.
 //
-// Returning an error refuses the connection. There is deliberately no "anonymous" return: a
-// Flight connection with no validated identity is refused, not admitted at READ. CEDAR admits
-// unauthenticated peers read-only because HTCondor's SEC_*_AUTHENTICATION defaults to OPTIONAL
-// and both ends negotiate down to nothing -- a compatibility concession a NEW endpoint has not
-// inherited and should not adopt, because it cannot be withdrawn later without breaking
-// whoever came to depend on it.
+// An EMPTY user with no error is the anonymous peer, and it is a legitimate answer. That
+// follows CEDAR: `peerUser` returns "" for a peer that authenticated with nothing
+// (server.go:518), the ALLOW_/DENY_ policy is then asked about that empty identity, and
+// whatever it says is the answer. Matching it means this endpoint adds no exposure of its own
+// -- what an anonymous caller may read is whatever the pool's ALLOW_READ already grants an
+// anonymous CEDAR caller, decided by the same policy, and an operator who has tightened one
+// has tightened both.
+//
+// The distinction that still matters is between presenting NOTHING and presenting something
+// BAD. No credential is anonymous; a credential that fails to verify is an error and refuses
+// the connection, because a caller who meant to authenticate and failed should be told so
+// rather than quietly downgraded to anonymous and then puzzled by what is missing.
 type Authenticator interface {
-	// Authenticate returns the fully-qualified user, or an error to refuse.
+	// Authenticate returns the mapped user, "" for an anonymous peer, or an error to
+	// refuse the connection outright.
 	Authenticate(ctx context.Context, md metadata.MD) (string, error)
 	// Name identifies the mechanism in logs and refusals.
 	Name() string
@@ -117,13 +124,12 @@ func (s *Sessions) For(ctx context.Context) (*dbrpc.Client, func(), error) {
 	if err != nil {
 		return nil, nil, status.Errorf(codes.Unauthenticated, "%s: %v", s.authn.Name(), err)
 	}
-	if user == "" {
-		return nil, nil, status.Errorf(codes.Unauthenticated,
-			"%s returned no identity; an unauthenticated connection is refused", s.authn.Name())
-	}
+	// An empty user is the anonymous peer, not a failure: the policy below decides whether
+	// it may read, exactly as it does for an anonymous CEDAR peer.
 	addr := peerAddr(ctx)
 	if !s.authz("READ", addr, user) {
-		return nil, nil, status.Errorf(codes.PermissionDenied, "%s is not authorized to read", user)
+		return nil, nil, status.Errorf(codes.PermissionDenied, "%s is not authorized to read",
+			describeUser(user))
 	}
 
 	cc, sc := net.Pipe()
@@ -210,16 +216,24 @@ func (s *Sessions) StreamAuthInterceptor() grpc.StreamServerInterceptor {
 	}
 }
 
+// check refuses a connection whose credential is BAD, before any handler runs. It does not
+// refuse one that presented no credential: that is the anonymous peer, and whether it may read
+// is the authorizer's decision in For, not this one's.
 func (s *Sessions) check(ctx context.Context) error {
 	md, _ := metadata.FromIncomingContext(ctx)
-	user, err := s.authn.Authenticate(ctx, md)
-	if err != nil {
+	if _, err := s.authn.Authenticate(ctx, md); err != nil {
 		return status.Errorf(codes.Unauthenticated, "%s: %v", s.authn.Name(), err)
 	}
-	if user == "" {
-		return status.Errorf(codes.Unauthenticated, "%s returned no identity", s.authn.Name())
-	}
 	return nil
+}
+
+// describeUser names an identity for an error message. The anonymous peer has no name, and
+// saying so reads better than an empty pair of quotes and points at the right config knob.
+func describeUser(user string) string {
+	if user == "" {
+		return "an unauthenticated peer"
+	}
+	return user
 }
 
 // peerFromContext returns the peer's "host:port", for the address half of an authorization

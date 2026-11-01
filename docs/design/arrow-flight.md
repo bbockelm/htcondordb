@@ -590,12 +590,30 @@ mapped fully-qualified user. Three mechanisms, in the order they are worth build
    HTCondor's existing `AUTH_SSL_*` parameters for the server's own key and chain rather than
    inventing a parallel set.
 
-**Fail closed: no anonymous access.** CEDAR admits an unauthenticated peer as read-only,
-because HTCondor's default `SEC_*_AUTHENTICATION` is `OPTIONAL` and both ends negotiate down to
-nothing. That is a compatibility concession a *new* endpoint has not inherited and should not
-adopt: a Flight connection with no validated identity is refused, not admitted at READ. This is
-the kind of default that cannot be tightened later without breaking whoever came to depend on
-it, so it has to be right on the first release.
+**Authentication is OPTIONAL by default, following CEDAR rather than being stricter.** An
+earlier draft of this section argued the opposite -- fail closed, no anonymous access, on the
+grounds that a new endpoint has not inherited HTCondor's `OPTIONAL` compatibility concession.
+That was overruled, and the counter-argument is the better one.
+
+CEDAR already serves an anonymous peer: `peerUser` returns `""` for a connection that
+negotiated no authentication (`server/server.go:518`), the `ALLOW_`/`DENY_` policy is asked
+about that empty identity, and whatever it answers is the answer. An endpoint that refused the
+same caller would not be safer, it would be *inconsistent* -- two doors onto one store with two
+different postures, where an operator who tightened `ALLOW_READ` would have tightened only one
+of them and could not easily tell which. Matching CEDAR means the Flight endpoint adds no
+exposure of its own: what an anonymous caller may read here is exactly what it may already read
+there, decided by the same policy.
+
+Permissive is not open. An anonymous caller still has to satisfy `ALLOW_READ`, still gets READ
+level only, and still has private attributes stripped. What changed is *who decides* -- the
+pool's policy rather than this code. `REQUIRED` remains available for a pool that wants this
+door stricter than its CEDAR one.
+
+**The distinction that does hold is between presenting nothing and presenting something bad.**
+No credential is anonymous. A credential that is present and fails to verify is an error that
+refuses the connection, because downgrading it would leave a caller who meant to authenticate
+puzzled by what is missing -- and would turn a revoked or expired token into a silent loss of
+privilege rather than a reported one.
 
 ### 8.4 Authorization, and one thing that must not leak
 

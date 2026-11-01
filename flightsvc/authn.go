@@ -116,3 +116,53 @@ func issuerHost(issuer string) string {
 	}
 	return s
 }
+
+// Optional and anonymous authentication, matching CEDAR's posture.
+//
+// HTCondor's SEC_*_AUTHENTICATION defaults to OPTIONAL, and with OPTIONAL at both ends the
+// negotiation settles on no authentication at all -- so CEDAR routinely serves a peer whose
+// identity is the empty string, and the ALLOW_/DENY_ policy decides what that peer may read.
+// These authenticators let the Flight endpoint behave the same way, which means a pool's
+// existing ALLOW_READ governs both doors rather than one being quietly stricter than the other.
+//
+// Being permissive here is not the same as being open. An anonymous caller still has to satisfy
+// ALLOW_READ, still gets READ level only, and still has private attributes stripped. What
+// changes is who decides -- the pool's policy rather than this package.
+
+type anonAuth struct{}
+
+// AnonymousAuthenticator maps every caller to the anonymous identity, leaving the whole
+// decision to the authorization policy. It is the direct analogue of a CEDAR connection that
+// negotiated no authentication.
+func AnonymousAuthenticator() Authenticator { return anonAuth{} }
+
+func (anonAuth) Name() string { return "NONE" }
+
+func (anonAuth) Authenticate(context.Context, metadata.MD) (string, error) { return "", nil }
+
+type optionalAuth struct {
+	inner Authenticator
+}
+
+// OptionalAuth verifies a credential when one is presented and falls back to the anonymous
+// identity when none is. This is what HTCondor means by OPTIONAL.
+//
+// A credential that is PRESENT but does not verify is still an error. Downgrading it to
+// anonymous would leave a caller who meant to authenticate wondering why half the data is
+// missing, with nothing anywhere saying their token was rejected -- and it would turn a
+// revoked or expired token into a silent loss of privilege rather than a reported one.
+func OptionalAuth(inner Authenticator) Authenticator {
+	if inner == nil {
+		return AnonymousAuthenticator()
+	}
+	return optionalAuth{inner: inner}
+}
+
+func (o optionalAuth) Name() string { return "OPTIONAL(" + o.inner.Name() + ")" }
+
+func (o optionalAuth) Authenticate(ctx context.Context, md metadata.MD) (string, error) {
+	if _, ok := BearerToken(md); !ok {
+		return "", nil // no credential offered: anonymous, as CEDAR would
+	}
+	return o.inner.Authenticate(ctx, md)
+}
