@@ -74,6 +74,11 @@ type Server struct {
 	sample int
 	// streamBudget caps the Arrow bytes one DoGet stream may hold; 0 is unlimited.
 	streamBudget int64
+	// sessions resolves a per-identity session, and is nil for a fixed-client server.
+	// Prepared-statement handles are bound to the identity it reports.
+	sessions *Sessions
+	// prep is the live prepared-statement table.
+	prep *prepared
 	// streams admits at most one token per concurrent DoGet stream. Nil means unlimited.
 	//
 	// A cap exists because this runs in the daemon: concurrent wide scans compete for CPU
@@ -129,7 +134,7 @@ func NewServer(db *dbrpc.Client, derive arrowtype.Options, alloc memory.Allocato
 	}
 	s := &Server{
 		dbFor: func(context.Context) (*dbrpc.Client, func(), error) { return db, func() {}, nil },
-		alloc: alloc, derive: derive,
+		alloc: alloc, derive: derive, prep: newPrepared(),
 	}
 	if err := s.registerSqlInfo(); err != nil {
 		return nil, err
@@ -147,7 +152,8 @@ func NewSessionServer(sessions *Sessions, derive arrowtype.Options, alloc memory
 	if alloc == nil {
 		alloc = memory.DefaultAllocator
 	}
-	s := &Server{dbFor: sessions.For, alloc: alloc, derive: derive}
+	s := &Server{dbFor: sessions.For, alloc: alloc, derive: derive,
+		sessions: sessions, prep: newPrepared()}
 	if err := s.registerSqlInfo(); err != nil {
 		return nil, err
 	}

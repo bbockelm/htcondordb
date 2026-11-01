@@ -119,16 +119,32 @@ func levelOptions(authorize Authorizer, addr, user string) dbrpc.ServeOptions {
 // serves every identity: what varies per RPC is the authorization the reads go through, and
 // that is exactly what the client carries.
 func (s *Sessions) For(ctx context.Context) (*dbrpc.Client, func(), error) {
+	client, _, release, err := s.forWithIdentity(ctx)
+	return client, release, err
+}
+
+// Identity returns the identity this RPC authenticated as, without opening a session. It is
+// what a prepared statement's handle is bound to, so one identity cannot use another's.
+func (s *Sessions) Identity(ctx context.Context) (string, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	user, err := s.authn.Authenticate(ctx, md)
 	if err != nil {
-		return nil, nil, status.Errorf(codes.Unauthenticated, "%s: %v", s.authn.Name(), err)
+		return "", status.Errorf(codes.Unauthenticated, "%s: %v", s.authn.Name(), err)
+	}
+	return user, nil
+}
+
+func (s *Sessions) forWithIdentity(ctx context.Context) (*dbrpc.Client, string, func(), error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	user, err := s.authn.Authenticate(ctx, md)
+	if err != nil {
+		return nil, "", nil, status.Errorf(codes.Unauthenticated, "%s: %v", s.authn.Name(), err)
 	}
 	// An empty user is the anonymous peer, not a failure: the policy below decides whether
 	// it may read, exactly as it does for an anonymous CEDAR peer.
 	addr := peerAddr(ctx)
 	if !s.authz("READ", addr, user) {
-		return nil, nil, status.Errorf(codes.PermissionDenied, "%s is not authorized to read",
+		return nil, "", nil, status.Errorf(codes.PermissionDenied, "%s is not authorized to read",
 			describeUser(user))
 	}
 
@@ -152,7 +168,7 @@ func (s *Sessions) For(ctx context.Context) (*dbrpc.Client, func(), error) {
 		// leaves that one reading as unknown, which is the safe reading and is what a
 		// networked client would also get. Worth saying out loud, because silence here
 		// is indistinguishable from everything being wired.
-		return nil, nil, fmt.Errorf(
+		return nil, "", nil, fmt.Errorf(
 			"dbrpc advertises no %v, which a client asks for; the loopback would read them as unknown",
 			missing)
 	}
@@ -163,7 +179,7 @@ func (s *Sessions) For(ctx context.Context) (*dbrpc.Client, func(), error) {
 	s.open[sess] = struct{}{}
 	s.mu.Unlock()
 
-	return client, func() {
+	return client, user, func() {
 		s.mu.Lock()
 		delete(s.open, sess)
 		s.mu.Unlock()

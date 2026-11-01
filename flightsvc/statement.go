@@ -317,7 +317,14 @@ func (s *Server) GetFlightInfoStatement(ctx context.Context, cmd flightsql.State
 // round trip, and it is the correct trade: a schema in the ticket would be a schema the client
 // could edit, and this one has to match what the encoder will actually produce.
 func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	stmt := string(ticket.GetStatementHandle())
+	return s.doGetQuery(ctx, string(ticket.GetStatementHandle()))
+}
+
+// doGetQuery is the one scan implementation, shared by a direct statement and a prepared one.
+// Two copies would drift, and the drift would be invisible: a prepared statement returning
+// subtly different rows from the same SQL run directly is the kind of bug nobody reports
+// because nobody compares.
+func (s *Server) doGetQuery(ctx context.Context, stmt string) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	parsed, err := parseQuery(stmt)
 	if err != nil {
 		return nil, nil, err
