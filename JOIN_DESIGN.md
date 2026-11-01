@@ -17,7 +17,7 @@ planner's main decision. Here is where each one stands.
 |---|---|---|---|
 | **hash join** | the `ON` spine has at least one equality | **done** | **done** |
 | **index-based equi join** | ditto, and the probed side has a built index on the key | **done** (key batching, §6.2) | **done**, awaiting a classad release |
-| **block nested loops** | no usable equality: non-equi `ON`, `CROSS JOIN` | **measured, declined** (§0.5) | **not started** — §7's carrier |
+| **block nested loops** | no usable equality: non-equi `ON`, `CROSS JOIN` | **declined**; the per-pair allocation it would have masked is fixed instead (§0.5) | **not started** — §7's carrier |
 
 Three things that table is saying, which are easy to miss:
 
@@ -169,11 +169,27 @@ grow. There is nothing for blocking to attack.
 
 What the 0.85 µs actually is: per candidate pair the loop allocates a composite ClassAd and
 evaluates the condition against it. A surviving pair costs about 0.3 µs more, which is the
-output row. So the optimization the measurement points at is **not** blocking the loop but
+output row. So the optimization the measurement pointed at was **not** blocking the loop but
 **not allocating a row per candidate** — reuse one composite to test the condition and
-allocate only on survival. For a band join rejecting 94% of its candidates that is most of
-the 0.85 µs. It is bounded by whether a reused ad is safe to re-evaluate against, which is a
-real question here and not an obvious yes.
+allocate only on survival.
+
+**That is now done, and it was worth less than this section first claimed.** The draft said
+the allocation was "most of the 0.85 µs". Measured:
+
+| arm | per pair before | after | |
+|---|---|---|---|
+| band, n=1024 (2.1M pairs) | 0.875 µs | 0.650 µs | **1.34x** |
+| band, n=256 (131k pairs) | 0.820 µs | 0.636 µs | **1.27x** |
+| equi | — | — | 1.01x |
+| expanding | — | — | 1.02x |
+
+So the allocation was about **a quarter** of the per-pair cost, not most of it: ~0.20 µs of
+~0.85 µs. The remaining ~0.64 µs is the condition evaluation itself, which is the work the
+join exists to do. The equi arm does not move because the hash narrows candidates to about
+one per row, leaving nothing to amortize; the expanding arm does not move because nearly
+every candidate survives and takes its row with it, which is the case the reuse cannot help
+by construction. Both of those are the mechanism confirming itself from the sides where it
+should do nothing.
 
 **This does not retire §7.** Zone skipping still needs a block loop, in the store, and for a
 reason none of the above measures: a zone predicate rejects a whole block of the inner side
