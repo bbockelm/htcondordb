@@ -137,9 +137,9 @@ and `WHERE` conjuncts only to the left (preserved) side. An `INNER JOIN` pushes 
 
 **Not supported yet**, each refused with the reason: `RIGHT`/`FULL OUTER` (swap the tables
 and use `LEFT JOIN`), `NATURAL JOIN` and `USING` (write the condition with `ON`),
-comma-separated `FROM` lists, more than two tables, sub-selects, `UNION`/`INTERSECT`/
-`EXCEPT`, and aggregates / `GROUP BY` / window functions over a join — the aggregate
-argument grammar takes a bare attribute name, which cannot say which table it means.
+comma-separated `FROM` lists, more than two tables, sub-selects, and aggregates /
+`GROUP BY` / window functions over a join — the aggregate argument grammar takes a bare
+attribute name, which cannot say which table it means.
 
 **Guard rails.** A join refuses rather than runs away when it would examine too many
 candidate pairs — either because the `ON` clause has no equality between the tables, so
@@ -151,9 +151,9 @@ built before `LIMIT` applies.
 
 **"Live jobs plus completed jobs" is not a join.** A job is in the queue *or* in history,
 never both, so joining `jobs` to `history` finds nothing to pair — a `LEFT JOIN` returns
-every live job with an entirely undefined right side. That question is a set union, which
-is not supported; run the two `SELECT`s separately. The genuine join over history is to a
-second archive, e.g. one row per run attempt:
+every live job with an entirely undefined right side. That question is a set union; see
+[UNION](#union--stacking-two-results) below. The genuine join over history is to a second
+archive, e.g. one row per run attempt:
 
 ```sql
 -- every run attempt of each job completed in the last day
@@ -165,6 +165,44 @@ SELECT h.ClusterId, e.RunInstanceId, e.ExitCode
 
 `JOIN` is not `MATCH`. A join is unilateral and says its own condition; matchmaking is
 bilateral and takes the condition from the ads themselves. Both are below.
+
+## UNION — stacking two results
+
+```sql
+SELECT <items> FROM <table> [WHERE ...]
+UNION [ALL]
+SELECT <items> FROM <table> [WHERE ...]
+[ORDER BY ...] [LIMIT n]
+```
+
+A union **stacks** rows; a join **pairs** them. "One user's live jobs plus their completed
+ones" is a union, because a job is in the queue or in history, never both:
+
+```sql
+SELECT 'live' AS src, ClusterId, Owner FROM jobs    WHERE Owner == "alice"
+UNION ALL
+SELECT 'done' AS src, ClusterId, Owner FROM history WHERE Owner == "alice"
+ORDER BY ClusterId;
+```
+
+The literal column is the SQL idiom for saying which branch a row came from.
+
+- **Rows are ClassAds**, so `SELECT * FROM jobs UNION ALL SELECT * FROM history` works even
+  though the two tables carry different attributes: the column set is the union of what the
+  branches carry, and a row from a branch lacking an attribute shows `undefined` rather than
+  shifting the columns.
+- **Named columns match by position**, and the first branch's headers name the output. A
+  branch selecting a different number of columns is refused, as is mixing `SELECT *` with
+  named columns.
+- **`UNION` de-duplicates, `UNION ALL` does not.** De-duplication compares rendered rows, so
+  two `undefined` values count as alike — matching SQL's `DISTINCT`, which treats `NULL`s as
+  alike, rather than `==`, under which `undefined == undefined` is undefined. The two forms
+  may not be mixed in one chain.
+- **`ORDER BY` and `LIMIT` apply to the whole union**, not to the branch they follow, and
+  may not appear on an earlier branch.
+- Each branch is an ordinary `SELECT` with its own pushdowns, and may itself be a `JOIN`.
+
+`INTERSECT` and `EXCEPT` are not supported.
 
 ## MATCH — matchmaking between two tables
 

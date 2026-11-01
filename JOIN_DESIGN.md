@@ -454,7 +454,7 @@ Estimation error compounds per join, which is the standard argument for keeping 
 out until there is a real estimator, and the reason EXPLAIN must print estimated *and*
 actual row counts once estimates exist at all.
 
-## 7c. Sub-selects: later, except for one
+## 7c. Sub-selects: later, except for one (see `SETOPS_DESIGN.md`)
 
 Sub-selects do not belong in the first join, but one shape should not wait for the rest.
 
@@ -481,10 +481,8 @@ union**. A job is in the queue or in history, never both, so pairing the two tab
 nothing to pair: a `LEFT JOIN` of jobs to history returns every live job with an entirely
 undefined right side, which looks like a broken feature rather than the wrong question.
 
-`UNION` / `INTERSECT` / `EXCEPT` are not supported. Given how common "live plus completed"
-is here, a set union is arguably worth more to this workload than general sub-selects, and
-should be weighed against them rather than assumed to come after. Until it exists the answer
-is two statements, and the parser should say that rather than reporting a stray token.
+`UNION` / `UNION ALL` now answer it; `INTERSECT` and `EXCEPT` do not. See
+`SETOPS_DESIGN.md`, which also carries the sub-select design sketched in §7c.
 
 By contrast, "the epochs of each completed job from the last day" is a genuine join:
 `history` to `epoch` on `(ClusterId, ProcId)` -- a composite key, one-to-many, with the day
