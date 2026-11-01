@@ -365,6 +365,29 @@ client, and that was always the larger prize (§7); a selective join should stil
 single-side materialization is a real memory improvement either way. What it undermines is
 the claim that moving the pairing into the store is a win *by itself*.
 
+**And the selective regime, measured rather than assumed.** The paragraph above says a
+selective join "should still win", which would have been the same mistake a third time. With
+a sparse right side -- one epoch row per fiftieth cluster, so the join filters instead of
+expanding -- best of both arm orders:
+
+| left rows | joined rows out | client-side | in the store | |
+|---|---|---|---|---|
+| 2048 | 40 | 21.6 ms | 19.2 ms | 1.13x faster |
+| 8192 | 163 | 90.3 ms | 76.8 ms | **1.18x faster** |
+
+So the direction does flip with the expansion ratio, which is the mechanism confirming itself
+from the other side. But the win is ~1.15x, not the ~2.2x the wire comparison implied, and
+the reason is instructive: both arms still SCAN the left side inside the store, and at these
+sizes that scan dominates. Removing the ship only moves the smaller term. The earlier tables
+isolated the ship by holding the scan constant, which is a fair way to price a wire and a
+misleading way to price a query.
+
+**What that leaves.** Moving the pairing is worth ~1.15x where it helps and -1.4x where it
+hurts. The case for executing a join in the store therefore rests on §7 -- block-level zone
+skipping, which attacks the scan rather than the ship, and which a client cannot do at all --
+and not on the pairing's location. That was always described as the larger prize; it is now
+the only one.
+
 **So the decision is a cost decision**, and it needs the expansion ratio -- output rows over
 input rows -- which is the same NDV estimate §7b says is missing. Until something can make
 that estimate the server-side join is off by default, behind `ExecConfig.ServerSideJoin`,

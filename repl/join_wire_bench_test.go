@@ -54,6 +54,44 @@ type joinBenchFixture struct {
 // archive with two rows per cluster. Both are value-indexed on ClusterId, which is what
 // gives the key-batch membership constraint an index to probe rather than a predicate to
 // evaluate per record.
+// newSelectiveJoinFixture is newJoinBenchFixture with a SPARSE right side: only every
+// sparsity-th cluster has epoch rows, so the join filters instead of expanding and the output
+// is far smaller than either input.
+//
+// This is the shape the wire argument was actually about, and the one the expanding fixture
+// cannot test. Keeping them as separate fixtures rather than a parameter makes it visible at
+// the call site which regime a benchmark is in, since that is what decides the answer.
+func newSelectiveJoinFixture(b testing.TB, n, sparsity int) *joinBenchFixture {
+	b.Helper()
+	cat, err := db.OpenCatalog(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	cfg := func(zone []string) db.ArchiveConfig {
+		return db.ArchiveConfig{SegmentSize: 1 << 16, ValueAttrs: []string{"ClusterId"}, ZoneAttrs: zone}
+	}
+	hist, err := cat.CreateArchiveTable("history", cfg([]string{"CompletionDate"}))
+	if err != nil {
+		b.Fatal(err)
+	}
+	epoch, err := cat.CreateArchiveTable("epoch", cfg(nil))
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 1; i <= n; i++ {
+		if aerr := hist.Append(benchHistoryAd(i)); aerr != nil {
+			b.Fatal(aerr)
+		}
+		if i%sparsity != 0 {
+			continue
+		}
+		if aerr := epoch.Append(benchEpochAd(i, 0)); aerr != nil {
+			b.Fatal(aerr)
+		}
+	}
+	return serveJoinFixture(b, cat)
+}
+
 func newJoinBenchFixture(b testing.TB, n int) *joinBenchFixture {
 	b.Helper()
 	cat, err := db.OpenCatalog(b.TempDir())
@@ -84,6 +122,13 @@ func newJoinBenchFixture(b testing.TB, n int) *joinBenchFixture {
 		}
 	}
 
+	return serveJoinFixture(b, cat)
+}
+
+// serveJoinFixture puts a server in front of a catalog and returns the two executors that
+// differ only in whether the handshake advertises the join.
+func serveJoinFixture(b testing.TB, cat *db.Catalog) *joinBenchFixture {
+	b.Helper()
 	s := dbrpc.NewServerCatalog(cat)
 	dial := func(advertise bool) *dbrpc.Client {
 		cp, sp := net.Pipe()
@@ -540,6 +585,59 @@ func BenchmarkJoinServerSide(b *testing.B) {
 					}
 				})
 			}
+		}
+		fix.cleanup()
+	}
+}
+
+// Does a SELECTIVE join win, as BenchmarkJoinServerSide's negative result left open?
+//
+// That benchmark measured an EXPANDING join -- two right rows per left row -- where the
+// composite output repeats the left ad per output row and the store moved more data than the
+// client did. The reasoning it was built on applies to the other regime: a join whose output
+// is far smaller than its inputs. Here only every fiftieth cluster has an epoch row, so the
+// store streams n/50 joined rows where the client must fetch all n of one side and all n/50
+// of the other before pairing anything.
+//
+// Asserting that without measuring it would be the same mistake twice.
+func BenchmarkJoinServerSideSelective(b *testing.B) {
+	const sparsity = 50
+	const sql = `SELECT h.ClusterId, h.Owner, e.ExitCode FROM history h JOIN epoch e ON h.ClusterId == e.ClusterId`
+	for _, n := range []int{2048, 8192} {
+		fix := newSelectiveJoinFixture(b, n, sparsity)
+		arms := []struct {
+			name string
+			exec *Executor
+		}{
+			{"client-side", fix.exec},
+			{"in-store", fix.srvExec},
+		}
+		if benchReverseJoinArms {
+			arms[0], arms[1] = arms[1], arms[0]
+		}
+		want := -1
+		for _, arm := range arms {
+			res, err := arm.exec.ExecString(sql)
+			if err != nil {
+				b.Fatalf("n=%d/%s: %v", n, arm.name, err)
+			}
+			if want == -1 {
+				want = len(res.Rows)
+			} else if len(res.Rows) != want {
+				b.Fatalf("n=%d: %s returned %d rows, the other %d", n, arm.name, len(res.Rows), want)
+			}
+		}
+		if want != n/sparsity {
+			b.Fatalf("n=%d: joined %d rows, expected %d; the fixture is not selective", n, want, n/sparsity)
+		}
+		for _, arm := range arms {
+			b.Run(fmt.Sprintf("n=%d/rows=%d/%s", n, want, arm.name), func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					if _, err := arm.exec.ExecString(sql); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
 		}
 		fix.cleanup()
 	}
