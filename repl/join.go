@@ -1057,19 +1057,37 @@ func (p *joinPlan) runStep(step *joinStep, rows []joinTuple, ads []*classad.Clas
 				candidates = buckets[k]
 			}
 		}
+		// One composite row, reused across this row's candidates. The condition has to be
+		// evaluated against a row that may not survive, so building a fresh ad per
+		// CANDIDATE means allocating for every pair the join is about to reject -- which,
+		// in a join with nothing to hash on, is nearly all of them. Here a candidate only
+		// swaps this step's member and re-evaluates; a candidate that survives takes the
+		// row with it and the next one starts a fresh scratch.
+		//
+		// Swapping a member is safe to re-evaluate against because Insert REPLACES an
+		// existing name in place: the attribute set does not change, so the ad is not
+		// marked dirty and is not re-sorted, and nothing about evaluation is memoized
+		// against it (the one map an ad keeps during evaluation is the cycle guard, which
+		// is scoped to a single Eval). TestJoinReusedCandidateRowAgreesWithFreshRows pins
+		// that rather than trusting it.
+		var scratch *classad.ClassAd
 		for _, r := range candidates {
 			budget.pairs--
 			if budget.pairs < 0 {
 				return nil, p.tooManyPairs(step, len(rows), len(ads))
 			}
+			if scratch == nil {
+				scratch = p.compose(t, step.side, nil)
+			}
+			scratch.InsertAttrClassAd(p.sides[step.side].ref.Alias, r)
 			// The hash only narrowed the candidates; the condition decides, in full, with
 			// ClassAd's own semantics.
-			row := p.compose(t, step.side, r)
-			if !step.condHolds(row) {
+			if !step.condHolds(scratch) {
 				continue
 			}
 			matched = true
-			out = append(out, p.keep(t, step.side, r, row, last))
+			out = append(out, p.keep(t, step.side, r, scratch, last))
+			scratch = nil // handed to the output; the next candidate builds its own
 			if len(out) > maxJoinOutputRows {
 				return nil, fmt.Errorf("the join produced more than %d rows; "+
 					"narrow it with WHERE (LIMIT does not help -- the rows are built "+
