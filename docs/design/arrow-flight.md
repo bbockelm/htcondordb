@@ -918,6 +918,31 @@ the lowering gets exercised without a gRPC stack:
 .dialect ansi        # the W1 front end, same code path ADBC uses
 ```
 
+**Shipped so far (the `ansi` package), and the one place it departs from this section.** The
+predicate subset is lowered: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`/`OR`/`NOT`, parentheses,
+`IS [NOT] NULL`, `IN`, `BETWEEN`, and the literals. String equality lowers to `=?=` per §9.5.
+
+The departure is polarity. §9.5 proposes a **guarded form** under negation; the implementation
+**refuses** there instead. Two forms of every predicate means one of them loses the index, and
+polarity is the analysis that is right in review and wrong three levels into a nested
+expression. Refusing is still a polarity analysis, but its failure mode is "you cannot write
+that yet" rather than silently wrong rows — and it is positional, so a string equality outside a
+`NOT` is unaffected and double negation returns to positive. The internal opcodes remain the way
+to lift the restriction, and nothing here blocks them.
+
+Also refused, each for a reason rather than for want of effort: string **ordering** (fold-order
+and byte-order are neither subset nor superset, and the dictionaries are fold-sorted so no index
+could serve a byte range), string **inequality** (its 3VL guard is correct but unverified
+against the index, and an unindexed inequality over a large table is better introduced
+deliberately than discovered), a **type-invalid** comparison (refused at bind time as a SQL
+engine does, rather than lowered into ClassAd's ERROR where it would quietly filter out every
+row), and an **unknown or untypeable** column.
+
+A caveat the in-process decision did NOT remove: the lowered constraint crosses `dbrpc` as
+**text**, because the Flight endpoint reads through an in-process loopback to reuse the
+authorization layer (§8.1). So an internal opcode with no surface syntax could not travel it as
+things stand — a second reason the refusal above is the right first move rather than a stopgap.
+
 **One caution, for the REPL only.** `.format` changes how results *print*; `.dialect` changes
 what a query *means* — `WHERE Owner = 'bbockelm'` folds case under ClassAd and does not under
 ANSI. So the mode has to be visible (prompt, `EXPLAIN`, and recorded on every logged statement
@@ -938,8 +963,9 @@ destination.
 
 **Implemented so far.** The measurement (`collections.AttrTypeProfiles`, dbrpc op 68), the type
 decision and encoder (`arrowtype`), an Arrow IPC export (`arrowstream`, `htcondordb-cli
-arrow`), and a Flight SQL endpoint served in process (`flightsvc`) accepting
-`SELECT * FROM <table>` and refusing the rest. Verified against a non-Go consumer: 2000 real
+arrow`), the ANSI predicate lowering (`ansi`), and a Flight SQL endpoint served in process
+(`flightsvc`) accepting `SELECT <cols|*> FROM <table> [WHERE <predicate>] [LIMIT n]` and
+refusing the rest. Verified against a non-Go consumer: 2000 real
 ap2001 history ads read back by pyarrow as 226 typed columns, with arithmetic over the columns
 the stray-expression bug would have made text.
 
