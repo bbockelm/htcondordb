@@ -697,13 +697,34 @@ Everything else stays on `BaseServer`'s defaults.
 | `RegisterSqlInfo` | the handful of entries ADBC reads at connect |
 | `DoGetCatalogs` / `DoGetDBSchemas` / `DoGetTables` / `DoGetTableTypes` | catalog browsing; schemas come from `schema_ref` |
 
-**Deliberately deferred:** Substrait (both plan variants), prepared statements, transactions
+**Deliberately deferred:** Substrait (both plan variants), transactions
 and savepoints, primary/imported/exported keys and cross-reference, `DoPutCommandStatementUpdate`
 (writes), `StatementIngest`, `XdbcTypeInfo`, `CancelFlightInfo`.
 
-Prepared statements are the first thing to add after v1, because that is how ADBC binds
-parameters; they are not v1-blocking (a client can inline literals), and `CreatePreparedStatement`
-+ `DoPutPreparedStatementQuery` + `DoGetPreparedStatement` is the whole increment.
+**Prepared statements with bound parameters are DONE**, which was listed here as the first thing
+to add after v1 because it is how ADBC binds parameters. `CreatePreparedStatement` +
+`DoPutPreparedStatementQuery` + `DoGetPreparedStatement` + `ClosePreparedStatement` are served,
+and `ansi.LowerTemplate` lowers a predicate with its `?` holes left open.
+
+Two decisions in that increment are worth recording, because both were arrived at by trying the
+obvious thing first:
+
+- **The lowered predicate is a FRAGMENT LIST, not a string with substitution markers.** A marker
+  scheme has to prove no other part of the expression can contain the marker, and the one
+  caller-controlled part is a string literal, whose rendered form can hold any byte that is not
+  a quote or a backslash. Binding is therefore a concatenation of pieces that were never
+  adjacent, and there is nothing to search. `TestBoundStringCannotEscapeItsLiteral` is the
+  check.
+- **A parameter slot covers the WHOLE comparison, not the value.** A NULL bound value does not
+  compare the column against null; it makes the comparison yield NULL, which drops the row --
+  `false` in a ClassAd WHERE clause, and `Cpus == false` is not it. So the slot renders either
+  `Cpus == 4` or `false`, decided where the operator is still in scope.
+
+A placeholder is validated for lowerability at PREPARE time, with no value, so every refusal the
+inline path gives is given to the parameterised path from the same code: `NOT Owner = ?` and
+`Owner > ?` are refused at the prepare, not at the bind. `executemany` over a SELECT is refused
+rather than served from the first parameter set, because N parameter sets are N result sets and a
+DoGet returns one.
 
 ### 9.3 Workstreams and what actually blocks what
 

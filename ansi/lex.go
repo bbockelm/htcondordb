@@ -3,10 +3,10 @@ package ansi
 import "strings"
 
 // A tokeniser for the predicate subset: identifiers, numbers, single-quoted strings,
-// comparison operators, parentheses and commas. It is deliberately not a SQL lexer -- there is
-// no arithmetic, no function call syntax, no qualified name -- because every token kind it does
-// not produce is a construct the lowering would have had to refuse anyway, and refusing at the
-// token is a clearer error than refusing at the parse.
+// comparison operators, parentheses, commas and `?` placeholders. It is deliberately not a SQL
+// lexer -- there is no arithmetic, no function call syntax, no qualified name -- because every
+// token kind it does not produce is a construct the lowering would have had to refuse anyway,
+// and refusing at the token is a clearer error than refusing at the parse.
 
 type tokKind int
 
@@ -19,6 +19,7 @@ const (
 	tokLParen
 	tokRParen
 	tokComma
+	tokParam
 	tokBad
 )
 
@@ -52,6 +53,12 @@ func (l *lexer) next() token {
 	case c == ',':
 		l.pos++
 		return token{kind: tokComma, text: ","}
+	case c == '?':
+		// A positional parameter placeholder. Only prepared statements can supply a
+		// value for one, so the direct path refuses it at the parse rather than
+		// comparing against a literal question mark.
+		l.pos++
+		return token{kind: tokParam, text: "?"}
 	case c == '\'':
 		return l.lexString()
 	case c == '"':
