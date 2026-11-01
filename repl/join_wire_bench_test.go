@@ -42,8 +42,11 @@ var benchReverseJoinArms = os.Getenv("BENCH_REVERSE_ARMS") != ""
 
 // joinBenchFixture holds one store and the two ways of reading it.
 type joinBenchFixture struct {
-	cat     *db.Catalog
-	exec    *Executor
+	cat  *db.Catalog
+	exec *Executor
+	// srvExec reaches the same store over a connection whose handshake advertises the
+	// server-side join, so the two differ only in where the pairing happens.
+	srvExec *Executor
 	cleanup func()
 }
 
@@ -51,6 +54,44 @@ type joinBenchFixture struct {
 // archive with two rows per cluster. Both are value-indexed on ClusterId, which is what
 // gives the key-batch membership constraint an index to probe rather than a predicate to
 // evaluate per record.
+// newSelectiveJoinFixture is newJoinBenchFixture with a SPARSE right side: only every
+// sparsity-th cluster has epoch rows, so the join filters instead of expanding and the output
+// is far smaller than either input.
+//
+// This is the shape the wire argument was actually about, and the one the expanding fixture
+// cannot test. Keeping them as separate fixtures rather than a parameter makes it visible at
+// the call site which regime a benchmark is in, since that is what decides the answer.
+func newSelectiveJoinFixture(b testing.TB, n, sparsity int) *joinBenchFixture {
+	b.Helper()
+	cat, err := db.OpenCatalog(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	cfg := func(zone []string) db.ArchiveConfig {
+		return db.ArchiveConfig{SegmentSize: 1 << 16, ValueAttrs: []string{"ClusterId"}, ZoneAttrs: zone}
+	}
+	hist, err := cat.CreateArchiveTable("history", cfg([]string{"CompletionDate"}))
+	if err != nil {
+		b.Fatal(err)
+	}
+	epoch, err := cat.CreateArchiveTable("epoch", cfg(nil))
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 1; i <= n; i++ {
+		if aerr := hist.Append(benchHistoryAd(i)); aerr != nil {
+			b.Fatal(aerr)
+		}
+		if i%sparsity != 0 {
+			continue
+		}
+		if aerr := epoch.Append(benchEpochAd(i, 0)); aerr != nil {
+			b.Fatal(aerr)
+		}
+	}
+	return serveJoinFixture(b, cat)
+}
+
 func newJoinBenchFixture(b testing.TB, n int) *joinBenchFixture {
 	b.Helper()
 	cat, err := db.OpenCatalog(b.TempDir())
@@ -81,14 +122,29 @@ func newJoinBenchFixture(b testing.TB, n int) *joinBenchFixture {
 		}
 	}
 
+	return serveJoinFixture(b, cat)
+}
+
+// serveJoinFixture puts a server in front of a catalog and returns the two executors that
+// differ only in whether the handshake advertises the join.
+func serveJoinFixture(b testing.TB, cat *db.Catalog) *joinBenchFixture {
+	b.Helper()
 	s := dbrpc.NewServerCatalog(cat)
-	cp, sp := net.Pipe()
-	go func() { _ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{Privileged: true}) }()
-	c := dbrpc.NewClient(dbrpc.NewStreamConn(cp))
+	dial := func(advertise bool) *dbrpc.Client {
+		cp, sp := net.Pipe()
+		go func() { _ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{Privileged: true}) }()
+		conn := dbrpc.NewStreamConn(cp)
+		if advertise {
+			return dbrpc.NewClient(conn, dbrpc.WithPeerSessionAttrs(s.SessionAttrs()))
+		}
+		return dbrpc.NewClient(conn)
+	}
+	c, sc := dial(false), dial(true)
 	return &joinBenchFixture{
 		cat:     cat,
 		exec:    NewExecutor(c, ExecConfig{}),
-		cleanup: func() { c.Close(); s.Close(); cat.Close() },
+		srvExec: NewExecutor(sc, ExecConfig{ServerSideJoin: true}),
+		cleanup: func() { c.Close(); sc.Close(); s.Close(); cat.Close() },
 	}
 }
 
@@ -464,6 +520,120 @@ func BenchmarkJoinKeyBatchByRightSize(b *testing.B) {
 			b.Run(fmt.Sprintf("right=%d/%s", 2*clusters, name), func(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					if _, err := runBenchJoinBatch(st, fix.fetchWhole, batching); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+		fix.cleanup()
+	}
+}
+
+// Does the join opcode actually collect the wire cost BenchmarkJoinWireCost measured?
+//
+// That benchmark priced the gap between joining over a connection and joining in-process:
+// a flat ~2.2x on a narrow projection and ~4.2x unprojected. The prediction was that moving
+// the pairing into the store collects it, because only the joined rows then cross. This runs
+// the SAME statement through two executors over the SAME store, differing only in whether the
+// handshake advertises the join -- so the difference is where the pairing happened and
+// nothing else.
+//
+// Both arms go through ExecString, not an internal helper: the question is what a query
+// costs, and the planning, rendering and ordering around the pairing are part of that.
+func BenchmarkJoinServerSide(b *testing.B) {
+	shapes := []struct{ name, sql string }{
+		{"narrow", `SELECT h.ClusterId, h.Owner, e.RunInstanceId, e.ExitCode FROM history h JOIN epoch e ON h.ClusterId == e.ClusterId`},
+		{"star", `SELECT * FROM history h JOIN epoch e ON h.ClusterId == e.ClusterId`},
+	}
+	for _, n := range []int{400, 2048, 8192} {
+		fix := newJoinBenchFixture(b, n)
+		for _, shape := range shapes {
+			arms := []struct {
+				name string
+				exec *Executor
+			}{
+				{"client-side", fix.exec},
+				{"in-store", fix.srvExec},
+			}
+			if benchReverseJoinArms {
+				arms[0], arms[1] = arms[1], arms[0]
+			}
+			// Agreement before timing: two arms that answer differently cannot be compared,
+			// and a join that quietly returned fewer rows would otherwise look like a fast one.
+			want := -1
+			for _, arm := range arms {
+				res, err := arm.exec.ExecString(shape.sql)
+				if err != nil {
+					b.Fatalf("n=%d %s/%s: %v", n, shape.name, arm.name, err)
+				}
+				if want == -1 {
+					want = len(res.Rows)
+				} else if len(res.Rows) != want {
+					b.Fatalf("n=%d %s: %s returned %d rows, the other %d",
+						n, shape.name, arm.name, len(res.Rows), want)
+				}
+			}
+			if want != 2*n {
+				b.Fatalf("n=%d %s: joined %d rows, expected %d", n, shape.name, want, 2*n)
+			}
+			for _, arm := range arms {
+				b.Run(fmt.Sprintf("n=%d/%s/%s", n, shape.name, arm.name), func(b *testing.B) {
+					for i := 0; i < b.N; i++ {
+						if _, err := arm.exec.ExecString(shape.sql); err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		}
+		fix.cleanup()
+	}
+}
+
+// Does a SELECTIVE join win, as BenchmarkJoinServerSide's negative result left open?
+//
+// That benchmark measured an EXPANDING join -- two right rows per left row -- where the
+// composite output repeats the left ad per output row and the store moved more data than the
+// client did. The reasoning it was built on applies to the other regime: a join whose output
+// is far smaller than its inputs. Here only every fiftieth cluster has an epoch row, so the
+// store streams n/50 joined rows where the client must fetch all n of one side and all n/50
+// of the other before pairing anything.
+//
+// Asserting that without measuring it would be the same mistake twice.
+func BenchmarkJoinServerSideSelective(b *testing.B) {
+	const sparsity = 50
+	const sql = `SELECT h.ClusterId, h.Owner, e.ExitCode FROM history h JOIN epoch e ON h.ClusterId == e.ClusterId`
+	for _, n := range []int{2048, 8192} {
+		fix := newSelectiveJoinFixture(b, n, sparsity)
+		arms := []struct {
+			name string
+			exec *Executor
+		}{
+			{"client-side", fix.exec},
+			{"in-store", fix.srvExec},
+		}
+		if benchReverseJoinArms {
+			arms[0], arms[1] = arms[1], arms[0]
+		}
+		want := -1
+		for _, arm := range arms {
+			res, err := arm.exec.ExecString(sql)
+			if err != nil {
+				b.Fatalf("n=%d/%s: %v", n, arm.name, err)
+			}
+			if want == -1 {
+				want = len(res.Rows)
+			} else if len(res.Rows) != want {
+				b.Fatalf("n=%d: %s returned %d rows, the other %d", n, arm.name, len(res.Rows), want)
+			}
+		}
+		if want != n/sparsity {
+			b.Fatalf("n=%d: joined %d rows, expected %d; the fixture is not selective", n, want, n/sparsity)
+		}
+		for _, arm := range arms {
+			b.Run(fmt.Sprintf("n=%d/rows=%d/%s", n, want, arm.name), func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					if _, err := arm.exec.ExecString(sql); err != nil {
 						b.Fatal(err)
 					}
 				}

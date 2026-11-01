@@ -62,6 +62,22 @@ type ExecConfig struct {
 	// named source's rows from the hub's mutable tables. When nil, `.retire` falls back to
 	// SyncControl, and reports it is unavailable when both are nil.
 	Retire func(schedd string) error
+
+	// ServerSideJoin asks the store to pair a join's rows, when it advertises that it can.
+	//
+	// OFF BY DEFAULT, because measured it is not yet a win. A joined row carries both sides,
+	// so a join that EXPANDS -- each left row matching several right rows -- repeats the left
+	// ad once per output row and the result is larger than the two inputs were. Against two
+	// tables with two right rows per left row the store's join moved 1.33x more data on a
+	// narrow projection and ran 1.4x slower end to end; the client's own join ships each side
+	// exactly once.
+	//
+	// The reasoning it was built on holds only for a SELECTIVE join, where fewer rows come out
+	// than went in. Deciding between them needs an estimate of that ratio, which is the
+	// cost-based planning this does not have yet -- so the choice is a flag until something
+	// can make it, and the flag exists so the path can be exercised and measured rather than
+	// sitting unused.
+	ServerSideJoin bool
 }
 
 // WriteKind identifies a mutation in a write batch.
@@ -93,6 +109,8 @@ type Executor struct {
 	resync     func(target string) error
 	syncCtl    func(action, target string, args []string) (string, error)
 	retire     func(schedd string) error
+	// serverJoin opts into asking the store to pair a join (see ExecConfig.ServerSideJoin).
+	serverJoin bool
 
 	// dialect selects how a predicate's expressions are read: as ClassAd expressions (the
 	// default and the historical behaviour) or lowered from ANSI SQL as the Flight SQL
@@ -197,7 +215,7 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin}
 }
 
 // SyncControl sends one DBSyncControl request to the daemon (see ExecConfig.SyncControl).

@@ -38,6 +38,7 @@ package repl
 // the && spine only and treats a || node as one opaque conjunct, never looking inside it.
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -47,6 +48,8 @@ import (
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/dbrpc"
 )
 
 // Join guard rails. A join can generate quadratic work from a short query, so the limits
@@ -104,6 +107,19 @@ type joinPlan struct {
 	// batchAttr is the right side's bare attribute in a single equi pair, if there is one;
 	// it is what key batching builds a membership constraint on.
 	batchAttr string
+
+	// The same predicates as text, for a server-side join: the wire carries ClassAd
+	// expressions, not compiled ones. They are the text the compiled forms were BUILT from
+	// (mustCompile parses e.String()), so they cannot disagree with them -- sending them is
+	// exactly as safe as the local evaluation already is.
+	condSrc, postSrc []string
+	equiSrc          []equiText
+}
+
+// equiText is one equality pair as text, each half already stripped of its alias so it reads
+// against its own side's ad.
+type equiText struct {
+	left, right string
 }
 
 // equiPair is one `<left expr> == <right expr>` conjunct, each half stripped of its alias
@@ -152,6 +168,7 @@ func planJoin(st *Statement) (*joinPlan, error) {
 		case sideLeft:
 			if p.kind == JoinLeft {
 				p.cond = append(p.cond, mustCompile(c))
+				p.condSrc = append(p.condSrc, c.String())
 				continue
 			}
 			p.left.where = andText(p.left.where, stripSide(c, aliases, 0))
@@ -159,6 +176,7 @@ func planJoin(st *Statement) (*joinPlan, error) {
 			p.right.where = andText(p.right.where, stripSide(c, aliases, 1))
 		default:
 			p.cond = append(p.cond, mustCompile(c))
+			p.condSrc = append(p.condSrc, c.String())
 		}
 	}
 
@@ -176,11 +194,13 @@ func planJoin(st *Statement) (*joinPlan, error) {
 		case sideRight:
 			if p.kind == JoinLeft {
 				p.post = append(p.post, mustCompile(c))
+				p.postSrc = append(p.postSrc, c.String())
 				continue
 			}
 			p.right.where = andText(p.right.where, stripSide(c, aliases, 1))
 		default:
 			p.post = append(p.post, mustCompile(c))
+			p.postSrc = append(p.postSrc, c.String())
 		}
 	}
 
@@ -212,12 +232,14 @@ func (p *joinPlan) extractEqui(on string, aliases map[string]int) {
 		default:
 			continue
 		}
-		le, lerr := classad.ParseExpr(stripSide(leftHalf, aliases, 0))
-		re, rerr := classad.ParseExpr(stripSide(rightHalf, aliases, 1))
+		lsrc, rsrc := stripSide(leftHalf, aliases, 0), stripSide(rightHalf, aliases, 1)
+		le, lerr := classad.ParseExpr(lsrc)
+		re, rerr := classad.ParseExpr(rsrc)
 		if lerr != nil || rerr != nil {
 			continue
 		}
 		p.equi = append(p.equi, equiPair{left: le, right: re})
+		p.equiSrc = append(p.equiSrc, equiText{left: lsrc, right: rsrc})
 		// Key batching needs a bare attribute on the right so the membership constraint
 		// can name it. Anything computed is still hashable, just not batchable.
 		if p.batchAttr == "" {
@@ -719,6 +741,17 @@ func (e *Executor) execJoin(st *Statement) (*Result, error) {
 		return nil, err
 	}
 
+	// Ask the store to join, when it can. Only the joined rows then cross the wire, where
+	// joining here ships both sides whole first -- a flat ~2.2x on a narrow projection and
+	// ~4.2x unprojected, before any network. The server also holds one side where this
+	// holds both. Everything after the pairing is unchanged: the rows that come back are
+	// the same composite ads p.join would have built.
+	if rows, ok, serr := e.joinServerSide(st, p); serr != nil {
+		return nil, serr
+	} else if ok {
+		return e.finishJoin(st, p, rows)
+	}
+
 	leftAds, err := e.fetchJoinSide(st, p.left, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", p.left.ref.Table, err)
@@ -741,6 +774,14 @@ func (e *Executor) execJoin(st *Statement) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	return e.finishJoin(st, p, rows)
+}
+
+// finishJoin is everything after the pairing: grouping, DISTINCT, ordering, the limit and
+// rendering. It is shared by both ways of producing the rows, because the rows are the same
+// composite ads either way -- which is what makes the server-side join a change of where the
+// pairing happens and not a second implementation of the statement.
+func (e *Executor) finishJoin(st *Statement, p *joinPlan, rows []*classad.ClassAd) (*Result, error) {
 	// Aggregation happens over the joined rows, which only exist here -- the server's
 	// aggregate is single-table and has no notion of a composite row. So a grouped join is
 	// reduced client-side, and EXPLAIN says so.
@@ -1284,8 +1325,33 @@ func (e *Executor) describeJoinPlan(st *Statement) []string {
 			"(%d group term(s), %d aggregate(s)); the server aggregate is single-table",
 			len(st.GroupBy), len(aggCallOrder(st))))
 	}
-	out = append(out, "  executed client-side: no join opcode is sent, so this runs against any server")
+	if e.serverJoinEligible(st, p) && e.c.SupportsNewer(dbrpc.FeatJoin) {
+		out = append(out, "  executed in the store: only the joined rows cross the wire, and one "+
+			"side is held rather than both")
+	} else {
+		out = append(out, "  executed client-side: "+whyNotServerSide(e, st, p))
+	}
 	return out
+}
+
+// whyNotServerSide says which reason a join is being paired here, because "client-side" on
+// its own leaves a reader unable to tell a server that cannot join from a statement that
+// cannot be sent -- and those have different answers.
+func whyNotServerSide(e *Executor, st *Statement, p *joinPlan) string {
+	switch {
+	case st.AsOf != "":
+		return "AS OF reads both sides at one instant, which the join opcode cannot ask for"
+	case e.txReads(p.left.ref.Table) || e.txReads(p.right.ref.Table):
+		return "a read inside a transaction must see that transaction's own writes, and the " +
+			"store joins committed state"
+	case !e.serverJoin:
+		return "the server-side join is not enabled; measured, it moves more data than this " +
+			"does whenever the join expands rather than filters"
+	case !e.c.SupportsNewer(dbrpc.FeatJoin):
+		return "this server does not advertise a server-side join, so no join opcode is sent"
+	default:
+		return "the plan could not be expressed for the store"
+	}
 }
 
 // resolveJoinOrderAliases rewrites each ORDER BY term that is a bare name matching a
@@ -1439,4 +1505,89 @@ func joinExprRefs(src string) []string {
 		return true
 	})
 	return out
+}
+
+// joinServerSide asks the store to do the pairing, returning the joined rows.
+//
+// ok is false when the join has to happen here instead, which is not a failure: an older
+// server, a server holding one database rather than a catalog, or a statement whose shape
+// the opcode does not carry. The client-side path is then taken exactly as before.
+//
+// The plan is already made. What crosses is that plan -- each side's pushed-down constraint
+// and projection, the residual condition and filter as ClassAd expression text, and the
+// equality halves that drive the hash -- so the server executes a decision this package
+// made rather than making its own.
+func (e *Executor) joinServerSide(st *Statement, p *joinPlan) ([]*classad.ClassAd, bool, error) {
+	if !e.serverJoinEligible(st, p) {
+		return nil, false, nil
+	}
+	req := dbrpc.JoinRequest{Spec: db.JoinSpec{
+		Kind:  serverJoinKind(p.kind),
+		Left:  db.JoinSide{Table: p.left.ref.Table, Alias: p.left.ref.Alias, Constraint: p.left.where, Project: p.left.project},
+		Right: db.JoinSide{Table: p.right.ref.Table, Alias: p.right.ref.Alias, Constraint: p.right.where, Project: p.right.project},
+		Cond:  p.condSrc,
+		Post:  p.postSrc,
+	}}
+	for _, eq := range p.equiSrc {
+		req.Spec.Equi = append(req.Spec.Equi, db.JoinEqui{Left: eq.left, Right: eq.right})
+	}
+	// The LIMIT only pushes down when nothing here reorders or removes rows afterwards.
+	// Sorting, DISTINCT and grouping all decide WHICH rows the limit keeps, so a limit
+	// applied before them would keep the wrong ones.
+	if st.Limit > 0 && len(st.OrderBy) == 0 && !st.Distinct && !hasAggregate(st) && len(st.GroupBy) == 0 {
+		req.Spec.Limit = st.Limit
+	}
+
+	var rows []*classad.ClassAd
+	err := e.c.Join(e.opCtx(), req, func(row string) bool {
+		ad, perr := classad.Parse(row)
+		if perr != nil {
+			return false
+		}
+		rows = append(rows, ad)
+		return true
+	})
+	if errors.Is(err, dbrpc.ErrJoinUnsupported) {
+		return nil, false, nil // join it here, as before
+	}
+	if err != nil {
+		// Including a limit the store met part way through, which arrives after the rows:
+		// a partial join must not be rendered as a complete one.
+		return nil, false, err
+	}
+	return rows, true, nil
+}
+
+// serverJoinEligible reports whether this statement's join can run in the store.
+//
+// Each refusal is a shape the opcode does not carry, not a performance judgement. A
+// point-in-time join would have to read both sides at one instant, which the op has no way
+// to ask for. A read inside a transaction must see that transaction's own uncommitted
+// writes, and the store joins committed state. And a plan whose predicates did not survive
+// being rendered to text cannot be sent at all.
+func (e *Executor) serverJoinEligible(st *Statement, p *joinPlan) bool {
+	if !e.serverJoin {
+		return false
+	}
+	if st.AsOf != "" {
+		return false
+	}
+	if e.txReads(p.left.ref.Table) || e.txReads(p.right.ref.Table) {
+		return false
+	}
+	if len(p.cond) != len(p.condSrc) || len(p.post) != len(p.postSrc) || len(p.equi) != len(p.equiSrc) {
+		return false
+	}
+	return true
+}
+
+func serverJoinKind(k JoinKind) db.JoinKind {
+	switch k {
+	case JoinLeft:
+		return db.JoinLeft
+	case JoinCross:
+		return db.JoinCross
+	default:
+		return db.JoinInner
+	}
 }
