@@ -635,17 +635,26 @@ A pathological read now runs in the daemon's address space. This is not hypothet
 `COUNT` shape panicked htcondordb in production for a 15-second outage. A gateway would have
 contained that. In process, containment has to be built:
 
-- **A panic barrier per RPC.** A deferred `recover()` *in the handler goroutine itself* — a
-  helper that wraps `recover()` in another function catches nothing, which is a mistake already
-  made once in this codebase. One query must not take the store down.
-- **A bounded Arrow allocator per stream.** `memory.DefaultAllocator` is unbounded; a wide
-  batch over a wide table can balloon. Budget each stream and fail *that RPC* when it is
-  exceeded, rather than letting the process meet the OOM killer.
-- **A concurrency cap on streams**, so a burst of clients cannot starve the store's own
-  goroutines and maintenance.
-- **Cancellation that actually reaches the scan.** gRPC gives the handler a context; it has to
-  be the context the scan takes, so a client hanging up stops the work rather than leaving it
-  running to completion for nobody.
+- **A panic barrier per RPC.** DONE. A deferred `recover()` *in the handler goroutine itself* —
+  a helper that wraps `recover()` in another function catches nothing, which is a mistake
+  already made once in this codebase. One query must not take the store down. **Still
+  untested**: removing it passes the suite, because nothing in the fixtures panics and inducing
+  one would mean an injection point in production code. Correct by inspection is not the same
+  as covered.
+- **A bounded Arrow allocator per stream.** DONE (`arrowtype.Budget`). One wrinkle worth
+  recording: `memory.Allocator` is `Allocate(size int) []byte` with no error return, and a nil
+  slice makes a builder write into nothing. **Panicking is the only refusal the interface
+  permits**, so the budget panics with a typed error and the handler's barrier turns it into a
+  failed request. A budget refusal reports `ResourceExhausted` with the numbers in it, kept
+  distinct from an internal fault, because the client's recourse is a narrower query rather
+  than a bug report.
+- **A concurrency cap on streams.** DONE. It **refuses rather than queues**: a queue of scans
+  inside the daemon is the thing the cap exists to prevent, and a refused client can retry
+  while one left hanging cannot tell whether to.
+- **Cancellation that actually reaches the scan.** The handler's context is the one the scan
+  takes, so a client hanging up stops the work. **Not independently tested** -- the flush select
+  honours `ctx.Done()`, but nothing proves a disconnect mid-stream actually stops the scan
+  rather than running it to completion for nobody.
 - **Watch retained allocators.** Arrow batches are large allocations in the same heap as the
   block cache and the mmap'd segments; a retained encoder pool here is the shape that already
   produced a 3 GB heap once.
@@ -926,6 +935,13 @@ Flight SQL additionally wants the catalog metadata commands (`CommandGetTables`,
 **Non-goals:** writes (Airport's `DoExchange`) — a second write path with its own transaction
 semantics for much less value than reads; scalar/table UDFs; `ALTER TABLE`; rung 1 as a
 destination.
+
+**Implemented so far.** The measurement (`collections.AttrTypeProfiles`, dbrpc op 68), the type
+decision and encoder (`arrowtype`), an Arrow IPC export (`arrowstream`, `htcondordb-cli
+arrow`), and a Flight SQL endpoint served in process (`flightsvc`) accepting
+`SELECT * FROM <table>` and refusing the rest. Verified against a non-Go consumer: 2000 real
+ap2001 history ads read back by pyarrow as 226 typed columns, with arithmetic over the columns
+the stray-expression bug would have made text.
 
 **Risks.** DuckDB's filter JSON is unversioned by policy (§7) — only if rung 3 is ever built.
 Catalog serialization cost for wide tables — measure a real jobs table early; §5.6 and SHA256
