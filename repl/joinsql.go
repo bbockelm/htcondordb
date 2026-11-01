@@ -269,8 +269,9 @@ func (p *parser) rejectSetOps() error {
 	return nil
 }
 
-// validateJoinTables checks the shape of the FROM clause once it is fully parsed: aliases
-// must be distinct, and v1 joins exactly two tables.
+// validateJoinTables checks the shape of the FROM clause once it is fully parsed. The only
+// rule here is that aliases are distinct; how many tables may be joined is a planner limit
+// (maxJoinTables), checked where the plan is built.
 func validateJoinTables(st *Statement) error {
 	refs := st.tableRefs()
 	seen := map[string]string{}
@@ -284,10 +285,6 @@ func validateJoinTables(st *Statement) error {
 				r.Alias, prev, r.Table, prev, r.Table)
 		}
 		seen[k] = r.Table
-	}
-	if len(st.Joins) > 1 {
-		return fmt.Errorf("joining %d tables is not supported yet; a statement joins at most two",
-			len(refs))
 	}
 	return nil
 }

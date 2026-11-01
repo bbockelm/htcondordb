@@ -40,6 +40,7 @@ package repl
 import (
 	"errors"
 	"fmt"
+	"math/bits"
 	"reflect"
 	"sort"
 	"strconv"
@@ -64,7 +65,15 @@ const (
 	maxJoinKeyBatch = 512
 	// maxJoinOutputRows caps the rows a join may produce. The result is materialized here
 	// to be sorted and rendered, so an unbounded one is an out-of-memory, not a slow query.
+	// It bounds every INTERMEDIATE result too, not only the last one: a chain of joins can
+	// blow up in the middle and come back down, and the row that exhausts memory does not
+	// care which step built it.
 	maxJoinOutputRows = 1_000_000
+	// maxJoinTables caps how many tables one statement may join. The join order is the
+	// order they were written -- there is no cost-based planner to choose another -- so
+	// past a handful of tables the difference between a fast plan and a cross product is
+	// the author's word order, and refusing says that better than a slow query does.
+	maxJoinTables = 8
 )
 
 // maxJoinPairs caps how many candidate PAIRS the join may examine. The per-side cap does
@@ -83,65 +92,103 @@ type joinSide struct {
 	project []string // attributes to fetch, or nil for whole ads
 }
 
-// joinPlan is a planned two-table join.
+// joinPlan is a planned join over two or more tables.
+//
+// The shape is LEFT-DEEP: sides[0] is the FROM table, and each step folds one more table
+// into the row built so far. `a JOIN b ON .. JOIN c ON ..` is planned as (a x b) x c, which
+// is the only shape SQL's syntax can express without parentheses, and it is what makes the
+// composite-ad model carry n tables for free -- a row simply gains a member per step, and
+// every predicate stays an ordinary ClassAd expression over one ad.
 type joinPlan struct {
-	kind  JoinKind
-	left  joinSide
-	right joinSide
+	// sides are the tables, in FROM-then-JOIN order. sides[0] is read first; every other
+	// side is brought in by the step of the same index.
+	sides []joinSide
 
-	// cond are the ON conjuncts that could not be pushed to one side -- the join condition
-	// proper -- compiled over the composite ad. A pair matches when every one is true.
-	cond []*classad.Expr
+	// steps are the JOIN clauses, in source order; steps[i] brings in sides[i+1]. A
+	// two-table join has exactly one.
+	steps []joinStep
 
 	// post are the WHERE conjuncts that could not be pushed down, compiled over the
-	// composite ad and applied after the pair is formed (and, for a LEFT JOIN, after an
-	// unmatched left row has been null-extended).
-	post []*classad.Expr
+	// composite ad and applied after the last step (and so after any null-extension).
+	post    []*classad.Expr
+	postSrc []string
+}
 
-	// equi are equality conjuncts of cond whose two halves each read only one side. They
-	// drive the hash build/probe. They NARROW candidates only: every surviving pair is
-	// still checked against cond in full, so the hash never has to reproduce ClassAd's
-	// equality semantics exactly.
+// joinStep is one JOIN clause, planned: the table it folds in, and the predicates that
+// decide the pairing at that point in the pipeline.
+type joinStep struct {
+	kind JoinKind
+	side int // index into sides of the table this step folds in
+
+	// cond are this step's ON conjuncts that could not be pushed to one side -- the join
+	// condition proper -- compiled over the composite ad as it stands at this step. A pair
+	// matches when every one is true.
+	cond []*classad.Expr
+
+	// equi are equality conjuncts of cond with the accumulated row on one side and this
+	// step's table on the other. They drive the hash build/probe, and they NARROW
+	// candidates only: every surviving pair is still checked against cond in full, so the
+	// hash never has to reproduce ClassAd's equality semantics exactly.
 	equi []equiPair
 
-	// batchAttr is the right side's bare attribute in a single equi pair, if there is one;
-	// it is what key batching builds a membership constraint on.
+	// batchAttr is this side's bare attribute in a single equi pair, if there is one; it
+	// is what key batching builds a membership constraint on.
 	batchAttr string
 
 	// The same predicates as text, for a server-side join: the wire carries ClassAd
 	// expressions, not compiled ones. They are the text the compiled forms were BUILT from
 	// (mustCompile parses e.String()), so they cannot disagree with them -- sending them is
 	// exactly as safe as the local evaluation already is.
-	condSrc, postSrc []string
-	equiSrc          []equiText
+	condSrc []string
+	equiSrc []equiText
 }
 
-// equiText is one equality pair as text, each half already stripped of its alias so it reads
-// against its own side's ad.
+// equiText is one equality pair as text, in the forms the wire needs.
 type equiText struct {
-	left, right string
+	// acc reads the composite row with its aliases intact, exactly as the compiled acc
+	// half does.
+	acc string
+	// side is this step's half, stripped of its alias so it reads against its own ad.
+	side string
+	// accStripped is acc with its alias stripped. That is only possible, and only
+	// meaningful, when the acc half reads the FIRST table alone: the server-side join
+	// evaluates its left half against that table's ad directly, so it needs this form and
+	// not acc. It is "" otherwise, which is also how serverJoinEligible learns the pair
+	// cannot be sent.
+	accStripped string
 }
 
-// equiPair is one `<left expr> == <right expr>` conjunct, each half stripped of its alias
-// so it evaluates against that side's own ad.
+// equiPair is one `<accumulated row> == <this step's table>` equality.
+//
+// The two halves evaluate in DIFFERENT SCOPES, which is the one asymmetry a reader has to
+// hold on to. acc is evaluated against the accumulated composite row, so it is NOT
+// alias-stripped: `a.ClusterId` has to read the composite's `a` member, and at the third
+// step it might read `a` or `b` or both. side is evaluated against the new table's own ad,
+// so it is stripped down to a bare attribute path.
 type equiPair struct {
-	left, right *classad.Expr
+	acc, side *classad.Expr
 }
+
+// twoTable reports whether this is the two-table shape every path handled before n-way
+// joins existed.
+func (p *joinPlan) twoTable() bool { return len(p.sides) == 2 }
 
 // --- planning ---
 
 // planJoin resolves the statement's aliases, splits its predicates, and compiles what is
 // left into a plan.
 func planJoin(st *Statement) (*joinPlan, error) {
-	if len(st.Joins) != 1 {
-		return nil, fmt.Errorf("a join reads exactly two tables")
+	if len(st.Joins) == 0 {
+		return nil, fmt.Errorf("a join reads at least two tables")
 	}
-	jc := st.Joins[0]
-	left := TableRef{Table: st.From[0].Table, Alias: st.From[0].Alias}
-	right := TableRef{Table: jc.Table, Alias: jc.Alias}
-	aliases := map[string]int{
-		strings.ToLower(left.Alias):  0,
-		strings.ToLower(right.Alias): 1,
+	refs := st.tableRefs()
+	if len(refs) > maxJoinTables {
+		return nil, fmt.Errorf("joining %d tables is not supported; the limit is %d",
+			len(refs), maxJoinTables)
+	}
+	aliases := make(map[string]int, len(refs))
+	for i, r := range refs {
+		aliases[strings.ToLower(r.Alias)] = i
 	}
 
 	// ORDER BY may name a projected alias rather than an attribute -- `SELECT j.Cpus * 2 AS
@@ -149,116 +196,212 @@ func planJoin(st *Statement) (*joinPlan, error) {
 	// validation, which would otherwise read the alias as an unqualified attribute.
 	resolveJoinOrderAliases(st)
 
-	if err := validateJoinClauses(st, aliases, left, right); err != nil {
+	if err := validateJoinClauses(st, aliases, refs); err != nil {
 		return nil, err
 	}
 
-	p := &joinPlan{kind: jc.Kind, left: joinSide{ref: left}, right: joinSide{ref: right}}
-
-	// ON. For an INNER (or CROSS) join a single-side conjunct is a filter on that side and
-	// pushes down. For a LEFT JOIN only the RIGHT side's conjuncts push: a left row that
-	// fails the condition still appears, null-extended, so filtering the left scan with a
-	// condition conjunct would drop rows the join must emit.
-	onParts, err := conjunctsOf(jc.On)
-	if err != nil {
-		return nil, fmt.Errorf("JOIN ON: %w", err)
+	p := &joinPlan{sides: make([]joinSide, len(refs))}
+	for i, r := range refs {
+		p.sides[i] = joinSide{ref: r}
 	}
-	for _, c := range onParts {
-		switch sidesOf(c, aliases) {
-		case sideLeft:
-			if p.kind == JoinLeft {
-				p.cond = append(p.cond, mustCompile(c))
-				p.condSrc = append(p.condSrc, c.String())
-				continue
-			}
-			p.left.where = andText(p.left.where, stripSide(c, aliases, 0))
-		case sideRight:
-			p.right.where = andText(p.right.where, stripSide(c, aliases, 1))
-		default:
-			p.cond = append(p.cond, mustCompile(c))
-			p.condSrc = append(p.condSrc, c.String())
+	for i, jc := range st.Joins {
+		p.steps = append(p.steps, joinStep{kind: jc.Kind, side: i + 1})
+	}
+
+	for i := range p.steps {
+		if err := p.planStep(i, st.Joins[i].On, aliases); err != nil {
+			return nil, err
 		}
 	}
-
-	// WHERE. The mirror image: a WHERE conjunct on the PRESERVED (left) side of a LEFT JOIN
-	// pushes down, while one on the right side must wait until after null-extension -- there
-	// it correctly turns the outer join into an inner one only if that is what was written.
-	whereParts, err := conjunctsOf(st.Where)
-	if err != nil {
-		return nil, fmt.Errorf("WHERE: %w", err)
+	if err := p.planWhere(st.Where, aliases); err != nil {
+		return nil, err
 	}
-	for _, c := range whereParts {
-		switch sidesOf(c, aliases) {
-		case sideLeft:
-			p.left.where = andText(p.left.where, stripSide(c, aliases, 0))
-		case sideRight:
-			if p.kind == JoinLeft {
-				p.post = append(p.post, mustCompile(c))
-				p.postSrc = append(p.postSrc, c.String())
-				continue
-			}
-			p.right.where = andText(p.right.where, stripSide(c, aliases, 1))
-		default:
-			p.post = append(p.post, mustCompile(c))
-			p.postSrc = append(p.postSrc, c.String())
-		}
-	}
-
-	p.extractEqui(jc.On, aliases)
-	p.left.project, p.right.project = joinProjection(st, aliases)
+	p.planProjection(st, aliases)
 	return p, nil
 }
 
-// extractEqui finds the ON conjuncts of the form `<left-only> == <right-only>` and compiles
-// each half against its own side. Used to hash rather than to decide: a pair the hash brings
-// together is still checked against the whole condition.
-func (p *joinPlan) extractEqui(on string, aliases map[string]int) {
+// planStep splits one step's ON clause: what can filter a single table's scan, and what has
+// to decide the pairing.
+//
+// The pushdown rule from the two-table case generalizes along the chain. A conjunct reading
+// only the table this step folds in is a filter on it, for an INNER and for a LEFT join
+// alike -- both push to the INNER side. A conjunct reading only a table already in the row
+// is a filter on the PRESERVED side, which a LEFT join must not apply: a row failing this
+// step's condition still appears, null-extended, so filtering that table's scan would drop
+// rows the join must emit. Anything reading more than one table decides the pairing here.
+//
+// A forward reference -- this step's ON naming a table a later step folds in -- is refused
+// rather than quietly deferred. SQL does not allow it, and a reader who writes it means
+// something this would not do.
+func (p *joinPlan) planStep(i int, on string, aliases map[string]int) error {
+	st := &p.steps[i]
+	parts, err := conjunctsOf(on)
+	if err != nil {
+		return fmt.Errorf("%s %s ON: %w", st.kind, p.sides[st.side].ref.Alias, err)
+	}
+	for _, c := range parts {
+		mask := sidesOf(c, aliases)
+		if ahead := mask &^ visibleAt(st.side); ahead != 0 {
+			return fmt.Errorf("%s %s ON reads %s, which is joined later; an ON clause may "+
+				"only refer to the tables above it", st.kind, p.sides[st.side].ref.Alias,
+				p.aliasesIn(ahead))
+		}
+		switch one, single := soleSide(mask); {
+		case !single:
+			st.cond = append(st.cond, mustCompile(c))
+			st.condSrc = append(st.condSrc, c.String())
+		case one == st.side:
+			p.pushTo(one, c, aliases)
+		case st.kind == JoinLeft:
+			// Preserved side under an outer join: must wait for the pairing.
+			st.cond = append(st.cond, mustCompile(c))
+			st.condSrc = append(st.condSrc, c.String())
+		default:
+			p.pushTo(one, c, aliases)
+		}
+	}
+	st.extractEqui(p, on, aliases)
+	return nil
+}
+
+// planWhere splits the WHERE clause. It is the mirror image of planStep: a conjunct on a
+// table that some step null-extends must wait until after that step, where it correctly
+// turns the outer join into an inner one only if that is what was written. Every other
+// single-table conjunct filters that table's scan.
+//
+// A table is null-extendable exactly when its own step is a LEFT join -- in a left-deep
+// chain every earlier table is on the preserved side of every later step, so being
+// preserved once is being preserved throughout.
+func (p *joinPlan) planWhere(where string, aliases map[string]int) error {
+	parts, err := conjunctsOf(where)
+	if err != nil {
+		return fmt.Errorf("WHERE: %w", err)
+	}
+	for _, c := range parts {
+		one, single := soleSide(sidesOf(c, aliases))
+		if single && !p.nullExtendable(one) {
+			p.pushTo(one, c, aliases)
+			continue
+		}
+		p.post = append(p.post, mustCompile(c))
+		p.postSrc = append(p.postSrc, c.String())
+	}
+	return nil
+}
+
+// pushTo folds a single-table conjunct into that table's scan constraint. A conjunct that
+// does not survive being stripped of its alias is left for the pairing instead -- declining
+// costs a pushdown, never an answer.
+func (p *joinPlan) pushTo(side int, c ast.Expr, aliases map[string]int) {
+	src := stripSide(c, aliases, side)
+	if src == "" {
+		p.post = append(p.post, mustCompile(c))
+		p.postSrc = append(p.postSrc, c.String())
+		return
+	}
+	p.sides[side].where = andText(p.sides[side].where, src)
+}
+
+// nullExtendable reports whether a row can reach the output with no member for this side,
+// which is true exactly when the step that folds it in is a LEFT join. sides[0] is never
+// null-extendable: it is the preserved side of every step.
+func (p *joinPlan) nullExtendable(side int) bool {
+	for i := range p.steps {
+		if p.steps[i].side == side {
+			return p.steps[i].kind == JoinLeft
+		}
+	}
+	return false
+}
+
+// aliasesIn names the tables a side mask covers, for an error message.
+func (p *joinPlan) aliasesIn(mask int) string {
+	var names []string
+	for i := range p.sides {
+		if mask&sideBit(i) != 0 {
+			names = append(names, p.sides[i].ref.Alias)
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+// extractEqui finds this step's ON conjuncts of the form
+// `<already-joined> == <this step's table>` and compiles each half in the scope it will be
+// evaluated in. Used to hash rather than to decide: a pair the hash brings together is
+// still checked against the whole condition.
+func (st *joinStep) extractEqui(p *joinPlan, on string, aliases map[string]int) {
 	parts, err := conjunctsOf(on)
 	if err != nil {
 		return
 	}
+	mine := sideBit(st.side)
 	for _, c := range parts {
 		bo, ok := unwrapParens(c).(*ast.BinaryOp)
 		if !ok || bo.Op != "==" {
 			continue
 		}
 		l, r := sidesOf(bo.Left, aliases), sidesOf(bo.Right, aliases)
-		var leftHalf, rightHalf ast.Expr
+		var accHalf, sideHalf ast.Expr
+		// One half must read this step's table and nothing else; the other must read only
+		// tables already in the row, and at least one of them -- a half reading no table is
+		// a constant, which is a filter and not a join key.
 		switch {
-		case l == sideLeft && r == sideRight:
-			leftHalf, rightHalf = bo.Left, bo.Right
-		case l == sideRight && r == sideLeft:
-			leftHalf, rightHalf = bo.Right, bo.Left
+		case r == mine && l != 0 && l&mine == 0:
+			accHalf, sideHalf = bo.Left, bo.Right
+		case l == mine && r != 0 && r&mine == 0:
+			accHalf, sideHalf = bo.Right, bo.Left
 		default:
 			continue
 		}
-		lsrc, rsrc := stripSide(leftHalf, aliases, 0), stripSide(rightHalf, aliases, 1)
-		le, lerr := classad.ParseExpr(lsrc)
-		re, rerr := classad.ParseExpr(rsrc)
-		if lerr != nil || rerr != nil {
+		// The accumulated half keeps its aliases: it reads the composite row, where
+		// `a.ClusterId` is a select over the `a` member. Only this side's half is stripped,
+		// because it reads its own table's ad directly.
+		accSrc := accHalf.String()
+		sideSrc := stripSide(sideHalf, aliases, st.side)
+		if sideSrc == "" {
 			continue
 		}
-		p.equi = append(p.equi, equiPair{left: le, right: re})
-		p.equiSrc = append(p.equiSrc, equiText{left: lsrc, right: rsrc})
-		// Key batching needs a bare attribute on the right so the membership constraint
+		ae, aerr := classad.ParseExpr(accSrc)
+		se, serr := classad.ParseExpr(sideSrc)
+		if aerr != nil || serr != nil {
+			continue
+		}
+		// The server-side join needs the acc half against the first table's own ad, which
+		// only exists as text when that is the only table it reads.
+		accStripped := ""
+		if sidesOf(accHalf, aliases) == sideBit(0) {
+			accStripped = stripSide(accHalf, aliases, 0)
+		}
+		st.equi = append(st.equi, equiPair{acc: ae, side: se})
+		st.equiSrc = append(st.equiSrc, equiText{acc: accSrc, side: sideSrc, accStripped: accStripped})
+		// Key batching needs a bare attribute on this side so the membership constraint
 		// can name it. Anything computed is still hashable, just not batchable.
-		if p.batchAttr == "" {
-			if ar, ok := unwrapParens(rightHalf).(*ast.SelectExpr); ok {
-				if base, attr, ok := qualifiedRef(ar, aliases); ok && base == 1 {
-					p.batchAttr = attr
+		if st.batchAttr == "" {
+			if ar, ok := unwrapParens(sideHalf).(*ast.SelectExpr); ok {
+				if base, attr, ok := qualifiedRef(ar, aliases); ok && base == st.side {
+					st.batchAttr = attr
 				}
 			}
 		}
 	}
 }
 
-// joinProjection returns the attributes each side must fetch, or nil for that side when the
-// statement reads attributes this cannot enumerate (a `*`, or an expression that does not
-// parse) and the whole ad is needed.
-func joinProjection(st *Statement, aliases map[string]int) (left, right []string) {
-	seen := [2]map[string]bool{{}, {}}
-	out := [2][]string{}
-	whole := [2]bool{}
+// planProjection records, for each side, the attributes the statement actually reads from
+// it -- or nil for that side when the statement reads attributes this cannot enumerate (a
+// `*`, or an expression that does not parse) and the whole ad is needed.
+func (p *joinPlan) planProjection(st *Statement, aliases map[string]int) {
+	n := len(p.sides)
+	seen := make([]map[string]bool, n)
+	out := make([][]string, n)
+	whole := make([]bool, n)
+	for i := range seen {
+		seen[i] = map[string]bool{}
+	}
+	allWhole := func() {
+		for i := range whole {
+			whole[i] = true
+		}
+	}
 	add := func(side int, attr string) {
 		k := strings.ToLower(attr)
 		if attr == "" || seen[side][k] {
@@ -273,7 +416,7 @@ func joinProjection(st *Statement, aliases map[string]int) (left, right []string
 		}
 		q, err := vm.Parse(src)
 		if err != nil {
-			whole[0], whole[1] = true, true
+			allWhole()
 			return
 		}
 		walkAST(q.Expr(), func(n ast.Expr) bool {
@@ -289,7 +432,7 @@ func joinProjection(st *Statement, aliases map[string]int) (left, right []string
 	for _, it := range st.Items {
 		switch {
 		case it.Star && it.Col == "":
-			whole[0], whole[1] = true, true
+			allWhole()
 		case it.Star:
 			if side, ok := aliases[strings.ToLower(it.Col)]; ok {
 				whole[side] = true
@@ -299,7 +442,7 @@ func joinProjection(st *Statement, aliases map[string]int) (left, right []string
 		default:
 			// A bare column in a join is refused during validation, so reaching here
 			// means an attribute set this cannot reason about; fetch everything.
-			whole[0], whole[1] = true, true
+			allWhole()
 		}
 	}
 	scan(st.Where)
@@ -310,26 +453,41 @@ func joinProjection(st *Statement, aliases map[string]int) (left, right []string
 		if t.Item.Expr != "" {
 			scan(t.Item.Expr)
 		} else {
-			whole[0], whole[1] = true, true
+			allWhole()
 		}
 	}
-	if whole[0] {
-		out[0] = nil
+	for i := range p.sides {
+		if whole[i] {
+			out[i] = nil
+		}
+		p.sides[i].project = out[i]
 	}
-	if whole[1] {
-		out[1] = nil
-	}
-	return out[0], out[1]
 }
 
 // --- reference resolution ---
 
-const (
-	sideNone  = 0 // no reference to either table (a constant, or CurrentTime)
-	sideLeft  = 1
-	sideRight = 2
-	sideBoth  = 3
-)
+// sideNone is the mask of an expression that reads no table at all -- a constant, or
+// CurrentTime. It is not a side a conjunct can be pushed to, so it decides the pairing
+// along with the genuinely cross-table conjuncts.
+const sideNone = 0
+
+// sideBit is side i's bit in a side mask. A mask is an int, so maxJoinTables sides fit with
+// room to spare.
+func sideBit(i int) int { return 1 << i }
+
+// visibleAt is the mask of the sides present in the row at the step that folds in side --
+// that side and every one before it. A reference outside it is a forward reference.
+func visibleAt(side int) int { return 1<<(side+1) - 1 }
+
+// soleSide reports the one side a mask covers, and whether it covers exactly one. A mask of
+// no sides is not a single side: a constant conjunct cannot be pushed into a scan, since
+// there is no scan it belongs to more than any other.
+func soleSide(mask int) (int, bool) {
+	if mask == sideNone || mask&(mask-1) != 0 {
+		return 0, false
+	}
+	return bits.TrailingZeros(uint(mask)), true
+}
 
 // magicUnscoped are the unscoped names a join expression may still use: attributes the
 // engine itself supplies rather than reading from an ad, so there is no table to qualify
@@ -362,11 +520,14 @@ func sidesOf(e ast.Expr, aliases map[string]int) int {
 				return false
 			}
 		case *ast.AttributeReference:
+			// MY and TARGET are the two-table spelling, and mean the first and second
+			// tables. With more than two they are ambiguous, which validateJoinExpr
+			// refuses outright rather than resolving by position.
 			switch v.Scope {
 			case ast.MyScope:
-				mask |= sideLeft
+				mask |= sideBit(0)
 			case ast.TargetScope:
-				mask |= sideRight
+				mask |= sideBit(1)
 			}
 		}
 		return true
@@ -596,16 +757,16 @@ func walkValue(v reflect.Value, visit func(ast.Expr) bool, depth int) {
 
 // validateJoinClauses refuses a join query whose expressions this cannot resolve
 // unambiguously, with a message that says which alias to write.
-func validateJoinClauses(st *Statement, aliases map[string]int, left, right TableRef) error {
+func validateJoinClauses(st *Statement, aliases map[string]int, refs []TableRef) error {
 	check := func(what, src string) error {
-		return validateJoinExpr(what, src, aliases, left, right)
+		return validateJoinExpr(what, src, aliases, refs)
 	}
 	// checkArg validates one aggregate's argument. COUNT(*) has no attribute to qualify;
 	// anything else must name its table, which over a composite row means a dotted path.
 	checkArg := func(what string, a AggCall) error {
 		if a.Arg != "" && a.Arg != "*" {
 			if !strings.Contains(a.Arg, ".") {
-				return unqualifiedErr(what+" "+a.Func+"()", a.Arg, left, right)
+				return unqualifiedErr(what+" "+a.Func+"()", a.Arg, refs)
 			}
 			if err := check(what, a.Arg); err != nil {
 				return err
@@ -651,7 +812,7 @@ func validateJoinClauses(st *Statement, aliases map[string]int, left, right Tabl
 				return err
 			}
 		case it.Expr == "":
-			return unqualifiedErr(what, it.Col, left, right)
+			return unqualifiedErr(what, it.Col, refs)
 		default:
 			if err := check(what, it.Expr); err != nil {
 				return err
@@ -678,7 +839,7 @@ func orderItems(st *Statement) []SelectItem {
 	return out
 }
 
-func validateJoinExpr(what, src string, aliases map[string]int, left, right TableRef) error {
+func validateJoinExpr(what, src string, aliases map[string]int, refs []TableRef) error {
 	if strings.TrimSpace(src) == "" {
 		return nil
 	}
@@ -703,9 +864,17 @@ func validateJoinExpr(what, src string, aliases map[string]int, left, right Tabl
 				bad = fmt.Errorf("%s: PARENT.%s has no meaning in a join", what, v.Name)
 				return false
 			}
+			// MY and TARGET name the first and second tables. Over three or more that is
+			// a guess about which pair was meant, so it is refused and the writer names
+			// the table -- the aliases are right there in the FROM clause.
+			if (v.Scope == ast.MyScope || v.Scope == ast.TargetScope) && len(refs) > 2 {
+				bad = fmt.Errorf("%s: %s.%s is ambiguous across %d tables; qualify it with "+
+					"a table alias instead", what, scopeName(v.Scope), v.Name, len(refs))
+				return false
+			}
 			if v.Scope == ast.NoScope && !magicUnscoped[strings.ToLower(v.Name)] &&
 				!strings.HasPrefix(strings.ToLower(v.Name), strings.ToLower(aggPlaceholderPrefix)) {
-				bad = unqualifiedErr(what, v.Name, left, right)
+				bad = unqualifiedErr(what, v.Name, refs)
 				return false
 			}
 		case *ast.RecordLiteral:
@@ -723,15 +892,27 @@ func validateJoinExpr(what, src string, aliases map[string]int, left, right Tabl
 	return bad
 }
 
-func unqualifiedErr(what, name string, left, right TableRef) error {
+func unqualifiedErr(what, name string, refs []TableRef) error {
+	forms := make([]string, len(refs))
+	for i, r := range refs {
+		forms[i] = r.Alias + "." + name
+	}
 	return fmt.Errorf("%s: %q is not qualified -- in a join every attribute must say which "+
-		"table it comes from, as %s.%s or %s.%s", what, name, left.Alias, name, right.Alias, name)
+		"table it comes from, as %s", what, name, strings.Join(forms, " or "))
+}
+
+// scopeName spells a scope prefix the way it was written, for an error that quotes it back.
+func scopeName(sc ast.AttributeScope) string {
+	if sc == ast.TargetScope {
+		return "TARGET"
+	}
+	return "MY"
 }
 
 // --- execution ---
 
-// execJoin runs a two-table join entirely in this process, over query ops that predate the
-// feature. See the file comment for the strategy.
+// execJoin runs the join entirely in this process, over query ops that predate the feature.
+// See the file comment for the strategy.
 func (e *Executor) execJoin(st *Statement) (*Result, error) {
 	if err := refuseUnsupportedJoin(st); err != nil {
 		return nil, err
@@ -745,36 +926,223 @@ func (e *Executor) execJoin(st *Statement) (*Result, error) {
 	// joining here ships both sides whole first -- a flat ~2.2x on a narrow projection and
 	// ~4.2x unprojected, before any network. The server also holds one side where this
 	// holds both. Everything after the pairing is unchanged: the rows that come back are
-	// the same composite ads p.join would have built.
+	// the same composite ads the pipeline would have built.
 	if rows, ok, serr := e.joinServerSide(st, p); serr != nil {
 		return nil, serr
 	} else if ok {
 		return e.finishJoin(st, p, rows)
 	}
 
-	leftAds, err := e.fetchJoinSide(st, p.left, 0)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", p.left.ref.Table, err)
-	}
-	// Key batching: with the left side in hand and an equality on a bare right-side
-	// attribute, the right scan can be narrowed to the values the left side actually has,
-	// instead of reading the whole table and discarding most of it here. Whether that is
-	// cheaper than reading the whole table depends on how big the whole table is, which is
-	// what decideKeyBatch weighs.
-	right := p.right
-	if d := e.decideKeyBatch(p, leftAds); d.constraint != "" {
-		right.where = andText(right.where, d.constraint)
-	}
-	rightAds, err := e.fetchJoinSide(st, right, 1)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", p.right.ref.Table, err)
-	}
-
-	rows, err := p.join(leftAds, rightAds)
+	rows, err := e.runJoinPipeline(st, p)
 	if err != nil {
 		return nil, err
 	}
 	return e.finishJoin(st, p, rows)
+}
+
+// runJoinPipeline folds one table into the row at a time, left to right.
+//
+// Every step has the same shape of input -- a composite row and one table's ads -- which is
+// what the first table is wrapped for. The wrap costs one ad per row of the first table and
+// buys a pipeline with no special first iteration, so a three-table join is the two-table
+// one run twice rather than a second algorithm.
+func (e *Executor) runJoinPipeline(st *Statement, p *joinPlan) ([]*classad.ClassAd, error) {
+	first, err := e.fetchJoinSide(st, p.sides[0], 0)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", p.sides[0].ref.Table, err)
+	}
+	rows := p.wrapFirst(first)
+
+	// One pair budget for the whole statement, not one per step. A chain of joins that each
+	// stay just inside a per-step budget would otherwise cost the sum of them, and the
+	// budget exists to bound the total work.
+	budget := joinBudget{pairs: maxJoinPairs}
+	for i := range p.steps {
+		step := &p.steps[i]
+		side := p.sides[step.side]
+		// Key batching: with the row so far in hand and an equality on a bare attribute of
+		// the table about to be read, that scan can be narrowed to the values the rows
+		// actually hold, instead of reading the whole table and discarding most of it here.
+		// Whether that is cheaper than reading the whole table depends on how big the whole
+		// table is, which is what decideKeyBatch weighs. It applies at every step, because
+		// a step's input is a composite row either way.
+		if d := e.decideKeyBatch(step, side, rows); d.constraint != "" {
+			side.where = andText(side.where, d.constraint)
+		}
+		ads, ferr := e.fetchJoinSide(st, side, step.side)
+		if ferr != nil {
+			return nil, fmt.Errorf("%s: %w", side.ref.Table, ferr)
+		}
+		rows, err = p.runStep(step, rows, ads, &budget)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return joinRowAds(rows), nil
+}
+
+// wrapFirst turns the first table's ads into one-member composite rows -- the input shape
+// every step takes.
+//
+// The one-element tuples are carved out of a single backing array rather than allocated
+// one at a time. At the sizes a join reaches, one allocation per row of the first table is
+// worth not making.
+func (p *joinPlan) wrapFirst(ads []*classad.ClassAd) []joinTuple {
+	rows := make([]joinTuple, len(ads))
+	backing := make([]*classad.ClassAd, len(ads))
+	for i, ad := range ads {
+		row := classad.New()
+		row.InsertAttrClassAd(p.sides[0].ref.Alias, ad)
+		backing[i] = ad
+		rows[i] = joinTuple{ads: backing[i : i+1 : i+1], ad: row}
+	}
+	return rows
+}
+
+// joinRowAds drops the per-side tuples, which only the pipeline needs, and keeps the
+// composite rows, which are the join's result.
+func joinRowAds(rows []joinTuple) []*classad.ClassAd {
+	out := make([]*classad.ClassAd, len(rows))
+	for i := range rows {
+		out[i] = rows[i].ad
+	}
+	return out
+}
+
+// joinTuple is one row in flight: the per-side ads it was built from, and the composite ad
+// every predicate is evaluated against.
+//
+// Carrying both means a step never has to take a composite apart to build the next one. It
+// matters because the composite is rebuilt once per CANDIDATE pair, not once per output row
+// -- the condition has to be evaluated against a row that may not survive -- so the cost of
+// reading the previous composite back would be paid on rejects too.
+type joinTuple struct {
+	ads []*classad.ClassAd // one per side folded in so far; nil = null-extended
+	ad  *classad.ClassAd   // the composite, members under the side aliases
+}
+
+// joinBudget is the pair allowance shared by every step of one statement.
+type joinBudget struct {
+	pairs int
+}
+
+// runStep folds one table into the rows built so far and returns the rows that result.
+func (p *joinPlan) runStep(step *joinStep, rows []joinTuple, ads []*classad.ClassAd, budget *joinBudget) ([]joinTuple, error) {
+	var out []joinTuple
+	last := step.side == len(p.sides)-1
+
+	// Hash the new table on the equality keys when there are any; otherwise every row so
+	// far is paired against every row of it and decided by the condition alone.
+	var buckets map[string][]*classad.ClassAd
+	if len(step.equi) > 0 {
+		buckets = make(map[string][]*classad.ClassAd, len(ads))
+		for _, ad := range ads {
+			k, ok := step.sideKey(ad)
+			if !ok {
+				continue // an undefined key equals nothing: ClassAd == propagates undefined
+			}
+			buckets[k] = append(buckets[k], ad)
+		}
+	}
+
+	for _, t := range rows {
+		matched := false
+		candidates := ads
+		if buckets != nil {
+			k, ok := step.accKey(t.ad)
+			if !ok {
+				candidates = nil // an undefined key on the accumulated row matches nothing
+			} else {
+				candidates = buckets[k]
+			}
+		}
+		for _, r := range candidates {
+			budget.pairs--
+			if budget.pairs < 0 {
+				return nil, p.tooManyPairs(step, len(rows), len(ads))
+			}
+			// The hash only narrowed the candidates; the condition decides, in full, with
+			// ClassAd's own semantics.
+			row := p.compose(t, step.side, r)
+			if !step.condHolds(row) {
+				continue
+			}
+			matched = true
+			out = append(out, p.keep(t, step.side, r, row, last))
+			if len(out) > maxJoinOutputRows {
+				return nil, fmt.Errorf("the join produced more than %d rows; "+
+					"narrow it with WHERE (LIMIT does not help -- the rows are built "+
+					"before they are limited)", maxJoinOutputRows)
+			}
+		}
+		if !matched && step.kind == JoinLeft {
+			// Null-extended: every reference to this step's table reads as undefined. The
+			// row keeps the composite it already had, which is exactly that.
+			out = append(out, p.keep(t, step.side, nil, t.ad, last))
+		}
+	}
+
+	// The WHERE residual is applied once, after the last step, so that a conjunct spanning
+	// tables sees every one of them and a LEFT JOIN's null-extension has already happened.
+	if last && len(p.post) > 0 {
+		kept := out[:0]
+		for _, t := range out {
+			if allTrue(p.post, t.ad) {
+				kept = append(kept, t)
+			}
+		}
+		out = kept
+	}
+	return out, nil
+}
+
+// compose builds the composite row for a candidate pair, without committing to it. r may be
+// nil, which leaves that side with no member -- the model's spelling of NULL.
+func (p *joinPlan) compose(t joinTuple, side int, r *classad.ClassAd) *classad.ClassAd {
+	row := classad.New()
+	for i, ad := range t.ads {
+		if ad != nil {
+			row.InsertAttrClassAd(p.sides[i].ref.Alias, ad)
+		}
+	}
+	if r != nil {
+		row.InsertAttrClassAd(p.sides[side].ref.Alias, r)
+	}
+	return row
+}
+
+// keep turns a surviving candidate into a row the next step can extend, reusing the
+// composite that was already built to decide it.
+//
+// On the LAST step there is no next step, so the per-side tuple is dead weight -- and it
+// would be one allocation per output row, which is the whole difference between this
+// pipeline and the two-table loop it replaced.
+func (p *joinPlan) keep(t joinTuple, side int, r, row *classad.ClassAd, last bool) joinTuple {
+	if last {
+		return joinTuple{ad: row}
+	}
+	ads := make([]*classad.ClassAd, side+1)
+	copy(ads, t.ads)
+	ads[side] = r
+	return joinTuple{ads: ads, ad: row}
+}
+
+// condHolds evaluates this step's join condition over a candidate row.
+func (step *joinStep) condHolds(row *classad.ClassAd) bool {
+	return allTrue(step.cond, row)
+}
+
+// allTrue reports whether every expression evaluates to a true boolean against the row. A
+// nil expression is not true: a predicate that failed to compile must not be read as one
+// that passed.
+func allTrue(exprs []*classad.Expr, row *classad.ClassAd) bool {
+	for _, ex := range exprs {
+		if ex == nil || !isTrue(ex.Eval(row)) {
+			return false
+		}
+	}
+	return true
 }
 
 // finishJoin is everything after the pairing: grouping, DISTINCT, ordering, the limit and
@@ -835,30 +1203,30 @@ func (e *Executor) fetchJoinSide(st *Statement, s joinSide, side int) ([]*classa
 	return ads, nil
 }
 
-// keyBatchConstraint folds the left side's key values into one membership constraint on the
-// right side's attribute. It returns "" when there is no single bare-attribute equality, when
-// a left row's key is not a usable literal, or when there are more distinct values than the
-// constraint should carry -- in each case the right side is simply scanned as planned.
-func (p *joinPlan) keyBatchConstraint(leftAds []*classad.ClassAd) string {
-	return p.batchConstraintFor(p.keyLiterals(leftAds))
+// keyBatchConstraint folds the accumulated rows' key values into one membership constraint
+// on this step's table. It returns "" when there is no single bare-attribute equality, when
+// a row's key is not a usable literal, or when there are more distinct values than the
+// constraint should carry -- in each case the table is simply scanned as planned.
+func (step *joinStep) keyBatchConstraint(rows []joinTuple) string {
+	return step.batchConstraintFor(step.keyLiterals(rows))
 }
 
-// keyLiterals collects the left side's distinct key values as ClassAd literals, sorted so
-// the same query explains the same way. It returns nil when there is no single bare-attribute
-// equality to batch on, when no left row has a usable key value, or when there are more
-// distinct values than one constraint should carry.
-func (p *joinPlan) keyLiterals(leftAds []*classad.ClassAd) []string {
-	if p.batchAttr == "" || len(p.equi) != 1 || len(leftAds) == 0 {
+// keyLiterals collects the accumulated rows' distinct key values as ClassAd literals,
+// sorted so the same query explains the same way. It returns nil when there is no single
+// bare-attribute equality to batch on, when no row has a usable key value, or when there
+// are more distinct values than one constraint should carry.
+func (step *joinStep) keyLiterals(rows []joinTuple) []string {
+	if step.batchAttr == "" || len(step.equi) != 1 || len(rows) == 0 {
 		return nil
 	}
 	seen := map[string]bool{}
 	var lits []string
-	for _, ad := range leftAds {
-		lit, ok := literalOf(p.equi[0].left.Eval(ad))
+	for _, t := range rows {
+		lit, ok := literalOf(step.equi[0].acc.Eval(t.ad))
 		if !ok {
-			// A left row with no usable key value matches nothing through this equality,
-			// so it contributes no constraint term -- but it also cannot be allowed to
-			// narrow the right side on its behalf, which it does not.
+			// A row with no usable key value matches nothing through this equality, so it
+			// contributes no constraint term -- but it also cannot be allowed to narrow
+			// this side on its behalf, which it does not.
 			continue
 		}
 		if seen[lit] {
@@ -877,15 +1245,15 @@ func (p *joinPlan) keyLiterals(leftAds []*classad.ClassAd) []string {
 	return lits
 }
 
-// batchConstraintFor folds the key literals into one membership constraint on the right
-// side's attribute.
-func (p *joinPlan) batchConstraintFor(lits []string) string {
+// batchConstraintFor folds the key literals into one membership constraint on this step's
+// attribute.
+func (step *joinStep) batchConstraintFor(lits []string) string {
 	if len(lits) == 0 {
 		return ""
 	}
 	terms := make([]string, len(lits))
 	for i, l := range lits {
-		terms[i] = p.batchAttr + " == " + l
+		terms[i] = step.batchAttr + " == " + l
 	}
 	return "(" + strings.Join(terms, " || ") + ")"
 }
@@ -921,25 +1289,25 @@ type keyBatchDecision struct {
 // carries no constraint of its own, which would make a whole-table count an overestimate of
 // what the scan actually reads. When it cannot be learned cheaply the decision falls back to
 // the key count alone, which is what this did before the cost was measured.
-func (e *Executor) decideKeyBatch(p *joinPlan, leftAds []*classad.ClassAd) keyBatchDecision {
-	lits := p.keyLiterals(leftAds)
+func (e *Executor) decideKeyBatch(step *joinStep, side joinSide, rows []joinTuple) keyBatchDecision {
+	lits := step.keyLiterals(rows)
 	d := keyBatchDecision{keys: len(lits)}
 	if len(lits) == 0 {
 		return d
 	}
-	if p.right.where != "" {
-		// The right side already filters itself, so its whole-table count would overstate
-		// the scan being avoided. Keep the pre-measurement behavior rather than decide on
-		// a number that does not describe this plan.
-		d.constraint = p.batchConstraintFor(lits)
+	if side.where != "" {
+		// This side already filters itself, so its whole-table count would overstate the
+		// scan being avoided. Keep the pre-measurement behavior rather than decide on a
+		// number that does not describe this plan.
+		d.constraint = step.batchConstraintFor(lits)
 		return d
 	}
-	rows, ok := e.cheapRowCount(p.right.ref.Table)
-	d.rightRows, d.knownRows = rows, ok
-	if ok && rows < len(lits)*minRightRowsPerKey {
+	n, ok := e.cheapRowCount(side.ref.Table)
+	d.rightRows, d.knownRows = n, ok
+	if ok && n < len(lits)*minRightRowsPerKey {
 		return d // the scan this would avoid is smaller than the constraint costs
 	}
-	d.constraint = p.batchConstraintFor(lits)
+	d.constraint = step.batchConstraintFor(lits)
 	return d
 }
 
@@ -966,100 +1334,30 @@ func literalOf(v classad.Value) (string, bool) {
 	return "", false
 }
 
-// join pairs the two sides and returns the composite rows, in left-side order.
-func (p *joinPlan) join(leftAds, rightAds []*classad.ClassAd) ([]*classad.ClassAd, error) {
-	var out []*classad.ClassAd
-	pairs := 0
-	emit := func(l, r *classad.ClassAd) {
-		row := p.composite(l, r)
-		for _, ex := range p.post {
-			if ex == nil || !isTrue(ex.Eval(row)) {
-				return
-			}
-		}
-		out = append(out, row)
-	}
-
-	// Hash the right side on the equality keys when there are any; otherwise every left row
-	// is paired against every right row and decided by the condition alone.
-	var buckets map[string][]*classad.ClassAd
-	if len(p.equi) > 0 {
-		buckets = make(map[string][]*classad.ClassAd, len(rightAds))
-		for _, r := range rightAds {
-			k, ok := p.hashKey(r, false)
-			if !ok {
-				continue // an undefined key equals nothing: ClassAd == propagates undefined
-			}
-			buckets[k] = append(buckets[k], r)
-		}
-	}
-
-	for _, l := range leftAds {
-		matched := false
-		candidates := rightAds
-		if buckets != nil {
-			k, ok := p.hashKey(l, true)
-			if !ok {
-				candidates = nil // an undefined key on the left matches nothing
-			} else {
-				candidates = buckets[k]
-			}
-		}
-		for _, r := range candidates {
-			pairs++
-			if pairs > maxJoinPairs {
-				return nil, p.tooManyPairs(len(leftAds), len(rightAds))
-			}
-			// The hash only narrowed the candidates; the condition decides, in full, with
-			// ClassAd's own semantics.
-			if !p.conditionHolds(l, r) {
-				continue
-			}
-			// The pair matched. Whether the row then survives the WHERE residual is a
-			// SEPARATE question, and conflating the two is a wrong answer: a matched row
-			// that WHERE drops must not come back as a null-extended one.
-			matched = true
-			emit(l, r)
-			if len(out) > maxJoinOutputRows {
-				return nil, fmt.Errorf("the join produced more than %d rows; "+
-					"narrow it with WHERE (LIMIT does not help -- the rows are built "+
-					"before they are limited)", maxJoinOutputRows)
-			}
-		}
-		if !matched && p.kind == JoinLeft {
-			emit(l, nil) // null-extended: every right-side reference reads as undefined
-		}
-	}
-	return out, nil
+// accKey renders the accumulated row's key values into a bucket key, and sideKey the new
+// table's. They differ only in which half of each equality they evaluate, and in what they
+// evaluate it against: accKey reads the composite row, sideKey the table's own ad.
+func (step *joinStep) accKey(row *classad.ClassAd) (string, bool) {
+	return step.bucketKey(row, true)
 }
 
-// conditionHolds evaluates the join condition over the pair.
-func (p *joinPlan) conditionHolds(l, r *classad.ClassAd) bool {
-	if len(p.cond) == 0 {
-		return true
-	}
-	row := p.composite(l, r)
-	for _, ex := range p.cond {
-		if ex == nil || !isTrue(ex.Eval(row)) {
-			return false
-		}
-	}
-	return true
+func (step *joinStep) sideKey(ad *classad.ClassAd) (string, bool) {
+	return step.bucketKey(ad, false)
 }
 
-// hashKey renders one ad's equality-key values into a bucket key.
+// bucketKey renders one ad's equality-key values into a bucket key.
 //
 // It must never put two ClassAd-equal values in different buckets, or a matching pair would
 // never be considered. So numbers of every kind (int, real, bool) normalize to one float
 // form -- ClassAd's == coerces across them -- and strings fold to lower case, because
 // ClassAd compares strings case-insensitively. Collisions in the other direction cost
 // nothing: a bucket is only a candidate list, and the condition re-checks every pair.
-func (p *joinPlan) hashKey(ad *classad.ClassAd, left bool) (string, bool) {
+func (step *joinStep) bucketKey(ad *classad.ClassAd, acc bool) (string, bool) {
 	var b strings.Builder
-	for i, pair := range p.equi {
-		ex := pair.right
-		if left {
-			ex = pair.left
+	for i, pair := range step.equi {
+		ex := pair.side
+		if acc {
+			ex = pair.acc
 		}
 		if ex == nil {
 			return "", false
@@ -1088,41 +1386,33 @@ func (p *joinPlan) hashKey(ad *classad.ClassAd, left bool) (string, bool) {
 		default:
 			return "", false // undefined, error, list or ad: equals nothing
 		}
-		if i < len(p.equi)-1 {
+		if i < len(step.equi)-1 {
 			b.WriteByte(0)
 		}
 	}
 	return b.String(), true
 }
 
-// composite builds the joined row: one ClassAd whose members are the two sides under their
-// aliases. A nil right side (an unmatched LEFT JOIN row) is simply absent, so every
-// reference through its alias evaluates to undefined.
-func (p *joinPlan) composite(l, r *classad.ClassAd) *classad.ClassAd {
-	row := classad.New()
-	if l != nil {
-		row.InsertAttrClassAd(p.left.ref.Alias, l)
-	}
-	if r != nil {
-		row.InsertAttrClassAd(p.right.ref.Alias, r)
-	}
-	return row
-}
-
 // tooManyPairs explains a budget refusal in terms of what the writer can change: whether
-// the condition gave the join anything to key on, and how big each side was.
-func (p *joinPlan) tooManyPairs(nleft, nright int) error {
-	why := fmt.Sprintf("%s has %d rows and %s has %d", p.left.ref.Alias, nleft, p.right.ref.Alias, nright)
+// the condition gave this step anything to key on, and how big its two inputs were.
+func (p *joinPlan) tooManyPairs(step *joinStep, nrows, nads int) error {
+	side := p.sides[step.side].ref.Alias
+	rowsOf := "the rows so far"
+	if step.side == 1 {
+		rowsOf = p.sides[0].ref.Alias
+	}
+	why := fmt.Sprintf("%s has %d rows and %s has %d", rowsOf, nrows, side, nads)
 	switch {
-	case len(p.equi) == 0:
-		return fmt.Errorf("the join would examine more than %d pairs (%s): its ON clause has "+
-			"no equality between the two tables, so every row is compared with every row. "+
-			"Add an equality term, or narrow a side with WHERE", maxJoinPairs, why)
+	case len(step.equi) == 0:
+		return fmt.Errorf("the join would examine more than %d pairs (%s): the ON clause "+
+			"joining %s has no equality against the tables above it, so every row is "+
+			"compared with every row. Add an equality term, or narrow a side with WHERE",
+			maxJoinPairs, why, side)
 	default:
-		return fmt.Errorf("the join would examine more than %d pairs (%s): the join key has "+
-			"too few distinct values to separate the rows, so matching is close to a cross "+
-			"product. Join on a more selective key, or narrow a side with WHERE",
-			maxJoinPairs, why)
+		return fmt.Errorf("the join would examine more than %d pairs (%s): the key joining "+
+			"%s has too few distinct values to separate the rows, so matching is close to "+
+			"a cross product. Join on a more selective key, or narrow a side with WHERE",
+			maxJoinPairs, why, side)
 	}
 }
 
@@ -1190,7 +1480,7 @@ func expandJoinStars(items []SelectItem, rows []*classad.ClassAd, p *joinPlan) (
 			out = append(out, it)
 			continue
 		}
-		aliases := []string{p.left.ref.Alias, p.right.ref.Alias}
+		aliases := p.aliases()
 		if it.Col != "" {
 			aliases = []string{it.Col}
 		}
@@ -1204,11 +1494,21 @@ func expandJoinStars(items []SelectItem, rows []*classad.ClassAd, p *joinPlan) (
 	return out, nil
 }
 
-// joinStarColumns is the column set of `SELECT *` over a join: every attribute of either
-// side, qualified by its alias so the two sides' like-named attributes stay distinct.
+// aliases lists the side aliases in FROM-then-JOIN order, which is the order `SELECT *`
+// presents their columns in.
+func (p *joinPlan) aliases() []string {
+	out := make([]string, len(p.sides))
+	for i := range p.sides {
+		out[i] = p.sides[i].ref.Alias
+	}
+	return out
+}
+
+// joinStarColumns is the column set of `SELECT *` over a join: every attribute of every
+// side, qualified by its alias so two sides' like-named attributes stay distinct.
 func joinStarColumns(rows []*classad.ClassAd, p *joinPlan) []string {
 	var cols []string
-	for _, alias := range []string{p.left.ref.Alias, p.right.ref.Alias} {
+	for _, alias := range p.aliases() {
 		for _, attr := range sideAttrs(rows, alias) {
 			cols = append(cols, alias+"."+attr)
 		}
@@ -1289,16 +1589,6 @@ func (e *Executor) describeJoinPlan(st *Statement) []string {
 	if err != nil {
 		return []string{"plan: " + err.Error()}
 	}
-	strategy := "nested loop (no equality to hash on)"
-	if len(p.equi) > 0 {
-		strategy = fmt.Sprintf("hash join on %d equality term(s), build side %s",
-			len(p.equi), p.right.ref.Alias)
-	}
-	out := []string{
-		fmt.Sprintf("%s: %s %s -> %s %s", p.kind,
-			p.left.ref.Table, p.left.ref.Alias, p.right.ref.Table, p.right.ref.Alias),
-		"  pairing: " + strategy,
-	}
 	side := func(s joinSide) string {
 		where := s.where
 		if where == "" {
@@ -1310,17 +1600,33 @@ func (e *Executor) describeJoinPlan(st *Statement) []string {
 		}
 		return fmt.Sprintf("  %s (%s): constraint %s; attrs %s", s.ref.Alias, s.ref.Table, where, proj)
 	}
-	out = append(out, side(p.left), side(p.right))
-	if p.batchAttr != "" {
-		// The decision needs the left side's actual keys, which EXPLAIN without ANALYZE
-		// has not read, so this reports what is available to batch on and the rule that
-		// will be applied to it rather than the outcome.
-		out = append(out, fmt.Sprintf("  key batching: %s.%s can be narrowed to the left side's keys "+
-			"(at most %d, and only if %s holds at least %d row(s) per key)",
-			p.right.ref.Alias, p.batchAttr, maxJoinKeyBatch, p.right.ref.Alias, minRightRowsPerKey))
+	out := []string{
+		fmt.Sprintf("join of %d tables, left to right: %s", len(p.sides),
+			strings.Join(p.aliases(), " -> ")),
+		side(p.sides[0]),
 	}
-	out = append(out, fmt.Sprintf("  checked per pair: %d condition term(s), %d post-filter term(s)",
-		len(p.cond), len(p.post)))
+	for i := range p.steps {
+		step := &p.steps[i]
+		s := p.sides[step.side]
+		strategy := "nested loop (no equality to hash on)"
+		if len(step.equi) > 0 {
+			strategy = fmt.Sprintf("hash join on %d equality term(s), build side %s",
+				len(step.equi), s.ref.Alias)
+		}
+		out = append(out,
+			fmt.Sprintf("%s %s %s: %s", step.kind, s.ref.Table, s.ref.Alias, strategy),
+			side(s),
+			fmt.Sprintf("  checked per pair: %d condition term(s)", len(step.cond)))
+		if step.batchAttr != "" {
+			// The decision needs the keys the rows so far actually hold, which EXPLAIN
+			// without ANALYZE has not read, so this reports what is available to batch on
+			// and the rule that will be applied to it rather than the outcome.
+			out = append(out, fmt.Sprintf("  key batching: %s.%s can be narrowed to the keys "+
+				"of the rows so far (at most %d, and only if %s holds at least %d row(s) per key)",
+				s.ref.Alias, step.batchAttr, maxJoinKeyBatch, s.ref.Alias, minRightRowsPerKey))
+		}
+	}
+	out = append(out, fmt.Sprintf("after the last join: %d post-filter term(s)", len(p.post)))
 	if hasAggregate(st) || len(st.GroupBy) > 0 {
 		out = append(out, fmt.Sprintf("  grouping: client-side over the joined rows "+
 			"(%d group term(s), %d aggregate(s)); the server aggregate is single-table",
@@ -1342,7 +1648,10 @@ func whyNotServerSide(e *Executor, st *Statement, p *joinPlan) string {
 	switch {
 	case st.AsOf != "":
 		return "AS OF reads both sides at one instant, which the join opcode cannot ask for"
-	case e.txReads(p.left.ref.Table) || e.txReads(p.right.ref.Table):
+	case !p.twoTable():
+		return fmt.Sprintf("the join opcode carries two tables and this statement joins %d",
+			len(p.sides))
+	case p.readsInTx(e):
 		return "a read inside a transaction must see that transaction's own writes, and the " +
 			"store joins committed state"
 	case !e.serverJoin:
@@ -1522,15 +1831,16 @@ func (e *Executor) joinServerSide(st *Statement, p *joinPlan) ([]*classad.ClassA
 	if !e.serverJoinEligible(st, p) {
 		return nil, false, nil
 	}
+	left, right, step := p.sides[0], p.sides[1], &p.steps[0]
 	req := dbrpc.JoinRequest{Spec: db.JoinSpec{
-		Kind:  serverJoinKind(p.kind),
-		Left:  db.JoinSide{Table: p.left.ref.Table, Alias: p.left.ref.Alias, Constraint: p.left.where, Project: p.left.project},
-		Right: db.JoinSide{Table: p.right.ref.Table, Alias: p.right.ref.Alias, Constraint: p.right.where, Project: p.right.project},
-		Cond:  p.condSrc,
+		Kind:  serverJoinKind(step.kind),
+		Left:  db.JoinSide{Table: left.ref.Table, Alias: left.ref.Alias, Constraint: left.where, Project: left.project},
+		Right: db.JoinSide{Table: right.ref.Table, Alias: right.ref.Alias, Constraint: right.where, Project: right.project},
+		Cond:  step.condSrc,
 		Post:  p.postSrc,
 	}}
-	for _, eq := range p.equiSrc {
-		req.Spec.Equi = append(req.Spec.Equi, db.JoinEqui{Left: eq.left, Right: eq.right})
+	for _, eq := range step.equiSrc {
+		req.Spec.Equi = append(req.Spec.Equi, db.JoinEqui{Left: eq.accStripped, Right: eq.side})
 	}
 	// The LIMIT only pushes down when nothing here reorders or removes rows afterwards.
 	// Sorting, DISTINCT and grouping all decide WHICH rows the limit keeps, so a limit
@@ -1573,13 +1883,36 @@ func (e *Executor) serverJoinEligible(st *Statement, p *joinPlan) bool {
 	if st.AsOf != "" {
 		return false
 	}
-	if e.txReads(p.left.ref.Table) || e.txReads(p.right.ref.Table) {
+	// The opcode carries exactly two sides. A longer chain is paired here; the store
+	// gaining an n-way join would be a protocol change, not a planner one.
+	if !p.twoTable() {
 		return false
 	}
-	if len(p.cond) != len(p.condSrc) || len(p.post) != len(p.postSrc) || len(p.equi) != len(p.equiSrc) {
+	if p.readsInTx(e) {
 		return false
+	}
+	step := &p.steps[0]
+	if len(step.cond) != len(step.condSrc) || len(p.post) != len(p.postSrc) ||
+		len(step.equi) != len(step.equiSrc) {
+		return false
+	}
+	for _, eq := range step.equiSrc {
+		if eq.accStripped == "" {
+			return false
+		}
 	}
 	return true
+}
+
+// readsInTx reports whether any side is a table the open transaction has written, whose
+// uncommitted writes a read must see and the store's join does not.
+func (p *joinPlan) readsInTx(e *Executor) bool {
+	for i := range p.sides {
+		if e.txReads(p.sides[i].ref.Table) {
+			return true
+		}
+	}
+	return false
 }
 
 func serverJoinKind(k JoinKind) db.JoinKind {

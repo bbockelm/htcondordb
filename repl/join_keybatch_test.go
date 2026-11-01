@@ -61,11 +61,11 @@ func TestKeyBatchDecision(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			leftAds, err := fix.exec.fetchJoinSide(st, p.left, 0)
+			leftAds, err := fix.exec.fetchJoinSide(st, p.sides[0], 0)
 			if err != nil {
 				t.Fatal(err)
 			}
-			d := fix.exec.decideKeyBatch(p, leftAds)
+			d := fix.exec.decideKeyBatch(&p.steps[0], p.sides[1], p.wrapFirst(leftAds))
 			if got := d.constraint != ""; got != tc.wantBatch {
 				t.Errorf("batched = %v, want %v (%s)", got, tc.wantBatch, tc.why)
 			}
@@ -136,7 +136,7 @@ func TestKeyBatchThresholdGoverns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	leftAds, err := fix.exec.fetchJoinSide(st, p.left, 0)
+	leftAds, err := fix.exec.fetchJoinSide(st, p.sides[0], 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,11 +145,11 @@ func TestKeyBatchThresholdGoverns(t *testing.T) {
 	defer func() { minRightRowsPerKey = restore }()
 
 	minRightRowsPerKey = 20
-	if d := fix.exec.decideKeyBatch(p, leftAds); d.constraint != "" {
+	if d := fix.exec.decideKeyBatch(&p.steps[0], p.sides[1], p.wrapFirst(leftAds)); d.constraint != "" {
 		t.Errorf("at a threshold of 20 rows per key, 2 per key should not batch")
 	}
 	minRightRowsPerKey = 1
-	if d := fix.exec.decideKeyBatch(p, leftAds); d.constraint == "" {
+	if d := fix.exec.decideKeyBatch(&p.steps[0], p.sides[1], p.wrapFirst(leftAds)); d.constraint == "" {
 		t.Errorf("at a threshold of 1 row per key, 2 per key should batch")
 	}
 }
