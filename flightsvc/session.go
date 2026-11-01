@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/PelicanPlatform/classad/dbrpc"
+	cedarsec "github.com/bbockelm/cedar/security"
 
 	"github.com/bbockelm/htcondordb/arrowtype"
 )
@@ -53,6 +54,26 @@ type Authenticator interface {
 	Authenticate(ctx context.Context, md metadata.MD) (string, error)
 	// Name identifies the mechanism in logs and refusals.
 	Name() string
+}
+
+// ScopedAuthenticator is an Authenticator whose credential can limit the authorization levels
+// its session may use: HTCondor's authorization bounding set, the "condor:/<LEVEL>" scopes of
+// a token. The levels are as the credential named them, before implied levels are added; nil
+// is no bounding set (the identity's ALLOW_* levels alone decide), and a non-nil set naming no
+// level admits nothing above ALLOW. An Authenticator that does not implement it never limits.
+type ScopedAuthenticator interface {
+	Authenticator
+	// AuthenticateScoped is Authenticate, also returning the credential's bounding set.
+	AuthenticateScoped(ctx context.Context, md metadata.MD) (user string, limits []string, err error)
+}
+
+// authenticateScoped authenticates through a, with its bounding set if it has one.
+func authenticateScoped(ctx context.Context, a Authenticator, md metadata.MD) (string, []string, error) {
+	if sa, ok := a.(ScopedAuthenticator); ok {
+		return sa.AuthenticateScoped(ctx, md)
+	}
+	user, err := a.Authenticate(ctx, md)
+	return user, nil, err
 }
 
 // Authorizer reports whether an identity holds an HTCondor authorization level. It is the same
@@ -103,9 +124,12 @@ func NewSessions(cat Catalog, authn Authenticator, authorize Authorizer, derive 
 // must never be the thing that widens what a principal can do. A DAEMON-authorized peer does
 // see private attributes, matching what it would see over CEDAR -- withholding them here would
 // be a second, quieter policy.
-func levelOptions(authorize Authorizer, addr, user string) dbrpc.ServeOptions {
+//
+// DAEMON counts only inside the credential's bounding set (limits), as over CEDAR: a token
+// scoped to READ is served at READ whatever ALLOW_DAEMON says of its identity.
+func levelOptions(authorize Authorizer, addr, user string, limits []string) dbrpc.ServeOptions {
 	switch {
-	case authorize("DAEMON", addr, user):
+	case cedarsec.AuthorizationLimitsPermit(limits, []string{"DAEMON"}) && authorize("DAEMON", addr, user):
 		return dbrpc.ServeOptions{ReadOnly: true, IncludePrivate: true, Privileged: true}
 	default:
 		return dbrpc.ServeOptions{ReadOnly: true, IncludePrivate: false}
@@ -136,20 +160,27 @@ func (s *Sessions) Identity(ctx context.Context) (string, error) {
 
 func (s *Sessions) forWithIdentity(ctx context.Context) (*dbrpc.Client, string, func(), error) {
 	md, _ := metadata.FromIncomingContext(ctx)
-	user, err := s.authn.Authenticate(ctx, md)
+	user, limits, err := authenticateScoped(ctx, s.authn, md)
 	if err != nil {
 		return nil, "", nil, status.Errorf(codes.Unauthenticated, "%s: %v", s.authn.Name(), err)
 	}
 	// An empty user is the anonymous peer, not a failure: the policy below decides whether
 	// it may read, exactly as it does for an anonymous CEDAR peer.
 	addr := peerAddr(ctx)
+	// The CEDAR session command is registered at READ, and HTCondor refuses a command whose
+	// level is outside the session's bounding set before it consults ALLOW_READ. A SciToken is
+	// always bounded, so one that names no condor level is refused here as it is over CEDAR.
+	if !cedarsec.AuthorizationLimitsPermit(limits, []string{"READ"}) {
+		return nil, "", nil, status.Errorf(codes.PermissionDenied,
+			"the credential's authorization limits %v do not include READ", limits)
+	}
 	if !s.authz("READ", addr, user) {
 		return nil, "", nil, status.Errorf(codes.PermissionDenied, "%s is not authorized to read",
 			describeUser(user))
 	}
 
 	cc, sc := net.Pipe()
-	opts := levelOptions(s.authz, addr, user)
+	opts := levelOptions(s.authz, addr, user, limits)
 	go func() { _ = s.cat.ServeConnOpts(dbrpc.NewStreamConn(sc), opts) }()
 
 	// Carry the peer's advertisement, as every dbrpc client must. A client built without it
