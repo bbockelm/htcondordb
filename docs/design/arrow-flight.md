@@ -726,6 +726,31 @@ inline path gives is given to the parameterised path from the same code: `NOT Ow
 rather than served from the first parameter set, because N parameter sets are N result sets and a
 DoGet returns one.
 
+**A real ADBC driver is in CI, and it is not redundant with the Go tests.** Every Go test here
+drives arrow-go's own `flightsql.Client` against arrow-go's own `flightsql` server, which checks
+that two halves of one library agree — not that the endpoint is conformant. Connecting
+`adbc_driver_flightsql` for the first time failed immediately:
+
+```
+NOT_FOUND: [FlightSQL] no information for sql info number 1 (GetInfo(DoGet))
+```
+
+`FLIGHT_SQL_SERVER_VERSION` was never registered, and **one missing SqlInfo entry fails a
+client's whole `adbc_get_info()` call** — so the endpoint looked broken to every ADBC client
+while the Go suite was green, because arrow-go's client never asks for it. Registered now, along
+with the facts a client asks next (`SERVER_SQL`, `SERVER_SUBSTRAIT`, transaction and cancel
+support), and the daemon passes its build stamp so deployments are distinguishable from the
+client side.
+
+The tests live in `python/tests/test_flightsql_adbc.py` against the session daemon's Flight
+listener — the same process that serves CEDAR, because that is how the endpoint deploys and a
+separate daemon would test a configuration nobody runs. `HTCONDORDB_REQUIRE_ADBC=1` turns a
+skipped driver into a failure, and the CI step additionally greps for named passes, because
+neither pytest's exit status nor a REQUIRE flag can speak for a test that was never collected.
+
+This is the same lesson as the DuckDB job (§12): a reader that is the writer's own library agrees
+with it by construction.
+
 ### 9.3 Workstreams and what actually blocks what
 
 ```

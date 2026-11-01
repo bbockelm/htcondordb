@@ -73,7 +73,10 @@ func startFlightSQL(ctx context.Context, cfg *config.Config, log *logging.Logger
 		grpc.UnaryInterceptor(sessions.UnaryAuthInterceptor()),
 		grpc.StreamInterceptor(sessions.StreamAuthInterceptor()),
 	)
-	fsrv, err := flightsvc.NewSessionFlightServer(sessions, nil, flightsvc.Limits{
+	fsrv, err := flightsvc.NewSessionFlightServer(sessions, nil, flightsvc.Settings{
+		// The build stamp, so a client's adbc_get_info() reports this daemon rather
+		// than the placeholder.
+		Version: version,
 		// Both default to unlimited when unset, which is what the endpoint did before
 		// the limits existed. An operator who has not configured them gets the old
 		// behaviour rather than a surprise refusal.

@@ -115,6 +115,11 @@ def daemon_address(tmp_path_factory) -> str:
         directory.mkdir()
 
     port = _free_port()
+    # A second listener for the Flight SQL endpoint, on the SAME daemon. Opening it here
+    # rather than in a fixture of its own is deliberate: it is how the endpoint actually
+    # deploys -- beside the CEDAR one in a single process -- and a separate daemon would
+    # test a configuration nobody runs. It costs one idle listener when no test uses it.
+    flight_port = _free_port()
     address_file = root / "address"
     config_file = root / "condor_config"
     config_file.write_text(
@@ -136,6 +141,11 @@ def daemon_address(tmp_path_factory) -> str:
                 "ALLOW_READ = *",
                 "ALLOW_WRITE = *",
                 "ALLOW_DAEMON = *",
+                f"HTCONDORDB_FLIGHT_ADDRESS = 127.0.0.1:{flight_port}",
+                # QDate is epoch seconds, so an Arrow client should read it as a
+                # timestamp rather than an integer. Declared here because nothing can
+                # infer it from the value.
+                "HTCONDORDB_FLIGHT_TIME_ATTRS = QDate",
                 "",
             ]
         )
@@ -183,6 +193,7 @@ def daemon_address(tmp_path_factory) -> str:
     # policy matches. Set it for the whole session: connect() takes no credentials by
     # design, exactly so the ambient configuration stays in charge.
     os.environ["CONDOR_CONFIG"] = str(config_file)
+    _daemon["flight"] = f"grpc://127.0.0.1:{flight_port}"
 
     yield address
 
@@ -209,6 +220,19 @@ def _daemon_is_alive():
     if death:
         pytest.fail(death, pytrace=False)
     yield
+
+
+@pytest.fixture(scope="session")
+def flight_address(daemon_address) -> str:
+    """The Flight SQL endpoint's URI on the session daemon, as an ADBC driver wants it.
+
+    Depends on daemon_address so the daemon is up before anything dials this; the port is
+    the one that fixture put in the daemon's config.
+    """
+    uri = _daemon.get("flight")
+    if not uri:
+        pytest.skip("the session daemon published no Flight SQL address")
+    return uri
 
 
 @pytest.fixture

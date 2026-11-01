@@ -125,6 +125,18 @@ func (s *Server) acquireStream() (func(), bool) {
 // that rule would never be exercised.
 func (s *Server) SetSampleMax(n int) { s.sample = n }
 
+// SetVersion declares the daemon's version to a client, which ADBC asks for by name at connect:
+// adbc_get_info() requests FLIGHT_SQL_SERVER_VERSION, and an unregistered entry comes back as
+// NOT_FOUND rather than as an empty string -- so the whole call fails and the client reports a
+// broken server. The default below keeps that from happening when nobody calls this; the daemon
+// passes its build stamp.
+func (s *Server) SetVersion(v string) error {
+	if v == "" {
+		return nil
+	}
+	return s.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerVersion, v)
+}
+
 // NewServer builds the Flight SQL service. The dbrpc client carries the connection's
 // authorization, so every read this serves is already scoped to what that connection may see;
 // serving one connection's server to a less privileged reader would defeat that.
@@ -173,7 +185,22 @@ func (s *Server) registerSqlInfo() error {
 		val interface{}
 	}{
 		{flightsql.SqlInfoFlightSqlServerName, "htcondordb"},
+		// A version is REQUIRED in practice, not optional: ADBC's adbc_get_info()
+		// requests it by name, and an unregistered entry is NOT_FOUND rather than an
+		// empty string, which fails the whole call. The daemon overwrites this with its
+		// build stamp through SetVersion; this placeholder is what keeps a Server nobody
+		// configures from looking broken to a real client. Found by connecting one --
+		// arrow-go's own client never asks, so no test in this package had reached it.
+		{flightsql.SqlInfoFlightSqlServerVersion, "unknown"},
 		{flightsql.SqlInfoFlightSqlServerArrowVersion, arrow.PkgVersion},
+		// This endpoint takes SQL, not Substrait plans. A client that asks and gets
+		// NOT_FOUND learns nothing; one that is told can pick the right path first time.
+		{flightsql.SqlInfoFlightSqlServerSql, true},
+		{flightsql.SqlInfoFlightSqlServerSubstrait, false},
+		// No transactions and no cancellation, said explicitly so a client does not
+		// offer either. SqlTransactionNone is the enum's "not supported" value.
+		{flightsql.SqlInfoFlightSqlServerTransaction, int32(flightsql.SqlTransactionNone)},
+		{flightsql.SqlInfoFlightSqlServerCancel, false},
 		// Read-only: there is no DML surface at all, and a client that knows this will
 		// not offer an editing UI it cannot use.
 		{flightsql.SqlInfoFlightSqlServerReadOnly, true},
