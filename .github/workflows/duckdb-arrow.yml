@@ -1,0 +1,80 @@
+name: duckdb-arrow
+
+# Runs the Arrow export against a REAL DuckDB, which is the only check that the streams this
+# daemon emits are usable by something that is not arrow-go.
+#
+# Why this needs a job of its own. The test lives in ./arrowstream and SKIPS when DuckDB is
+# absent, and DuckDB is absent from every other job -- so without this workflow the check would
+# exist, report nothing, and pass forever. A test that always skips is not a test; it is a
+# comment that costs CI minutes. This job installs the CLI and sets
+# HTCONDORDB_REQUIRE_DUCKDB=1, which turns every skip in that test into a failure, so the job
+# cannot go quietly green by not running the thing it exists to run.
+#
+# What it protects. Every other Arrow test reads a stream back with arrow-go, the library that
+# wrote it, which checks the encoder against itself. An attribute typed as text instead of a
+# number round-trips through arrow-go perfectly and fails sum() in DuckDB -- so only an
+# external engine distinguishes "valid Arrow" from "usable". That distinction has already cost
+# one real bug on this branch.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  duckdb:
+    name: Arrow export read by DuckDB
+    runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -mod=mod
+      GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
+      # The test is pointed at the binary installed below, and REQUIRE turns a skip into a
+      # failure. Without REQUIRE this job would pass on a runner where the download failed.
+      HTCONDORDB_REQUIRE_DUCKDB: "1"
+    steps:
+      - name: Checkout htcondordb
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version: '1.27', check-latest: true }
+
+      - name: Install the DuckDB CLI
+        run: |
+          set -euo pipefail
+          # The latest release rather than a pin: this job exists to catch OUR schemas being
+          # unusable, so tracking the engine a reader would actually have is the point. If a
+          # DuckDB release ever breaks it, that is news worth a failing job.
+          curl -sSL --retry 3 --max-time 300 \
+            -o duckdb.tar.gz \
+            https://github.com/duckdb/duckdb/releases/latest/download/duckdb-cli-linux-amd64.tar.gz
+          tar xzf duckdb.tar.gz
+          chmod +x duckdb
+          echo "HTCONDORDB_DUCKDB=$PWD/duckdb" >> "$GITHUB_ENV"
+          ./duckdb -no-agent -c "SELECT 'duckdb ready' AS status;"
+
+      - name: Install the nanoarrow extension
+        # Fetched once here rather than inside the test, so a network failure reports as an
+        # infrastructure step rather than as a confusing skip from the test itself.
+        run: ./duckdb -no-agent -c "INSTALL nanoarrow FROM community; LOAD nanoarrow; SELECT 'extension ready' AS status;"
+
+      - name: Run the DuckDB Arrow tests, and confirm they ran
+        # One step, because the run and the confirmation must see the SAME output: `go test`
+        # reports success for a package whose every test skipped, so the output is inspected
+        # for a PASS rather than the exit status trusted to mean work happened. That is the
+        # exact failure this job exists to prevent, so it is checked rather than assumed.
+        run: |
+          set -euo pipefail
+          out=$(go test -count=1 -timeout 10m -run TestDuckDB -v ./arrowstream/ 2>&1) || {
+            echo "$out"; exit 1;
+          }
+          echo "$out"
+          for name in TestDuckDBReadsTheStream TestDuckDBJoinsAgainstLocalData; do
+            if ! grep -q -- "--- PASS: $name" <<<"$out"; then
+              echo "::error::$name did not pass; without this check the job would go green having tested nothing"
+              exit 1
+            fi
+          done

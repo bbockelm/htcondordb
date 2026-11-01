@@ -532,6 +532,19 @@ func run() error {
 	// timing counters, so the database's health is scrapable directly (not only via a
 	// collector in front of it). It carries no secrets -- storage sizes and timings --
 	// but bind it to a trusted interface.
+	// Arrow Flight SQL (opt-in via HTCONDORDB_FLIGHT_ADDRESS): a gRPC listener serving
+	// this store to ADBC clients. It binds its own port -- gRPC cannot speak the
+	// shared-port handshake -- and it refuses to start without authentication configured,
+	// because unlike /metrics it serves ad CONTENTS and "bind it to a trusted interface"
+	// is not an adequate control for those. Reads go through per-identity dbrpc sessions,
+	// so a Flight caller gets exactly what the same identity gets over CEDAR.
+	if stopFlight, ferr := startFlightSQL(ctx, cfg, log, svc.RPC(), authorize); ferr != nil {
+		log.Error(logging.DestinationGeneral, "Arrow Flight SQL did not start", "err", ferr.Error())
+		return ferr
+	} else if stopFlight != nil {
+		defer stopFlight()
+	}
+
 	if addr := getStr(cfg, "HTCONDORDB_METRICS_ADDRESS"); addr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", metrics.Handler(ctx, svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, fedMgr.Metrics()))
