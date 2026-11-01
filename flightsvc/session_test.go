@@ -296,3 +296,18 @@ func TestOptionalAuthDistinguishesAbsentFromBad(t *testing.T) {
 		t.Errorf("OptionalAuth(nil) = %q/%v, want anonymous", u, err)
 	}
 }
+
+// TestLoopbackPeerAttrsAreComplete pins the equivalence the loopback relies on. It supplies the
+// server's own advertisement in place of a handshake, which is correct only while both sides
+// name the same attributes -- if dbrpc grows one a client asks for and the server does not set,
+// a loopback reads it as unknown and nothing says so. That is the silent failure
+// command/advertise_wiring_test.go exists to prevent, and a text scan cannot catch it.
+func TestLoopbackPeerAttrsAreComplete(t *testing.T) {
+	attrs, missing := loopbackPeerAttrs()
+	if len(missing) > 0 {
+		t.Errorf("dbrpc advertises no %v, which a client asks for", missing)
+	}
+	if len(attrs) == 0 {
+		t.Error("the server advertises nothing at all; the check above cannot fail and proves nothing")
+	}
+}

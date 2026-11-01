@@ -12,7 +12,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
@@ -355,4 +357,131 @@ func nullableCount(s *arrow.Schema) int {
 		}
 	}
 	return n
+}
+
+// TestStreamBudgetRefusesRatherThanGrows is the containment this endpoint needs because it
+// runs in the daemon. memory.DefaultAllocator grows until the process cannot; in a gateway
+// that is a dead gateway, in process it is a dead daemon taking the job queue's reader with
+// it. The query must fail instead, and it must say so as a resource limit rather than as an
+// internal fault, because the client's recourse is a narrower query.
+func TestStreamBudgetRefusesRatherThanGrows(t *testing.T) {
+	cl, svc, done := harness(t, 200)
+	defer done()
+	svc.SetStreamBudget(2048) // far too small for 200 rows of several columns
+	ctx := context.Background()
+
+	info, err := cl.Execute(ctx, "SELECT * FROM "+dbrpc.DefaultTable)
+	if err != nil {
+		t.Fatalf("Execute should still plan; only the stream is budgeted: %v", err)
+	}
+	rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket)
+	if err == nil {
+		for rdr.Next() {
+		}
+		err = rdr.Err()
+		rdr.Release()
+	}
+	if err == nil {
+		t.Fatal("a 2 KiB budget served 200 rows; the budget is not reaching the encoder")
+	}
+	if got := status.Code(err); got != codes.ResourceExhausted {
+		t.Errorf("code %v, want ResourceExhausted -- a configured limit is not an internal fault (%v)", got, err)
+	}
+	if !strings.Contains(err.Error(), "budget") {
+		t.Errorf("error %q does not mention the budget, so an operator cannot tell what to raise", err)
+	}
+}
+
+// TestStreamBudgetGenerousEnoughStillWorks keeps the test above honest: it must fail because
+// the budget is small, not because a budget was set at all.
+func TestStreamBudgetGenerousEnoughStillWorks(t *testing.T) {
+	cl, svc, done := harness(t, 200)
+	defer done()
+	svc.SetStreamBudget(64 << 20)
+	ctx := context.Background()
+
+	info, err := cl.Execute(ctx, "SELECT * FROM "+dbrpc.DefaultTable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rdr.Release()
+	rows := 0
+	for rdr.Next() {
+		rows += int(rdr.Record().NumRows())
+	}
+	if err := rdr.Err(); err != nil {
+		t.Fatalf("a 64 MiB budget refused 200 rows: %v", err)
+	}
+	if rows != 200 {
+		t.Errorf("read %d rows, want 200", rows)
+	}
+}
+
+// TestMaxStreamsRefusesWithoutQueueing covers the cap's semantics directly rather than over
+// gRPC, and the reason is worth recording: a client cannot hold a slot open by declining to
+// read. The server's scan goroutine fills the channel and finishes -- for any result small
+// enough to keep a test fast, that happens before the client reads a byte -- and releasing the
+// slot then is correct, because the work it accounts for is done. Demonstrating contention
+// through the client would need a fixture big enough to block the goroutine on a full channel,
+// which buys nothing this does not already pin.
+//
+// What matters is that the cap REFUSES rather than queues. A queue of scans inside the daemon
+// is precisely what the cap exists to prevent: a refused client can retry, a client left
+// hanging cannot tell whether to.
+func TestMaxStreamsRefusesWithoutQueueing(t *testing.T) {
+	_, svc, done := harness(t, 10)
+	defer done()
+
+	svc.SetMaxStreams(2)
+	first, ok := svc.acquireStream()
+	if !ok {
+		t.Fatal("the first slot was refused")
+	}
+	second, ok := svc.acquireStream()
+	if !ok {
+		t.Fatal("the second slot was refused with a cap of two")
+	}
+	if _, ok := svc.acquireStream(); ok {
+		t.Error("a third slot was admitted with a cap of two")
+	}
+
+	// Releasing admits another: a limit on concurrency, not a permanent ceiling.
+	first()
+	third, ok := svc.acquireStream()
+	if !ok {
+		t.Error("no slot after one was released")
+	}
+
+	// Releasing twice must not manufacture capacity, or a double release would raise the
+	// effective cap -- the same class of bug as accounting that goes negative.
+	third()
+	third()
+	second()
+	for i := 0; i < 2; i++ {
+		if _, ok := svc.acquireStream(); !ok {
+			t.Fatalf("slot %d unavailable after every release", i)
+		}
+	}
+	if _, ok := svc.acquireStream(); ok {
+		t.Error("capacity exceeded the cap after a double release")
+	}
+}
+
+// TestMaxStreamsUnlimited: an unconfigured endpoint is uncapped, which is what it did before
+// the cap existed, and the zero value has to mean that rather than "no streams allowed".
+func TestMaxStreamsUnlimited(t *testing.T) {
+	_, svc, done := harness(t, 10)
+	defer done()
+	for _, n := range []int{0, -1} {
+		svc.SetMaxStreams(n)
+		for i := 0; i < 50; i++ {
+			if _, ok := svc.acquireStream(); !ok {
+				t.Fatalf("SetMaxStreams(%d): refused slot %d, want unlimited", n, i)
+			}
+		}
+	}
 }

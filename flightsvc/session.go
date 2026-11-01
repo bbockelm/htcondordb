@@ -135,7 +135,28 @@ func (s *Sessions) For(ctx context.Context) (*dbrpc.Client, func(), error) {
 	cc, sc := net.Pipe()
 	opts := levelOptions(s.authz, addr, user)
 	go func() { _ = s.cat.ServeConnOpts(dbrpc.NewStreamConn(sc), opts) }()
-	client := dbrpc.NewClient(dbrpc.NewStreamConn(cc))
+
+	// Carry the peer's advertisement, as every dbrpc client must. A client built without it
+	// reads every server as SupportUnknown and quietly keeps to the probe paths -- which
+	// from the outside looks exactly like talking to an old server, with nothing failing
+	// and nothing logged (see command/advertise_wiring_test.go, which checks that no client
+	// forgets).
+	//
+	// A loopback is the one case with no handshake to capture it from, and also the one
+	// case that needs none: the peer is this very process, so its advertisement is
+	// ServerSessionAttrs() exactly. Reaching for a handshake here would be inventing a
+	// negotiation with ourselves.
+	attrs, missing := loopbackPeerAttrs()
+	if len(missing) > 0 {
+		// Not fatal: an attribute a client wants and the server does not advertise
+		// leaves that one reading as unknown, which is the safe reading and is what a
+		// networked client would also get. Worth saying out loud, because silence here
+		// is indistinguishable from everything being wired.
+		return nil, nil, fmt.Errorf(
+			"dbrpc advertises no %v, which a client asks for; the loopback would read them as unknown",
+			missing)
+	}
+	client := dbrpc.NewClient(dbrpc.NewStreamConn(cc), dbrpc.WithPeerSessionAttrs(attrs))
 
 	sess := &session{client: client}
 	s.mu.Lock()
@@ -245,4 +266,24 @@ func peerFromContext(ctx context.Context) (string, bool) {
 		return "", false
 	}
 	return p.Addr.String(), true
+}
+
+// loopbackPeerAttrs is the peer advertisement for an in-process session, plus any attribute a
+// networked client would ask for that the server does not actually advertise.
+//
+// The coverage check is the point. A loopback cannot capture an advertisement from a handshake,
+// so it supplies the server's own -- correct, because the peer IS this process. But that is
+// only equivalent while the two sides name the same attributes: if dbrpc grows one a client
+// asks for and the server does not set, a loopback reads it as unknown and nothing says so,
+// which is the same silent failure command/advertise_wiring_test.go exists to prevent. So the
+// mismatch is reported rather than assumed away.
+func loopbackPeerAttrs() (map[string]string, []string) {
+	attrs := dbrpc.ServerSessionAttrs()
+	var missing []string
+	for _, name := range dbrpc.ClientSessionAttrNames() {
+		if _, ok := attrs[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	return attrs, missing
 }
