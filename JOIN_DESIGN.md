@@ -324,6 +324,53 @@ answer it got would still be a whole-table count where the server could decide p
 from zone maps. The cap was the honest thing to do with the information a client had. It need not stay that
 way, because the information is obtainable.
 
+#### Measured again, once the store could join: the wire argument is conditional
+
+The tables above price the gap between joining over a connection and joining in-process, and
+§10 Phase 3 took that as the case for moving the pairing into the store. Built and measured,
+it does not follow. The same statement through two executors over the same store, differing
+only in whether the handshake advertises the join, best of both arm orders:
+
+| left keys | shape | client-side | in the store | |
+|---|---|---|---|---|
+| 400 | 4 attributes | 13.7 ms | 19.0 ms | **1.39x SLOWER** |
+| 2048 | 4 attributes | 69.3 ms | 93.6 ms | **1.35x slower** |
+| 8192 | 4 attributes | 283 ms | 396 ms | **1.40x slower** |
+| 400 | `SELECT *` | 82.9 ms | 85.4 ms | 1.03x slower |
+| 2048 | `SELECT *` | 436 ms | 458 ms | 1.05x slower |
+| 8192 | `SELECT *` | 1755 ms | 1839 ms | 1.05x slower |
+
+**A joined row carries both sides, so a join that EXPANDS moves more data than its inputs.**
+Each history row here matches two epoch rows, so the composite output repeats the history ad
+once per output row. Counting attribute-values per cluster, with two right rows per left row:
+
+| shape | client ships | store ships | |
+|---|---|---|---|
+| narrow (2 attrs each side) | 2 + 2·2 = **6** | 2·(2+2) = **8** | 1.33x more |
+| `SELECT *` (40 + 16 attrs) | 40 + 2·16 = **72** | 2·(40+16) = **112** | 1.56x more |
+
+1.33x more data, 1.40x slower: the arithmetic and the clock agree, so the mechanism is not in
+doubt. The `SELECT *` rows move more data still and show less of it, because at that width
+other costs dominate the ratio.
+
+**What was wrong with the reasoning.** §6.2 compared "both sides shipped whole" against
+"joined rows shipped" and treated the second as the smaller. That holds only when the join
+is SELECTIVE -- when fewer rows come out than went in. For a 1:N join the left side is
+duplicated per output row and the comparison inverts. The earlier tables are not wrong about
+what they measured; they measured the cost of the wire, not the cost of the join, and the
+join changes how many rows cross it.
+
+**What this does not undermine.** Block-level zone skipping is still unreachable from a
+client, and that was always the larger prize (§7); a selective join should still win, and the
+single-side materialization is a real memory improvement either way. What it undermines is
+the claim that moving the pairing into the store is a win *by itself*.
+
+**So the decision is a cost decision**, and it needs the expansion ratio -- output rows over
+input rows -- which is the same NDV estimate §7b says is missing. Until something can make
+that estimate the server-side join is off by default, behind `ExecConfig.ServerSideJoin`,
+with this measurement as the reason. A flag rather than deleted code, because the path has to
+be exercised and re-measured as the rest of Phase 3 lands.
+
 #### Pricing it with the one number that was missing
 
 The count aggregate already reaches an O(1) length for a mutable table and a zone-pruned
@@ -910,13 +957,14 @@ vectorized residual (§8.2) land here and land **first**: same machinery as the 
 path, but with no `TargetScope`, no composite ad and no outer-join asymmetry to get wrong.
 Measure `RecordsReassembled` before building.
 
-**Phase 3 — `opJoin` (opcode 69).** Justified by §6.2 and by §7, on two grounds that the
+**Phase 3 — `opJoin` (opcode 69).** Was justified by §6.2 and by §7, on two grounds that the
 MATCH measurement of §8.2 neither supports nor undermines: the wire and per-row rebuild cost
 a flat ~2.2x on a narrow projection and ~4.2x on `SELECT *`, before any network; and the
 access-path decisions need statistics that only the server holds. Block skipping is not
 merely slower from a client — it is unreachable, so all of §7 is server-only by construction
 rather than by preference. Same new-opcode-plus-`ErrXUnsupported`-fallback pattern `opTopK`
-and `opArchiveAggregateStats` use, so an older server degrades to Phase 1.
+and `opArchiveAggregateStats` use, so an older server degrades to Phase 1. The wire ground did not survive being built and
+measured; see "Measured again, once the store could join" in §6.
 
 Phase 3 is being built in increments, and the first one deliberately leaves out most of
 what this section describes. What it contains, and why:
