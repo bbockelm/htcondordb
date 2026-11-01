@@ -24,12 +24,16 @@ import (
 // routing a gRPC client cannot speak. So this binds its own port, following the precedent the
 // daemon already sets for its metrics/pprof listener.
 //
-// ONE DIFFERENCE FROM THAT PRECEDENT, and it matters. The metrics listener's own comment says
-// it "carries no secrets -- storage sizes and timings -- but bind it to a trusted interface".
-// This one carries AD CONTENTS. "Trusted interface" is not an adequate control for that, so
-// authentication is mandatory and the listener refuses to start without it rather than falling
-// back to something permissive. There is no way to configure an open Flight endpoint by
-// omission, which is the only safe shape for a default that cannot be tightened later.
+// ONE DIFFERENCE FROM THAT PRECEDENT. The metrics listener's own comment says it "carries no
+// secrets -- storage sizes and timings -- but bind it to a trusted interface". This one carries
+// AD CONTENTS, so a trusted interface is not the control; the authorization policy is.
+//
+// Authentication follows CEDAR rather than being stricter: OPTIONAL by default, which verifies
+// a credential when one is offered and otherwise serves the anonymous identity, leaving
+// ALLOW_READ to decide. The endpoint therefore adds no exposure of its own -- what an anonymous
+// caller may read here is what the same caller may already read over CEDAR, decided by the same
+// policy, so an operator who has tightened one has tightened both. REQUIRED is available for a
+// pool that wants this door stricter than that one.
 
 // startFlightSQL starts the Flight SQL endpoint if HTCONDORDB_FLIGHT_ADDRESS is set. It
 // returns a stop function, or nil if the endpoint is not configured.
@@ -39,12 +43,9 @@ func startFlightSQL(ctx context.Context, cfg *config.Config, log *logging.Logger
 		return nil, nil
 	}
 
-	authn, err := flightAuthenticator(cfg, log)
+	authn, err := flightAuthenticator(cfg)
 	if err != nil {
-		// Fail the startup rather than serving unauthenticated. An operator who set the
-		// address meant to serve; serving the job queue to anyone who connects is not
-		// what they meant, and a warning in a log is not a control.
-		return nil, fmt.Errorf("HTCONDORDB_FLIGHT_ADDRESS is set but no authentication is configured: %w", err)
+		return nil, err
 	}
 
 	sessions, err := flightsvc.NewSessions(cat, authn, authorize, flightDeriveOptions(cfg))
@@ -87,24 +88,47 @@ func startFlightSQL(ctx context.Context, cfg *config.Config, log *logging.Logger
 	return func() { gsrv.Stop(); sessions.Close() }, nil
 }
 
-// flightAuthenticator builds the configured mechanism. Exactly one is available today
-// (SciToken bearer credentials), and an unrecognised or absent setting is an error rather than
-// a fallback -- see the comment on startFlightSQL for why there is no permissive default.
-func flightAuthenticator(cfg *config.Config, log *logging.Logger) (flightsvc.Authenticator, error) {
-	switch method := getStr(cfg, "HTCONDORDB_FLIGHT_AUTHENTICATION"); method {
-	case "SCITOKEN", "scitoken":
-		// Issuers are required: cedar's verifier accepts nothing without them, mirroring
-		// HTCondor's own SCITOKENS map-file behaviour, so an endpoint configured without
-		// any could never admit a caller.
-		return flightsvc.SciTokenAuthenticator(flightsvc.SciTokenConfig{
-			Issuers:   getList(cfg, "HTCONDORDB_FLIGHT_SCITOKEN_ISSUERS"),
-			Audiences: getList(cfg, "SCITOKENS_SERVER_AUDIENCE"),
-		})
-	case "":
-		return nil, fmt.Errorf("set HTCONDORDB_FLIGHT_AUTHENTICATION (SCITOKEN)")
-	default:
-		return nil, fmt.Errorf("unknown HTCONDORDB_FLIGHT_AUTHENTICATION %q (known: SCITOKEN)", method)
+// flightAuthenticator builds the configured mechanism.
+//
+// The default is OPTIONAL, which is what HTCondor's SEC_*_AUTHENTICATION defaults to and what
+// CEDAR therefore does: verify a credential when one is offered, and otherwise serve the
+// anonymous identity and let ALLOW_READ decide. That keeps one policy governing both doors.
+// REQUIRED is available for a pool that wants this endpoint stricter than its CEDAR one.
+//
+// Permissive is not open. An anonymous caller still has to satisfy ALLOW_READ, still gets READ
+// level only, and still has private attributes stripped -- what changes is that the pool's
+// policy decides rather than this code.
+func flightAuthenticator(cfg *config.Config) (flightsvc.Authenticator, error) {
+	method := getStr(cfg, "HTCONDORDB_FLIGHT_AUTHENTICATION")
+	if method == "" {
+		method = "OPTIONAL"
 	}
+	switch strings.ToUpper(method) {
+	case "NONE":
+		return flightsvc.AnonymousAuthenticator(), nil
+	case "OPTIONAL":
+		// With no issuers configured there is no credential this could verify, so
+		// OPTIONAL degenerates to anonymous rather than erroring: an operator who
+		// configured no token issuers has not asked for token authentication.
+		sci, err := flightSciToken(cfg)
+		if err != nil {
+			return flightsvc.AnonymousAuthenticator(), nil
+		}
+		return flightsvc.OptionalAuth(sci), nil
+	case "SCITOKEN", "REQUIRED":
+		return flightSciToken(cfg)
+	default:
+		return nil, fmt.Errorf("unknown HTCONDORDB_FLIGHT_AUTHENTICATION %q (known: OPTIONAL, SCITOKEN, NONE)", method)
+	}
+}
+
+// flightSciToken builds the SciToken verifier. Issuers are required because cedar's verifier
+// accepts nothing without them, mirroring HTCondor's own SCITOKENS map-file behaviour.
+func flightSciToken(cfg *config.Config) (flightsvc.Authenticator, error) {
+	return flightsvc.SciTokenAuthenticator(flightsvc.SciTokenConfig{
+		Issuers:   getList(cfg, "HTCONDORDB_FLIGHT_SCITOKEN_ISSUERS"),
+		Audiences: getList(cfg, "SCITOKENS_SERVER_AUDIENCE"),
+	})
 }
 
 // flightDeriveOptions carries the type declarations into the endpoint: which attributes are

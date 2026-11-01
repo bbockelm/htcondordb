@@ -73,7 +73,7 @@ func TestNewSessionsRefusesWithoutAuthenticator(t *testing.T) {
 	}
 }
 
-func TestSessionRefusesUnauthenticated(t *testing.T) {
+func TestSessionRefusals(t *testing.T) {
 	cat, done := store(t)
 	defer done()
 
@@ -82,8 +82,12 @@ func TestSessionRefusesUnauthenticated(t *testing.T) {
 		auth Authenticator
 		want codes.Code
 	}{
+		// A credential that fails to verify is an authentication failure.
 		{"authentication failed", fixedAuth{err: fmt.Errorf("bad token")}, codes.Unauthenticated},
-		{"no identity returned", fixedAuth{user: ""}, codes.Unauthenticated},
+		// No identity is the ANONYMOUS peer, which is not a failure -- it is handed to
+		// the policy, and this policy admits only alice, so the refusal is an
+		// authorization one. See TestAnonymousPeerFollowsPolicy for the admitted case.
+		{"anonymous, denied by policy", fixedAuth{user: ""}, codes.PermissionDenied},
 		{"not authorized to read", fixedAuth{user: "bob"}, codes.PermissionDenied},
 	} {
 		s, err := NewSessions(cat, c.auth, allowLevels("alice", "READ"), arrowtype.Options{})
@@ -224,4 +228,71 @@ func mustSchema(t *testing.T, client *dbrpc.Client) *arrow.Schema {
 		t.Fatal("empty schema")
 	}
 	return schema
+}
+
+// TestAnonymousPeerFollowsPolicy is the posture change: an unauthenticated caller is not
+// refused by this package, it is handed to the authorization policy exactly as an anonymous
+// CEDAR peer is. Whatever ALLOW_READ says about the empty identity is the answer.
+func TestAnonymousPeerFollowsPolicy(t *testing.T) {
+	cat, done := store(t)
+	defer done()
+
+	// ALLOW_READ admits the anonymous identity: served, read-only, no private attributes.
+	allowAnon := func(perm, _, user string) bool { return user == "" && perm == "READ" }
+	s, err := NewSessions(cat, AnonymousAuthenticator(), allowAnon, arrowtype.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, release, err := s.For(context.Background())
+	if err != nil {
+		t.Fatalf("anonymous peer refused though the policy admits it: %v", err)
+	}
+	defer release()
+	schema := mustSchema(t, client)
+	if len(schema.FieldIndices("ClaimId")) != 0 {
+		t.Error("an anonymous peer was served a ClaimId column")
+	}
+	if len(schema.FieldIndices("Owner")) == 0 {
+		t.Error("an anonymous peer got nothing at all; the test proves nothing")
+	}
+
+	// ALLOW_READ does NOT admit it: refused, by the policy rather than by this package.
+	denyAnon := func(_, _, user string) bool { return user != "" }
+	s2, err := NewSessions(cat, AnonymousAuthenticator(), denyAnon, arrowtype.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s2.For(context.Background()); err == nil {
+		t.Error("anonymous peer admitted though the policy denies it")
+	} else if got := status.Code(err); got != codes.PermissionDenied {
+		t.Errorf("code %v, want PermissionDenied -- it is an authorization decision, not an authentication one", got)
+	}
+}
+
+// TestOptionalAuthDistinguishesAbsentFromBad is the line that keeps OPTIONAL honest. No
+// credential is anonymous. A credential that fails to verify is an ERROR -- downgrading it
+// would leave a caller who meant to authenticate puzzled by what is missing, and would turn a
+// revoked or expired token into a silent loss of privilege.
+func TestOptionalAuthDistinguishesAbsentFromBad(t *testing.T) {
+	inner := fixedAuth{err: fmt.Errorf("token did not verify")}
+	a := OptionalAuth(inner)
+
+	// Nothing presented: anonymous, no error.
+	user, err := a.Authenticate(context.Background(), metadata.MD{})
+	if err != nil {
+		t.Errorf("no credential should be anonymous, got error: %v", err)
+	}
+	if user != "" {
+		t.Errorf("no credential mapped to %q, want the anonymous identity", user)
+	}
+
+	// Something presented that does not verify: refused.
+	if _, err := a.Authenticate(context.Background(), metadata.Pairs("authorization", "Bearer junk")); err == nil {
+		t.Error("a credential that does not verify was accepted as anonymous")
+	}
+
+	// A nil inner degenerates to anonymous rather than panicking.
+	if u, err := OptionalAuth(nil).Authenticate(context.Background(), metadata.Pairs("authorization", "Bearer x")); err != nil || u != "" {
+		t.Errorf("OptionalAuth(nil) = %q/%v, want anonymous", u, err)
+	}
 }
