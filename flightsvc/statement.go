@@ -471,9 +471,33 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 				return false
 			}
 		}
-		scanErr := db.QueryTableStream(ctx, table, constraint, parsed.limit, func(row string) bool {
-			// QueryTable streams BRACKETED new-ClassAd text, not old.
-			ad, perr := classad.Parse(row)
+		// The REFS-CHASING projection op, for three reasons that happen to coincide.
+		//
+		// It reaches an ARCHIVE. The plain query op does not -- it refuses one by
+		// design and says so -- so reading `history`, the table most queries are about,
+		// used to fail after the endpoint had already listed it and derived its schema.
+		// The projection op serves a mutable table, a view's backing and an archive
+		// alike.
+		//
+		// It PUSHES THE PROJECTION DOWN, inside the decode walk: a non-projected
+		// attribute is never rendered, and a projection the hot header covers is served
+		// from the hot header alone. Before this, `SELECT Owner FROM jobs` pulled every
+		// attribute of every matching ad and this encoder dropped the rest on the floor.
+		//
+		// And it chases the projected expressions' REFERENCES, which this encoder needs
+		// because it EVALUATES. `MemoryUsage` projected without the siblings it is
+		// written over evaluates to undefined, so the plain projection op would turn a
+		// perfectly good integer column into nulls -- correct for a relay forwarding
+		// text, wrong for anything that evaluates. parsed.cols is nil for SELECT *,
+		// which the op reads as "no projection": every attribute, as before.
+		//
+		// No fallback to the non-refs op. Every Flight read goes through the in-process
+		// dbrpc loopback (see session.go), so the server is this same binary and cannot
+		// be a build that lacks the opcode. A fallback here would be untestable code
+		// guarding an impossible case.
+		scanErr := db.QueryRawProjectRefsStream(ctx, table, constraint, parsed.cols, parsed.limit, func(row string) bool {
+			// The projection ops stream OLD-ClassAd text, not the bracketed form.
+			ad, perr := classad.ParseOld(row)
 			if perr != nil {
 				return true
 			}

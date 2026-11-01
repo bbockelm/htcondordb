@@ -1099,6 +1099,7 @@ sampled one, and the columnar producer — roughly in that order of value per un
 | Authentication and authorization (§8.3–§8.4) | `flightsvc/authn.go`, `session.go` | token or anonymous → CEDAR's own `Authorizer`; READ-only whatever the peer holds |
 | Containment (§8.5) | `flightsvc/statement.go`, `server.go` | panic barrier per stream, byte budget, stream cap that refuses rather than queues |
 | Flight SQL method set (§9.2) | `flightsvc/server.go`, `statement.go`, `prepared.go` | catalogs, schemas, tables, table types, statement, prepared + bind |
+| Projected scan, archives included | `flightsvc/statement.go` | the refs-chasing projection op: reaches an archive, pushes the projection down, keeps expressions evaluable |
 | SqlInfo conformance | `flightsvc/server.go` | the entries a real driver asks for at connect, one of which failed every ADBC client while Go was green |
 | ANSI → ClassAd lowering (W1, §10) | `ansi/` | the comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, and `?` holes |
 | The same dialect in the REPL | `repl/dialect.go`, `-dialect` | one Arrow-column→SQL-kind mapping serves both front doors (`arrowtype/sqlkinds.go`) |
@@ -1150,53 +1151,36 @@ of them are in classad rather than here.
    (`flightsvc/session.go`). Any path that bypasses dbrpc has to carry both with it, or Arrow
    becomes the private-attribute oracle `private_gate.go` exists to prevent.
 
-**The step available now is not columnar at all.** Stop pulling whole ads as bracketed text.
-`QueryRawProjectRefsStream` applies the projection *inside* the decode walk, so non-projected
-attributes are never rendered and a hot-header-covered projection is served from the hot header
-alone — and it chases the references of the projected expressions, which this encoder needs,
-because `MemoryUsage` projected without its siblings evaluates to undefined rather than to a
-number.
+**The first step was not columnar at all, and it is taken.** The scan no longer pulls whole ads
+as bracketed text: `QueryRawProjectRefsStream` applies the projection *inside* the decode walk,
+so a non-projected attribute is never rendered and a projection the hot header covers is served
+from the hot header alone. Refs-chasing rather than the plain projection op because this encoder
+evaluates — `MemoryUsage` projected without the siblings it is written over evaluates to
+undefined, which turns a good integer column into nulls. The same change made archive tables
+readable (§13.3).
 
 `QueryRawWireStream` goes further and skips the text form altogether; a wire-form read measured
 12.8x end to end elsewhere in this tree, which is the same reason §9.3 insists the columnar
-encoder be measured against it and not against the string path. But it is a **second** step, not
-a free upgrade of the first: `opQueryRawWire` is not served from an archive — probed directly, it
-answers *"QueryRawWire is not served from an archive; use QueryRawProject, which does read one"* —
-so adopting the wire form would re-break `history` unless classad teaches that op to read one.
-Projection first, wire form after, and the wire form needs work upstream.
+encoder be measured against it and not against the string path. But it is **blocked upstream**,
+not merely next: `opQueryRawWire` is not served from an archive — probed directly, it answers
+*"QueryRawWire is not served from an archive; use QueryRawProject, which does read one"* — so
+adopting it today would re-break `history`. It needs the archive case added in classad first.
 
 ### 13.3 What is left
 
 Ordered by value per unit of work, not by position in the stack.
 
-1. **`SELECT * FROM history` returns an error, and no projection is pushed down.** These are
-   one change. Probed against a catalog holding an archive, the endpoint lists the table, derives
-   its schema, and then fails the read:
+**One item came off this list while the section was being written**, because writing it down is
+what found it: `SELECT * FROM history` returned an error. The endpoint listed the archive table,
+derived its schema (776 bytes of it), and then failed the read, because `opQuery` refuses an
+archive by design and says so. Nothing caught it: every Flight test ran against a single mutable
+table, and the one test that mentioned an archive name only checked that the *recogniser* accepts
+a `/`. Moving the scan onto the refs-chasing projection op fixed it and pushed the projection down
+in the same change (§13.2), and the harness now holds an archive. The lesson is the fixture, not
+the API: a new read surface needs an archive in its tests from the first one, or it cannot see
+this class of bug at all.
 
-   ```
-   Tables()  ->  [history jobs]
-
-   GetExecuteSchema("SELECT * FROM history")
-             ->  ok, 776 bytes of serialized schema
-
-   DoGet(the same query)
-             ->  dbrpc: archive table "history": Query is not served from an archive;
-                 use ArchiveQuery, which answers newest-first with the limit pushed down
-   ```
-
-   `opQuery`, which `QueryTableStream` uses, refuses an archive deliberately and says so
-   (`tableOr`, dbrpc `server.go:476` — a refusal that names the archive rather than claiming the
-   table does not exist, precisely so a history table stops denying its own existence). So the
-   table most queries are about is advertised, typed, and unreadable, and nothing catches it:
-   every Flight test runs against a single mutable table, and `flightsvc/server_test.go:643` only
-   checks that the *recogniser* accepts a name with a `/` in it.
-
-   The projection ops serve a mutable table, a view's backing and an archive uniformly — probed,
-   `QueryRawProjectRefsStream` returns the archive's rows — so moving the scan onto it fixes the
-   archive hole, stops `SELECT Owner FROM jobs` pulling every attribute of every matching ad, and
-   takes the first step of §13.2, in one change. Build the archive case into the harness at the
-   same time; a fixture with only a mutable table cannot see this class of bug at all.
-2. **The schema is sampled per RPC, not declared.** `tableSchemaWith` profiles up to 10 000
+1. **The schema is sampled per RPC, not declared.** `tableSchemaWith` profiles up to 10 000
    records on every statement, every bind and every DoGet, with no cache and no generation
    (`flightsvc/statement.go:166`). Three consequences. `GetFlightInfoStatement` and
    `DoGetStatement` sample **independently**, so the schema promised and the schema delivered are
@@ -1205,7 +1189,7 @@ Ordered by value per unit of work, not by position in the stack.
    scan. §5.7's describe-table op — a type map stored beside the columnar schema, sharing its
    generation counter, overridable by an admin — was not built; what shipped is `opAttrTypes`
    returning sampled profiles, which is the measurement and not the declaration.
-3. **The type decision is made on the stored form, while the encoder evaluates.**
+2. **The type decision is made on the stored form, while the encoder evaluates.**
    `AttrTypeProfiles` classifies wire nodes and states that it evaluates nothing, so `expr`
    competes as a value class and an expression-dominant attribute is ruled `Untyped`
    (`arrowtype/derive.go:315`). On ap2001's `history` that drops `MemoryUsage` from the schema
@@ -1213,18 +1197,18 @@ Ordered by value per unit of work, not by position in the stack.
    established §5.1 was a one-off script; the server op that would act on it reports stored
    classes. Profiling *evaluated* values is work in `collections`, and it is what makes §5.1
    true of the schema and not only of the encoder.
-4. **There is no tail column.** §5.6 specifies `SELECT *` as the typed columns plus one `_ad`
+3. **There is no tail column.** §5.6 specifies `SELECT *` as the typed columns plus one `_ad`
    column carrying everything not promoted. `Schema` simply omits every `Untyped` attribute
    (`arrowtype/derive.go:463`), which is the "schema that lies by omission" §5.6 names:
    `Requirements`, whose *text* is the only useful form of it, is invisible over ADBC rather
    than preserved. Until item 3 lands, so is `MemoryUsage` — and those two failures look
    identical from a client, which is the argument for building the tail column first.
-5. **Overrides and strictness are implemented and unreachable.** `arrowtype.Options.Overrides`
+4. **Overrides and strictness are implemented and unreachable.** `arrowtype.Options.Overrides`
    and `StrictMixedKinds` are tested, and the daemon wires only `TimeAttrs`
    (`cmd/htcondordb/flight.go:167`). An admin can declare an epoch attribute, but cannot force a
    column's type or ask to be refused rather than handed a text fallback. Configuration, not
    design.
-6. **The SQL surface is a recogniser, not the executor.** `parseQuery`
+5. **The SQL surface is a recogniser, not the executor.** `parseQuery`
    (`flightsvc/statement.go:81`) is one regexp; an aggregate, `GROUP BY`, `ORDER BY`, a `JOIN`, a
    set operation or a function is refused rather than approximated. The `repl` executor does all
    of them, and the server-side TopK and the archive `GROUP BY` already exist underneath — so a
@@ -1232,21 +1216,21 @@ Ordered by value per unit of work, not by position in the stack.
    whose store could have answered. This is the largest remaining piece of W1 and the one that
    most changes what the endpoint is *for*; §9.2's note that the method set sits "over the
    existing `repl` executor" describes the intent, not the code.
-7. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
+6. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
    parses cells and keeps its own `knownTimeAttrs` (`grafana/pkg/plugin/frame.go:15`), and the
    DB-API cursor still documents `description` as "what arrived, not a schema"
    (`python/htcondordb/cursor.py:523`). There is no `arrow()` on the Python client and no
    `.arrow` in the REPL, both of which §9.4 asked for as nearly free once the encoder existed.
    The encoder exists.
-8. **The two front doors sample different amounts.** The REPL's ANSI dialect profiles 2000
+7. **The two front doors sample different amounts.** The REPL's ANSI dialect profiles 2000
    records (`repl/dialect.go:91`), the endpoint 10 000, so the set of columns each believes the
    table has can differ on the same table at the same moment. One kind mapping already serves
    both (`arrowtype/sqlkinds.go`); the sample size should too.
-9. **Then the columnar producer** (§13.2, and §9.3's closing paragraph). It is last because
-   items 1 and 2 remove the costs that are not per-value work — a whole ad rendered to reach one
-   attribute, a profile scan per RPC — without touching `collections` at all, and because it
-   needs the baseline item 1 establishes: measured against today's string path it would flatter
-   itself.
+8. **Then the columnar producer** (§13.2, and §9.3's closing paragraph). It is last because the
+   costs that are not per-value work come off without touching `collections` at all — the whole
+   ad rendered to reach one attribute is already gone, and item 1 takes the profile scan per RPC
+   — and because the comparison has to be against the projected read, not against the string path
+   it replaced, or it will flatter itself.
 
 Still deliberately not built: writes, Substrait, transactions and savepoints, key metadata,
 `XdbcTypeInfo`, `CancelFlightInfo` (§9.2), and everything in §11.
