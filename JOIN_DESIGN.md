@@ -910,18 +910,46 @@ vectorized residual (§8.2) land here and land **first**: same machinery as the 
 path, but with no `TargetScope`, no composite ad and no outer-join asymmetry to get wrong.
 Measure `RecordsReassembled` before building.
 
-**Phase 3 — `opJoin` (opcode 66; 65 is the current high-water mark).** Justified by §6.2
-and by §7, on two grounds that the MATCH measurement of §8.2 neither supports nor
-undermines: the wire and per-row rebuild cost 2x on a narrow projection and 4.5x on
-`SELECT *`, before any network; and the access-path decisions need statistics that only the
-server holds. Block skipping is not merely slower from a client — it is unreachable, so all
-of §7 is server-only by construction rather than by preference. Two tables, `ON` as
-a ClassAd expression, executed inside the store: the join `ColumnSource` of §6.1, the block
-sweep and zone skipping of §7, wire-form row assembly, streaming only joined output rows.
-Same new-opcode-plus-`ErrXUnsupported`-fallback pattern `opTopK` and
-`opArchiveAggregateStats` use, so an older server degrades to Phase 1. Then aggregates over
-a join pushed server-side — `SELECT j.Owner, COUNT(*) FROM jobs j JOIN history h ON …` is
-what dashboards actually ask, and only the grouped result should cross the wire.
+**Phase 3 — `opJoin` (opcode 69).** Justified by §6.2 and by §7, on two grounds that the
+MATCH measurement of §8.2 neither supports nor undermines: the wire and per-row rebuild cost
+a flat ~2.2x on a narrow projection and ~4.2x on `SELECT *`, before any network; and the
+access-path decisions need statistics that only the server holds. Block skipping is not
+merely slower from a client — it is unreachable, so all of §7 is server-only by construction
+rather than by preference. Same new-opcode-plus-`ErrXUnsupported`-fallback pattern `opTopK`
+and `opArchiveAggregateStats` use, so an older server degrades to Phase 1.
+
+Phase 3 is being built in increments, and the first one deliberately leaves out most of
+what this section describes. What it contains, and why:
+
+- **The join runs in `db`, not in `dbrpc`.** Alongside the aggregate ladder, for the reason
+  that one already lives there: an embedded caller gets the same execution the RPC handler
+  does, rather than two implementations of the same rules. `db.Catalog.Join` takes a plan and
+  streams composite ads.
+- **The CALLER supplies the plan.** Which conjuncts went to which side, which equalities
+  drive the hash. That splitting is settled, tested and identical wherever it runs, and
+  re-deriving it server-side would be a second implementation of §5. A server-side planner
+  is a later increment, and it is what §7b is about.
+- **One side is held, not two.** The hash is built on one side and the other streamed
+  against it. A client join holds both, so this is a memory improvement independent of the
+  wire one.
+- **A view resolves to BOTH halves.** A continuous aggregate moves sealed buckets into an
+  archive, so a join reading only the backing would join against the unsealed tail — the
+  same defect the read paths had.
+- **Limits are the server's own.** A request can only ask for less. A caller must not be
+  able to ask a daemon to hold or produce an unbounded amount.
+- **A limit met mid-stream is reported after the rows.** It cannot be a refusal, because rows
+  have already been sent. It goes out as an `stErr` following them, which the streaming
+  client surfaces on a partial result — a truncated join must not read as a complete one.
+  This turned up that two of the three client stream readers dropped `stBadReq` and HUNG
+  rather than falling back, which is fixed separately and matters to every op, not just this
+  one.
+- **Not yet here:** the block sweep and zone skipping of §7, the vectorized `ColumnSource` of
+  §6.1, wire-form row assembly, and server-side planning. The first increment buys the wire
+  and the single-side materialization; those buy the rest.
+
+Then aggregates over a join pushed server-side — `SELECT j.Owner, COUNT(*) FROM jobs j JOIN
+history h ON …` is what dashboards actually ask, and only the grouped result should cross the
+wire.
 
 **Phase 4 — MATCH-specific: the ranked join.** The items that have no join analogue, in
 dependency order:
