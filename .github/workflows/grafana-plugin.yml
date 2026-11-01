@@ -15,6 +15,12 @@ on:
   pull_request:
     paths: ['grafana/**', 'go.mod', 'go.sum', '.github/workflows/grafana-plugin.yml']
 
+# One run per workflow per ref. PR runs are cancelled when a new push supersedes them;
+# pushes to main are never cancelled, because every commit that lands must still be tested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
