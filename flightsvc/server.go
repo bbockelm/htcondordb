@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -50,16 +51,65 @@ const tableType = "TABLE"
 const defaultSchemaName = "htcondordb"
 
 // Server is a read-only Flight SQL server over one htcondordb daemon.
+//
+// The dbrpc client is resolved PER RPC rather than held, because one Flight server serves every
+// connection while each connection's reads must go through a session carrying its own
+// identity's authorization. dbFor is that resolution: a fixed client for a single-identity
+// server, or a freshly authorized loopback session for a multi-identity one.
+//
+// Per RPC, not per connection, and deliberately: gRPC offers no stable per-connection handle in
+// a handler's context without a stats handler, and a session per RPC is a pipe and a goroutine
+// whose cost is small beside the ad text already crossing it. Rung 0 is not the fast path.
 type Server struct {
 	flightsql.BaseServer
 
-	db    *dbrpc.Client
+	// dbFor returns a client for this RPC and a release to call when the RPC's work --
+	// including any stream it started -- is finished.
+	dbFor func(context.Context) (*dbrpc.Client, func(), error)
 	alloc memory.Allocator
 	// derive carries the type declarations -- epoch attributes, and the overrides for
 	// attributes whose type inference cannot decide (see arrowtype.Override).
 	derive arrowtype.Options
 	// sample caps how many records a schema derivation reads; 0 uses the default.
 	sample int
+	// streamBudget caps the Arrow bytes one DoGet stream may hold; 0 is unlimited.
+	streamBudget int64
+	// streams admits at most one token per concurrent DoGet stream. Nil means unlimited.
+	//
+	// A cap exists because this runs in the daemon: concurrent wide scans compete for CPU
+	// and heap with the store's own goroutines and its maintenance, and the failure mode of
+	// having no cap is not a slow endpoint but a slow DATABASE. Refusing the eleventh
+	// stream is a client's problem; starving the store is everyone's.
+	streams chan struct{}
+}
+
+// SetStreamBudget caps the Arrow bytes a single DoGet stream may hold. Zero is unlimited,
+// which is memory.DefaultAllocator's behaviour and what an unconfigured endpoint gets.
+func (s *Server) SetStreamBudget(bytes int64) { s.streamBudget = bytes }
+
+// SetMaxStreams caps concurrent DoGet streams. Zero or less is unlimited.
+func (s *Server) SetMaxStreams(n int) {
+	if n <= 0 {
+		s.streams = nil
+		return
+	}
+	s.streams = make(chan struct{}, n)
+}
+
+// acquireStream takes a slot without waiting. Blocking would turn a cap into a queue, and a
+// queue of scans inside the daemon is the thing the cap exists to prevent -- a client told
+// "too many streams" can retry, a client left hanging cannot tell whether to.
+func (s *Server) acquireStream() (func(), bool) {
+	if s.streams == nil {
+		return func() {}, true
+	}
+	select {
+	case s.streams <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-s.streams }) }, true
+	default:
+		return nil, false
+	}
 }
 
 // SetSampleMax caps how many records a schema derivation reads. Zero restores the default.
@@ -77,7 +127,27 @@ func NewServer(db *dbrpc.Client, derive arrowtype.Options, alloc memory.Allocato
 	if alloc == nil {
 		alloc = memory.DefaultAllocator
 	}
-	s := &Server{db: db, alloc: alloc, derive: derive}
+	s := &Server{
+		dbFor: func(context.Context) (*dbrpc.Client, func(), error) { return db, func() {}, nil },
+		alloc: alloc, derive: derive,
+	}
+	if err := s.registerSqlInfo(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// NewSessionServer builds a Flight SQL service that resolves a per-identity session for every
+// RPC, which is how one server serves many identities without any of them seeing another's
+// authorization.
+func NewSessionServer(sessions *Sessions, derive arrowtype.Options, alloc memory.Allocator) (*Server, error) {
+	if sessions == nil {
+		return nil, fmt.Errorf("flightsvc: no sessions")
+	}
+	if alloc == nil {
+		alloc = memory.DefaultAllocator
+	}
+	s := &Server{dbFor: sessions.For, alloc: alloc, derive: derive}
 	if err := s.registerSqlInfo(); err != nil {
 		return nil, err
 	}
@@ -184,7 +254,12 @@ func (s *Server) GetFlightInfoTables(_ context.Context, cmd flightsql.GetTables,
 // honouring rather than refusing: a catalog browser that cannot see column types is not much
 // of a catalog browser.
 func (s *Server) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	names, err := s.db.Tables(ctx)
+	db, release, err := s.dbFor(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+	names, err := db.Tables(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -204,7 +279,7 @@ func (s *Server) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arr
 		if !cmd.GetIncludeSchema() {
 			continue
 		}
-		sch, _, derr := s.tableSchema(ctx, name)
+		sch, _, derr := s.tableSchemaWith(ctx, db, name)
 		if derr != nil {
 			// A table whose schema cannot be derived is still a table; reporting it
 			// with no schema is more useful than failing the whole listing, which

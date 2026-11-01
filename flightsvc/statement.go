@@ -2,6 +2,7 @@ package flightsvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -10,8 +11,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/dbrpc"
 
 	"github.com/bbockelm/htcondordb/arrowtype"
 )
@@ -57,8 +61,19 @@ func parseSelectAll(query string) (string, error) {
 // tableSchema derives a table's Arrow schema from a measurement of what its attributes hold.
 // It returns the decisions too, so a caller can report which attributes got no column.
 func (s *Server) tableSchema(ctx context.Context, table string) (*arrow.Schema, []arrowtype.Decision, error) {
+	db, release, err := s.dbFor(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+	return s.tableSchemaWith(ctx, db, table)
+}
+
+// tableSchemaWith is tableSchema on a client the caller already holds, so a handler that makes
+// several calls on one session does not open a session per call.
+func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table string) (*arrow.Schema, []arrowtype.Decision, error) {
 	max := s.sampleMax()
-	rep, err := s.db.AttrTypeProfiles(ctx, table, max)
+	rep, err := db.AttrTypeProfiles(ctx, table, max)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -139,25 +154,50 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 	if err != nil {
 		return nil, nil, err
 	}
-	schema, decisions, err := s.tableSchema(ctx, table)
+	// A stream slot first: refusing here costs nothing, while refusing after the schema
+	// derivation would have spent a profile round trip on a request we decline anyway.
+	slot, ok := s.acquireStream()
+	if !ok {
+		return nil, nil, status.Errorf(codes.ResourceExhausted,
+			"too many concurrent Flight streams (limit %d); retry shortly", cap(s.streams))
+	}
+	db, release, err := s.dbFor(ctx)
 	if err != nil {
+		slot()
+		return nil, nil, err
+	}
+	schema, decisions, err := s.tableSchemaWith(ctx, db, table)
+	if err != nil {
+		release()
+		slot()
 		return nil, nil, err
 	}
 
 	ch := make(chan flight.StreamChunk, 2)
 	go func() {
+		// The session and the stream slot outlive this call: DoGetStatement returns as
+		// soon as the stream exists, and the scan runs afterwards. Releasing on return
+		// would close the loopback under the goroutine still reading through it, and
+		// would free the slot while the work it accounts for is still running.
+		defer slot()
+		defer release()
 		defer close(ch)
 		// A panic here would otherwise take the daemon down with it: this runs in
 		// process, and one query must not be an outage. The recover is in this
 		// goroutine deliberately -- a helper that wrapped recover() would catch
 		// nothing, which is a mistake already made once in this tree.
+		//
+		// It is also the channel the memory budget refuses through: memory.Allocator
+		// cannot return an error, so arrowtype.Budget panics, and this is what turns
+		// that into a failed request rather than a dead daemon.
+		budget := arrowtype.NewBudget(s.alloc, s.streamBudget)
 		defer func() {
 			if r := recover(); r != nil {
-				ch <- flight.StreamChunk{Err: fmt.Errorf("query panicked: %v", r)}
+				ch <- flight.StreamChunk{Err: streamPanicError(r, budget)}
 			}
 		}()
 
-		enc := arrowtype.NewEncoder(decisions, arrowtype.EncodeOptions{Alloc: s.alloc})
+		enc := arrowtype.NewEncoder(decisions, arrowtype.EncodeOptions{Alloc: budget})
 		defer enc.Release()
 
 		flush := func() bool {
@@ -171,7 +211,7 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 				return false
 			}
 		}
-		scanErr := s.db.QueryTableStream(ctx, table, "true", 0, func(row string) bool {
+		scanErr := db.QueryTableStream(ctx, table, "true", 0, func(row string) bool {
 			// QueryTable streams BRACKETED new-ClassAd text, not old.
 			ad, perr := classad.Parse(row)
 			if perr != nil {
@@ -195,10 +235,49 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 // batchRows matches arrowstream's default, for the same reason sampleMax does.
 const batchRows = 2048
 
-// NewFlightServer wraps the service as a Flight server ready to register with gRPC.
+// NewFlightServer wraps a service as a Flight server ready to register with gRPC.
 func NewFlightServer(s *Server, alloc memory.Allocator) flight.FlightServer {
 	if alloc == nil {
 		alloc = memory.DefaultAllocator
 	}
 	return flightsql.NewFlightServerWithAllocator(s, alloc)
+}
+
+// Limits are the resource bounds an in-process endpoint needs. Both zero means unlimited,
+// which is what the endpoint did before the limits existed.
+type Limits struct {
+	// StreamBudgetBytes caps the Arrow memory one DoGet stream may hold.
+	StreamBudgetBytes int64
+	// MaxStreams caps concurrent DoGet streams.
+	MaxStreams int
+}
+
+// NewSessionFlightServer is NewFlightServer for a service that resolves a per-identity session
+// on every RPC. One Flight server serves every connection; what differs per RPC is the
+// authorization its reads go through.
+func NewSessionFlightServer(sessions *Sessions, alloc memory.Allocator, limits Limits) (flight.FlightServer, error) {
+	srv, err := NewSessionServer(sessions, sessions.Derive(), alloc)
+	if err != nil {
+		return nil, err
+	}
+	srv.SetStreamBudget(limits.StreamBudgetBytes)
+	srv.SetMaxStreams(limits.MaxStreams)
+	return NewFlightServer(srv, alloc), nil
+}
+
+// streamPanicError turns a recovered panic into the error a client sees.
+//
+// A budget refusal is reported as ResourceExhausted with the numbers in it, because it is an
+// ordinary resource limit and the client's recourse is a narrower query or a smaller batch --
+// quite different from an internal fault, which is what anything else is. Reporting both the
+// same way would have an operator hunting a bug when the answer is a configured limit.
+func streamPanicError(r any, budget *arrowtype.Budget) error {
+	var over *arrowtype.ErrBudgetExceeded
+	if err, ok := r.(error); ok && errors.As(err, &over) {
+		return status.Errorf(codes.ResourceExhausted,
+			"this query needs more Arrow memory than the per-stream budget allows (%d bytes): %v",
+			over.Limit, over)
+	}
+	return status.Errorf(codes.Internal, "the query failed internally (peak Arrow use %d bytes): %v",
+		budget.Peak(), r)
 }

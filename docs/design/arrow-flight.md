@@ -101,6 +101,13 @@ byte-for-byte, confirming the copy is faithful). darwin/arm64, `go1.26.0`, unstr
 | + Flight + gRPC + msgpack (rungs 1–3) | 46,063,954 | **+11,163,776 more (+35.1% of base)** |
 | full stack | 46,063,954 | +14,221,440 (+44.7%) |
 
+**Measured again once it was really wired in.** The table above comes from synthetic arms that
+link the dependencies without using them. With `flightsvc` actually serving from the daemon --
+flightsql, the catalog schemas, the per-identity session machinery -- the daemon goes from
+35,803,010 to 51,962,834 bytes: **+16.2 MB (+45.1%)**, against the +14.2 MB the synthetic arm
+predicted. The estimate was good to about two megabytes and low, which is the direction an
+estimate from a program that merely imports a library usually errs.
+
 **No cgo.** Verified, not assumed: `arrowtype`, the daemon, and the full stack (arrow + array
 + ipc + flight + flightsql + grpc + msgpack linked into a copy of the daemon) all build with
 `CGO_ENABLED=0`, and every package we would use declares zero cgo files. The only cgo in
@@ -583,12 +590,30 @@ mapped fully-qualified user. Three mechanisms, in the order they are worth build
    HTCondor's existing `AUTH_SSL_*` parameters for the server's own key and chain rather than
    inventing a parallel set.
 
-**Fail closed: no anonymous access.** CEDAR admits an unauthenticated peer as read-only,
-because HTCondor's default `SEC_*_AUTHENTICATION` is `OPTIONAL` and both ends negotiate down to
-nothing. That is a compatibility concession a *new* endpoint has not inherited and should not
-adopt: a Flight connection with no validated identity is refused, not admitted at READ. This is
-the kind of default that cannot be tightened later without breaking whoever came to depend on
-it, so it has to be right on the first release.
+**Authentication is OPTIONAL by default, following CEDAR rather than being stricter.** An
+earlier draft of this section argued the opposite -- fail closed, no anonymous access, on the
+grounds that a new endpoint has not inherited HTCondor's `OPTIONAL` compatibility concession.
+That was overruled, and the counter-argument is the better one.
+
+CEDAR already serves an anonymous peer: `peerUser` returns `""` for a connection that
+negotiated no authentication (`server/server.go:518`), the `ALLOW_`/`DENY_` policy is asked
+about that empty identity, and whatever it answers is the answer. An endpoint that refused the
+same caller would not be safer, it would be *inconsistent* -- two doors onto one store with two
+different postures, where an operator who tightened `ALLOW_READ` would have tightened only one
+of them and could not easily tell which. Matching CEDAR means the Flight endpoint adds no
+exposure of its own: what an anonymous caller may read here is exactly what it may already read
+there, decided by the same policy.
+
+Permissive is not open. An anonymous caller still has to satisfy `ALLOW_READ`, still gets READ
+level only, and still has private attributes stripped. What changed is *who decides* -- the
+pool's policy rather than this code. `REQUIRED` remains available for a pool that wants this
+door stricter than its CEDAR one.
+
+**The distinction that does hold is between presenting nothing and presenting something bad.**
+No credential is anonymous. A credential that is present and fails to verify is an error that
+refuses the connection, because downgrading it would leave a caller who meant to authenticate
+puzzled by what is missing -- and would turn a revoked or expired token into a silent loss of
+privilege rather than a reported one.
 
 ### 8.4 Authorization, and one thing that must not leak
 
@@ -610,17 +635,26 @@ A pathological read now runs in the daemon's address space. This is not hypothet
 `COUNT` shape panicked htcondordb in production for a 15-second outage. A gateway would have
 contained that. In process, containment has to be built:
 
-- **A panic barrier per RPC.** A deferred `recover()` *in the handler goroutine itself* — a
-  helper that wraps `recover()` in another function catches nothing, which is a mistake already
-  made once in this codebase. One query must not take the store down.
-- **A bounded Arrow allocator per stream.** `memory.DefaultAllocator` is unbounded; a wide
-  batch over a wide table can balloon. Budget each stream and fail *that RPC* when it is
-  exceeded, rather than letting the process meet the OOM killer.
-- **A concurrency cap on streams**, so a burst of clients cannot starve the store's own
-  goroutines and maintenance.
-- **Cancellation that actually reaches the scan.** gRPC gives the handler a context; it has to
-  be the context the scan takes, so a client hanging up stops the work rather than leaving it
-  running to completion for nobody.
+- **A panic barrier per RPC.** DONE. A deferred `recover()` *in the handler goroutine itself* —
+  a helper that wraps `recover()` in another function catches nothing, which is a mistake
+  already made once in this codebase. One query must not take the store down. **Still
+  untested**: removing it passes the suite, because nothing in the fixtures panics and inducing
+  one would mean an injection point in production code. Correct by inspection is not the same
+  as covered.
+- **A bounded Arrow allocator per stream.** DONE (`arrowtype.Budget`). One wrinkle worth
+  recording: `memory.Allocator` is `Allocate(size int) []byte` with no error return, and a nil
+  slice makes a builder write into nothing. **Panicking is the only refusal the interface
+  permits**, so the budget panics with a typed error and the handler's barrier turns it into a
+  failed request. A budget refusal reports `ResourceExhausted` with the numbers in it, kept
+  distinct from an internal fault, because the client's recourse is a narrower query rather
+  than a bug report.
+- **A concurrency cap on streams.** DONE. It **refuses rather than queues**: a queue of scans
+  inside the daemon is the thing the cap exists to prevent, and a refused client can retry
+  while one left hanging cannot tell whether to.
+- **Cancellation that actually reaches the scan.** The handler's context is the one the scan
+  takes, so a client hanging up stops the work. **Not independently tested** -- the flush select
+  honours `ctx.Done()`, but nothing proves a disconnect mid-stream actually stops the scan
+  rather than running it to completion for nobody.
 - **Watch retained allocators.** Arrow batches are large allocations in the same heap as the
   block cache and the mmap'd segments; a retained encoder pool here is the shape that already
   produced a 3 GB heap once.
@@ -901,6 +935,13 @@ Flight SQL additionally wants the catalog metadata commands (`CommandGetTables`,
 **Non-goals:** writes (Airport's `DoExchange`) — a second write path with its own transaction
 semantics for much less value than reads; scalar/table UDFs; `ALTER TABLE`; rung 1 as a
 destination.
+
+**Implemented so far.** The measurement (`collections.AttrTypeProfiles`, dbrpc op 68), the type
+decision and encoder (`arrowtype`), an Arrow IPC export (`arrowstream`, `htcondordb-cli
+arrow`), and a Flight SQL endpoint served in process (`flightsvc`) accepting
+`SELECT * FROM <table>` and refusing the rest. Verified against a non-Go consumer: 2000 real
+ap2001 history ads read back by pyarrow as 226 typed columns, with arithmetic over the columns
+the stray-expression bug would have made text.
 
 **Risks.** DuckDB's filter JSON is unversioned by policy (§7) — only if rung 3 is ever built.
 Catalog serialization cost for wide tables — measure a real jobs table early; §5.6 and SHA256
