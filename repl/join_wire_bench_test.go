@@ -301,19 +301,19 @@ func (f *joinBenchFixture) runBenchJoin(st *Statement, fetch joinFetch) (int, er
 	if err != nil {
 		return 0, err
 	}
-	leftAds, err := fetch(st, p.left, 0)
+	leftAds, err := fetch(st, p.sides[0], 0)
 	if err != nil {
 		return 0, err
 	}
-	right := p.right
-	if d := f.exec.decideKeyBatch(p, leftAds); d.constraint != "" {
+	right := p.sides[1]
+	if d := f.exec.decideKeyBatch(&p.steps[0], p.sides[1], p.wrapFirst(leftAds)); d.constraint != "" {
 		right.where = andText(right.where, d.constraint)
 	}
 	rightAds, err := fetch(st, right, 1)
 	if err != nil {
 		return 0, err
 	}
-	rows, err := p.join(leftAds, rightAds)
+	rows, err := joinTwoSides(p, leftAds, rightAds)
 	if err != nil {
 		return 0, err
 	}
@@ -462,13 +462,13 @@ func runBenchJoinBatch(st *Statement, fetch joinFetch, batching bool) (int, erro
 	if err != nil {
 		return 0, err
 	}
-	leftAds, err := fetch(st, p.left, 0)
+	leftAds, err := fetch(st, p.sides[0], 0)
 	if err != nil {
 		return 0, err
 	}
-	right := p.right
+	right := p.sides[1]
 	if batching {
-		if batch := p.keyBatchConstraint(leftAds); batch != "" {
+		if batch := p.steps[0].keyBatchConstraint(p.wrapFirst(leftAds)); batch != "" {
 			right.where = andText(right.where, batch)
 		}
 	}
@@ -476,7 +476,7 @@ func runBenchJoinBatch(st *Statement, fetch joinFetch, batching bool) (int, erro
 	if err != nil {
 		return 0, err
 	}
-	rows, err := p.join(leftAds, rightAds)
+	rows, err := joinTwoSides(p, leftAds, rightAds)
 	if err != nil {
 		return 0, err
 	}
