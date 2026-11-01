@@ -3,6 +3,7 @@ package flightsvc
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"google.golang.org/grpc/metadata"
@@ -38,6 +39,8 @@ type SciTokenConfig struct {
 	// Audiences is SCITOKENS_SERVER_AUDIENCE. A token naming an audience must name one of
 	// these; a token with no audience claim is accepted only when this is empty.
 	Audiences []string
+	// HTTPClient fetches issuer metadata and keys; nil trusts the system roots.
+	HTTPClient *http.Client
 }
 
 type sciTokenAuth struct {
@@ -52,32 +55,42 @@ func SciTokenAuthenticator(cfg SciTokenConfig) (Authenticator, error) {
 		return nil, fmt.Errorf("no trusted SciToken issuers configured, so no token could be accepted")
 	}
 	return sciTokenAuth{opts: cedarsec.SciTokenVerifyOptions{
-		Accept:    cedarsec.AcceptIssuers(cfg.Issuers...),
-		Audiences: cfg.Audiences,
+		Accept:     cedarsec.AcceptIssuers(cfg.Issuers...),
+		Audiences:  cfg.Audiences,
+		HTTPClient: cfg.HTTPClient,
 	}}, nil
 }
 
 func (sciTokenAuth) Name() string { return "SCITOKEN" }
 
 func (a sciTokenAuth) Authenticate(ctx context.Context, md metadata.MD) (string, error) {
+	user, _, err := a.AuthenticateScoped(ctx, md)
+	return user, err
+}
+
+// AuthenticateScoped also returns the token's bounding set, as HTCondor builds it from a
+// SciToken's scope claim: a SciToken is always bounded, by the levels its "condor:/<LEVEL>"
+// scopes name (a WLCG token's compute scopes count as READ and WRITE), so one with no condor
+// scope reaches no level above ALLOW.
+func (a sciTokenAuth) AuthenticateScoped(ctx context.Context, md metadata.MD) (string, []string, error) {
 	tok, ok := BearerToken(md)
 	if !ok {
-		return "", fmt.Errorf("no bearer credential in the request metadata")
+		return "", nil, fmt.Errorf("no bearer credential in the request metadata")
 	}
 	if !cedarsec.IsSciToken(tok) {
 		// Saying which credential was presented saves an operator from guessing why a
 		// token that works against the schedd is refused here.
-		return "", fmt.Errorf("the bearer credential is not a SciToken (an HTCondor IDTOKEN is not supported by this endpoint yet)")
+		return "", nil, fmt.Errorf("the bearer credential is not a SciToken (an HTCondor IDTOKEN is not supported by this endpoint yet)")
 	}
 	claims, err := cedarsec.VerifySciToken(ctx, tok, a.opts)
 	if err != nil {
-		return "", fmt.Errorf("verifying the SciToken: %w", err)
+		return "", nil, fmt.Errorf("verifying the SciToken: %w", err)
 	}
 	user, err := identityFromClaims(claims)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return user, nil
+	return user, claims.AuthorizationLimits, nil
 }
 
 // identityFromClaims maps verified claims to a fully-qualified identity.
@@ -161,8 +174,14 @@ func OptionalAuth(inner Authenticator) Authenticator {
 func (o optionalAuth) Name() string { return "OPTIONAL(" + o.inner.Name() + ")" }
 
 func (o optionalAuth) Authenticate(ctx context.Context, md metadata.MD) (string, error) {
+	user, _, err := o.AuthenticateScoped(ctx, md)
+	return user, err
+}
+
+// AuthenticateScoped carries the inner credential's bounding set. The anonymous peer has none.
+func (o optionalAuth) AuthenticateScoped(ctx context.Context, md metadata.MD) (string, []string, error) {
 	if _, ok := BearerToken(md); !ok {
-		return "", nil // no credential offered: anonymous, as CEDAR would
+		return "", nil, nil // no credential offered: anonymous, as CEDAR would
 	}
-	return o.inner.Authenticate(ctx, md)
+	return authenticateScoped(ctx, o.inner, md)
 }

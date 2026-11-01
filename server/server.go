@@ -5,7 +5,8 @@
 //
 // One authenticated CEDAR connection carries an entire dbrpc multiplex. The
 // access level is decided once, at connection time, from the authenticated
-// identity:
+// identity, bounded by the credential's authorization limits (a token's
+// "condor:/<LEVEL>" scopes; see effectiveLevel):
 //
 //   - READ  -> read-only, and every ad returned has its private (secret)
 //     attributes stripped (claim ids, capabilities, transfer keys).
@@ -402,7 +403,14 @@ func (s *Service) RegisterOn(srv *cedarserver.Server) {
 // handleSession serves one authenticated CEDAR connection as a dbrpc multiplex,
 // scoped to the connection's effective authorization level.
 func (s *Service) handleSession(ctx context.Context, c *cedarserver.Conn) error {
-	level := s.effectiveLevel(c)
+	level, allowed := s.effectiveLevel(c)
+	if level != allowed {
+		// Debug, once per connection: the Info line below already says which level the session
+		// got, and this one says why it is lower than the ALLOW_* tables grant the identity.
+		s.log.Debug("htcondordb session level bounded by the credential's authorization limits",
+			"remote", c.RemoteAddr, "user", peerUser(c), "allow_level", allowed.String(),
+			"level", level.String(), "limits", c.AuthorizationLimits())
+	}
 	opts := s.ServeOptions(level, peerSession(c))
 	// Names the connection for diagnostics only: it is what a per-query log line and a
 	// slow-query exemplar report as the user who ran the expensive query. Authorization
@@ -511,16 +519,42 @@ func serveOptionsFor(level Level) dbrpc.ServeOptions {
 	}
 }
 
-// effectiveLevel returns the highest level the authenticated peer holds. The
-// command was already gated at READ by the server's Authorizer, so a peer that
-// reaches here holds at least READ; we escalate by probing WRITE then DAEMON.
-func (s *Service) effectiveLevel(c *cedarserver.Conn) Level {
-	user := peerUser(c)
+// effectiveLevel returns the level the connection is served at, and the level the ALLOW_/DENY_
+// tables alone grant its identity. The command was already gated at READ -- by the server's
+// Authorizer and by the session's authorization bounding set -- so a peer that reaches here holds
+// at least READ; we escalate by probing DAEMON, then WRITE.
+//
+// A level counts only if the identity is authorized at it AND it lies inside the session's
+// bounding set, which is how an HTCondor daemon decides a level inside a command handler
+// (Sock::isAuthorizationInBoundingSet before IpVerify). The bounding set is the credential's:
+// an IDTOKEN's "condor:/<LEVEL>" scopes (no such scope: no bounding set, so an unscoped token
+// is limited by its identity alone; any other scope is ignored), a SciToken's condor scopes
+// (always bounded, so a SciToken naming no level reaches no level above ALLOW), or a CLAIMTOBE
+// session's command level. Each level in the set brings the levels it implies: DAEMON brings
+// WRITE and READ, ADMINISTRATOR brings WRITE and READ, WRITE brings READ. So a READ-scoped
+// token is served at READ whatever ALLOW_DAEMON says of its identity. The set is kept with the
+// cached session, so a connection that resumes the session is bounded the same way.
+//
+// The identity is the one the dispatch authorized (Conn.AuthorizationUser): a session that did
+// not authenticate is "unauthenticated@unmapped" whatever user its record names, as HTCondor's
+// getFullyQualifiedUser reports it.
+func (s *Service) effectiveLevel(c *cedarserver.Conn) (level, allowed Level) {
+	user := c.AuthorizationUser()
 	addr := c.RemoteAddr
+	allowed = s.levelWithin(addr, user, func(string) bool { return true })
+	if c.AuthorizationLimits() == nil {
+		return allowed, allowed
+	}
+	return s.levelWithin(addr, user, c.InAuthorizationBoundingSet), allowed
+}
+
+// levelWithin returns the highest of DAEMON and WRITE that inBound admits and the identity is
+// authorized at, or READ.
+func (s *Service) levelWithin(addr, user string, inBound func(perm string) bool) Level {
 	switch {
-	case s.authorize("DAEMON", addr, user):
+	case inBound("DAEMON") && s.authorize("DAEMON", addr, user):
 		return LevelDaemon
-	case s.authorize("WRITE", addr, user):
+	case inBound("WRITE") && s.authorize("WRITE", addr, user):
 		return LevelWrite
 	default:
 		return LevelRead

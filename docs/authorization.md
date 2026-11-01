@@ -21,6 +21,31 @@ re-checking the `ALLOW_`/`DENY_` policy on the peer. Private stripping and
 read-only enforcement are implemented in `dbrpc` via per-connection
 `ServeOptions`.
 
+### Token scopes
+
+A level counts only if it is inside the session's authorization bounding set,
+as in HTCondor's daemons. The bounding set comes from the credential:
+
+- An IDTOKEN's `condor:/<LEVEL>` scopes. A token with no such scope has no
+  bounding set, and its identity's `ALLOW_` levels alone decide; other scopes
+  are ignored.
+- A SciToken's condor scopes (a WLCG token's `compute.*` scopes count as READ
+  and WRITE). A SciToken is always bounded: one with no condor scope may not
+  open a session at all.
+
+Each level brings the levels it implies: `DAEMON` brings WRITE and READ,
+`ADMINISTRATOR` brings WRITE and READ, `WRITE` brings READ. So a token scoped
+to `condor:/READ` gets a READ session (read-only, private attributes stripped,
+admin actions refused) even when `ALLOW_DAEMON` names its identity; the
+DAEMON-level commands (`DBSyncControl`, `DBRaft`) are refused to it outright.
+The bounding set is kept with the cached session, so a resumed session —
+including one persisted by `SEC_PERSIST_SESSIONS` — keeps it.
+
+A session the bounding set lowered logs it at Debug —
+`htcondordb session level bounded by the credential's authorization limits …
+allow_level=DAEMON level=READ limits=[READ]`. The Flight SQL endpoint applies
+the same rule to the SciToken it verifies.
+
 ## Tables owned by an in-process writer
 
 Some tables are maintained by a writer inside the daemon, and are read-only to

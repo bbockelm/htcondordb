@@ -72,10 +72,61 @@ func TestEffectiveLevel(t *testing.T) {
 	for _, tc := range cases {
 		c := &cedarserver.Conn{
 			RemoteAddr:  "192.0.2.1:5000",
-			Negotiation: &security.SecurityNegotiation{User: tc.user},
+			Negotiation: &security.SecurityNegotiation{User: tc.user, Authentication: tc.user != ""},
 		}
-		if got := svc.effectiveLevel(c); got != tc.want {
-			t.Errorf("effectiveLevel(user=%q) = %s, want %s", tc.user, got, tc.want)
+		if got, allowed := svc.effectiveLevel(c); got != tc.want || allowed != tc.want {
+			t.Errorf("effectiveLevel(user=%q) = %s (allowed %s), want %s", tc.user, got, allowed, tc.want)
+		}
+	}
+}
+
+// TestEffectiveLevelUnauthenticatedSessionIsNotItsUser: a session that did not authenticate is
+// authorized as the unauthenticated identity, as the dispatch authorized it, even when its
+// record names a user that ALLOW_DAEMON admits.
+func TestEffectiveLevelUnauthenticatedSessionIsNotItsUser(t *testing.T) {
+	svc := &Service{authorize: func(_, _, user string) bool { return user == "root@pool" }}
+	c := &cedarserver.Conn{
+		RemoteAddr:  "192.0.2.1:5000",
+		Negotiation: &security.SecurityNegotiation{User: "root@pool", Authentication: false},
+	}
+	if got, allowed := svc.effectiveLevel(c); got != LevelRead || allowed != LevelRead {
+		t.Errorf("unauthenticated session naming root@pool: level %s (allowed %s), want READ", got, allowed)
+	}
+}
+
+// TestEffectiveLevelBoundedByAuthorizationLimits: the level is the identity's ALLOW_* level
+// bounded by the session's authorization bounding set, with each limit bringing the levels it
+// implies. The identity here is authorized at every level, so any lowering is the bound's.
+func TestEffectiveLevelBoundedByAuthorizationLimits(t *testing.T) {
+	svc := &Service{authorize: func(_, _, user string) bool { return user == "condor@pool" }}
+	cases := []struct {
+		limits []string
+		want   Level
+	}{
+		{nil, LevelDaemon},                        // unscoped token: no bounding set
+		{[]string{"READ"}, LevelRead},             // the web API's token
+		{[]string{"WRITE"}, LevelWrite},           // WRITE implies READ only
+		{[]string{"DAEMON"}, LevelDaemon},         // DAEMON implies WRITE and READ
+		{[]string{"ADMINISTRATOR"}, LevelWrite},   // implies WRITE, not DAEMON
+		{[]string{"ADVERTISE_STARTD"}, LevelRead}, // implies READ
+		{[]string{"READ", "WRITE"}, LevelWrite},   // the union of the limits
+		{[]string{"DENY"}, LevelRead},             // a SciToken with no condor scope
+		{[]string{}, LevelRead},                   // a bounding set naming no level
+		{[]string{"NEGOTIATOR", "DAEMON"}, LevelDaemon},
+	}
+	for _, tc := range cases {
+		c := &cedarserver.Conn{
+			RemoteAddr: "192.0.2.1:5000",
+			Negotiation: &security.SecurityNegotiation{
+				User: "condor@pool", Authentication: true, AuthorizationLimits: tc.limits,
+			},
+		}
+		got, allowed := svc.effectiveLevel(c)
+		if got != tc.want {
+			t.Errorf("limits %q: level %s, want %s", tc.limits, got, tc.want)
+		}
+		if allowed != LevelDaemon {
+			t.Errorf("limits %q: allowed level %s, want DAEMON (the ALLOW_* tables alone)", tc.limits, allowed)
 		}
 	}
 }
