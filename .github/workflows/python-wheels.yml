@@ -95,6 +95,16 @@ jobs:
         run: |
           python -m pip install -q --upgrade pip
           python -m pip install -q pytest cffi
+          # A REAL ADBC Flight SQL driver, which is the only external check on the Flight
+          # SQL endpoint: every Go test drives arrow-go's own client against arrow-go's own
+          # server, so the two halves of one library agree with each other and nothing says
+          # whether the endpoint is conformant. Connecting this driver for the first time
+          # failed immediately on a SqlInfo entry arrow-go's client never requests.
+          #
+          # Installed unconditionally, not best-effort: the run step sets
+          # HTCONDORDB_REQUIRE_ADBC=1, so a missing driver becomes a test failure rather
+          # than a silent skip. Failing here instead reports it as what it is.
+          python -m pip install -q adbc_driver_flightsql pyarrow
           # classad2 comes from HTCondor's own wheels, which exist for Linux. It is what
           # the conn.ads() and write_ads() tests need; without it they skip, so a failure
           # to install must not fail the job -- but on Linux it should succeed, and the
@@ -105,11 +115,30 @@ jobs:
             echo "::warning::htcondor bindings unavailable; ClassAd tests will skip"
           fi
 
-      - name: Run the suite
+      - name: Run the suite, and confirm the ADBC tests ran
+        env:
+          # Turns every skip in the ADBC tests into a failure, so the Flight SQL endpoint
+          # cannot go unchecked just because a driver failed to import.
+          HTCONDORDB_REQUIRE_ADBC: "1"
         # The integration tests start a real daemon on a free port with a throwaway config
         # and store, so this exercises the whole stack -- cffi, the C client, CEDAR, the
-        # SQL layer -- not just the pure-Python parts.
-        run: make python-test
+        # SQL layer, and now the Flight SQL endpoint through a real ADBC driver -- not just
+        # the pure-Python parts.
+        #
+        # The output is inspected for named passes afterwards. REQUIRE already turns a skip
+        # into a failure, but it cannot speak for a test that was never collected: a renamed
+        # file or a broken import at collection time would leave pytest reporting success
+        # over a suite missing the tests this step exists to run.
+        run: |
+          set -euo pipefail
+          out=$(make python-test 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          for name in test_adbc_get_info test_adbc_bound_parameters test_adbc_select_and_types; do
+            if ! grep -q "${name} PASSED" <<<"$out"; then
+              echo "::error::${name} did not run; the Flight SQL endpoint went unchecked"
+              exit 1
+            fi
+          done
 
   linux:
     name: manylinux ${{ matrix.arch }}

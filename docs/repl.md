@@ -284,6 +284,7 @@ It is a dry run: it reports matches, it does not claim/consume resources.
 ```
 .help                 show help
 .format <mode>        table (default) | json | classad | classad-new
+.dialect <d>          classad (default) | ansi -- how WHERE expressions are read
 .output <file>        redirect query output to a file; .output stdout to restore
 .quit                 exit
 ```
@@ -299,6 +300,55 @@ aggregate result serializes its group rows. One-shot mode takes `-format`:
 ```sh
 htcondordb-cli -format json    -e "SELECT * FROM machines WHERE Cpus >= 8"
 htcondordb-cli -format classad -e 'SELECT * FROM jobs WHERE Owner == "alice"'
+```
+
+### `.dialect` — which language a WHERE clause is in
+
+A `WHERE` clause is a **ClassAd** expression by default, which is why the full ClassAd
+language works in one (`=?=`, `undefined`, `member()`, `regexp()`, `?:`). ClassAd compares
+strings **case-insensitively**, so this matches `alice`, `ALICE` and `Alice` alike:
+
+```sql
+SELECT Owner FROM jobs WHERE Owner == "alice"
+```
+
+The Arrow Flight SQL endpoint cannot read it that way. A client writing `WHERE Owner =
+'alice'` means SQL's `=`, which does **not** fold case, so the same text selects different
+rows over the two doors — each correct for its reader, with nothing in the results to say
+which you got. `.dialect ansi` reads a predicate the way that endpoint does:
+
+```
+> .dialect ansi
+dialect: ansi
+  string comparisons are now case-sensitive, and a predicate this dialect cannot lower
+  faithfully is refused. `.dialect classad` to go back.
+
+> SELECT Owner FROM jobs WHERE Owner = 'alice'   -- matches "alice" only
+> .dialect classad
+```
+
+Use it to check what a Flight SQL or ADBC client will get, without needing one to hand.
+
+**It is deliberately less capable.** The ANSI dialect lowers only what it can prove
+equivalent and refuses the rest rather than approximating it, because a half-understood
+query returns rows that look right. `WHERE Owner > 'R'` works in the ClassAd dialect and is
+refused here: ClassAd's fold-order and SQL's byte-order results are neither a subset nor a
+superset of one another, and the stored dictionaries are fold-sorted, so no index could
+serve a byte-ordered range anyway. Also refused: inequality on a string column, a negated
+string equality, a comparison whose literal cannot be what the column holds, a predicate on
+an attribute with no scalar form (a policy expression), and any `JOIN` or set operation —
+a bare column there could belong to either table.
+
+What it adds over the default: `IN` and `BETWEEN`, neither of which the ClassAd dialect
+parses. `IS [NOT] NULL` is **not** an addition — it is already translated in both dialects and
+means the same thing in each.
+
+Column types come from the same derivation the Flight SQL endpoint uses, read fresh per
+statement, so an attribute that appeared since the session started is usable immediately.
+One-shot mode takes `-dialect`:
+
+```sh
+htcondordb-cli -dialect ansi -e "SELECT Owner FROM jobs WHERE Owner = 'alice'"
 ```
 
 ## Diagnostics and index tuning

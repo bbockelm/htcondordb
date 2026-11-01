@@ -63,6 +63,9 @@ Flags:
                       more than one database advertises there
   -e <sql>            execute one statement, print the result, and exit
   -format <mode>      output format for -e: table (default) | json | classad | classad-new
+  -dialect <d>        how WHERE expressions are read: classad (default) | ansi. ansi matches
+                      the Flight SQL endpoint -- string = is case-SENSITIVE, and a predicate
+                      it cannot lower faithfully is refused rather than approximated
   -key-attr <name>    attribute holding each row's primary key (default: Key)
   -consistent         route writes through the raft cluster (consistent HA mode)
   -debug              log at DEBUG (default is WARNING; quiets library chatter)
@@ -99,7 +102,7 @@ arrow subcommand:
 
   -version            print version and exit
 
-Interactive meta-commands: .tables .use .help .format .output .quit
+Interactive meta-commands: .tables .use .help .format .dialect .output .quit
   (type .help in the shell)
 
 Language: multiple tables (no joins). SELECT / INSERT / UPDATE / DELETE with
@@ -212,6 +215,11 @@ func run() error {
 	// owns, reach the daemon's sync managers over the DBSyncControl command.
 	execCfg.SyncControl = syncControlClient(ctx, cfg, addr)
 	exec := repl.NewExecutor(dbc, execCfg)
+	// Set before either path runs, so -dialect applies to a one-shot statement and is the
+	// starting dialect of an interactive session (where `.dialect` can still change it).
+	if derr := applyDialectFlag(exec, fs.dialect); derr != nil {
+		return derr
+	}
 
 	// One-shot mode: -e, or statements passed as arguments.
 	if oneShot := oneShotStatements(fs); oneShot != "" {
@@ -290,6 +298,7 @@ type flags struct {
 	consistent bool
 	loadKey    string // `load`: source attribute used as the primary key
 	format     string // one-shot output format (-format)
+	dialect    string // how WHERE expressions are read (-dialect)
 	loadTable  string // -table: `load`'s target table (default "ads"), or `fsck`'s filter
 	loadAuto   bool   // `load`: route each ad to a table named for its MyType
 	fsckDir    string // `fsck`: database directory to inspect (default: from config)
@@ -300,6 +309,25 @@ type flags struct {
 	debug      bool
 	version    bool
 	args       []string
+}
+
+// applyDialectFlag sets the executor's predicate dialect from -dialect; an empty name leaves
+// the default.
+//
+// Extracted from run so the wiring is testable. A flag that parses into the struct and is never
+// applied to the executor is a silent no-op -- the flag appears to work, every query keeps its
+// old meaning, and nothing says so. That is exactly what a mutation of this call revealed when
+// the only test checked that parseFlags stored the string.
+func applyDialectFlag(exec *repl.Executor, name string) error {
+	if name == "" {
+		return nil
+	}
+	d, err := repl.ParseDialect(name)
+	if err != nil {
+		return err
+	}
+	exec.SetDialect(d)
+	return nil
 }
 
 func parseFlags() *flags {
@@ -352,6 +380,11 @@ func parseFlags() *flags {
 			i++
 			if i < len(args) {
 				f.format = args[i]
+			}
+		case "-dialect", "--dialect":
+			i++
+			if i < len(args) {
+				f.dialect = args[i]
 			}
 		case "-table", "--table":
 			i++

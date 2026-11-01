@@ -211,22 +211,70 @@ func (s *Server) GetSchemaStatement(ctx context.Context, cmd flightsql.Statement
 // so a predicate this endpoint cannot serve is refused when the schema is asked for rather
 // than surfacing only once rows are fetched.
 func (s *Server) planSchema(ctx context.Context, q string) (*arrow.Schema, query, error) {
+	schema, _, parsed, err := s.planStatement(ctx, q)
+	return schema, parsed, err
+}
+
+// planStatement is planSchema plus the parameter schema, which only a prepare needs. One
+// implementation so a prepared statement cannot disagree with a direct one about what a query
+// means or which columns it returns.
+//
+// The parameter schema is built from the DECLARED column types, so a client binds what it would
+// read: a placeholder against a timestamp column takes a timestamp, not the integer underneath.
+func (s *Server) planStatement(ctx context.Context, q string) (*arrow.Schema, *arrow.Schema, query, error) {
 	parsed, err := parseQuery(q)
 	if err != nil {
-		return nil, query{}, err
+		return nil, nil, query{}, err
 	}
 	_, decisions, err := s.tableSchema(ctx, parsed.table)
 	if err != nil {
-		return nil, query{}, err
+		return nil, nil, query{}, err
 	}
-	if _, err := constraintFor(parsed, decisions); err != nil {
-		return nil, query{}, err
+	tmpl, err := templateFor(parsed, decisions)
+	if err != nil {
+		return nil, nil, query{}, err
 	}
 	picked, err := project(decisions, parsed.cols)
 	if err != nil {
-		return nil, query{}, err
+		return nil, nil, query{}, err
 	}
-	return schemaOf(picked), parsed, nil
+	return schemaOf(picked), paramSchema(tmpl, decisions), parsed, nil
+}
+
+// paramSchema describes the placeholders, in order.
+//
+// EMPTY RATHER THAN NIL when a statement takes none: saying "no parameters" beats leaving a
+// client to infer it from an absent field.
+func paramSchema(tmpl *ansi.Template, decisions []arrowtype.Decision) *arrow.Schema {
+	if tmpl == nil {
+		return arrow.NewSchema(nil, nil)
+	}
+	params := tmpl.Params()
+	byName := make(map[string]arrow.DataType, len(decisions))
+	for _, d := range decisions {
+		if d.Verdict == arrowtype.Typed {
+			byName[strings.ToLower(d.Name)] = d.Field.Type
+		}
+	}
+	fields := make([]arrow.Field, 0, len(params))
+	for i, p := range params {
+		dt, ok := byName[strings.ToLower(p.Column)]
+		if !ok {
+			// Unreachable from a lowered template -- an untyped column cannot carry a
+			// placeholder, because its comparison is refused. Typed rather than
+			// skipped so the field count still matches the placeholder count if that
+			// ever stops being true.
+			dt = arrow.BinaryTypes.String
+		}
+		fields = append(fields, arrow.Field{
+			// Named for the column and its position, because a client showing a bind
+			// error needs to know WHICH placeholder, and two may share a column.
+			Name:     fmt.Sprintf("%s_%d", p.Column, i+1),
+			Type:     dt,
+			Nullable: true, // binding NULL is allowed; it drops the row
+		})
+	}
+	return arrow.NewSchema(fields, nil)
 }
 
 // constraintFor lowers the query's WHERE clause to a ClassAd constraint, against the types the
@@ -234,45 +282,68 @@ func (s *Server) planSchema(ctx context.Context, q string) (*arrow.Schema, query
 //
 // The types are what make the lowering decidable: whether `=` on a column is the
 // case-sensitive problem or an ordinary number is a question only the declared type answers.
-func constraintFor(q query, decisions []arrowtype.Decision) (string, error) {
-	if q.where == "" {
+func constraintFor(q query, decisions []arrowtype.Decision, bound *args) (string, error) {
+	tmpl, err := templateFor(q, decisions)
+	if err != nil {
+		return "", err
+	}
+	if tmpl == nil {
+		// No predicate at all. Values bound to it are a client bug worth naming rather
+		// than ignoring: ignoring them would run a query that selects everything.
+		if bound != nil && len(bound.vals) > 0 {
+			return "", status.Errorf(codes.InvalidArgument,
+				"%d value(s) were bound to a statement that has no parameters", len(bound.vals))
+		}
 		return "true", nil
 	}
-	lowered, err := ansi.Lower(q.where, columnsOf(decisions))
+	if bound == nil {
+		// The direct path, which has no way to supply a value -- so a placeholder is
+		// refused here with ansi's own message, naming prepared statements.
+		//
+		// A PREPARED statement that has not been bound arrives with an empty args rather
+		// than nil, so it falls past this to Bind's parameter-count check and is told to
+		// bind its values. Same refusal either way; the one a client can act on differs.
+		if n := len(tmpl.Params()); n > 0 {
+			return "", fmt.Errorf("in the WHERE clause: %w", &ansi.Unsupported{
+				Reason: fmt.Sprintf("this predicate has %d placeholder(s), and only a "+
+					"prepared statement can supply a value for one", n)})
+		}
+		bound = &args{}
+	}
+	lowered, err := tmpl.Bind(bound.vals)
 	if err != nil {
 		return "", fmt.Errorf("in the WHERE clause: %w", err)
 	}
 	return lowered, nil
 }
 
+// args are the values bound to a prepared statement.
+//
+// A NIL args means a DIRECT statement, which is not the same as an empty one: a prepared
+// statement with no placeholders binds nothing and is still prepared, and only the direct path
+// refuses a `?`.
+type args struct{ vals []any }
+
+// templateFor lowers the WHERE clause to a template with its placeholders open. A nil template
+// means the query has no predicate.
+func templateFor(q query, decisions []arrowtype.Decision) (*ansi.Template, error) {
+	if q.where == "" {
+		return nil, nil
+	}
+	tmpl, err := ansi.LowerTemplate(q.where, columnsOf(decisions))
+	if err != nil {
+		return nil, fmt.Errorf("in the WHERE clause: %w", err)
+	}
+	return tmpl, nil
+}
+
 // columnsOf exposes the derivation's decisions as column kinds.
 //
-// An attribute with no TYPED column is reported as present-but-untyped rather than absent, so a
-// predicate on `Requirements` is refused for the right reason -- it is a policy expression with
-// no scalar form -- instead of being reported as a column that does not exist.
+// The mapping lives in arrowtype because the REPL's ANSI dialect needs the same one, and two
+// copies would let this endpoint and the REPL disagree about a column's type -- and so about
+// what a query means.
 func columnsOf(decisions []arrowtype.Decision) ansi.Columns {
-	kinds := make(map[string]ansi.Kind, len(decisions))
-	for _, d := range decisions {
-		if d.Verdict != arrowtype.Typed {
-			kinds[d.Name] = ansi.KindUnknown
-			continue
-		}
-		switch d.Field.Type.ID() {
-		case arrow.INT64:
-			kinds[d.Name] = ansi.KindInt
-		case arrow.FLOAT64:
-			kinds[d.Name] = ansi.KindReal
-		case arrow.STRING:
-			kinds[d.Name] = ansi.KindString
-		case arrow.BOOL:
-			kinds[d.Name] = ansi.KindBool
-		case arrow.TIMESTAMP:
-			kinds[d.Name] = ansi.KindTimestamp
-		default:
-			kinds[d.Name] = ansi.KindUnknown
-		}
-	}
-	return ansi.KindsFromNames(kinds)
+	return arrowtype.Columns(decisions)
 }
 
 // schemaOf builds the Arrow schema of the typed decisions, in their given order.
@@ -317,14 +388,14 @@ func (s *Server) GetFlightInfoStatement(ctx context.Context, cmd flightsql.State
 // round trip, and it is the correct trade: a schema in the ticket would be a schema the client
 // could edit, and this one has to match what the encoder will actually produce.
 func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	return s.doGetQuery(ctx, string(ticket.GetStatementHandle()))
+	return s.doGetQuery(ctx, string(ticket.GetStatementHandle()), nil)
 }
 
 // doGetQuery is the one scan implementation, shared by a direct statement and a prepared one.
 // Two copies would drift, and the drift would be invisible: a prepared statement returning
 // subtly different rows from the same SQL run directly is the kind of bug nobody reports
 // because nobody compares.
-func (s *Server) doGetQuery(ctx context.Context, stmt string) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	parsed, err := parseQuery(stmt)
 	if err != nil {
 		return nil, nil, err
@@ -348,7 +419,7 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string) (*arrow.Schema, <-
 		slot()
 		return nil, nil, err
 	}
-	constraint, err := constraintFor(parsed, allDecisions)
+	constraint, err := constraintFor(parsed, allDecisions, bound)
 	if err != nil {
 		release()
 		slot()
@@ -432,25 +503,39 @@ func NewFlightServer(s *Server, alloc memory.Allocator) flight.FlightServer {
 	return flightsql.NewFlightServerWithAllocator(s, alloc)
 }
 
-// Limits are the resource bounds an in-process endpoint needs. Both zero means unlimited,
-// which is what the endpoint did before the limits existed.
-type Limits struct {
-	// StreamBudgetBytes caps the Arrow memory one DoGet stream may hold.
+// Settings are what an in-process endpoint's host configures. Zero values keep the behaviour
+// the endpoint had before each setting existed.
+type Settings struct {
+	// StreamBudgetBytes caps the Arrow memory one DoGet stream may hold. Zero is
+	// unlimited.
 	StreamBudgetBytes int64
-	// MaxStreams caps concurrent DoGet streams.
+	// MaxStreams caps concurrent DoGet streams. Zero is unlimited.
 	MaxStreams int
+	// Version is the host's own version, reported to a client as
+	// FLIGHT_SQL_SERVER_VERSION. Empty leaves the placeholder, which matters because
+	// ADBC's adbc_get_info() asks for this entry by name and reads an unregistered one as
+	// NOT_FOUND rather than as empty -- failing the whole call.
+	Version string
 }
+
+// Limits is the former name of Settings, kept so the rename does not break a caller.
+//
+// Deprecated: use Settings.
+type Limits = Settings
 
 // NewSessionFlightServer is NewFlightServer for a service that resolves a per-identity session
 // on every RPC. One Flight server serves every connection; what differs per RPC is the
 // authorization its reads go through.
-func NewSessionFlightServer(sessions *Sessions, alloc memory.Allocator, limits Limits) (flight.FlightServer, error) {
+func NewSessionFlightServer(sessions *Sessions, alloc memory.Allocator, set Settings) (flight.FlightServer, error) {
 	srv, err := NewSessionServer(sessions, sessions.Derive(), alloc)
 	if err != nil {
 		return nil, err
 	}
-	srv.SetStreamBudget(limits.StreamBudgetBytes)
-	srv.SetMaxStreams(limits.MaxStreams)
+	srv.SetStreamBudget(set.StreamBudgetBytes)
+	srv.SetMaxStreams(set.MaxStreams)
+	if err := srv.SetVersion(set.Version); err != nil {
+		return nil, err
+	}
 	return NewFlightServer(srv, alloc), nil
 }
 

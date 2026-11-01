@@ -697,13 +697,59 @@ Everything else stays on `BaseServer`'s defaults.
 | `RegisterSqlInfo` | the handful of entries ADBC reads at connect |
 | `DoGetCatalogs` / `DoGetDBSchemas` / `DoGetTables` / `DoGetTableTypes` | catalog browsing; schemas come from `schema_ref` |
 
-**Deliberately deferred:** Substrait (both plan variants), prepared statements, transactions
+**Deliberately deferred:** Substrait (both plan variants), transactions
 and savepoints, primary/imported/exported keys and cross-reference, `DoPutCommandStatementUpdate`
 (writes), `StatementIngest`, `XdbcTypeInfo`, `CancelFlightInfo`.
 
-Prepared statements are the first thing to add after v1, because that is how ADBC binds
-parameters; they are not v1-blocking (a client can inline literals), and `CreatePreparedStatement`
-+ `DoPutPreparedStatementQuery` + `DoGetPreparedStatement` is the whole increment.
+**Prepared statements with bound parameters are DONE**, which was listed here as the first thing
+to add after v1 because it is how ADBC binds parameters. `CreatePreparedStatement` +
+`DoPutPreparedStatementQuery` + `DoGetPreparedStatement` + `ClosePreparedStatement` are served,
+and `ansi.LowerTemplate` lowers a predicate with its `?` holes left open.
+
+Two decisions in that increment are worth recording, because both were arrived at by trying the
+obvious thing first:
+
+- **The lowered predicate is a FRAGMENT LIST, not a string with substitution markers.** A marker
+  scheme has to prove no other part of the expression can contain the marker, and the one
+  caller-controlled part is a string literal, whose rendered form can hold any byte that is not
+  a quote or a backslash. Binding is therefore a concatenation of pieces that were never
+  adjacent, and there is nothing to search. `TestBoundStringCannotEscapeItsLiteral` is the
+  check.
+- **A parameter slot covers the WHOLE comparison, not the value.** A NULL bound value does not
+  compare the column against null; it makes the comparison yield NULL, which drops the row --
+  `false` in a ClassAd WHERE clause, and `Cpus == false` is not it. So the slot renders either
+  `Cpus == 4` or `false`, decided where the operator is still in scope.
+
+A placeholder is validated for lowerability at PREPARE time, with no value, so every refusal the
+inline path gives is given to the parameterised path from the same code: `NOT Owner = ?` and
+`Owner > ?` are refused at the prepare, not at the bind. `executemany` over a SELECT is refused
+rather than served from the first parameter set, because N parameter sets are N result sets and a
+DoGet returns one.
+
+**A real ADBC driver is in CI, and it is not redundant with the Go tests.** Every Go test here
+drives arrow-go's own `flightsql.Client` against arrow-go's own `flightsql` server, which checks
+that two halves of one library agree — not that the endpoint is conformant. Connecting
+`adbc_driver_flightsql` for the first time failed immediately:
+
+```
+NOT_FOUND: [FlightSQL] no information for sql info number 1 (GetInfo(DoGet))
+```
+
+`FLIGHT_SQL_SERVER_VERSION` was never registered, and **one missing SqlInfo entry fails a
+client's whole `adbc_get_info()` call** — so the endpoint looked broken to every ADBC client
+while the Go suite was green, because arrow-go's client never asks for it. Registered now, along
+with the facts a client asks next (`SERVER_SQL`, `SERVER_SUBSTRAIT`, transaction and cancel
+support), and the daemon passes its build stamp so deployments are distinguishable from the
+client side.
+
+The tests live in `python/tests/test_flightsql_adbc.py` against the session daemon's Flight
+listener — the same process that serves CEDAR, because that is how the endpoint deploys and a
+separate daemon would test a configuration nobody runs. `HTCONDORDB_REQUIRE_ADBC=1` turns a
+skipped driver into a failure, and the CI step additionally greps for named passes, because
+neither pytest's exit status nor a REQUIRE flag can speak for a test that was never collected.
+
+This is the same lesson as the DuckDB job (§12): a reader that is the writer's own library agrees
+with it by construction.
 
 ### 9.3 Workstreams and what actually blocks what
 
@@ -910,13 +956,39 @@ vocabulary it has to work with.
 
 **ADBC does not choose a dialect**; the Flight SQL endpoint is ANSI-only (§9.5). The REPL keeps
 a choice, because it is the one place both dialects are useful — ClassAd stays the default for
-everyone who already types it, and `.dialect ansi` beside `.format` (`repl/repl.go:131`) is how
-the lowering gets exercised without a gRPC stack:
+everyone who already types it, and `.dialect` beside `.format` is how the lowering gets
+exercised without a gRPC stack:
 
 ```
 .dialect classad     # today's behavior (default)
-.dialect ansi        # the W1 front end, same code path ADBC uses
+.dialect ansi        # the same lowering ADBC gets
 ```
+
+**`.dialect` is SHIPPED** (`repl/dialect.go`). Three things about it are worth recording:
+
+- **It translates at the PARSE boundary, not after it.** `Statement.Where` is documented as "the
+  translated ClassAd constraint" — by the time the executor runs, `Owner = 'alice'` is already
+  `Owner == "alice"`, and handing that to a SQL parser produces nonsense rather than an error
+  anyone can act on. The first implementation did exactly that. The parser now also keeps the
+  clause's raw text (`WhereRaw`), which is what the ANSI lowering reads. The translation happens
+  once in `Exec`, before anything else, so the scan, a DELETE's selector and **EXPLAIN** all
+  work from one constraint — an EXPLAIN that reported the untranslated plan would describe a
+  query that never ran.
+- **It recurses into wrapped statements.** EXPLAIN wraps the statement it reports on and
+  `CREATE MATERIALIZED VIEW` embeds the SELECT that defines it; both carry the predicate.
+- **A JOIN or a set operation is refused under ANSI.** A bare column could belong to either
+  table, and lowering it against the first table's types would type it from the wrong one.
+
+The column types come from `arrowtype.Columns`, the **same mapping** the Flight SQL endpoint
+uses, deliberately in one place: two surfaces lower SQL against these types, and a second copy
+would let them disagree about a column's type and so about what a query means — exactly the
+divergence the `ansi` package exists to remove. The types are derived per statement rather than
+cached, so a column added during a session is visible immediately instead of being refused as
+unknown until the REPL restarts.
+
+ANSI is **strictly less capable** in the REPL, on purpose: `WHERE Owner > 'R'` works today and
+is refused under ANSI. The dialect is a compatibility and debugging tool — the only way to see
+what an ADBC client will get without an ADBC client in hand — not an upgrade path.
 
 **Shipped so far (the `ansi` package), and the one place it departs from this section.** The
 predicate subset is lowered: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`/`OR`/`NOT`, parentheses,

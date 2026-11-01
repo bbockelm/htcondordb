@@ -151,7 +151,7 @@ func TestPreparedHandleIsBoundToItsOwner(t *testing.T) {
 		t.Fatalf("alice could not prepare: %v", err)
 	}
 	// Alice can use her own handle.
-	if _, err := srv.preparedQuery(ctx, fakeHandle{h: res.Handle}); err != nil {
+	if _, err := srv.preparedStatement(ctx, fakeHandle{h: res.Handle}); err != nil {
 		t.Errorf("the owner could not use her own handle: %v", err)
 	}
 
@@ -165,7 +165,7 @@ func TestPreparedHandleIsBoundToItsOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	bobSrv.prep = srv.prep // share the table, so only ownership can refuse him
-	if _, err := bobSrv.preparedQuery(ctx, fakeHandle{h: res.Handle}); err == nil {
+	if _, err := bobSrv.preparedStatement(ctx, fakeHandle{h: res.Handle}); err == nil {
 		t.Error("another identity used a handle it did not create")
 	} else if got := status.Code(err); got != codes.NotFound {
 		t.Errorf("code %v, want NotFound -- the same answer an unknown handle gets, so the "+
@@ -173,7 +173,7 @@ func TestPreparedHandleIsBoundToItsOwner(t *testing.T) {
 	}
 
 	// An unknown handle reports identically.
-	if _, err := srv.preparedQuery(ctx, fakeHandle{h: []byte("0123456789abcdef")}); err == nil {
+	if _, err := srv.preparedStatement(ctx, fakeHandle{h: []byte("0123456789abcdef")}); err == nil {
 		t.Error("an unknown handle was accepted")
 	} else if got := status.Code(err); got != codes.NotFound {
 		t.Errorf("unknown handle code %v, want NotFound", got)
@@ -229,17 +229,18 @@ func TestPreparedEntriesExpire(t *testing.T) {
 	}
 }
 
-// TestBindingParametersIsRefused: accepting a bind and ignoring the values would run the
-// unparameterised query and return rows that look like an answer.
-func TestBindingParametersIsRefused(t *testing.T) {
+// TestBindAgainstUnknownHandleIsRefused: the handle is resolved BEFORE the parameter data is
+// read, so a bind cannot be used to probe which handles exist -- and it reports the same
+// NotFound an unowned handle gets, for the same reason.
+func TestBindAgainstUnknownHandleIsRefused(t *testing.T) {
 	_, svc, done := harness(t, 10)
 	defer done()
 	_, err := svc.DoPutPreparedStatementQuery(context.Background(), fakeHandle{h: []byte("x")}, nil, nil)
 	if err == nil {
-		t.Fatal("a parameter bind was accepted")
+		t.Fatal("a bind against an unknown handle was accepted")
 	}
-	if got := status.Code(err); got != codes.Unimplemented {
-		t.Errorf("code %v, want Unimplemented", got)
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("code %v, want NotFound", got)
 	}
 }
 

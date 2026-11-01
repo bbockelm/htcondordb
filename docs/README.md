@@ -12,6 +12,9 @@ quickstart. These pages cover the details:
   resolution.
 - **[Authorization & security](authorization.md)** — READ/WRITE/DAEMON access
   levels, the command set, and how to get WRITE.
+- **[Arrow Flight SQL](arrow-flight-sql.md)** — serve tables to Arrow-native
+  clients (ADBC, pandas, Polars, DuckDB): turning it on, who may read what, the
+  SQL it accepts, and why `WHERE` is ANSI here rather than ClassAd.
 - **[Federation hub](federation.md)** — fan many access points' mirrors into one
   catalog: discovery, sticky membership, per-AP freshness.
 - **[High availability](ha.md)** — `standalone`, `leader-follower`, and raft-based

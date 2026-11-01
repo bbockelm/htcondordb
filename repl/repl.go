@@ -173,6 +173,8 @@ func (s *session) runMeta(console io.Writer, line string) bool {
 		runVersion(console)
 	case ".format", ".mode":
 		s.setFormat(console, arg)
+	case ".dialect":
+		s.setDialect(console, arg)
 	case ".output", ".out", "\\o":
 		s.setOutput(console, arg)
 	default:
@@ -196,6 +198,30 @@ func (s *session) setFormat(console io.Writer, arg string) {
 	}
 	s.format = f
 	fmt.Fprintf(console, "format: %s\n", s.format)
+}
+
+// setDialect switches how predicates are read, or reports it when no arg given.
+func (s *session) setDialect(console io.Writer, arg string) {
+	if arg == "" {
+		fmt.Fprintf(console, "dialect: %s\n", s.exec.Dialect())
+		if s.exec.Dialect() == DialectClassAd {
+			fmt.Fprint(console, "  (`.dialect ansi` reads predicates as the Flight SQL "+
+				"endpoint does: string = becomes case-SENSITIVE, and anything that cannot "+
+				"be lowered faithfully is refused rather than approximated)\n")
+		}
+		return
+	}
+	d, err := ParseDialect(arg)
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	s.exec.SetDialect(d)
+	fmt.Fprintf(console, "dialect: %s\n", d)
+	if d == DialectANSI {
+		fmt.Fprint(console, "  string comparisons are now case-sensitive, and a predicate "+
+			"this dialect cannot lower faithfully is refused. `.dialect classad` to go back.\n")
+	}
 }
 
 // setOutput redirects query output to a file, or back to the console with
@@ -336,6 +362,9 @@ Meta-commands:
   .tables               list tables (* marks the current one)
   .use <table>          set the current table for the commands below
   .format <mode>        table (default) | json | classad | classad-new
+  .dialect <d>          classad (default) | ansi -- how WHERE expressions are read.
+                        ansi matches the Flight SQL endpoint: string = is case-
+                        SENSITIVE, and anything it cannot lower faithfully is refused
   .output <file>        send query output to a file; .output stdout to restore
   .views                list materialized views
   .export [view]        Prometheus text exposition for a view (all views if omitted)

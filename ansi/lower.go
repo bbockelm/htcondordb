@@ -47,9 +47,10 @@ import (
 	"strings"
 )
 
-// Kind is a column's type, as the schema declared it. It decides which lowering a comparison
-// gets, which is the §5 type map earning its keep: without declared types there is no way to
-// know whether `=` on this column is the case-sensitive problem or an ordinary number.
+// Kind is a column's type, as the schema derivation declared it. It decides which lowering a
+// comparison gets, which is what makes the lowering decidable at all: without a declared type
+// there is no way to know whether `=` on this column is the case-sensitive problem or an
+// ordinary number.
 type Kind int
 
 const (
@@ -97,6 +98,23 @@ func unsup(format string, args ...any) error {
 // would admit the row. It does not mean the two evaluate to the same VALUE -- SQL's NULL and
 // ClassAd's false both drop a row, and that is the equivalence a WHERE clause needs.
 func Lower(predicate string, cols Columns) (string, error) {
+	t, err := LowerTemplate(predicate, cols)
+	if err != nil {
+		return "", err
+	}
+	if n := len(t.params); n > 0 {
+		return "", unsup("this predicate has %d placeholder(s), and only a prepared "+
+			"statement can supply a value for one", n)
+	}
+	return t.Bind(nil)
+}
+
+// LowerTemplate is Lower with placeholders left open, for a prepared statement.
+//
+// Lower is this function plus a refusal, rather than a second parser, so the two paths cannot
+// disagree about what SQL means -- the same reason a prepared statement and a direct one share
+// one scan.
+func LowerTemplate(predicate string, cols Columns) (*Template, error) {
 	if cols == nil {
 		cols = func(string) (Kind, bool) { return KindUnknown, false }
 	}
@@ -104,12 +122,12 @@ func Lower(predicate string, cols Columns) (string, error) {
 	p.next()
 	out, err := p.parseOr(positive)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if p.tok.kind != tokEOF {
-		return "", unsup("unexpected %q after the predicate", p.tok.text)
+		return nil, unsup("unexpected %q after the predicate", p.tok.text)
 	}
-	return out, nil
+	return &Template{body: out, params: p.params}, nil
 }
 
 // polarity tracks whether the current position is negated, which decides whether a comparison
@@ -129,9 +147,17 @@ func (p polarity) flip() polarity {
 }
 
 type parser struct {
-	lex  *lexer
-	tok  token
-	cols Columns
+	lex    *lexer
+	tok    token
+	cols   Columns
+	params []Param
+}
+
+// addParam records a placeholder and returns its index. Order is source order, which is what
+// positional binding means.
+func (p *parser) addParam(col string, kind Kind) int {
+	p.params = append(p.params, Param{Column: col, Kind: kind})
+	return len(p.params) - 1
 }
 
 func (p *parser) next() { p.tok = p.lex.next() }
@@ -148,71 +174,71 @@ func (p *parser) peekKeyword(kw string) bool {
 	return p.tok.kind == tokIdent && strings.EqualFold(p.tok.text, kw)
 }
 
-func (p *parser) parseOr(pol polarity) (string, error) {
+func (p *parser) parseOr(pol polarity) (expr, error) {
 	left, err := p.parseAnd(pol)
 	if err != nil {
-		return "", err
+		return expr{}, err
 	}
 	for p.peekKeyword("OR") {
 		p.next()
 		right, err := p.parseAnd(pol)
 		if err != nil {
-			return "", err
+			return expr{}, err
 		}
-		left = "(" + left + " || " + right + ")"
+		left = seq("(", left, " || ", right, ")")
 	}
 	return left, nil
 }
 
-func (p *parser) parseAnd(pol polarity) (string, error) {
+func (p *parser) parseAnd(pol polarity) (expr, error) {
 	left, err := p.parseUnary(pol)
 	if err != nil {
-		return "", err
+		return expr{}, err
 	}
 	for p.peekKeyword("AND") {
 		p.next()
 		right, err := p.parseUnary(pol)
 		if err != nil {
-			return "", err
+			return expr{}, err
 		}
-		left = "(" + left + " && " + right + ")"
+		left = seq("(", left, " && ", right, ")")
 	}
 	return left, nil
 }
 
-func (p *parser) parseUnary(pol polarity) (string, error) {
+func (p *parser) parseUnary(pol polarity) (expr, error) {
 	if p.acceptKeyword("NOT") {
 		inner, err := p.parseUnary(pol.flip())
 		if err != nil {
-			return "", err
+			return expr{}, err
 		}
-		return "!(" + inner + ")", nil
+		return seq("!(", inner, ")"), nil
 	}
 	if p.tok.kind == tokLParen {
 		p.next()
 		inner, err := p.parseOr(pol)
 		if err != nil {
-			return "", err
+			return expr{}, err
 		}
 		if p.tok.kind != tokRParen {
-			return "", unsup("missing closing parenthesis")
+			return expr{}, unsup("missing closing parenthesis")
 		}
 		p.next()
-		return "(" + inner + ")", nil
+		return seq("(", inner, ")"), nil
 	}
 	return p.parsePredicate(pol)
 }
 
 // parsePredicate handles one comparison: the only place a column, an operator and a literal
 // meet, and therefore the only place the dialect question arises.
-func (p *parser) parsePredicate(pol polarity) (string, error) {
+func (p *parser) parsePredicate(pol polarity) (expr, error) {
 	if p.tok.kind != tokIdent {
-		return "", unsup("expected a column name, got %q", p.tok.text)
+		return expr{}, unsup("expected a column name, got %q", p.tok.text)
 	}
 	col := p.tok.text
 	kind, known := p.cols(col)
 	if !known {
-		return "", unsup("unknown column %q; a predicate on an attribute the schema does not "+
+		return expr{}, unsup("unknown column %q; a predicate on an attribute the schema does not "+
 			"describe cannot be lowered, because which lowering is correct depends on its type", col)
 	}
 	p.next()
@@ -222,12 +248,12 @@ func (p *parser) parsePredicate(pol polarity) (string, error) {
 	if p.acceptKeyword("IS") {
 		notNull := p.acceptKeyword("NOT")
 		if !p.acceptKeyword("NULL") {
-			return "", unsup("expected NULL after IS")
+			return expr{}, unsup("expected NULL after IS")
 		}
 		if notNull {
-			return quoteCol(col) + " isnt undefined", nil
+			return fixed(quoteCol(col) + " isnt undefined"), nil
 		}
-		return quoteCol(col) + " is undefined", nil
+		return fixed(quoteCol(col) + " is undefined"), nil
 	}
 
 	if p.peekKeyword("IN") {
@@ -241,13 +267,52 @@ func (p *parser) parsePredicate(pol polarity) (string, error) {
 
 	op, err := p.parseCompareOp()
 	if err != nil {
-		return "", err
+		return expr{}, err
+	}
+	return p.parseOperand(col, kind, op, pol)
+}
+
+// parseOperand reads the right-hand side of a comparison -- a literal or a placeholder -- and
+// lowers the comparison.
+//
+// A placeholder is checked for lowerability NOW, with a nil literal, so a client learns at
+// prepare time that `NOT Owner = ?` will not be served rather than at the bind. Every refusal
+// the inline path gives is therefore given to the parameterised path too, from the same code.
+func (p *parser) parseOperand(col string, kind Kind, op string, pol polarity) (expr, error) {
+	if p.tok.kind == tokParam {
+		p.next()
+		if _, err := lowerCompare(col, kind, op, nil, pol); err != nil {
+			return expr{}, err
+		}
+		idx := p.addParam(col, kind)
+		param := Param{Column: col, Kind: kind}
+		return expr{frags: []frag{{slot: idx, render: func(v any) (string, error) {
+			bv, err := normalize(v)
+			if err != nil {
+				return "", err
+			}
+			if err := bv.check(param); err != nil {
+				return "", err
+			}
+			if bv.null {
+				// SQL compares nothing to NULL successfully, so the row drops.
+				// The whole comparison collapses, not the operand -- see param.go.
+				return "false", nil
+			}
+			out, err := lowerCompare(col, kind, op, &literal{kind: bv.kind, text: bv.literal()}, pol)
+			if err != nil {
+				return "", err
+			}
+			// A bound comparison has no placeholders of its own, so it is one
+			// fragment and this cannot recurse.
+			return out.frags[0].text, nil
+		}}}}, nil
 	}
 	lit, err := p.parseLiteral()
 	if err != nil {
-		return "", err
+		return expr{}, err
 	}
-	return lowerCompare(col, kind, op, lit, pol)
+	return lowerCompare(col, kind, op, &lit, pol)
 }
 
 func (p *parser) parseCompareOp() (string, error) {
@@ -263,22 +328,19 @@ func (p *parser) parseCompareOp() (string, error) {
 	return "", unsup("operator %q", op)
 }
 
-func (p *parser) parseIn(col string, kind Kind, pol polarity) (string, error) {
+func (p *parser) parseIn(col string, kind Kind, pol polarity) (expr, error) {
 	if p.tok.kind != tokLParen {
-		return "", unsup("expected ( after IN")
+		return expr{}, unsup("expected ( after IN")
 	}
 	p.next()
-	var terms []string
+	var terms []expr
 	for {
-		lit, err := p.parseLiteral()
-		if err != nil {
-			return "", err
-		}
 		// IN is a disjunction of equalities, so each one carries the same lowering -- and
-		// the same refusal, if equality on this column cannot be lowered.
-		term, err := lowerCompare(col, kind, "=", lit, pol)
+		// the same refusal, if equality on this column cannot be lowered. Each operand
+		// may be a placeholder, which is how a client binds a list.
+		term, err := p.parseOperand(col, kind, "=", pol)
 		if err != nil {
-			return "", err
+			return expr{}, err
 		}
 		terms = append(terms, term)
 		if p.tok.kind == tokComma {
@@ -288,41 +350,40 @@ func (p *parser) parseIn(col string, kind Kind, pol polarity) (string, error) {
 		break
 	}
 	if p.tok.kind != tokRParen {
-		return "", unsup("missing ) after an IN list")
+		return expr{}, unsup("missing ) after an IN list")
 	}
 	p.next()
 	if len(terms) == 1 {
 		return terms[0], nil
 	}
-	return "(" + strings.Join(terms, " || ") + ")", nil
+	parts := []any{"("}
+	for i, t := range terms {
+		if i > 0 {
+			parts = append(parts, " || ")
+		}
+		parts = append(parts, t)
+	}
+	return seq(append(parts, ")")...), nil
 }
 
-func (p *parser) parseBetween(col string, kind Kind) (string, error) {
+func (p *parser) parseBetween(col string, kind Kind) (expr, error) {
 	if kind == KindString {
-		return "", unsup("BETWEEN on the string column %q: it is a pair of ordering "+
+		return expr{}, unsup("BETWEEN on the string column %q: it is a pair of ordering "+
 			"comparisons, and ClassAd orders strings case-insensitively while SQL does not, "+
 			"so neither bound can be lowered faithfully", col)
 	}
-	lo, err := p.parseLiteral()
+	loTerm, err := p.parseOperand(col, kind, ">=", positive)
 	if err != nil {
-		return "", err
+		return expr{}, err
 	}
 	if !p.acceptKeyword("AND") {
-		return "", unsup("expected AND in BETWEEN")
+		return expr{}, unsup("expected AND in BETWEEN")
 	}
-	hi, err := p.parseLiteral()
+	hiTerm, err := p.parseOperand(col, kind, "<=", positive)
 	if err != nil {
-		return "", err
+		return expr{}, err
 	}
-	loTerm, err := lowerCompare(col, kind, ">=", lo, positive)
-	if err != nil {
-		return "", err
-	}
-	hiTerm, err := lowerCompare(col, kind, "<=", hi, positive)
-	if err != nil {
-		return "", err
-	}
-	return "(" + loTerm + " && " + hiTerm + ")", nil
+	return seq("(", loTerm, " && ", hiTerm, ")"), nil
 }
 
 // literal is a parsed SQL literal, kept with its own kind so a comparison can check it against
@@ -365,9 +426,15 @@ func (p *parser) parseLiteral() (literal, error) {
 }
 
 // lowerCompare is where the dialect divergence is actually decided.
-func lowerCompare(col string, kind Kind, op string, lit literal, pol polarity) (string, error) {
-	if err := checkLiteralKind(col, kind, lit); err != nil {
-		return "", err
+//
+// A nil literal means "would this comparison be lowerable?", which is how a placeholder is
+// validated at prepare time without a value. Every refusal below is reachable both ways, so a
+// parameterised predicate cannot be accepted where its inline twin would be refused.
+func lowerCompare(col string, kind Kind, op string, lit *literal, pol polarity) (expr, error) {
+	if lit != nil {
+		if err := checkLiteralKind(col, kind, *lit); err != nil {
+			return expr{}, err
+		}
 	}
 	switch kind {
 	case KindString:
@@ -384,41 +451,48 @@ func lowerCompare(col string, kind Kind, op string, lit literal, pol polarity) (
 		case "<>":
 			cadOp = "!="
 		}
-		return quoteCol(col) + " " + cadOp + " " + lit.text, nil
+		if lit == nil {
+			return expr{}, nil
+		}
+		return fixed(quoteCol(col) + " " + cadOp + " " + lit.text), nil
 	}
 	// Reached when a caller reports the column as present but with no usable type -- an
 	// attribute that exists and has no scalar form, such as a policy expression. Saying so
 	// beats "unknown column", which would send someone looking for a typo.
-	return "", unsup("column %q exists but has no declared scalar type, so a comparison on it "+
+	return expr{}, unsup("column %q exists but has no declared scalar type, so a comparison on it "+
 		"cannot be lowered; it is available as text in the untyped tail", col)
 }
 
-func lowerStringCompare(col, op string, lit literal, pol polarity) (string, error) {
+func lowerStringCompare(col, op string, lit *literal, pol polarity) (expr, error) {
 	switch op {
 	case "=":
 		if pol != positive {
-			return "", unsup("negated equality on the string column %q: it lowers to "+
+			return expr{}, unsup("negated equality on the string column %q: it lowers to "+
 				"ClassAd identity, which yields false where SQL yields NULL -- "+
 				"unobservable under AND and OR, but not under NOT", col)
+		}
+		if lit == nil {
+			return expr{}, nil
 		}
 		// `=?=` is case-sensitive AND is the form the store indexes exactly: probe.go
 		// routes it to the categorical index's exact-case postings. ClassAd's `==` would
 		// be case-INSENSITIVE here, which is the whole divergence this package exists for.
-		return quoteCol(col) + " =?= " + lit.text, nil
+		return fixed(quoteCol(col) + " =?= " + lit.text), nil
 	case "<>", "!=":
-		return "", unsup("inequality on the string column %q: it needs a three-valued "+
+		return expr{}, unsup("inequality on the string column %q: it needs a three-valued "+
 			"guard whose index behaviour is unverified, and an unindexed inequality over a "+
 			"large table is better introduced deliberately than discovered", col)
 	}
-	return "", unsup("ordering comparison %q on the string column %q: ClassAd compares strings "+
+	return expr{}, unsup("ordering comparison %q on the string column %q: ClassAd compares strings "+
 		"case-insensitively and SQL does not, and the two orderings are neither a subset nor a "+
 		"superset of one another, so there is no faithful lowering", op, col)
 }
 
-// checkLiteralKind refuses a comparison whose literal cannot be what the column holds. This is
-// the binder the §5 type map makes possible: SQL rejects a type-invalid comparison when the
-// statement is bound, and doing the same here beats lowering it and letting ClassAd's ERROR
-// quietly filter out every row.
+// checkLiteralKind refuses a comparison whose literal cannot be what the column holds.
+//
+// Having declared column types is what makes this possible at all: SQL rejects a type-invalid
+// comparison when the statement is bound, and doing the same here beats lowering it and letting
+// ClassAd's ERROR quietly filter out every row.
 func checkLiteralKind(col string, kind Kind, lit literal) error {
 	switch kind {
 	case KindString:
