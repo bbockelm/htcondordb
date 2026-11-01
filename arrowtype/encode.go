@@ -50,6 +50,10 @@ const (
 	CauseError
 	// CauseUncoercible: a value of a kind the column's type cannot represent.
 	CauseUncoercible
+	// CauseNonNullable: the cell had no value and the column was DECLARED non-nullable, so
+	// there is nothing this encoder can write that is both in-type and true. It writes the
+	// null anyway, to keep the row aligned, and reports the error; the batch is not usable.
+	CauseNonNullable
 )
 
 func (c Cause) String() string {
@@ -62,6 +66,8 @@ func (c Cause) String() string {
 		return "error"
 	case CauseUncoercible:
 		return "uncoercible"
+	case CauseNonNullable:
+		return "non-nullable"
 	}
 	return "?"
 }
@@ -159,15 +165,27 @@ func (e *Encoder) Rows() int { return e.rows }
 // Stats reports what happened per column, cumulative across every batch.
 func (e *Encoder) Stats() []ColumnStats { return e.stats }
 
-// Append encodes one ad as a row. It returns an error only under Strict.
+// Append encodes one ad as a row.
+//
+// EVERY column is appended, always, even when a cell fails. A record batch is columnar: a row
+// that stopped at the third of five columns leaves two builders a row short, and the next
+// NewRecord panics on the ragged result rather than returning an error -- so bailing out mid-row
+// turned a reportable problem into a crash. The cell's own handler writes a null for whatever
+// it could not store, and the first error is returned once the row is complete.
+//
+// A returned error therefore means "this row is in the batch and something about it is wrong",
+// not "this row was skipped". Under Strict the caller is expected to discard the batch; without
+// it, errors are raised only for a violated declaration (a null in a column declared
+// non-nullable), because that is a promise the caller asked to have enforced.
 func (e *Encoder) Append(ad *classad.ClassAd) error {
+	var firstErr error
 	for i, attr := range e.attrs {
-		if err := e.appendCell(i, attr, ad); err != nil {
-			return err
+		if err := e.appendCell(i, attr, ad); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	e.rows++
-	return nil
+	return firstErr
 }
 
 func (e *Encoder) appendCell(i int, attr string, ad *classad.ClassAd) error {
@@ -178,20 +196,14 @@ func (e *Encoder) appendCell(i int, attr string, ad *classad.ClassAd) error {
 	// though both become null: "the attribute was not there" and "it was there and had no
 	// value" are different answers to a question about the data.
 	if _, ok := ad.Lookup(attr); !ok {
-		b.AppendNull()
-		st.Nulls[CauseAbsent]++
-		return nil
+		return e.appendNull(b, st, i, attr, CauseAbsent)
 	}
 	v := ad.EvaluateAttr(attr)
 	switch v.Type() {
 	case classad.UndefinedValue:
-		b.AppendNull()
-		st.Nulls[CauseUndefined]++
-		return nil
+		return e.appendNull(b, st, i, attr, CauseUndefined)
 	case classad.ErrorValue:
-		b.AppendNull()
-		st.Nulls[CauseError]++
-		return nil
+		return e.appendNull(b, st, i, attr, CauseError)
 	}
 	return e.coerce(b, st, attr, v)
 }
@@ -310,6 +322,21 @@ func (e *Encoder) coerce(b array.Builder, st *ColumnStats, attr string, v classa
 	default:
 		return e.uncoercible(b, st, attr, v)
 	}
+	return nil
+}
+
+// appendNull writes a null and records why. A column declared non-nullable has no honest value
+// for this cell -- a zero would fabricate data and skipping the cell would ragged the row -- so
+// the null is written to keep the batch well-formed and the error says the declaration was not
+// kept. Without that error, the batch would carry nulls in a column whose schema promises none,
+// and a consumer is entitled to skip the validity bitmap of a non-nullable field entirely.
+func (e *Encoder) appendNull(b array.Builder, st *ColumnStats, i int, attr string, c Cause) error {
+	b.AppendNull()
+	if !e.schema.Field(i).Nullable {
+		st.Nulls[CauseNonNullable]++
+		return fmt.Errorf("%s: declared non-nullable but this row's value is %s", attr, c)
+	}
+	st.Nulls[c]++
 	return nil
 }
 

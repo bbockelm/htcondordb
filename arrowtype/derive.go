@@ -251,9 +251,17 @@ func Derive(m Measured, opts Options) Decision {
 			if ov.Nullable != nil {
 				nullable = *ov.Nullable
 			}
-			d := typed(m, opts, dt, nullable, "override-kind",
-				"declared as "+ov.Kind+"; measured "+measuredAs(m))
-			return d
+			// Not through typed(): the epoch rule must not reach a declared kind.
+			// Declaring int for an attribute that is also listed in TimeAttrs is how a
+			// caller says "I know it is epoch seconds and I want the raw number", and a
+			// declaration that TimeAttrs could overrule would not be a declaration.
+			return Decision{
+				Name:    m.Name,
+				Verdict: Typed,
+				Field:   arrow.Field{Name: m.Name, Type: dt, Nullable: nullable, Metadata: fieldMeta(m, "override-kind")},
+				Reason:  "override-kind",
+				Detail:  "declared as " + ov.Kind + "; measured " + measuredAs(m),
+			}
 		}
 		if ov.Nullable != nil {
 			// Nullability alone was declared; the kind still comes from the
@@ -355,17 +363,22 @@ func typed(m Measured, opts Options, dt arrow.DataType, nullable bool, reason, d
 			detail += "; declared as unix-epoch seconds, so it is a timestamp"
 		}
 	}
-	md := arrow.MetadataFrom(map[string]string{
-		"htcondor:reason":  reason,
-		"htcondor:classes": strings.Join(sorted(keys(m.ValueClasses)), ","),
-	})
 	return Decision{
 		Name:    m.Name,
 		Verdict: Typed,
-		Field:   arrow.Field{Name: m.Name, Type: dt, Nullable: nullable, Metadata: md},
+		Field:   arrow.Field{Name: m.Name, Type: dt, Nullable: nullable, Metadata: fieldMeta(m, reason)},
 		Reason:  reason,
 		Detail:  detail,
 	}
+}
+
+// fieldMeta records on the field how its type was reached, so a consumer reading only the
+// schema can still see whether a column was derived or declared.
+func fieldMeta(m Measured, reason string) arrow.Metadata {
+	return arrow.MetadataFrom(map[string]string{
+		"htcondor:reason":  reason,
+		"htcondor:classes": strings.Join(sorted(keys(m.ValueClasses)), ","),
+	})
 }
 
 func scalarType(class string) (arrow.DataType, bool) {
@@ -419,7 +432,23 @@ func sorted(in []string) []string {
 func Schema(ms []Measured, opts Options) (*arrow.Schema, []Decision) {
 	decisions := make([]Decision, 0, len(ms))
 	fields := make([]arrow.Field, 0, len(ms))
+	// ClassAd attribute names are case-insensitive, so two measurements that differ only in
+	// case are one attribute. Emitting both would put two columns in the schema for it,
+	// with whatever types each measurement happened to reach -- a conflict presented as two
+	// facts. The first wins and the rest are reported, because which spelling is "right" is
+	// not this package's to decide, but publishing both is wrong either way.
+	seen := make(map[string]string, len(ms))
 	for _, m := range ms {
+		key := strings.ToLower(m.Name)
+		if first, dup := seen[key]; dup {
+			decisions = append(decisions, Decision{
+				Name: m.Name, Verdict: Untyped, Reason: "duplicate-name",
+				Detail: "the same attribute was already measured as " + first +
+					"; ClassAd names are case-insensitive, so one column covers both",
+			})
+			continue
+		}
+		seen[key] = m.Name
 		d := Derive(m, opts)
 		decisions = append(decisions, d)
 		if d.Verdict == Typed {

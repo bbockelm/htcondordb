@@ -1,6 +1,7 @@
 # Design sketch: Arrow output, and how far up the Flight stack to climb
 
-**Status:** draft for review. No code written.
+**Status:** the type-inference layer (§5) is implemented in `arrowtype/`; the Flight and transport
+sections below remain a sketch. Measurements in §3 stand as taken.
 **Grounded in:** `repl/sql.go`, `repl/exec.go`, `repl/rowstream.go`, `grafana/pkg/plugin/frame.go`,
 and in classad's `collections/adschema.go`, `collections/vm/vecexec.go`, `dbrpc/proto.go`,
 `db/aggregate.go`. Binary sizes in §3 are measured, not estimated; §3.1 says how.
