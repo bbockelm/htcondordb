@@ -100,6 +100,19 @@ byte-for-byte, confirming the copy is faithful). darwin/arm64, `go1.26.0`, unstr
 | + Flight + gRPC + msgpack (rungs 1–3) | 46,063,954 | **+11,163,776 more (+35.1% of base)** |
 | full stack | 46,063,954 | +14,221,440 (+44.7%) |
 
+**No cgo.** Verified, not assumed: `arrowtype`, the daemon, and the full stack (arrow + array
++ ipc + flight + flightsql + grpc + msgpack linked into a copy of the daemon) all build with
+`CGO_ENABLED=0`, and every package we would use declares zero cgo files. The only cgo in
+arrow-go is `arrow/cdata`, the C Data Interface for handing arrays to C or Python Arrow
+in-process, which we do not import. So static builds, musl images and the RPM cross-build are
+unaffected.
+
+The `modernc.org/sqlite` version arrow-go drags in points the opposite way from how it looks:
+modernc's SQLite is the *pure-Go* one, C transpiled to Go precisely to avoid cgo. It is also
+go.mod-only -- sqlite appears in the dependency tree of none of the packages we use (flightsql,
+flight, ipc, array all report zero), because arrow-go needs it for its own Flight SQL example
+server. MVS raises the version; nothing links it.
+
 Notes that matter for interpreting these:
 
 - The daemon **already links protobuf** (2,826 symbols, via `prometheus/client_golang` →
