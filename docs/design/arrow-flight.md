@@ -1179,10 +1179,27 @@ others are the CPU it costs.
 **That first table hides its own answer, and a first reading of it got this wrong.** The top row
 is labelled "scan + projection + render + loopback" and was then reasoned about as if it were all
 *scan* — irreducible storage work — which produced a ceiling of 1.74x for ever removing the parse
-and the encode. Splitting the row apart kills that conclusion. `BenchmarkWireNativeRead` runs the
-same query through `opQueryRawWire`, which skips the text form entirely, and the wire scan costs
-**1 610 ns/row against the text projection's 9 437** — 5.9x less, over tight spreads (1.1% and
-3.0% across five runs). The render was 83% of what the scan appeared to cost.
+and the encode. Splitting the row apart kills that conclusion.
+
+**What "render" means here**, since the word is doing real work: a stored record is binary —
+inline attribute names and typed value nodes, each a tag byte plus a varint or a length-prefixed
+string. The text projection op walks each matched record and builds ClassAd SOURCE TEXT from it,
+literally the bytes `Owner = "user43"\nClusterId = 1029\n…`, which then crosses dbrpc as a string
+for the consumer to parse back. The wire op produces no text at all: it assembles a
+self-contained row by copying the stored nodes.
+
+`BenchmarkWireNativeRead` runs the same query both ways — same constraint, same matching, same
+projection, same reference closure, same loopback, a yield that only counts — and the wire scan
+costs **1 610 ns/row against the text projection's 9 437**, 5.9x less, over tight spreads (1.1%
+and 3.0% across five runs). The render was 83% of what the scan appeared to cost.
+
+**And that 83% is CPU, not payload.** The obvious alternative explanation is that the text form
+is simply bigger, so more bytes cross the pipe. Measured on the same records and projection, it
+is **156.3 bytes/row against 139.8 — a ratio of 1.12x**. Sixteen extra bytes a row through an
+in-process pipe is worth nanoseconds, so it accounts for well under 1% of the gap. What the text
+path is spending is the per-attribute work of FORMATTING: decode the node, turn an integer into
+decimal digits or a string into a quoted and escaped literal, write `Name = value\n`. The wire
+path copies the node's bytes instead.
 
 So the real attribution of a read, on the columnar tier, is:
 
