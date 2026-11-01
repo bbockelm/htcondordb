@@ -12,6 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/dbrpc"
 
 	"github.com/bbockelm/htcondordb/arrowtype"
 )
@@ -57,8 +58,19 @@ func parseSelectAll(query string) (string, error) {
 // tableSchema derives a table's Arrow schema from a measurement of what its attributes hold.
 // It returns the decisions too, so a caller can report which attributes got no column.
 func (s *Server) tableSchema(ctx context.Context, table string) (*arrow.Schema, []arrowtype.Decision, error) {
+	db, release, err := s.dbFor(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+	return s.tableSchemaWith(ctx, db, table)
+}
+
+// tableSchemaWith is tableSchema on a client the caller already holds, so a handler that makes
+// several calls on one session does not open a session per call.
+func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table string) (*arrow.Schema, []arrowtype.Decision, error) {
 	max := s.sampleMax()
-	rep, err := s.db.AttrTypeProfiles(ctx, table, max)
+	rep, err := db.AttrTypeProfiles(ctx, table, max)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -139,13 +151,22 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 	if err != nil {
 		return nil, nil, err
 	}
-	schema, decisions, err := s.tableSchema(ctx, table)
+	db, release, err := s.dbFor(ctx)
 	if err != nil {
+		return nil, nil, err
+	}
+	schema, decisions, err := s.tableSchemaWith(ctx, db, table)
+	if err != nil {
+		release()
 		return nil, nil, err
 	}
 
 	ch := make(chan flight.StreamChunk, 2)
 	go func() {
+		// The session outlives this call: DoGetStatement returns as soon as the stream
+		// exists, and the scan runs on the session afterwards. Releasing on return
+		// would close the loopback under the goroutine still reading through it.
+		defer release()
 		defer close(ch)
 		// A panic here would otherwise take the daemon down with it: this runs in
 		// process, and one query must not be an outage. The recover is in this
@@ -171,7 +192,7 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 				return false
 			}
 		}
-		scanErr := s.db.QueryTableStream(ctx, table, "true", 0, func(row string) bool {
+		scanErr := db.QueryTableStream(ctx, table, "true", 0, func(row string) bool {
 			// QueryTable streams BRACKETED new-ClassAd text, not old.
 			ad, perr := classad.Parse(row)
 			if perr != nil {
@@ -195,10 +216,21 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 // batchRows matches arrowstream's default, for the same reason sampleMax does.
 const batchRows = 2048
 
-// NewFlightServer wraps the service as a Flight server ready to register with gRPC.
+// NewFlightServer wraps a service as a Flight server ready to register with gRPC.
 func NewFlightServer(s *Server, alloc memory.Allocator) flight.FlightServer {
 	if alloc == nil {
 		alloc = memory.DefaultAllocator
 	}
 	return flightsql.NewFlightServerWithAllocator(s, alloc)
+}
+
+// NewSessionFlightServer is NewFlightServer for a service that resolves a per-identity session
+// on every RPC. One Flight server serves every connection; what differs per RPC is the
+// authorization its reads go through.
+func NewSessionFlightServer(sessions *Sessions, alloc memory.Allocator) (flight.FlightServer, error) {
+	srv, err := NewSessionServer(sessions, sessions.Derive(), alloc)
+	if err != nil {
+		return nil, err
+	}
+	return NewFlightServer(srv, alloc), nil
 }
