@@ -45,6 +45,14 @@ func (p *parser) captureExpr(stop func() bool, lift *[]AggCall) (expr, raw strin
 			break
 		}
 		t := p.peek()
+		// An unmatched closing bracket at the top level ends the expression and is left for
+		// the caller to consume. Without this the depth counter goes negative and the stop
+		// predicate -- which only fires at depth 0 -- never fires again, so the expression
+		// runs to the end of the statement: a window's `OVER (ORDER BY j.ClusterId)` then
+		// failed with a stray-parenthesis error instead of reaching its own parser.
+		if depth == 0 && (t.kind == tPunct || t.kind == tOp) && (t.text == ")" || t.text == "}") {
+			break
+		}
 		sub, matched, terr := p.translateSQL(lift)
 		if terr != nil {
 			return "", "", terr
@@ -121,6 +129,21 @@ func (p *parser) translateSQL(lift *[]AggCall) (out string, matched bool, err er
 		}
 		p.pos++ // NULL
 		return "is undefined", true, nil
+
+	// IN is refused rather than mistranslated. ClassAd spells membership member(x, {..}),
+	// which takes the left operand as an ARGUMENT -- and by the time this sees IN, that
+	// operand has already been written through to the output verbatim, so it cannot be
+	// moved inside a call. `NOT IN` was worse than unsupported: NOT translated to `!` on
+	// its own and the result, `Owner ! IN (...)`, reached the ClassAd parser as a syntax
+	// error pointing at the `!`. Say what to write instead.
+	case p.isKeyword("IN"), p.isKeyword("NOT") && p.peekKeywordAt(1, "IN"):
+		neg := p.isKeyword("NOT")
+		form, want := "x IN (a, b)", `member(x, {a, b})`
+		if neg {
+			form, want = "x NOT IN (a, b)", `!member(x, {a, b})`
+		}
+		return "", false, fmt.Errorf("%s is not supported; ClassAd spells membership as a "+
+			"function, so write %s", form, want)
 
 	case p.isKeyword("AND"):
 		p.pos++

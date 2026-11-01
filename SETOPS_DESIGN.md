@@ -102,9 +102,51 @@ is precisely
 WHERE a.k IN (SELECT b.k FROM b WHERE ...)
 ```
 
-so only the grammar is missing. MATCH wants semijoin semantics too — "does this request
-have any candidate at all?" is `EXISTS`, not a ranked match — which is a second reason this
-shape earns its place ahead of general subqueries.
+so the *execution* is already written. MATCH wants semijoin semantics too — "does this
+request have any candidate at all?" is `EXISTS`, not a ranked match — which is a second
+reason this shape earns its place ahead of general subqueries.
+
+**But "only the grammar is missing" understated it, and the sequencing changed once that was
+checked.** There is no `IN` operator at all, list form included: `WHERE Owner IN ('alice',
+'bob')` reaches the ClassAd parser verbatim and fails, and `NOT IN` was worse than
+unsupported — `NOT` translated to `!` on its own, so `Owner NOT IN ('alice')` became
+`Owner ! IN (...)` and surfaced as a syntax error pointing at the `!`. Both are now refused
+with the ClassAd spelling, `member(x, {a, b})`, which does work.
+
+The obstacle is architectural rather than a missing case. ClassAd spells membership as a
+*function*, so the left operand has to move inside a call — and by the time the expression
+capture reaches `IN`, that operand has already been written through to the output verbatim.
+`captureExpr` streams source left to right and cannot retract it.
+
+The buffering is the easy half; the hard half is knowing **how far back to retract**, because
+the left operand is not one token. It can be an attribute, a qualified path, a function call,
+a parenthesized expression, or a bare expression — and SQL precedence makes `a + b IN (…)`
+mean `(a + b) IN (…)`, so finding the operand's start means knowing operator precedence,
+which is exactly the parsing this layer exists to avoid. A token pre-pass has the identical
+difficulty by a different route, plus the hazard that `IN` is not reserved here, so an
+attribute may legitimately be named `In`. The honest full fix is to parse `WHERE` into an AST
+and unparse it, which trades away the verbatim passthrough that lets the whole ClassAd
+language work in a `WHERE` without this parser knowing any of it.
+
+**The subquery is the easy part; the infix `IN` is the hard part.** That is the thing to hold
+on to, because it is the opposite of how the two look. These are PREFIX forms — contiguous
+token runs — and fit the existing machinery with no architectural change at all:
+
+```sql
+WHERE member(j.ClusterId, (SELECT h.ClusterId FROM hist h WHERE ...))
+WHERE EXISTS (SELECT 1 FROM hist h WHERE h.ClusterId == j.ClusterId)
+```
+
+`translateSQL` can match `(` followed by `SELECT`, consume the subquery whole, and substitute
+the materialized values — which is the same `(attr == v1 || attr == v2 || …)` construction
+key batching already builds. So the full semijoin CAPABILITY is reachable without touching
+the operand-boundary problem; only the infix `IN` spelling depends on solving it.
+
+**So the recommendation is to decline `IN` and add subqueries in argument position**:
+`member(x, (SELECT …))` plus `EXISTS` / `NOT EXISTS`, with the value cap and plain-scan
+fallback below. It is consistent with `WHERE` being a ClassAd expression rather than SQL —
+users already write `=?=`, `member()` and `regexp()` — and `IN` sugar can be layered on later
+if someone wants to pay for real expression parsing.
 
 Two things to settle when it is built:
 

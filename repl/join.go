@@ -578,6 +578,19 @@ func validateJoinClauses(st *Statement, aliases map[string]int, left, right Tabl
 	check := func(what, src string) error {
 		return validateJoinExpr(what, src, aliases, left, right)
 	}
+	// checkArg validates one aggregate's argument. COUNT(*) has no attribute to qualify;
+	// anything else must name its table, which over a composite row means a dotted path.
+	checkArg := func(what string, a AggCall) error {
+		if a.Arg != "" && a.Arg != "*" {
+			if !strings.Contains(a.Arg, ".") {
+				return unqualifiedErr(what+" "+a.Func+"()", a.Arg, left, right)
+			}
+			if err := check(what, a.Arg); err != nil {
+				return err
+			}
+		}
+		return check(what+" FILTER", a.Filter)
+	}
 	for _, j := range st.Joins {
 		if err := check("JOIN ON", j.On); err != nil {
 			return err
@@ -586,29 +599,61 @@ func validateJoinClauses(st *Statement, aliases map[string]int, left, right Tabl
 	if err := check("WHERE", st.Where); err != nil {
 		return err
 	}
-	for _, it := range st.Items {
-		if it.Star {
-			continue
-		}
-		if it.Expr == "" {
-			return unqualifiedErr("SELECT", it.Col, left, right)
-		}
-		if err := check("SELECT", it.Expr); err != nil {
+	for _, g := range st.GroupBy {
+		if err := check("GROUP BY", g); err != nil {
 			return err
 		}
 	}
+	for _, it := range append(st.Items, orderItems(st)...) {
+		what := "SELECT"
+		if it.fromOrderBy {
+			what = "ORDER BY"
+		}
+		switch {
+		case it.Star:
+			// `*` and `alias.*` name no single attribute; the expansion is checked when
+			// the column set is built.
+		case it.IsAggregate():
+			if err := checkArg(what, AggCall{Func: it.Agg, Arg: it.Col, Filter: it.AggFilter}); err != nil {
+				return err
+			}
+		case len(it.Aggs) > 0:
+			// An expression with aggregates lifted out of it: the surrounding expression
+			// refers to each as __agg_N, which validateJoinExpr allows unqualified.
+			for _, a := range it.Aggs {
+				if err := checkArg(what, a); err != nil {
+					return err
+				}
+			}
+			if err := check(what, it.Expr); err != nil {
+				return err
+			}
+		case it.Expr == "":
+			return unqualifiedErr(what, it.Col, left, right)
+		default:
+			if err := check(what, it.Expr); err != nil {
+				return err
+			}
+		}
+	}
+	for _, a := range st.HavingAggs {
+		if err := checkArg("HAVING", a); err != nil {
+			return err
+		}
+	}
+	return check("HAVING", st.Having)
+}
+
+// orderItems returns the ORDER BY terms as select items tagged with their origin, so one
+// loop validates both lists and the error names the clause the reader wrote.
+func orderItems(st *Statement) []SelectItem {
+	out := make([]SelectItem, 0, len(st.OrderBy))
 	for _, t := range st.OrderBy {
-		if t.Item.Star {
-			continue
-		}
-		if t.Item.Expr == "" {
-			return unqualifiedErr("ORDER BY", t.Item.Col, left, right)
-		}
-		if err := check("ORDER BY", t.Item.Expr); err != nil {
-			return err
-		}
+		it := t.Item
+		it.fromOrderBy = true
+		out = append(out, it)
 	}
-	return nil
+	return out
 }
 
 func validateJoinExpr(what, src string, aliases map[string]int, left, right TableRef) error {
@@ -636,7 +681,8 @@ func validateJoinExpr(what, src string, aliases map[string]int, left, right Tabl
 				bad = fmt.Errorf("%s: PARENT.%s has no meaning in a join", what, v.Name)
 				return false
 			}
-			if v.Scope == ast.NoScope && !magicUnscoped[strings.ToLower(v.Name)] {
+			if v.Scope == ast.NoScope && !magicUnscoped[strings.ToLower(v.Name)] &&
+				!strings.HasPrefix(strings.ToLower(v.Name), strings.ToLower(aggPlaceholderPrefix)) {
 				bad = unqualifiedErr(what, v.Name, left, right)
 				return false
 			}
@@ -679,10 +725,12 @@ func (e *Executor) execJoin(st *Statement) (*Result, error) {
 	}
 	// Key batching: with the left side in hand and an equality on a bare right-side
 	// attribute, the right scan can be narrowed to the values the left side actually has,
-	// instead of reading the whole table and discarding most of it here.
+	// instead of reading the whole table and discarding most of it here. Whether that is
+	// cheaper than reading the whole table depends on how big the whole table is, which is
+	// what decideKeyBatch weighs.
 	right := p.right
-	if batch := p.keyBatchConstraint(leftAds); batch != "" {
-		right.where = andText(right.where, batch)
+	if d := e.decideKeyBatch(p, leftAds); d.constraint != "" {
+		right.where = andText(right.where, d.constraint)
 	}
 	rightAds, err := e.fetchJoinSide(st, right, 1)
 	if err != nil {
@@ -692,6 +740,12 @@ func (e *Executor) execJoin(st *Statement) (*Result, error) {
 	rows, err := p.join(leftAds, rightAds)
 	if err != nil {
 		return nil, err
+	}
+	// Aggregation happens over the joined rows, which only exist here -- the server's
+	// aggregate is single-table and has no notion of a composite row. So a grouped join is
+	// reduced client-side, and EXPLAIN says so.
+	if hasAggregate(st) || len(st.GroupBy) > 0 {
+		return e.aggregateJoinRows(st, rows)
 	}
 	if st.Distinct {
 		rows = dedupeAds(rows)
@@ -708,16 +762,8 @@ func (e *Executor) execJoin(st *Statement) (*Result, error) {
 // refuseUnsupportedJoin rejects the clauses a join does not carry yet, each with the reason
 // rather than a bare "unsupported".
 func refuseUnsupportedJoin(st *Statement) error {
-	if hasAggregate(st) || len(st.GroupBy) > 0 {
-		return fmt.Errorf("aggregates and GROUP BY over a join are not supported yet; " +
-			"the aggregate argument grammar takes a bare attribute name, which cannot say " +
-			"which table it comes from")
-	}
 	if hasWindow(st) {
 		return fmt.Errorf("window functions over a join are not supported yet")
-	}
-	if st.Having != "" {
-		return fmt.Errorf("HAVING needs GROUP BY, which a join does not support yet")
 	}
 	if st.Qualify != "" {
 		return fmt.Errorf("QUALIFY filters a window column, which a join does not support yet")
@@ -753,8 +799,16 @@ func (e *Executor) fetchJoinSide(st *Statement, s joinSide, side int) ([]*classa
 // a left row's key is not a usable literal, or when there are more distinct values than the
 // constraint should carry -- in each case the right side is simply scanned as planned.
 func (p *joinPlan) keyBatchConstraint(leftAds []*classad.ClassAd) string {
+	return p.batchConstraintFor(p.keyLiterals(leftAds))
+}
+
+// keyLiterals collects the left side's distinct key values as ClassAd literals, sorted so
+// the same query explains the same way. It returns nil when there is no single bare-attribute
+// equality to batch on, when no left row has a usable key value, or when there are more
+// distinct values than one constraint should carry.
+func (p *joinPlan) keyLiterals(leftAds []*classad.ClassAd) []string {
 	if p.batchAttr == "" || len(p.equi) != 1 || len(leftAds) == 0 {
-		return ""
+		return nil
 	}
 	seen := map[string]bool{}
 	var lits []string
@@ -771,19 +825,81 @@ func (p *joinPlan) keyBatchConstraint(leftAds []*classad.ClassAd) string {
 		}
 		seen[lit] = true
 		if len(lits) >= maxJoinKeyBatch {
-			return "" // too many distinct keys: a plain scan is cheaper than the constraint
+			return nil // more keys than one constraint should carry
 		}
 		lits = append(lits, lit)
 	}
 	if len(lits) == 0 {
+		return nil
+	}
+	sort.Strings(lits)
+	return lits
+}
+
+// batchConstraintFor folds the key literals into one membership constraint on the right
+// side's attribute.
+func (p *joinPlan) batchConstraintFor(lits []string) string {
+	if len(lits) == 0 {
 		return ""
 	}
-	sort.Strings(lits) // a stable constraint, so the same query explains the same way
 	terms := make([]string, len(lits))
 	for i, l := range lits {
 		terms[i] = p.batchAttr + " == " + l
 	}
 	return "(" + strings.Join(terms, " || ") + ")"
+}
+
+// minRightRowsPerKey is how many rows the right side must hold per left-side key before
+// narrowing its scan to those keys is worth the constraint's own cost.
+//
+// The constraint is not free: its cost grows with the key count, while the scan it avoids
+// grows with the right table's size, so whether it pays is a trade between two quantities
+// and not a property of either alone. Measured at 400 keys, batching cost 4.0x MORE against
+// a 1,024-row right table and 1.5x more at 4,096 rows, broke even around 8,000, and was 2.0x
+// better at 16,384 and 8.0x better at 65,536 -- break-even near 20 rows per key.
+//
+// A var rather than a const so a test can move it, and so a site whose data disagrees with
+// the fixture this was measured on has somewhere to change it. The figure is one shape's
+// break-even, not a law.
+var minRightRowsPerKey = 20
+
+// keyBatchDecision is why the join did or did not narrow the right side's scan, so EXPLAIN
+// can say which and on what basis.
+type keyBatchDecision struct {
+	constraint string // "" = not batching
+	keys       int
+	rightRows  int
+	knownRows  bool // false = the right side's size could not be learned cheaply
+}
+
+// decideKeyBatch chooses whether to narrow the right side's scan to the left side's keys.
+//
+// Knowing the key count is only half the trade; the other half is how many rows the
+// unbatched scan would read. That number is on the server, so it is asked for only when the
+// answer can change the decision -- there is something to batch on, and the right side
+// carries no constraint of its own, which would make a whole-table count an overestimate of
+// what the scan actually reads. When it cannot be learned cheaply the decision falls back to
+// the key count alone, which is what this did before the cost was measured.
+func (e *Executor) decideKeyBatch(p *joinPlan, leftAds []*classad.ClassAd) keyBatchDecision {
+	lits := p.keyLiterals(leftAds)
+	d := keyBatchDecision{keys: len(lits)}
+	if len(lits) == 0 {
+		return d
+	}
+	if p.right.where != "" {
+		// The right side already filters itself, so its whole-table count would overstate
+		// the scan being avoided. Keep the pre-measurement behavior rather than decide on
+		// a number that does not describe this plan.
+		d.constraint = p.batchConstraintFor(lits)
+		return d
+	}
+	rows, ok := e.cheapRowCount(p.right.ref.Table)
+	d.rightRows, d.knownRows = rows, ok
+	if ok && rows < len(lits)*minRightRowsPerKey {
+		return d // the scan this would avoid is smaller than the constraint costs
+	}
+	d.constraint = p.batchConstraintFor(lits)
+	return d
 }
 
 // literalOf renders a scalar value as the ClassAd literal naming it, for the membership
@@ -1154,11 +1270,20 @@ func (e *Executor) describeJoinPlan(st *Statement) []string {
 	}
 	out = append(out, side(p.left), side(p.right))
 	if p.batchAttr != "" {
-		out = append(out, fmt.Sprintf("  key batching: %s.%s narrowed to the left side's keys (max %d)",
-			p.right.ref.Alias, p.batchAttr, maxJoinKeyBatch))
+		// The decision needs the left side's actual keys, which EXPLAIN without ANALYZE
+		// has not read, so this reports what is available to batch on and the rule that
+		// will be applied to it rather than the outcome.
+		out = append(out, fmt.Sprintf("  key batching: %s.%s can be narrowed to the left side's keys "+
+			"(at most %d, and only if %s holds at least %d row(s) per key)",
+			p.right.ref.Alias, p.batchAttr, maxJoinKeyBatch, p.right.ref.Alias, minRightRowsPerKey))
 	}
 	out = append(out, fmt.Sprintf("  checked per pair: %d condition term(s), %d post-filter term(s)",
 		len(p.cond), len(p.post)))
+	if hasAggregate(st) || len(st.GroupBy) > 0 {
+		out = append(out, fmt.Sprintf("  grouping: client-side over the joined rows "+
+			"(%d group term(s), %d aggregate(s)); the server aggregate is single-table",
+			len(st.GroupBy), len(aggCallOrder(st))))
+	}
 	out = append(out, "  executed client-side: no join opcode is sent, so this runs against any server")
 	return out
 }
@@ -1199,4 +1324,119 @@ func maxJoinPairsForTest(n int) func() {
 	prev := maxJoinPairs
 	maxJoinPairs = n
 	return func() { maxJoinPairs = prev }
+}
+
+// aggregateJoinRows groups the joined rows and reduces each group, the client-side
+// counterpart of the server's single-table aggregate.
+//
+// Every group key is an expression over the composite row rather than an attribute of it --
+// `GROUP BY j.Owner` reads the Owner of the row's j member -- so each one is compiled once
+// and evaluated per row. Past that the machinery is the same as the single-table client-side
+// paths use: reduceAggs for the values, the positional projector for HAVING and the column
+// order, then ORDER BY and LIMIT over the reduced rows.
+func (e *Executor) aggregateJoinRows(st *Statement, rows []*classad.ClassAd) (*Result, error) {
+	// Compile each group key once. Parsing per row is what made a grouped CASE query spend
+	// most of its time in the ClassAd parser on the single-table path.
+	keyExpr := make([]*classad.Expr, len(st.Items))
+	for j, it := range st.Items {
+		if it.GroupLevel() || it.Star {
+			continue
+		}
+		src := it.Expr
+		if src == "" {
+			src = it.Col
+		}
+		ex, err := classad.ParseExpr(src)
+		if err != nil {
+			return nil, fmt.Errorf("GROUP BY %q: %w", src, err)
+		}
+		keyExpr[j] = ex
+	}
+
+	type group struct {
+		vals []string
+		rows []*classad.ClassAd
+	}
+	var order []string
+	groups := map[string]*group{}
+	for _, row := range rows {
+		vals := make([]string, 0, len(st.Items))
+		for j, it := range st.Items {
+			if it.GroupLevel() || keyExpr[j] == nil {
+				continue
+			}
+			vals = append(vals, valueDisplay(keyExpr[j].Eval(row)))
+		}
+		key := strings.Join(vals, "\x00")
+		g := groups[key]
+		if g == nil {
+			g = &group{vals: vals}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.rows = append(g.rows, row)
+	}
+
+	proj, err := positionalGroupProjector(st)
+	if err != nil {
+		return nil, err
+	}
+	res := &Result{IsSelect: true, Columns: proj.columns()}
+	for _, key := range order {
+		g := groups[key]
+		vals := reduceAggs(st, g.rows)
+		if !proj.keep(g.vals, vals) {
+			continue
+		}
+		res.Rows = append(res.Rows, proj.row(g.vals, vals))
+	}
+	if len(st.OrderBy) > 0 {
+		if err := sortRows(res, st.OrderBy); err != nil {
+			return nil, err
+		}
+	}
+	if st.Limit > 0 && len(res.Rows) > st.Limit {
+		res.Rows = res.Rows[:st.Limit]
+	}
+	return res, nil
+}
+
+// joinExprRefs returns the attribute references of an expression over a joined row, each as
+// the whole dotted path it was written as.
+//
+// It exists because vm's ReadAttrs reports the leaf of a select -- `h.Owner` comes back as
+// "h" -- which is the right answer for a read plan and the wrong one for asking whether a
+// reference is a grouped column. An unqualified reference is returned as written, so a scope
+// check still catches it.
+func joinExprRefs(src string) []string {
+	if strings.TrimSpace(src) == "" {
+		return nil
+	}
+	q, err := vm.Parse(src)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(path string) {
+		if k := strings.ToLower(path); path != "" && !seen[k] {
+			seen[k] = true
+			out = append(out, path)
+		}
+	}
+	walkAST(q.Expr(), func(n ast.Expr) bool {
+		switch v := n.(type) {
+		case *ast.SelectExpr:
+			if base, ok := unwrapParens(v.Record).(*ast.AttributeReference); ok && base.Scope == ast.NoScope {
+				add(base.Name + "." + v.Attr)
+				return false
+			}
+		case *ast.AttributeReference:
+			if v.Scope == ast.NoScope {
+				add(v.Name)
+			}
+		}
+		return true
+	})
+	return out
 }
