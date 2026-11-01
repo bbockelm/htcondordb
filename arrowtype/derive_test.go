@@ -1,0 +1,261 @@
+package arrowtype
+
+import (
+	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow"
+)
+
+func m(name string, sampled, present int, classes map[string]int) Measured {
+	return Measured{Name: name, Sampled: sampled, Present: present, ValueClasses: classes}
+}
+
+func TestDeriveSingleClass(t *testing.T) {
+	cases := []struct {
+		class string
+		want  arrow.Type
+	}{
+		{"int", arrow.INT64},
+		{"real", arrow.FLOAT64},
+		{"bool", arrow.BOOL},
+		{"string", arrow.STRING},
+	}
+	for _, c := range cases {
+		d := Derive(m("X", 100, 100, map[string]int{c.class: 100}), Options{})
+		if d.Verdict != Typed {
+			t.Errorf("%s: verdict %v, want Typed (%s)", c.class, d.Verdict, d.Detail)
+			continue
+		}
+		if d.Field.Type.ID() != c.want {
+			t.Errorf("%s: type %v, want %v", c.class, d.Field.Type.ID(), c.want)
+		}
+		if d.Field.Nullable {
+			t.Errorf("%s: nullable, want not -- present in every record with no nulls", c.class)
+		}
+		if d.Reason != "single-class" {
+			t.Errorf("%s: reason %q, want single-class", c.class, d.Reason)
+		}
+	}
+}
+
+// TestDeriveNullability separates the two independent ways a column admits nulls. They are
+// different facts -- absent from the record, versus present and holding undefined -- and a
+// derivation that noticed only one would produce a non-nullable column that then has to hold a
+// null.
+func TestDeriveNullability(t *testing.T) {
+	full := Derive(m("X", 100, 100, map[string]int{"int": 100}), Options{})
+	if full.Field.Nullable {
+		t.Error("fully present, no nulls: nullable, want not")
+	}
+
+	absent := Derive(m("X", 100, 60, map[string]int{"int": 60}), Options{})
+	if !absent.Field.Nullable {
+		t.Error("absent from 40 records: not nullable, want nullable")
+	}
+
+	stored := Measured{Name: "X", Sampled: 100, Present: 100, Nulls: 10,
+		ValueClasses: map[string]int{"int": 90}}
+	if d := Derive(stored, Options{}); !d.Field.Nullable {
+		t.Error("present but holding undefined: not nullable, want nullable")
+	}
+}
+
+// TestDeriveIntRealWidening is the case that matters most on real data: ClassAd writes an
+// integral float without a decimal point, so a float-valued attribute arrives as a mix of int
+// and real nodes. BytesRecvd was 67 int to 1933 real on a real history table.
+func TestDeriveIntRealWidening(t *testing.T) {
+	d := Derive(m("BytesRecvd", 2000, 2000, map[string]int{"int": 67, "real": 1933}), Options{})
+	if d.Verdict != Typed || d.Field.Type.ID() != arrow.FLOAT64 {
+		t.Fatalf("verdict %v type %v, want Typed float64 (%s)", d.Verdict, d.Field.Type, d.Detail)
+	}
+	if d.Reason != "int-real-widened" {
+		t.Errorf("reason %q, want int-real-widened", d.Reason)
+	}
+}
+
+// TestDeriveIntRealLossyRefusesFloat is the guard that makes the widening above safe. An
+// integer past 2^53 shares a float64 with its neighbour, so widening would alter values rather
+// than round them -- the store keeps an int64 payload specifically to preserve these.
+func TestDeriveIntRealLossyRefusesFloat(t *testing.T) {
+	lossy := Measured{Name: "BytesSent", Sampled: 2000, Present: 2000,
+		ValueClasses: map[string]int{"int": 1000, "real": 1000}, LossyAsFloat: 1}
+	d := Derive(lossy, Options{})
+	if d.Field.Type.ID() == arrow.FLOAT64 {
+		t.Fatal("widened to float64 despite a value past 2^53")
+	}
+	if d.Reason != "int-real-lossy" {
+		t.Errorf("reason %q, want int-real-lossy", d.Reason)
+	}
+	if d.Verdict != Typed || d.Field.Type.ID() != arrow.STRING {
+		t.Errorf("verdict %v type %v, want a text column by default", d.Verdict, d.Field.Type)
+	}
+}
+
+func TestDeriveUntypedCases(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         Measured
+		wantReason string
+	}{
+		{
+			name:       "nothing but nulls",
+			in:         Measured{Name: "X", Sampled: 100, Present: 100, Nulls: 100, ValueClasses: map[string]int{}},
+			wantReason: "no-value-observed",
+		},
+		{
+			// Requirements evaluated to a boolean in 1685 of 2000 real ads, plus 141
+			// errors -- a match expression with no machine to match against. Its text
+			// is the useful form.
+			name:       "predominantly an expression",
+			in:         m("Requirements", 2000, 2000, map[string]int{"expr": 1995, "bool": 5}),
+			wantReason: "expression-valued",
+		},
+		{
+			name:       "list values",
+			in:         m("Tags", 100, 100, map[string]int{"list": 100}),
+			wantReason: "composite-value",
+		},
+		{
+			name:       "nested ad values",
+			in:         m("Nested", 100, 100, map[string]int{"classad": 100}),
+			wantReason: "composite-value",
+		},
+	}
+	for _, c := range cases {
+		d := Derive(c.in, Options{})
+		if d.Verdict != Untyped {
+			t.Errorf("%s: verdict %v, want Untyped", c.name, d.Verdict)
+		}
+		if d.Reason != c.wantReason {
+			t.Errorf("%s: reason %q, want %q", c.name, d.Reason, c.wantReason)
+		}
+		if d.Detail == "" {
+			t.Errorf("%s: no detail; an omitted column must say why", c.name)
+		}
+	}
+}
+
+func TestDeriveMixedKinds(t *testing.T) {
+	in := m("Mixed", 100, 100, map[string]int{"int": 90, "string": 10})
+	d := Derive(in, Options{})
+	if d.Verdict != Typed || d.Field.Type.ID() != arrow.STRING {
+		t.Fatalf("verdict %v type %v, want a text column", d.Verdict, d.Field.Type)
+	}
+	if d.Reason != "mixed-kinds" {
+		t.Errorf("reason %q, want mixed-kinds", d.Reason)
+	}
+
+	strict := Derive(in, Options{StrictMixedKinds: true})
+	if strict.Verdict != Untyped {
+		t.Errorf("strict: verdict %v, want Untyped", strict.Verdict)
+	}
+}
+
+// TestDeriveEpochDeclaration pins that epoch-to-timestamp is a DECLARATION and not a guess: it
+// applies to the names given and to no others, and only where the underlying type is numeric.
+func TestDeriveEpochDeclaration(t *testing.T) {
+	opts := Options{TimeAttrs: map[string]bool{"qdate": true, "completiondate": true}}
+
+	d := Derive(m("QDate", 100, 100, map[string]int{"int": 100}), opts)
+	if d.Field.Type.ID() != arrow.TIMESTAMP {
+		t.Errorf("QDate: type %v, want timestamp", d.Field.Type)
+	}
+
+	// Attribute names are case-insensitive in ClassAd, so the declaration must be too.
+	if d2 := Derive(m("qDaTe", 100, 100, map[string]int{"int": 100}), opts); d2.Field.Type.ID() != arrow.TIMESTAMP {
+		t.Errorf("qDaTe: type %v, want timestamp (names are case-insensitive)", d2.Field.Type)
+	}
+
+	// An undeclared numeric attribute stays numeric: this is the mechanism replacing the
+	// hardcoded guessing the Grafana plugin does today.
+	if d3 := Derive(m("Cpus", 100, 100, map[string]int{"int": 100}), opts); d3.Field.Type.ID() != arrow.INT64 {
+		t.Errorf("Cpus: type %v, want int64 -- not declared a time attribute", d3.Field.Type)
+	}
+
+	// A declared name whose values are strings is NOT a timestamp; the declaration says how
+	// to read a number, not how to parse text.
+	strs := Derive(m("CompletionDate", 100, 100, map[string]int{"string": 100}), opts)
+	if strs.Field.Type.ID() != arrow.STRING {
+		t.Errorf("CompletionDate (strings): type %v, want utf8", strs.Field.Type)
+	}
+}
+
+func TestDeriveMetadataCarriesReasonAndClasses(t *testing.T) {
+	d := Derive(m("BytesRecvd", 2000, 2000, map[string]int{"int": 67, "real": 1933}), Options{})
+	md := d.Field.Metadata
+	got := map[string]string{}
+	for i, k := range md.Keys() {
+		got[k] = md.Values()[i]
+	}
+	if got["htcondor:reason"] != "int-real-widened" {
+		t.Errorf("metadata reason %q", got["htcondor:reason"])
+	}
+	if got["htcondor:classes"] != "int,real" {
+		t.Errorf("metadata classes %q, want \"int,real\" (sorted, so it is stable)", got["htcondor:classes"])
+	}
+}
+
+// TestSchemaOrderAndOmissions pins the two things a consumer depends on: field order follows
+// the input (which the store reports most-present-first), and an attribute that got no column
+// is still reported so the caller can route it to the tail rather than discover the omission
+// later.
+func TestSchemaOrderAndOmissions(t *testing.T) {
+	in := []Measured{
+		m("Owner", 100, 100, map[string]int{"string": 100}),
+		m("Requirements", 100, 100, map[string]int{"expr": 100}),
+		m("Cpus", 100, 100, map[string]int{"int": 100}),
+	}
+	s, decisions := Schema(in, Options{})
+	if got := s.NumFields(); got != 2 {
+		t.Fatalf("%d fields, want 2 (Requirements is untyped)", got)
+	}
+	if s.Field(0).Name != "Owner" || s.Field(1).Name != "Cpus" {
+		t.Errorf("field order %q,%q, want Owner,Cpus", s.Field(0).Name, s.Field(1).Name)
+	}
+	if len(decisions) != 3 {
+		t.Fatalf("%d decisions, want one per input attribute", len(decisions))
+	}
+	if decisions[1].Verdict != Untyped || decisions[1].Name != "Requirements" {
+		t.Errorf("decision[1] = %+v, want Requirements untyped", decisions[1])
+	}
+}
+
+// TestDeriveAgainstMeasuredShapes runs the rules over the attribute shapes actually measured on
+// a production AP (2000 ads from each of a live queue and a history table), so the rules are
+// pinned against real data rather than only against cases invented to exercise them.
+func TestDeriveAgainstMeasuredShapes(t *testing.T) {
+	opts := Options{TimeAttrs: map[string]bool{"qdate": true}}
+	cases := []struct {
+		in       Measured
+		wantType arrow.Type
+		wantKind Verdict
+	}{
+		// history: BytesRecvd 67 int / 1933 real -- a float attribute written without
+		// decimal points.
+		{m("BytesRecvd", 2000, 2000, map[string]int{"int": 67, "real": 1933}), arrow.FLOAT64, Typed},
+		// history: CpusUsage 2 int / 1998 real.
+		{m("CpusUsage", 2000, 2000, map[string]int{"int": 2, "real": 1998}), arrow.FLOAT64, Typed},
+		// jobs: Rank 1 int / 1999 real.
+		{m("Rank", 2000, 2000, map[string]int{"int": 1, "real": 1999}), arrow.FLOAT64, Typed},
+		// history: MemoryUsage is an expression in 1996 of 2000 ads; it evaluates to an
+		// integer, but the profile measures stored form, so the typed column comes from
+		// the evaluated profile, not this one.
+		{m("MemoryUsage", 2000, 2000, map[string]int{"expr": 1996, "int": 4}), arrow.NULL, Untyped},
+		// history: MachineAttrGLIDEIN_Site0 is 25 strings against 1975 undefined -- a
+		// uniformly string attribute that usually has no value.
+		{Measured{Name: "MachineAttrGLIDEIN_Site0", Sampled: 2000, Present: 2000, Nulls: 1975,
+			ValueClasses: map[string]int{"string": 25}}, arrow.STRING, Typed},
+		// A declared epoch attribute.
+		{m("QDate", 2000, 2000, map[string]int{"int": 2000}), arrow.TIMESTAMP, Typed},
+	}
+	for _, c := range cases {
+		d := Derive(c.in, opts)
+		if d.Verdict != c.wantKind {
+			t.Errorf("%s: verdict %v, want %v (%s)", c.in.Name, d.Verdict, c.wantKind, d.Detail)
+			continue
+		}
+		if d.Verdict == Typed && d.Field.Type.ID() != c.wantType {
+			t.Errorf("%s: type %v, want %v", c.in.Name, d.Field.Type.ID(), c.wantType)
+		}
+	}
+}
