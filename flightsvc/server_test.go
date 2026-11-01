@@ -248,15 +248,18 @@ func assertSeededTypes(t *testing.T, schema *arrow.Schema) {
 // Nothing downstream corrects this server, so a query it half-understands would return rows
 // that look right and are not. Every one of these must be refused, and the refusal must say
 // what IS accepted.
+// TestUnsupportedSQLIsRefused covers the two kinds of refusal, which say different things on
+// purpose. A statement whose SHAPE is unsupported names the accepted shape, because the user
+// needs to know what to write instead. A predicate the lowering will not translate explains
+// THAT predicate's problem -- restating the grammar there would be useless, since the shape was
+// fine and the semantics were not.
 func TestUnsupportedSQLIsRefused(t *testing.T) {
 	cl, _, done := harness(t, 10)
 	defer done()
 	ctx := context.Background()
 
+	// Shape refusals: must name what is accepted.
 	for _, q := range []string{
-		// Each of these has semantics to get wrong, which is why it waits for the ANSI
-		// front end rather than being approximated now.
-		`SELECT * FROM ads WHERE Owner = 'alice'`,
 		`SELECT COUNT(*) FROM ads`,
 		`SELECT Owner AS who FROM ads`,
 		`SELECT upper(Owner) FROM ads`,
@@ -270,9 +273,32 @@ func TestUnsupportedSQLIsRefused(t *testing.T) {
 			t.Errorf("%q: accepted, want a refusal", q)
 			continue
 		}
-		// The refusal has to name the accepted shape, or it blocks without teaching.
 		if !strings.Contains(err.Error(), "FROM <table>") {
-			t.Errorf("%q: refusal %q does not say what is accepted", q, err)
+			t.Errorf("%q: refusal %q does not say what shape is accepted", q, err)
+		}
+	}
+
+	// Predicate refusals: must say the WHERE clause is the problem, and why. Each of these
+	// is valid SQL whose ClassAd meaning would differ, so it is declined rather than
+	// approximated.
+	for _, c := range []struct{ q, reason string }{
+		{`SELECT * FROM ads WHERE Owner > 'R'`, "case-insensitively"},
+		{`SELECT * FROM ads WHERE Owner <> 'alice'`, "three-valued"},
+		{`SELECT * FROM ads WHERE NOT Owner = 'alice'`, "negated equality"},
+		{`SELECT * FROM ads WHERE Nope = 'x'`, "unknown column"},
+		{`SELECT * FROM ads WHERE Requirements = TRUE`, "no declared scalar type"},
+		{`SELECT * FROM ads WHERE Owner = 5`, "non-string literal"},
+	} {
+		_, err := cl.Execute(ctx, c.q)
+		if err == nil {
+			t.Errorf("%q: accepted, want a refusal", c.q)
+			continue
+		}
+		if !strings.Contains(err.Error(), "WHERE clause") {
+			t.Errorf("%q: refusal %q does not locate the problem in the WHERE clause", c.q, err)
+		}
+		if !strings.Contains(err.Error(), c.reason) {
+			t.Errorf("%q: refusal %q does not explain the reason (%s)", c.q, err, c.reason)
 		}
 	}
 }
@@ -630,5 +656,104 @@ func TestParseQueryShapes(t *testing.T) {
 				t.Errorf("%q: col %d = %q, want %q", c.q, i, got.cols[i], c.cols[i])
 			}
 		}
+	}
+}
+
+// TestWhereClause is the dialect reaching the endpoint. The case-sensitivity check is the one
+// that matters: ClassAd's == would match both spellings, and SQL's = must match one.
+func TestWhereClause(t *testing.T) {
+	cl, _, done := harness(t, 40)
+	defer done()
+	ctx := context.Background()
+
+	count := func(q string) int {
+		t.Helper()
+		info, err := cl.Execute(ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		rdr, err := cl.DoGet(ctx, info.Endpoint[0].Ticket)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		defer rdr.Release()
+		n := 0
+		for rdr.Next() {
+			n += int(rdr.Record().NumRows())
+		}
+		if err := rdr.Err(); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return n
+	}
+
+	all := count(`SELECT * FROM ` + dbrpc.DefaultTable)
+	if all != 40 {
+		t.Fatalf("unfiltered count %d, want 40", all)
+	}
+
+	// The seed writes Owner = user0..user3, so a quarter match.
+	if got := count(`SELECT * FROM ` + dbrpc.DefaultTable + ` WHERE Owner = 'user1'`); got != 10 {
+		t.Errorf("Owner = 'user1' matched %d rows, want 10", got)
+	}
+	// Case-sensitively: ClassAd's == would match these, SQL's = must not.
+	if got := count(`SELECT * FROM ` + dbrpc.DefaultTable + ` WHERE Owner = 'USER1'`); got != 0 {
+		t.Errorf("Owner = 'USER1' matched %d rows; = must be case-sensitive", got)
+	}
+	// Numeric, boolean composition, IN and BETWEEN all reach the store.
+	if got := count(`SELECT * FROM ` + dbrpc.DefaultTable + ` WHERE ClusterId >= 1020`); got != 20 {
+		t.Errorf("ClusterId >= 1020 matched %d rows, want 20", got)
+	}
+	if got := count(`SELECT * FROM ` + dbrpc.DefaultTable + ` WHERE Owner = 'user1' AND ClusterId >= 1020`); got != 5 {
+		t.Errorf("the conjunction matched %d rows, want 5", got)
+	}
+	if got := count(`SELECT * FROM ` + dbrpc.DefaultTable + ` WHERE Owner IN ('user1', 'user2')`); got != 20 {
+		t.Errorf("IN matched %d rows, want 20", got)
+	}
+	if got := count(`SELECT * FROM ` + dbrpc.DefaultTable + ` WHERE ClusterId BETWEEN 1000 AND 1009`); got != 10 {
+		t.Errorf("BETWEEN matched %d rows, want 10", got)
+	}
+	// WHERE composes with projection and LIMIT.
+	if got := count(`SELECT Owner FROM ` + dbrpc.DefaultTable + ` WHERE Owner = 'user1' LIMIT 3`); got != 3 {
+		t.Errorf("WHERE + projection + LIMIT matched %d rows, want 3", got)
+	}
+}
+
+// TestWhereDoesNotChangeTheSchema: a predicate selects ROWS. The columns a table offers are a
+// property of the table, and a schema that varied by query would make a cached catalog
+// worthless.
+func TestWhereDoesNotChangeTheSchema(t *testing.T) {
+	cl, _, done := harness(t, 20)
+	defer done()
+	ctx := context.Background()
+
+	plain, err := clientSchemaOf(ctx, cl, `SELECT * FROM `+dbrpc.DefaultTable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filtered, err := clientSchemaOf(ctx, cl, `SELECT * FROM `+dbrpc.DefaultTable+` WHERE ClusterId > 1005`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plain.Equal(filtered) {
+		t.Error("a WHERE clause changed the schema")
+	}
+}
+
+// TestWhereRefusalIsReportedBeforeRowsAreFetched: a predicate the endpoint cannot serve must
+// fail when the schema is asked for, not after a client has committed to reading a stream.
+func TestWhereRefusalIsReportedBeforeRowsAreFetched(t *testing.T) {
+	cl, _, done := harness(t, 20)
+	defer done()
+	ctx := context.Background()
+	q := `SELECT * FROM ` + dbrpc.DefaultTable + ` WHERE Owner > 'R'`
+
+	if _, err := cl.GetExecuteSchema(ctx, q); err == nil {
+		t.Error("GetExecuteSchema accepted a predicate the endpoint cannot serve")
+	}
+	if _, err := cl.Execute(ctx, q); err == nil {
+		t.Error("Execute accepted it too")
+	} else if !strings.Contains(err.Error(), "WHERE clause") {
+		t.Errorf("refusal %q does not say the WHERE clause is the problem", err)
 	}
 }

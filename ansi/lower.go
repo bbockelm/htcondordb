@@ -386,7 +386,11 @@ func lowerCompare(col string, kind Kind, op string, lit literal, pol polarity) (
 		}
 		return quoteCol(col) + " " + cadOp + " " + lit.text, nil
 	}
-	return "", unsup("column %q has no declared type", col)
+	// Reached when a caller reports the column as present but with no usable type -- an
+	// attribute that exists and has no scalar form, such as a policy expression. Saying so
+	// beats "unknown column", which would send someone looking for a typo.
+	return "", unsup("column %q exists but has no declared scalar type, so a comparison on it "+
+		"cannot be lowered; it is available as text in the untyped tail", col)
 }
 
 func lowerStringCompare(col, op string, lit literal, pol polarity) (string, error) {

@@ -18,6 +18,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/dbrpc"
 
+	"github.com/bbockelm/htcondordb/ansi"
 	"github.com/bbockelm/htcondordb/arrowtype"
 )
 
@@ -43,17 +44,17 @@ import (
 // as an alternation rather than as a captured quote matched again.
 // The accepted grammar: SELECT <cols> FROM <table> [LIMIT n].
 //
-// It grew from `SELECT *` by exactly the argument that made `SELECT *` safe to start with:
-// a column list and a row count contain NO EXPRESSION, so they mean the same thing in every
-// SQL dialect and nothing about them can be reinterpreted when the ANSI front end lands. A
-// WHERE clause, an aggregate, an alias, a function or an ORDER BY would all have semantics to
-// get wrong, so they are still refused.
+// The column list and the row count contain NO EXPRESSION, so they mean the same thing in
+// every SQL dialect. The WHERE clause does not -- it is where the ClassAd/ANSI divergence
+// lives -- so it goes through the ansi package, which lowers what it can prove equivalent and
+// refuses the rest. An aggregate, an alias, a function or an ORDER BY still have semantics
+// nothing here can get right, so they remain refused.
 //
 // Still a recogniser and not a parser. It accepts a shape or declines; there is no partial
 // understanding in between, which is the property that makes a narrow surface safe rather than
 // merely small.
 
-var selectRe = regexp.MustCompile(`(?is)^\s*select\s+(.+?)\s+from\s+(?:"([A-Za-z_][A-Za-z0-9_./-]*)"|([A-Za-z_][A-Za-z0-9_./-]*))(?:\s+limit\s+(\d+))?\s*;?\s*$`)
+var selectRe = regexp.MustCompile(`(?is)^\s*select\s+(.+?)\s+from\s+(?:"([A-Za-z_][A-Za-z0-9_./-]*)"|([A-Za-z_][A-Za-z0-9_./-]*))(?:\s+where\s+(.+?))?(?:\s+limit\s+(\d+))?\s*;?\s*$`)
 
 // identRe is one bare or double-quoted column name, and nothing else: no expression, no alias,
 // no qualification. A list of these is the whole of what a projection may be.
@@ -64,13 +65,17 @@ type query struct {
 	table string
 	// cols is the projection in the order asked for, or nil for SELECT *. Order matters:
 	// `SELECT b, a` must return b then a, because a client reads by position.
-	cols  []string
+	cols []string
+	// where is the predicate as written, still SQL. It is lowered against the table's
+	// declared types, which the recogniser does not have -- so recognising and lowering
+	// are separate steps.
+	where string
 	limit int
 }
 
-const unsupportedHint = "this endpoint accepts `SELECT <columns|*> FROM <table> [LIMIT n]` and nothing " +
-	"else yet. A WHERE clause, an aggregate, an alias, a function or an ORDER BY is refused rather " +
-	"than approximated, because a partly-understood query returns rows that look right"
+const unsupportedHint = "this endpoint accepts `SELECT <columns|*> FROM <table> [WHERE <predicate>] " +
+	"[LIMIT n]`. An aggregate, an alias, a function or an ORDER BY is refused rather than " +
+	"approximated, because a partly-understood query returns rows that look right"
 
 // parseQuery recognises a statement, or returns an error naming what is supported.
 func parseQuery(q string) (query, error) {
@@ -82,7 +87,8 @@ func parseQuery(q string) (query, error) {
 	if out.table == "" {
 		out.table = m[3]
 	}
-	if lim := m[4]; lim != "" {
+	out.where = strings.TrimSpace(m[4])
+	if lim := m[5]; lim != "" {
 		n, err := strconv.Atoi(lim)
 		if err != nil {
 			return query{}, fmt.Errorf("unsupported SQL: LIMIT %q is not a row count", lim)
@@ -198,6 +204,12 @@ func (s *Server) GetSchemaStatement(ctx context.Context, cmd flightsql.Statement
 
 // planSchema recognises a query and returns the schema its rows will carry, projection applied.
 // It is what lets the schema be answered without running anything.
+//
+// A WHERE clause does NOT change the schema: it selects rows, and the columns a table offers
+// are a property of the table. Deriving the schema from a predicate's matches instead would
+// make it vary by query and a consumer's cached catalog worthless. It is still lowered here,
+// so a predicate this endpoint cannot serve is refused when the schema is asked for rather
+// than surfacing only once rows are fetched.
 func (s *Server) planSchema(ctx context.Context, q string) (*arrow.Schema, query, error) {
 	parsed, err := parseQuery(q)
 	if err != nil {
@@ -207,11 +219,60 @@ func (s *Server) planSchema(ctx context.Context, q string) (*arrow.Schema, query
 	if err != nil {
 		return nil, query{}, err
 	}
+	if _, err := constraintFor(parsed, decisions); err != nil {
+		return nil, query{}, err
+	}
 	picked, err := project(decisions, parsed.cols)
 	if err != nil {
 		return nil, query{}, err
 	}
 	return schemaOf(picked), parsed, nil
+}
+
+// constraintFor lowers the query's WHERE clause to a ClassAd constraint, against the types the
+// schema derivation declared. "true" -- everything -- when there is no predicate.
+//
+// The types are what make the lowering decidable: whether `=` on a column is the
+// case-sensitive problem or an ordinary number is a question only the declared type answers.
+func constraintFor(q query, decisions []arrowtype.Decision) (string, error) {
+	if q.where == "" {
+		return "true", nil
+	}
+	lowered, err := ansi.Lower(q.where, columnsOf(decisions))
+	if err != nil {
+		return "", fmt.Errorf("in the WHERE clause: %w", err)
+	}
+	return lowered, nil
+}
+
+// columnsOf exposes the derivation's decisions as column kinds.
+//
+// An attribute with no TYPED column is reported as present-but-untyped rather than absent, so a
+// predicate on `Requirements` is refused for the right reason -- it is a policy expression with
+// no scalar form -- instead of being reported as a column that does not exist.
+func columnsOf(decisions []arrowtype.Decision) ansi.Columns {
+	kinds := make(map[string]ansi.Kind, len(decisions))
+	for _, d := range decisions {
+		if d.Verdict != arrowtype.Typed {
+			kinds[d.Name] = ansi.KindUnknown
+			continue
+		}
+		switch d.Field.Type.ID() {
+		case arrow.INT64:
+			kinds[d.Name] = ansi.KindInt
+		case arrow.FLOAT64:
+			kinds[d.Name] = ansi.KindReal
+		case arrow.STRING:
+			kinds[d.Name] = ansi.KindString
+		case arrow.BOOL:
+			kinds[d.Name] = ansi.KindBool
+		case arrow.TIMESTAMP:
+			kinds[d.Name] = ansi.KindTimestamp
+		default:
+			kinds[d.Name] = ansi.KindUnknown
+		}
+	}
+	return ansi.KindsFromNames(kinds)
 }
 
 // schemaOf builds the Arrow schema of the typed decisions, in their given order.
@@ -280,6 +341,12 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 		slot()
 		return nil, nil, err
 	}
+	constraint, err := constraintFor(parsed, allDecisions)
+	if err != nil {
+		release()
+		slot()
+		return nil, nil, err
+	}
 	decisions, err := project(allDecisions, parsed.cols)
 	if err != nil {
 		release()
@@ -326,7 +393,7 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 				return false
 			}
 		}
-		scanErr := db.QueryTableStream(ctx, table, "true", parsed.limit, func(row string) bool {
+		scanErr := db.QueryTableStream(ctx, table, constraint, parsed.limit, func(row string) bool {
 			// QueryTable streams BRACKETED new-ClassAd text, not old.
 			ad, perr := classad.Parse(row)
 			if perr != nil {
