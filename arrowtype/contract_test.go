@@ -125,3 +125,32 @@ func TestSchemaDoesNotEmitTwoColumnsForOneAttribute(t *testing.T) {
 			"has to be able to see that it was folded away", ds[1].Verdict, ds[1].Reason)
 	}
 }
+
+// An expression is not a non-null, for the same reason it is not a type. The measurement
+// records that an attribute HOLDS an expression; what it evaluates to is decided at encode
+// time and can be undefined, which is a null. Declaring such a column non-nullable off a
+// complete sample broke the encoder on RequestMemory, which is an integer in almost every
+// record and an expression in a few.
+func TestExpressionValuedColumnAdmitsNulls(t *testing.T) {
+	m := Measured{
+		Name: "RequestMemory", Sampled: 100, Present: 100, Complete: true,
+		ValueClasses: map[string]int{"int": 98, "expr": 2},
+	}
+	d := Derive(m, Options{})
+	if d.Verdict != Typed {
+		t.Fatalf("verdict = %v, want Typed (an expression is not a competing kind)", d.Verdict)
+	}
+	if !d.Field.Nullable {
+		t.Errorf("a complete sample of a column holding expressions declared it non-nullable; " +
+			"the expression's value is not in the measurement and may evaluate to undefined")
+	}
+
+	// With no expression in it, a complete sample still proves the column dense.
+	dense := Derive(Measured{
+		Name: "Cpus", Sampled: 100, Present: 100, Complete: true,
+		ValueClasses: map[string]int{"int": 100},
+	}, Options{})
+	if dense.Field.Nullable {
+		t.Errorf("a complete sample with no expressions should still declare non-nullable")
+	}
+}

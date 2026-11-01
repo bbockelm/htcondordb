@@ -86,6 +86,15 @@ func isNullable(m Measured) bool {
 	if m.Present < m.Sampled || m.Nulls > 0 {
 		return true
 	}
+	// An expression is not a non-null, for the same reason it is not a type: the
+	// measurement records that the attribute HOLDS an expression, and what that expression
+	// evaluates to is decided at encode time, against an ad that may not carry what it
+	// refers to. Both undefined and error are nulls. So an attribute holding any expression
+	// can admit a null however complete the sample was -- RequestMemory is an integer in
+	// almost every record and an expression in a few, and those few evaluate to undefined.
+	if m.ValueClasses["expr"] > 0 {
+		return true
+	}
 	return !m.Complete
 }
 
