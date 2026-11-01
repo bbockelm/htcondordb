@@ -1582,80 +1582,84 @@ Two gaps sit on the path and should be closed with it:
 
    **Measured** (`BenchmarkReadShapes`, 20 000-record archive, a six-column projection, medians
    of three, Apple M2 Pro) against the reference-chasing text projection parsed and evaluated the
-   way every such consumer does today. Ad width is a dimension rather than a detail, because a
-   six-column projection out of a nine-attribute record asks a different question from the same
-   projection out of a job ad:
+   way every such consumer does today. Ad width is a dimension of the benchmark rather than a
+   detail — a six-column projection out of a nine-attribute record asks a different question from
+   the same projection out of a job ad, and the narrow case flatters whichever path reads the whole
+   record. The 45-attribute figures, which are the realistic ones:
 
-   | ad | tier | projection | text ns/row | values ns/row | |
-   |---|---|---|---|---|---|
-   | 9 attrs | record | literals | 5 783 | **1 336** | 4.3x |
-   | 9 attrs | record | with an expression | 8 471 | **2 822** | 3.0x |
-   | 9 attrs | columnar | literals | 5 667 | **1 814** | 3.1x |
-   | 9 attrs | columnar | with an expression | 9 964 | **4 802** | 2.1x |
-   | 45 attrs | record | literals | 11 521 | **6 181** | 1.9x |
-   | 45 attrs | record | with an expression | 17 715 | **10 697** | 1.7x |
-   | 45 attrs | columnar | literals | 5 484 | **2 020** | 2.7x |
-   | 45 attrs | columnar | with an expression | 22 542 | **19 092** | 1.2x |
+   | tier | projection | text ns/row | values ns/row | |
+   |---|---|---|---|---|
+   | record | literals | 12 592 | **6 220** | 2.0x |
+   | record | with an expression | 17 715 | **10 357** | 1.7x |
+   | columnar | literals | 5 561 | **2 113** | 2.6x |
+   | columnar | with an expression | 23 424 | **2 246** | **10.4x** |
 
-   Less than the 7x the wire-row arm suggested, and the reason is the honest one: this op does not
-   only delete the text round trip, it MOVES the evaluation from the consumer to the server. That
-   is still the right place for it — the server has the record's reference closure — but it is work
-   the text arm's server never did.
+   The last row is not the value frame on its own; it is the value frame plus item 5, and it is
+   why that item moved to the front. Before item 5 landed the same arm measured 19 092 ns/row.
+
+   Against the wire-row arm's 7x this is less in the literal cases, and the reason is the honest
+   one: this op does not only delete the text round trip, it MOVES the evaluation from the consumer
+   to the server. That is still the right place for it — the server has the record's reference
+   closure and its precomputed values — but it is work the text arm's server never did.
 
    It joined `redacted_raw_ops_test.go`'s table in the same commit, and the three mutants that
    matter were checked to fail named tests: a column kind that always declines, a server that
    accepts a flag bit it does not know, and a server that ignores its session's privilege.
 4. `flightsvc` reads it and appends straight to `array.Builder`. The encoder does not change; what
    reaches it stops being text.
-5. **The expression fallback, which the measurement above promoted ahead of everything columnar.**
-   An expression-valued attribute roughly doubles the typed read and costs it 86% of its
-   allocations (59 against 8.1 per row on the record tier). On a columnarized archive it is worse
-   than that, and the counter says exactly why: projecting `MemoryUsage` reassembled **20 000 of
-   20 000** records, against **349 of 20 000** for the same projection with a literal in its place.
-   An expression cell is escaped out of its column, so the columnar projection cannot serve it and
-   the whole record is rebuilt — for every row, because every row has one.
+5. ~~**The expression fallback.**~~ **Done, and it was the largest win of the three.**
 
-   This is the case §14.1 was asked about, and the mechanism is now known rather than guessed.
-   The evaluated value **does** exist: on that same fixture, `MAX(MemoryUsage) GROUP BY JobStatus`
-   reassembles **0** records and reports the columnar tier, because the aggregate resolves through
-   a scope that reads the computed region. The projection resolves through the ad's wire bytes
-   instead, so it never sees it — and the expression stays in the narrowed ad, where the closure
-   check correctly rejects it (`MemoryUsage` reads `ResidentSetSize`, which the projection did not
-   name). After eight consecutive misses the scan stops attempting the fast path at all, which is
-   why the counter shows 8 closure reassemblies and 20 000 total.
+   The problem, measured: projecting `MemoryUsage` reassembled **20 000 of 20 000** records against
+   **349** for the same projection with a literal in its place. An expression cell is escaped out of
+   its column, so it came back in the narrowed ad, the closure check correctly rejected it — it
+   reads `ResidentSetSize`, which the projection did not name — and after eight consecutive misses
+   the scan abandoned the columnar path for the rest of the segment. One ordinary attribute cost the
+   whole projection its fast path, for every row, because every row had one.
 
-   So the fix is specific: let a projection plan whose consumer EVALUATES substitute the computed
-   literal for the escaped expression cell. `projPlan.closure` already means exactly "this consumer
-   evaluates rather than relays", which is precisely the licence needed — the storage layer's rule
-   is that a computed value must never leak into an ad as if it were the attribute's stored literal,
-   and a consumer that only ever sees the evaluated result cannot tell the difference. A relaying
-   consumer (`QueryRawWire`) keeps the expression, as it must. Bounded, in `collections`, and
-   nothing above the storage layer has to know.
+   The value was already there, and this is the case §14.1 was asked about. Columnarizing computes
+   a qualifying expression cell once and keeps the literal beside the block, which is how the
+   aggregates read these attributes from columns today: on the same fixture `MAX(MemoryUsage) GROUP
+   BY JobStatus` reassembles **0** records and reports the columnar tier. The projection resolved
+   through the ad's wire bytes and never saw it.
 
-6. Only then revisit (a). Once 1–5 have landed, what is left of a read is the storage read itself,
+   The fix substitutes that literal for the escaped expression cell. Result: **19 092 → 2 246
+   ns/row** and 246 → 18 allocations per row, which puts an expression-valued column at parity with
+   a literal one (2 113) and closes a 9.4x penalty that one attribute imposed on an otherwise
+   identical read.
+
+   **The gate is the whole of the safety argument, and the obvious choice was wrong.** The storage
+   layer's rule is that a computed value never appears in an ad as if it were the attribute's stored
+   literal — a consumer that RELAYS what it is given would ship an ad different from the record.
+   `projPlan.closure` looks like the right licence and is not: it means the consumer follows
+   references, and `QueryRawWireRefs` does that and then ships the entries. Gating on it put
+   `Mem = 1` into relayed rows where the record holds `Mem = (Rss+1023)/1024`. The licence is a
+   separate, strictly stronger flag — the consumer sees only the evaluated result — and a test fails
+   with exactly that message when the gate is moved back.
+
+6. Only then revisit (a). Once 1–4 have landed, what is left of a read is the storage read itself,
    and a columnar producer can finally be argued against a small, honest remainder rather than
    against a text path that should never have been in the measurement.
 
 **What the width dimension settles, and one claim it corrects.** An earlier run of this benchmark
 used nine-attribute records only, and concluded from it that the columnar accelerator is "worth less
 than nothing" on a materializing read. That was an artifact of the fixture: at nine attributes
-reassembly is nearly free, so a columnar projection has almost nothing to beat. At a realistic job-ad
-width the accelerator is a **large win where it can run** — 6 181 → 2 020 ns/row on the typed path,
-**3.1x**, and 2.1x on the text path — and the right conclusion is the opposite of the one recorded.
+reassembly is nearly free, so a columnar projection has almost nothing to beat. At a realistic
+job-ad width the accelerator is a large win where it can run — 6 220 → 2 113 ns/row on the typed
+path, **2.9x**, and 2.3x on the text path — and the right conclusion is the opposite of the one
+recorded.
 
-What does not change is the ordering, because the same table shows why. Reading the same columns out
-of the same records:
+It also found item 5, by making a gap visible that the narrow fixture had hidden. Reading the same
+columns out of the same 45-attribute records on the typed path:
 
-| 45-attr ad, typed path | ns/row |
-|---|---|
-| columnar, literal projection | **2 020** |
-| columnar, one expression-valued attribute among the six | **19 092** |
+| columnar, typed path | before item 5 | after |
+|---|---|---|
+| literal projection | 2 020 | 2 113 |
+| one expression-valued attribute among the six | **19 092** | **2 246** |
 
-**A 9.4x swing on otherwise identical reads, caused by one column.** That is the whole of §14.6 item
-5 in one number, and it is the reason the columnar producer is still last: a producer built over a
-path that one ordinary attribute can cost an order of magnitude is premature. Fix the expression
-cell first and the accelerator's 3.1x becomes available to the projection it is currently thrown away
-by.
+A 9.4x swing caused by one ordinary column, now closed. The ordering it argued for stands and is
+simply spent: a producer built over a path that one attribute could cost an order of magnitude would
+have been premature, and the accelerator's gain is now available to the projection that was throwing
+it away.
 
 ## 15. Parked: the one Airport-only opportunity worth remembering
 
