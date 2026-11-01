@@ -16,25 +16,30 @@ planner's main decision. Here is where each one stands.
 | algorithm | applies when | client (`repl`) | store (`db.Join`) |
 |---|---|---|---|
 | **hash join** | the `ON` spine has at least one equality | **done** | **done** |
-| **index-based equi join** | ditto, and the probed side has an index on the key | **done** (key batching, §6.2) | **not started** |
-| **block nested loops** | no usable equality: non-equi `ON`, `CROSS JOIN` | **not started** | **not started** |
+| **index-based equi join** | ditto, and the probed side has a built index on the key | **done** (key batching, §6.2) | **done**, awaiting a classad release |
+| **block nested loops** | no usable equality: non-equi `ON`, `CROSS JOIN` | **measured, declined** (§0.5) | **not started** — §7's carrier |
 
 Three things that table is saying, which are easy to miss:
 
-- The **hash** path is the only one that is finished on both sides, and it is the one the
-  measurements in §6.2 were taken on.
-- The **index** path exists only on the client, which is the wrong place for it. A client
-  batches the left side's key values into one `in` constraint and lets the server's index
-  resolve them (§6.2, "Key batching"). That works, but the client has to guess whether it
-  is worth doing, from a row count it has to ask for — §6.2's "a client cannot price it".
-  The store knows the index's selectivity for free. The server-side join does **no** index
-  probing at all today: `db.Join` hashes one side and scans the other, whatever the
-  indexes say.
-- There is **no block nested loops anywhere**. An equality-free `ON` falls to naive
-  tuple-at-a-time nested loops over two fully materialized slices, which is both the
-  slowest ordering of the work and unbounded in memory. This matters twice over: it is the
-  fallback algorithm for every non-equi join, *and* it is the loop that §7's zone-map
-  skipping needs in order to skip anything.
+- The **hash** path is the oldest and the one every measurement in §6.2 was taken on. It is
+  also the wrong shape for a selective join against a large table, because it reads one side
+  whole to build buckets the other side will mostly never probe.
+- The **index** path now exists on both sides, and the two are not the same thing. The
+  client folds its key values into one `in` constraint and hopes the server has an index to
+  resolve it with; it cannot see the index set, and prices the trade from a row count it
+  must ask for, which describes the whole table rather than the scan. The store decides from
+  three numbers it holds for free — whether an index is **built**, how many rows the hashed
+  side holds, and how many segments it spans — and that third number is the one that makes
+  the decision correct rather than plausible. §0.1's own measurement: 23x faster at 16 keys,
+  11x at 32, then **3x slower at 64** and 29x slower at 256, with the crossover predicted by
+  comparing `segments × keys` against the row count and by nothing simpler.
+- **Block nested loops still exists nowhere**, but the reason to want it has narrowed to one.
+  §0.5 measured the equality-free loop and found its per-pair cost flat across a 16x change
+  in working-set size, which is the opposite of what a locality problem looks like — so
+  blocking it on the client has nothing to attack, and is declined. In the store it remains
+  the only loop that ever holds a (left block, right block) pair, which is what §7's zone
+  skipping needs in order to skip anything. That argument is about the pair **count** and
+  survives §0.5 untouched.
 
 ### 0.2 By area
 
@@ -54,7 +59,7 @@ Three things that table is saying, which are easy to miss:
 | Window functions / `QUALIFY` over a join | — | refused |
 | `INTERSECT`, `EXCEPT` | — | refused |
 | **Joining more than two tables** | 0.4 | **done** (client-side, left-deep, up to 8) |
-| Index-based equi join inside the store | 0.1 | **not started** |
+| Index-based equi join inside the store | §0.1 | **done** in classad, awaiting a release |
 | `LEFT JOIN` anti-join correctness | 0.4 | **fixed** in both implementations |
 | Block nested loops | 7 | **not started** |
 | Zone-map block skipping | 7 | **not started** — measure the ceiling first |
@@ -80,6 +85,10 @@ exists inside a block loop. So the blocked-nested-loop algorithm is not merely t
 for non-equi joins — it is the carrier for the one remaining optimization with a large
 claimed payoff. And a planner that chooses between three algorithms is only worth building
 once there are three.
+
+§0.5 measures the equality-free loop and concludes that the CLIENT-side half of that chain is
+not worth building. The store-side half still is, for a reason the measurement does not
+touch.
 
 **Multi-table joins turned out to be a planner change, not a parser change** -- and are
 now done; 0.4 records the shape. Join *order* became a real decision in the process, which
@@ -137,6 +146,45 @@ accepted, and the anti-join idiom reported every left row instead of the unmatch
 Both implementations had it, which is why the differential test comparing them never fired.
 **A second implementation is an oracle only for what it does differently.** The test that
 catches it states SQL's semantics directly.
+
+### 0.5 The equality-free loop, measured — and why it is not blocked
+
+Everything measured before this was an equi join. An equality-free `ON` — every non-equi
+join, every `CROSS JOIN` — falls to a different loop: each accumulated row against every
+row of the next table, tuple at a time, with both sides materialized. `BenchmarkJoinNonEqui`
+prices it against the hash path over the same data, with the fetch baseline subtracted so
+what is left is the pairing:
+
+| n | arm | pairs | pairing | per pair |
+|---|---|---|---|---|
+| 256 | band (`h.ClusterId > e.ClusterId && < +5`) | 131,072 | 111.0 ms | **0.847 µs** |
+| 1024 | band | 2,097,152 | 1806.3 ms | **0.861 µs** |
+| 256 | expanding (nearly every pair survives) | 131,072 | 152.4 ms | 1.16 µs |
+
+**The per-pair cost is flat across a 16x change in pair count and working-set size** —
+0.847 µs against 0.861 µs. That one number settles the client-side question. Blocking an
+inner loop exists to improve locality and cut inner-side re-reads, and both would show up
+here as a per-pair cost that GROWS as the inner side stops fitting in cache. It does not
+grow. There is nothing for blocking to attack.
+
+What the 0.85 µs actually is: per candidate pair the loop allocates a composite ClassAd and
+evaluates the condition against it. A surviving pair costs about 0.3 µs more, which is the
+output row. So the optimization the measurement points at is **not** blocking the loop but
+**not allocating a row per candidate** — reuse one composite to test the condition and
+allocate only on survival. For a band join rejecting 94% of its candidates that is most of
+the 0.85 µs. It is bounded by whether a reused ad is safe to re-evaluate against, which is a
+real question here and not an obvious yes.
+
+**This does not retire §7.** Zone skipping still needs a block loop, in the store, and for a
+reason none of the above measures: a zone predicate rejects a whole block of the inner side
+without forming its pairs at all. That attacks the pair COUNT, where everything in this
+section attacks the per-pair cost. A client cannot do it — it cannot see blocks — and the
+hash path cannot carry it. So the chain in §0.3 survives with its first link moved into the
+store.
+
+The band arm's predicate is a band, not an impossibility, on purpose: an arm that keeps zero
+rows measures only rejection while reading as "selective". The first draft of this benchmark
+had exactly that, and the fixture now fails the benchmark rather than reporting it.
 
 ## 1. The problem
 
