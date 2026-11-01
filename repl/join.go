@@ -725,10 +725,12 @@ func (e *Executor) execJoin(st *Statement) (*Result, error) {
 	}
 	// Key batching: with the left side in hand and an equality on a bare right-side
 	// attribute, the right scan can be narrowed to the values the left side actually has,
-	// instead of reading the whole table and discarding most of it here.
+	// instead of reading the whole table and discarding most of it here. Whether that is
+	// cheaper than reading the whole table depends on how big the whole table is, which is
+	// what decideKeyBatch weighs.
 	right := p.right
-	if batch := p.keyBatchConstraint(leftAds); batch != "" {
-		right.where = andText(right.where, batch)
+	if d := e.decideKeyBatch(p, leftAds); d.constraint != "" {
+		right.where = andText(right.where, d.constraint)
 	}
 	rightAds, err := e.fetchJoinSide(st, right, 1)
 	if err != nil {
@@ -797,8 +799,16 @@ func (e *Executor) fetchJoinSide(st *Statement, s joinSide, side int) ([]*classa
 // a left row's key is not a usable literal, or when there are more distinct values than the
 // constraint should carry -- in each case the right side is simply scanned as planned.
 func (p *joinPlan) keyBatchConstraint(leftAds []*classad.ClassAd) string {
+	return p.batchConstraintFor(p.keyLiterals(leftAds))
+}
+
+// keyLiterals collects the left side's distinct key values as ClassAd literals, sorted so
+// the same query explains the same way. It returns nil when there is no single bare-attribute
+// equality to batch on, when no left row has a usable key value, or when there are more
+// distinct values than one constraint should carry.
+func (p *joinPlan) keyLiterals(leftAds []*classad.ClassAd) []string {
 	if p.batchAttr == "" || len(p.equi) != 1 || len(leftAds) == 0 {
-		return ""
+		return nil
 	}
 	seen := map[string]bool{}
 	var lits []string
@@ -815,19 +825,81 @@ func (p *joinPlan) keyBatchConstraint(leftAds []*classad.ClassAd) string {
 		}
 		seen[lit] = true
 		if len(lits) >= maxJoinKeyBatch {
-			return "" // too many distinct keys: a plain scan is cheaper than the constraint
+			return nil // more keys than one constraint should carry
 		}
 		lits = append(lits, lit)
 	}
 	if len(lits) == 0 {
+		return nil
+	}
+	sort.Strings(lits)
+	return lits
+}
+
+// batchConstraintFor folds the key literals into one membership constraint on the right
+// side's attribute.
+func (p *joinPlan) batchConstraintFor(lits []string) string {
+	if len(lits) == 0 {
 		return ""
 	}
-	sort.Strings(lits) // a stable constraint, so the same query explains the same way
 	terms := make([]string, len(lits))
 	for i, l := range lits {
 		terms[i] = p.batchAttr + " == " + l
 	}
 	return "(" + strings.Join(terms, " || ") + ")"
+}
+
+// minRightRowsPerKey is how many rows the right side must hold per left-side key before
+// narrowing its scan to those keys is worth the constraint's own cost.
+//
+// The constraint is not free: its cost grows with the key count, while the scan it avoids
+// grows with the right table's size, so whether it pays is a trade between two quantities
+// and not a property of either alone. Measured at 400 keys, batching cost 4.0x MORE against
+// a 1,024-row right table and 1.5x more at 4,096 rows, broke even around 8,000, and was 2.0x
+// better at 16,384 and 8.0x better at 65,536 -- break-even near 20 rows per key.
+//
+// A var rather than a const so a test can move it, and so a site whose data disagrees with
+// the fixture this was measured on has somewhere to change it. The figure is one shape's
+// break-even, not a law.
+var minRightRowsPerKey = 20
+
+// keyBatchDecision is why the join did or did not narrow the right side's scan, so EXPLAIN
+// can say which and on what basis.
+type keyBatchDecision struct {
+	constraint string // "" = not batching
+	keys       int
+	rightRows  int
+	knownRows  bool // false = the right side's size could not be learned cheaply
+}
+
+// decideKeyBatch chooses whether to narrow the right side's scan to the left side's keys.
+//
+// Knowing the key count is only half the trade; the other half is how many rows the
+// unbatched scan would read. That number is on the server, so it is asked for only when the
+// answer can change the decision -- there is something to batch on, and the right side
+// carries no constraint of its own, which would make a whole-table count an overestimate of
+// what the scan actually reads. When it cannot be learned cheaply the decision falls back to
+// the key count alone, which is what this did before the cost was measured.
+func (e *Executor) decideKeyBatch(p *joinPlan, leftAds []*classad.ClassAd) keyBatchDecision {
+	lits := p.keyLiterals(leftAds)
+	d := keyBatchDecision{keys: len(lits)}
+	if len(lits) == 0 {
+		return d
+	}
+	if p.right.where != "" {
+		// The right side already filters itself, so its whole-table count would overstate
+		// the scan being avoided. Keep the pre-measurement behavior rather than decide on
+		// a number that does not describe this plan.
+		d.constraint = p.batchConstraintFor(lits)
+		return d
+	}
+	rows, ok := e.cheapRowCount(p.right.ref.Table)
+	d.rightRows, d.knownRows = rows, ok
+	if ok && rows < len(lits)*minRightRowsPerKey {
+		return d // the scan this would avoid is smaller than the constraint costs
+	}
+	d.constraint = p.batchConstraintFor(lits)
+	return d
 }
 
 // literalOf renders a scalar value as the ClassAd literal naming it, for the membership
@@ -1198,8 +1270,12 @@ func (e *Executor) describeJoinPlan(st *Statement) []string {
 	}
 	out = append(out, side(p.left), side(p.right))
 	if p.batchAttr != "" {
-		out = append(out, fmt.Sprintf("  key batching: %s.%s narrowed to the left side's keys (max %d)",
-			p.right.ref.Alias, p.batchAttr, maxJoinKeyBatch))
+		// The decision needs the left side's actual keys, which EXPLAIN without ANALYZE
+		// has not read, so this reports what is available to batch on and the rule that
+		// will be applied to it rather than the outcome.
+		out = append(out, fmt.Sprintf("  key batching: %s.%s can be narrowed to the left side's keys "+
+			"(at most %d, and only if %s holds at least %d row(s) per key)",
+			p.right.ref.Alias, p.batchAttr, maxJoinKeyBatch, p.right.ref.Alias, minRightRowsPerKey))
 	}
 	out = append(out, fmt.Sprintf("  checked per pair: %d condition term(s), %d post-filter term(s)",
 		len(p.cond), len(p.post)))

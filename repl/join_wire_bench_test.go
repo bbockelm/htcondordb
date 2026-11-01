@@ -237,7 +237,10 @@ func insertBenchValue(ad *classad.ClassAd, name string, v classad.Value) {
 // runBenchJoin is execJoin's fetch-batch-join core, with the fetch left open. Keeping the
 // planning, the key-batch decision and the hash join identical across arms is the whole
 // point: whatever the arms differ by, it is not any of those.
-func runBenchJoin(st *Statement, fetch joinFetch) (int, error) {
+//
+// The key-batch decision is the shipped one, so this measures the plan a real query gets --
+// including the cheap row count it asks the server for, which every arm pays equally.
+func (f *joinBenchFixture) runBenchJoin(st *Statement, fetch joinFetch) (int, error) {
 	p, err := planJoin(st)
 	if err != nil {
 		return 0, err
@@ -247,8 +250,8 @@ func runBenchJoin(st *Statement, fetch joinFetch) (int, error) {
 		return 0, err
 	}
 	right := p.right
-	if batch := p.keyBatchConstraint(leftAds); batch != "" {
-		right.where = andText(right.where, batch)
+	if d := f.exec.decideKeyBatch(p, leftAds); d.constraint != "" {
+		right.where = andText(right.where, d.constraint)
 	}
 	rightAds, err := fetch(st, right, 1)
 	if err != nil {
@@ -316,7 +319,7 @@ func BenchmarkJoinWireCost(b *testing.B) {
 			// like a fast one.
 			want := -1
 			for _, arm := range arms {
-				got, rerr := runBenchJoin(st, arm.fetch)
+				got, rerr := fix.runBenchJoin(st, arm.fetch)
 				if rerr != nil {
 					b.Fatalf("n=%d %s/%s: %v", n, shape.name, arm.name, rerr)
 				}
@@ -334,7 +337,7 @@ func BenchmarkJoinWireCost(b *testing.B) {
 			for _, arm := range arms {
 				b.Run(fmt.Sprintf("n=%d/%s/%s", n, shape.name, arm.name), func(b *testing.B) {
 					for i := 0; i < b.N; i++ {
-						if _, rerr := runBenchJoin(st, arm.fetch); rerr != nil {
+						if _, rerr := fix.runBenchJoin(st, arm.fetch); rerr != nil {
 							b.Fatal(rerr)
 						}
 					}

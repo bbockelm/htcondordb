@@ -254,19 +254,25 @@ three runs of ten, both arm orders, best (warmest) median per arm:
 
 | left keys | shape | wire | in-process | wire costs |
 |---|---|---|---|---|
-| 128 | 4 attributes | 8.0 ms | 5.1 ms | 1.6x |
-| 400 | 4 attributes | 44.3 ms | 36.2 ms | 1.2x |
-| 2048 | 4 attributes | 66.4 ms | 31.0 ms | 2.1x |
-| 8192 | 4 attributes | 268 ms | 130 ms | 2.1x |
-| 128 | `SELECT *` | 16.0 ms | 6.1 ms | 2.6x |
-| 400 | `SELECT *` | 69.3 ms | 38.9 ms | 1.8x |
-| 2048 | `SELECT *` | 202 ms | 45.9 ms | 4.4x |
-| 8192 | `SELECT *` | 841 ms | 186 ms | **4.5x** |
+| 128 | 4 attributes | 4.2 ms | 2.0 ms | 2.10x |
+| 400 | 4 attributes | 13.4 ms | 6.2 ms | 2.16x |
+| 2048 | 4 attributes | 68.8 ms | 31.4 ms | 2.19x |
+| 8192 | 4 attributes | 280 ms | 128 ms | 2.19x |
+| 128 | `SELECT *` | 12.1 ms | 2.8 ms | 4.32x |
+| 400 | `SELECT *` | 38.7 ms | 9.0 ms | 4.30x |
+| 2048 | `SELECT *` | 199 ms | 45.6 ms | 4.37x |
+| 8192 | `SELECT *` | 833 ms | 205 ms | 4.07x |
 
-So the wire and the per-row rebuild are **2x on a narrow projection and 4.5x on `SELECT *`**,
-and the `SELECT *` factor grows with the row count while the narrow one flattens — the
-projection is what keeps the narrow case bounded, and a projection is exactly what a person
-asking for joined records does not supply.
+So the wire and the per-row rebuild cost a **flat ~2.2x on a narrow projection and ~4.2x on
+`SELECT *`**, and the striking thing is how flat: the factor does not move across a 64x range
+of cardinality. It is a per-row tax, exactly as the mechanism predicts, and the projection is
+what sets the rate — a projection being exactly what a person asking for joined records does
+not supply.
+
+The first version of this table showed the ratio wandering between 1.2x and 4.5x, which was
+not the wire's doing. It was the key-batch pessimization below inflating all three arms at
+128 and 400 keys and so diluting the ratio between them. Fixing that did not change what the
+wire costs; it revealed it.
 
 Both numbers understate it. `net.Pipe` is an in-memory pipe, so the wire arm pays
 serialization and framing but no network latency or bandwidth; and client and server share a
@@ -315,7 +321,46 @@ not about assembly cost. **The client cannot make this decision**, because the s
 needs — the right side's size, and how much of it the constraint excludes — lives on the
 server. The client would have to pay a round trip to ask before it could plan, and the
 answer it got would still be a whole-table count where the server could decide per segment
-from zone maps. The cap is the honest thing to do with the information a client has.
+from zone maps. The cap was the honest thing to do with the information a client had. It need not stay that
+way, because the information is obtainable.
+
+#### Pricing it with the one number that was missing
+
+The count aggregate already reaches an O(1) length for a mutable table and a zone-pruned
+count for an archive, so the right side's size can be had for one round trip. The join now
+asks for it, and declines to batch when the right side holds fewer than `minRightRowsPerKey`
+(20, the measured break-even) rows per left-side key.
+
+It asks only when the answer can change the decision -- there is a single bare-attribute
+equality to batch on, and the right side carries no constraint of its own, which would make a
+whole-table count an overestimate of what the unbatched scan actually reads. When the count
+cannot be had cheaply the decision falls back to the key count alone, so an older server
+behaves exactly as before; the count helper never falls back to counting rows client-side,
+because a decision that scans a whole history table to decide whether to scan a whole history
+table is worse than not deciding.
+
+Measured against the same fixture, best of both arm orders:
+
+| left keys | shape | before | after | |
+|---|---|---|---|---|
+| 128 | 4 attributes | 8.0 ms | 4.2 ms | 1.89x faster |
+| 400 | 4 attributes | 44.3 ms | 13.4 ms | **3.31x faster** |
+| 400 | `SELECT *` | 69.3 ms | 38.7 ms | 1.79x faster |
+| 2048 | 4 attributes | 66.4 ms | 68.8 ms | unchanged |
+| 8192 | `SELECT *` | 841 ms | 833 ms | unchanged |
+
+The in-process arms gain more than the wire arm does (5.84x at 400 keys on the projected
+read), because the constraint's cost was being paid on top of a smaller base. And 2048 and
+8192 are unchanged, which is the signature to look for: those cardinalities were already
+declining to batch via the cap, so a fix aimed only at the wrongly-batched regime should leave
+them exactly alone, and does.
+
+**What this does not fix.** The other direction -- the cap forbidding a win still worth 8x at
+65,536 rows -- is left alone deliberately. Raising it means asking whether an `in` probe with
+thousands of values is sane server-side, which is a separate question with its own
+measurement, and conflating the two would risk a regression to chase an improvement.
+`minRightRowsPerKey` is a `var`, not a `const`: one fixture's break-even is not a law, and a
+site whose data disagrees needs somewhere to change it.
 
 ## 7. Block-looping and zone-map block skipping
 

@@ -97,6 +97,18 @@ func TestJoinFetchArmsAgree(t *testing.T) {
 // the named paths, so the arms are compared on the values they produced rather than on a row
 // count that two different wrong answers could share.
 func renderBenchJoin(st *Statement, fetch joinFetch, paths []string) ([]string, error) {
+	return renderJoinWith(st, fetch, paths, true)
+}
+
+// renderBenchJoinBatch renders a two-column join with key batching forced on or off, for the
+// tests that must show the decision changes only the work and not the answer.
+func renderBenchJoinBatch(st *Statement, fetch joinFetch, batching bool) ([]string, error) {
+	return renderJoinWith(st, fetch, []string{"h.ClusterId", "e.ExitCode"}, batching)
+}
+
+// renderJoinWith is the shared core: plan, fetch both sides (optionally narrowing the right
+// one to the left's keys), pair them, and render the named paths.
+func renderJoinWith(st *Statement, fetch joinFetch, paths []string, batching bool) ([]string, error) {
 	p, err := planJoin(st)
 	if err != nil {
 		return nil, err
@@ -106,8 +118,10 @@ func renderBenchJoin(st *Statement, fetch joinFetch, paths []string) ([]string, 
 		return nil, err
 	}
 	right := p.right
-	if batch := p.keyBatchConstraint(leftAds); batch != "" {
-		right.where = andText(right.where, batch)
+	if batching {
+		if batch := p.keyBatchConstraint(leftAds); batch != "" {
+			right.where = andText(right.where, batch)
+		}
 	}
 	rightAds, err := fetch(st, right, 1)
 	if err != nil {

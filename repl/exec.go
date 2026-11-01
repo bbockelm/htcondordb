@@ -1710,6 +1710,34 @@ func (e *Executor) archiveAggregateColRows(table, where string, groups []dbrpc.G
 	return e.c.ArchiveAggregateBucketed(e.opCtx(), table, where, groups, aggs)
 }
 
+// cheapRowCount reports how many rows a table holds, but ONLY when the server can answer
+// from its counters rather than by reading records: the count aggregate reaches an O(1)
+// length for a mutable table and a zone-pruned count for an archive.
+//
+// ok=false means "not known cheaply", and the caller must treat it as no information rather
+// than as zero. Unlike archiveRowCount this never falls back to counting rows here: it exists
+// to inform a planning decision, and a decision that scans a whole history table to decide
+// whether to scan a whole history table is worse than not deciding at all. Any error at all
+// reports not-known, so an older server simply leaves the caller with its prior behavior.
+func (e *Executor) cheapRowCount(table string) (int, bool) {
+	aggs := []dbrpc.AggSpec{{Func: dbrpc.AggCount, Arg: "*"}}
+	var rows []dbrpc.AggRow
+	var err error
+	if e.isArchive(table) {
+		rows, err = e.c.ArchiveAggregate(e.opCtx(), table, "true", nil, aggs)
+	} else {
+		rows, err = e.c.AggregateTable(e.opCtx(), table, "true", nil, aggs)
+	}
+	if err != nil || len(rows) == 0 || len(rows[0].Values) == 0 {
+		return 0, false
+	}
+	n, cerr := strconv.Atoi(rows[0].Values[0])
+	if cerr != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 // archiveRowCount returns the number of rows in an append-only history table via the
 // server-side count aggregate (falling back to a client-side count against an older server).
 func (e *Executor) archiveRowCount(table string) (int, error) {
