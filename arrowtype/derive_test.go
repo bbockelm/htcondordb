@@ -135,6 +135,58 @@ func TestDeriveUntypedCases(t *testing.T) {
 	}
 }
 
+// TestDeriveStrayExpressionDoesNotRetype is a regression test for a real bug, found by running
+// the rules over production ads rather than over invented cases -- which is why it is worth
+// doing that routinely.
+//
+// RequestMemory is an integer in 1994 of 1995 records on a live AP and an expression in ONE;
+// RequestDisk the same; LeaveJobInQueue is a boolean in 1999 of 2000 and an expression in one.
+// Counting that single record as a competing kind made each of them a TEXT column -- an integer
+// attribute a reader cannot do arithmetic on, with nothing anywhere to say why. An expression
+// is not a type: it is an unevaluated form that becomes one, and the encoder evaluates it.
+func TestDeriveStrayExpressionDoesNotRetype(t *testing.T) {
+	cases := []struct {
+		name string
+		in   Measured
+		want arrow.Type
+	}{
+		{"RequestMemory", m("RequestMemory", 1995, 1995, map[string]int{"int": 1994, "expr": 1}), arrow.INT64},
+		{"RequestDisk", m("RequestDisk", 1995, 1995, map[string]int{"int": 1994, "expr": 1}), arrow.INT64},
+		{"LeaveJobInQueue", m("LeaveJobInQueue", 2000, 2000, map[string]int{"bool": 1999, "expr": 1}), arrow.BOOL},
+		// And the int/real widening still applies through a stray expression.
+		{"BytesRecvd", m("BytesRecvd", 2000, 2000, map[string]int{"int": 67, "real": 1932, "expr": 1}), arrow.FLOAT64},
+	}
+	for _, c := range cases {
+		d := Derive(c.in, Options{})
+		if d.Verdict != Typed {
+			t.Errorf("%s: verdict %v, want Typed (%s)", c.name, d.Verdict, d.Detail)
+			continue
+		}
+		if d.Field.Type.ID() != c.want {
+			t.Errorf("%s: type %v, want %v -- one expression must not retype the column",
+				c.name, d.Field.Type.ID(), c.want)
+		}
+	}
+}
+
+// TestDeriveExpressionShareStillDecidesWhetherToType: dropping expressions from the KIND
+// decision must not drop them from the decision of whether to type the attribute at all. A
+// formula whose text is the point still gets no column.
+func TestDeriveExpressionShareStillDecidesWhetherToType(t *testing.T) {
+	// Requirements: 1995 expressions to 5 booleans. Predominantly a formula.
+	req := Derive(m("Requirements", 2000, 2000, map[string]int{"expr": 1995, "bool": 5}), Options{})
+	if req.Verdict != Untyped || req.Reason != "expression-valued" {
+		t.Errorf("Requirements: %v/%s, want Untyped/expression-valued", req.Verdict, req.Reason)
+	}
+
+	// Every value an expression and nothing else observed: still nothing to type, and the
+	// reason must say it was expressions rather than nulls.
+	all := Derive(m("PeriodicHold", 100, 100, map[string]int{"expr": 100}), Options{})
+	if all.Verdict != Untyped || all.Reason != "expression-valued" {
+		t.Errorf("PeriodicHold: %v/%s, want Untyped/expression-valued", all.Verdict, all.Reason)
+	}
+}
+
 func TestDeriveMixedKinds(t *testing.T) {
 	in := m("Mixed", 100, 100, map[string]int{"int": 90, "string": 10})
 	d := Derive(in, Options{})

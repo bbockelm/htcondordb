@@ -112,10 +112,26 @@ func (o Options) isTime(name string) bool {
 	return o.TimeAttrs[strings.ToLower(name)]
 }
 
-// classes returns the value-class names present, and the single one if there is exactly one.
-func classes(m Measured) (names []string, only string) {
+// AN EXPRESSION IS NOT A TYPE, any more than undefined is.
+//
+// It is an unevaluated form that BECOMES a type once evaluated, and the encoder evaluates
+// (§5.1), so a record holding an expression contributes a value of whatever that expression
+// yields -- not a distinct kind the column has to accommodate.
+//
+// Counting it as a competing class is a bug with teeth. Measured on a real AP, RequestMemory is
+// an integer in 1994 records and an expression in ONE; RequestDisk the same; LeaveJobInQueue is
+// a boolean in 1999 and an expression in one. Treating that one record as a second kind made
+// each of them a TEXT column -- an integer attribute a reader cannot do arithmetic on, with no
+// error anywhere to say why. That is precisely the failure this package exists to prevent: a
+// plausible schema hiding a type error.
+//
+// What the expression share still decides is whether the attribute is typed AT ALL: an
+// attribute that is PREDOMINANTLY an expression is a formula whose text is the point
+// (Requirements, PeriodicHold), and Derive leaves those untyped. That check reads the raw
+// classes, below; this function is only about the kinds a typed column must hold.
+func typeClasses(m Measured) (names []string, only string) {
 	for name, n := range m.ValueClasses {
-		if n > 0 {
+		if n > 0 && name != "expr" {
 			names = append(names, name)
 		}
 	}
@@ -139,13 +155,19 @@ func dominant(m Measured) string {
 
 // Derive decides one attribute's Arrow type.
 func Derive(m Measured, opts Options) Decision {
-	names, only := classes(m)
+	names, only := typeClasses(m)
 
-	// Nothing but nulls: there is no type here. Declaring one would invite a reader to treat
-	// the column as meaningful; declaring it as text would be a column of empty strings.
+	// Nothing to type. Either every sampled value was a null, or every one was an expression
+	// whose evaluated kind this measurement does not record -- in both cases declaring a type
+	// would invite a reader to treat the column as meaningful, and declaring text would give
+	// a column of empty strings.
 	if len(names) == 0 {
-		return Decision{Name: m.Name, Verdict: Untyped, Reason: "no-value-observed",
-			Detail: "every sampled value was undefined or error, so no type was observed"}
+		reason, detail := "no-value-observed", "every sampled value was undefined or error, so no type was observed"
+		if m.ValueClasses["expr"] > 0 {
+			reason = "expression-valued"
+			detail = "every sampled value was an expression, so no evaluated kind was observed"
+		}
+		return Decision{Name: m.Name, Verdict: Untyped, Reason: reason, Detail: detail}
 	}
 
 	// Predominantly an expression. Evaluating it yields a value, and on real data that value
