@@ -101,6 +101,13 @@ byte-for-byte, confirming the copy is faithful). darwin/arm64, `go1.26.0`, unstr
 | + Flight + gRPC + msgpack (rungs 1–3) | 46,063,954 | **+11,163,776 more (+35.1% of base)** |
 | full stack | 46,063,954 | +14,221,440 (+44.7%) |
 
+**Measured again once it was really wired in.** The table above comes from synthetic arms that
+link the dependencies without using them. With `flightsvc` actually serving from the daemon --
+flightsql, the catalog schemas, the per-identity session machinery -- the daemon goes from
+35,803,010 to 51,962,834 bytes: **+16.2 MB (+45.1%)**, against the +14.2 MB the synthetic arm
+predicted. The estimate was good to about two megabytes and low, which is the direction an
+estimate from a program that merely imports a library usually errs.
+
 **No cgo.** Verified, not assumed: `arrowtype`, the daemon, and the full stack (arrow + array
 + ipc + flight + flightsql + grpc + msgpack linked into a copy of the daemon) all build with
 `CGO_ENABLED=0`, and every package we would use declares zero cgo files. The only cgo in

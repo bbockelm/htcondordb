@@ -50,10 +50,21 @@ const tableType = "TABLE"
 const defaultSchemaName = "htcondordb"
 
 // Server is a read-only Flight SQL server over one htcondordb daemon.
+//
+// The dbrpc client is resolved PER RPC rather than held, because one Flight server serves every
+// connection while each connection's reads must go through a session carrying its own
+// identity's authorization. dbFor is that resolution: a fixed client for a single-identity
+// server, or a freshly authorized loopback session for a multi-identity one.
+//
+// Per RPC, not per connection, and deliberately: gRPC offers no stable per-connection handle in
+// a handler's context without a stats handler, and a session per RPC is a pipe and a goroutine
+// whose cost is small beside the ad text already crossing it. Rung 0 is not the fast path.
 type Server struct {
 	flightsql.BaseServer
 
-	db    *dbrpc.Client
+	// dbFor returns a client for this RPC and a release to call when the RPC's work --
+	// including any stream it started -- is finished.
+	dbFor func(context.Context) (*dbrpc.Client, func(), error)
 	alloc memory.Allocator
 	// derive carries the type declarations -- epoch attributes, and the overrides for
 	// attributes whose type inference cannot decide (see arrowtype.Override).
@@ -77,7 +88,27 @@ func NewServer(db *dbrpc.Client, derive arrowtype.Options, alloc memory.Allocato
 	if alloc == nil {
 		alloc = memory.DefaultAllocator
 	}
-	s := &Server{db: db, alloc: alloc, derive: derive}
+	s := &Server{
+		dbFor: func(context.Context) (*dbrpc.Client, func(), error) { return db, func() {}, nil },
+		alloc: alloc, derive: derive,
+	}
+	if err := s.registerSqlInfo(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// NewSessionServer builds a Flight SQL service that resolves a per-identity session for every
+// RPC, which is how one server serves many identities without any of them seeing another's
+// authorization.
+func NewSessionServer(sessions *Sessions, derive arrowtype.Options, alloc memory.Allocator) (*Server, error) {
+	if sessions == nil {
+		return nil, fmt.Errorf("flightsvc: no sessions")
+	}
+	if alloc == nil {
+		alloc = memory.DefaultAllocator
+	}
+	s := &Server{dbFor: sessions.For, alloc: alloc, derive: derive}
 	if err := s.registerSqlInfo(); err != nil {
 		return nil, err
 	}
@@ -184,7 +215,12 @@ func (s *Server) GetFlightInfoTables(_ context.Context, cmd flightsql.GetTables,
 // honouring rather than refusing: a catalog browser that cannot see column types is not much
 // of a catalog browser.
 func (s *Server) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	names, err := s.db.Tables(ctx)
+	db, release, err := s.dbFor(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+	names, err := db.Tables(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -204,7 +240,7 @@ func (s *Server) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arr
 		if !cmd.GetIncludeSchema() {
 			continue
 		}
-		sch, _, derr := s.tableSchema(ctx, name)
+		sch, _, derr := s.tableSchemaWith(ctx, db, name)
 		if derr != nil {
 			// A table whose schema cannot be derived is still a table; reporting it
 			// with no schema is more useful than failing the whole listing, which
