@@ -53,8 +53,9 @@ Three things that table is saying, which are easy to miss:
 | `opJoin` (69) + feature advertisement, no probing | 10 | **done**, off by default — see §6.2 |
 | Window functions / `QUALIFY` over a join | — | refused |
 | `INTERSECT`, `EXCEPT` | — | refused |
-| **Joining more than two tables** | 0.3 | refused by `validateJoinTables` |
+| **Joining more than two tables** | 0.4 | **done** (client-side, left-deep, up to 8) |
 | Index-based equi join inside the store | 0.1 | **not started** |
+| `LEFT JOIN` anti-join correctness | 0.4 | **fixed** in both implementations |
 | Block nested loops | 7 | **not started** |
 | Zone-map block skipping | 7 | **not started** — measure the ceiling first |
 | Vectorized residual / join `ColumnSource` | 6.1 | **not started** |
@@ -80,13 +81,62 @@ for non-equi joins — it is the carrier for the one remaining optimization with
 claimed payoff. And a planner that chooses between three algorithms is only worth building
 once there are three.
 
-**Multi-table joins are a planner change, not a parser change.** `parseJoins` already
-consumes any number of `JOIN` clauses and `Statement.Joins` already holds them; the refusal
-is one check in `validateJoinTables`. What is actually missing is downstream: `joinPlan`
-holds exactly a `left` and a `right`, `sidesOf` returns a two-bit mask, and the executor
-pairs two materialized slices. Generalizing those three is the work. Join *order* then
-becomes a real decision for the first time — with two tables there is only one shape — so
-multi-table is also what makes §7b stop being optional.
+**Multi-table joins turned out to be a planner change, not a parser change** -- and are
+now done; 0.4 records the shape. Join *order* became a real decision in the process, which
+is what makes 7b stop being optional rather than merely desirable.
+
+### 0.4 Multi-table joins: the shape, and what it cost
+
+The plan is **left-deep**: `sides[0]` is the `FROM` table and each step folds in one more.
+`a JOIN b ON ... JOIN c ON ...` is `(a x b) x c`, which is the only shape SQL's syntax can
+express without parentheses, and the composite-ad model carries it for free -- a row gains a
+member per step and every predicate stays an ordinary ClassAd expression over one ad. An
+n-way join is therefore the two-way join run n-1 times, not a second algorithm.
+
+Three things generalized cleanly, and one did not:
+
+- **The side mask was already n-wide.** `sidesOf` built `1 << side` from the start, so
+  classifying a conjunct across eight tables needed no new code -- only replacing the
+  `sideLeft`/`sideRight`/`sideBoth` constants that had been reading the mask two bits at a
+  time.
+- **The pushdown rules compose along the chain.** An `ON` conjunct reading only the table
+  its own step folds in pushes to that scan for `INNER` and `LEFT` alike (both push to the
+  *inner* side); one reading only a table already in the row pushes only when the step is
+  `INNER`. A `WHERE` conjunct pushes to any side that is not null-extendable, and in a
+  left-deep chain a side is null-extendable exactly when **its own** step is a `LEFT` join
+  -- every earlier table is preserved by every later step, so being preserved once is being
+  preserved throughout. That last sentence is why the rule is one comparison and not a walk.
+- **Key batching generalized for nothing.** It narrows a scan to the key values its input
+  actually holds; since every step's input is a composite row, the third and fourth tables
+  get it on the same terms as the second.
+- **The equality halves ended up in different scopes**, which is the one asymmetry a reader
+  has to hold. The half reading the accumulated row keeps its aliases, because `a.ClusterId`
+  is a select over the row's `a` member and at the third step it might read `a` or `b`; the
+  half reading the new table is stripped to a bare path. The wire needs a third form -- the
+  accumulated half *stripped* -- which only exists when that half reads the first table
+  alone, and that is also how the planner decides a pair cannot be sent to a store whose
+  opcode carries two sides.
+
+**A forward reference is refused.** An `ON` clause naming a table a later step folds in is
+an error, not a deferral: SQL does not allow it, and deferring it would silently answer a
+different question.
+
+**`MY` and `TARGET` are refused past two tables.** They mean the first and second tables,
+which is a guess about which pair was meant once there are three. The aliases are in the
+`FROM` clause; the error says to use them.
+
+**What the restructure found.** Separating "did this pair match the `ON` clause" from "did
+the row survive `WHERE`" exposed a correctness bug in the shipped two-table join, and in the
+store's join by the same mechanism. `emit()` formed the row, applied the `WHERE` residual,
+and returned whether a row came out; the caller read that as *"this pair matched"*. So a
+pair satisfying `ON` but failing `WHERE` left `matched` false, the left row was
+null-extended, and the residual was re-evaluated against the null-extended row -- where
+`h.Key =?= undefined` is true. The row the filter had just rejected was replaced by one it
+accepted, and the anti-join idiom reported every left row instead of the unmatched ones.
+
+Both implementations had it, which is why the differential test comparing them never fired.
+**A second implementation is an oracle only for what it does differently.** The test that
+catches it states SQL's semantics directly.
 
 ## 1. The problem
 

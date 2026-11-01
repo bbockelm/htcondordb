@@ -113,13 +113,13 @@ func renderJoinWith(st *Statement, fetch joinFetch, paths []string, batching boo
 	if err != nil {
 		return nil, err
 	}
-	leftAds, err := fetch(st, p.left, 0)
+	leftAds, err := fetch(st, p.sides[0], 0)
 	if err != nil {
 		return nil, err
 	}
-	right := p.right
+	right := p.sides[1]
 	if batching {
-		if batch := p.keyBatchConstraint(leftAds); batch != "" {
+		if batch := p.steps[0].keyBatchConstraint(p.wrapFirst(leftAds)); batch != "" {
 			right.where = andText(right.where, batch)
 		}
 	}
@@ -127,7 +127,7 @@ func renderJoinWith(st *Statement, fetch joinFetch, paths []string, batching boo
 	if err != nil {
 		return nil, err
 	}
-	rows, err := p.join(leftAds, rightAds)
+	rows, err := joinTwoSides(p, leftAds, rightAds)
 	if err != nil {
 		return nil, err
 	}

@@ -90,8 +90,8 @@ func TestLeftJoinRightSideWhereIsNotPushed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.right.where != "" {
-		t.Fatalf("LEFT JOIN pushed a WHERE conjunct into the right scan: %q", p.right.where)
+	if p.sides[1].where != "" {
+		t.Fatalf("LEFT JOIN pushed a WHERE conjunct into the right scan: %q", p.sides[1].where)
 	}
 	if len(p.post) != 1 {
 		t.Fatalf("expected the right-side WHERE to be a post-filter, got %d terms", len(p.post))
@@ -116,8 +116,8 @@ func TestLeftJoinLeftSideOnIsNotPushed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.left.where != "" {
-		t.Fatalf("LEFT JOIN pushed an ON conjunct into the left scan: %q", p.left.where)
+	if p.sides[0].where != "" {
+		t.Fatalf("LEFT JOIN pushed an ON conjunct into the left scan: %q", p.sides[0].where)
 	}
 	r := mustExec(t, e, `SELECT j.Owner, h.ExitCode FROM jobs j
 		LEFT JOIN hist h ON j.ClusterId == h.ClusterId && j.Owner == "alice"`)
@@ -136,14 +136,14 @@ func TestInnerJoinPushesBothSides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(p.left.where, "Owner") {
-		t.Errorf("left constraint = %q, want the Owner conjunct pushed", p.left.where)
+	if !strings.Contains(p.sides[0].where, "Owner") {
+		t.Errorf("left constraint = %q, want the Owner conjunct pushed", p.sides[0].where)
 	}
-	if strings.Contains(p.left.where, "j.") {
-		t.Errorf("left constraint %q still carries the alias", p.left.where)
+	if strings.Contains(p.sides[0].where, "j.") {
+		t.Errorf("left constraint %q still carries the alias", p.sides[0].where)
 	}
-	if !strings.Contains(p.right.where, "ExitCode") {
-		t.Errorf("right constraint = %q, want the ExitCode conjunct pushed", p.right.where)
+	if !strings.Contains(p.sides[1].where, "ExitCode") {
+		t.Errorf("right constraint = %q, want the ExitCode conjunct pushed", p.sides[1].where)
 	}
 }
 
@@ -286,7 +286,7 @@ func TestJoinRefusesUnsupportedForms(t *testing.T) {
 		`SELECT j.Owner FROM jobs j, hist h`:                                                          "JOIN",
 		`SELECT j.Owner FROM jobs j CROSS JOIN hist h ON j.ClusterId == h.ClusterId`:                  "no ON",
 		`SELECT j.Owner FROM jobs j JOIN hist h`:                                                      "needs an ON",
-		`SELECT j.Owner FROM jobs j JOIN hist h ON j.ClusterId == h.ClusterId JOIN x y ON y.a == j.a`: "at most two",
+		`SELECT j.Owner FROM jobs j JOIN hist h ON j.ClusterId == h.ClusterId JOIN hist h ON h.a == j.a`: "duplicate table alias",
 	}
 	for q, want := range cases {
 		_, err := Parse(q)
@@ -331,14 +331,14 @@ func TestJoinKeyBatching(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.batchAttr != "ClusterId" {
-		t.Fatalf("batchAttr = %q, want ClusterId", p.batchAttr)
+	if p.steps[0].batchAttr != "ClusterId" {
+		t.Fatalf("batchAttr = %q, want ClusterId", p.steps[0].batchAttr)
 	}
-	left, err := e.fetchJoinSide(st, p.left, 0)
+	left, err := e.fetchJoinSide(st, p.sides[0], 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch := p.keyBatchConstraint(left)
+	batch := p.steps[0].keyBatchConstraint(p.wrapFirst(left))
 	if !strings.Contains(batch, "ClusterId == 1") || !strings.Contains(batch, "ClusterId == 3") {
 		t.Fatalf("key batch %q does not name alice's clusters", batch)
 	}
@@ -569,11 +569,11 @@ func TestHistoryJoinEpochsLastDay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.equi) != 2 {
-		t.Errorf("got %d equality terms, want both ClusterId and ProcId hashed", len(p.equi))
+	if len(p.steps[0].equi) != 2 {
+		t.Errorf("got %d equality terms, want both ClusterId and ProcId hashed", len(p.steps[0].equi))
 	}
-	if !strings.Contains(p.left.where, "CompletionDate") {
-		t.Errorf("left constraint %q did not take the time filter", p.left.where)
+	if !strings.Contains(p.sides[0].where, "CompletionDate") {
+		t.Errorf("left constraint %q did not take the time filter", p.sides[0].where)
 	}
 }
 
@@ -616,4 +616,16 @@ func newEpochExec(t *testing.T) (*Executor, func()) {
 	go func() { _ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{Privileged: true}) }()
 	c := dbrpc.NewClient(dbrpc.NewStreamConn(cp))
 	return NewExecutor(c, ExecConfig{}), func() { c.Close(); s.Close(); cat.Close() }
+}
+
+// joinTwoSides pairs two already-fetched sides through the pipeline's one step, for the
+// tests and benchmarks that fetch each side themselves in order to time or inspect the
+// halves separately.
+func joinTwoSides(p *joinPlan, left, right []*classad.ClassAd) ([]*classad.ClassAd, error) {
+	budget := joinBudget{pairs: maxJoinPairs}
+	rows, err := p.runStep(&p.steps[0], p.wrapFirst(left), right, &budget)
+	if err != nil {
+		return nil, err
+	}
+	return joinRowAds(rows), nil
 }
