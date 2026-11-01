@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -71,6 +72,44 @@ type Server struct {
 	derive arrowtype.Options
 	// sample caps how many records a schema derivation reads; 0 uses the default.
 	sample int
+	// streamBudget caps the Arrow bytes one DoGet stream may hold; 0 is unlimited.
+	streamBudget int64
+	// streams admits at most one token per concurrent DoGet stream. Nil means unlimited.
+	//
+	// A cap exists because this runs in the daemon: concurrent wide scans compete for CPU
+	// and heap with the store's own goroutines and its maintenance, and the failure mode of
+	// having no cap is not a slow endpoint but a slow DATABASE. Refusing the eleventh
+	// stream is a client's problem; starving the store is everyone's.
+	streams chan struct{}
+}
+
+// SetStreamBudget caps the Arrow bytes a single DoGet stream may hold. Zero is unlimited,
+// which is memory.DefaultAllocator's behaviour and what an unconfigured endpoint gets.
+func (s *Server) SetStreamBudget(bytes int64) { s.streamBudget = bytes }
+
+// SetMaxStreams caps concurrent DoGet streams. Zero or less is unlimited.
+func (s *Server) SetMaxStreams(n int) {
+	if n <= 0 {
+		s.streams = nil
+		return
+	}
+	s.streams = make(chan struct{}, n)
+}
+
+// acquireStream takes a slot without waiting. Blocking would turn a cap into a queue, and a
+// queue of scans inside the daemon is the thing the cap exists to prevent -- a client told
+// "too many streams" can retry, a client left hanging cannot tell whether to.
+func (s *Server) acquireStream() (func(), bool) {
+	if s.streams == nil {
+		return func() {}, true
+	}
+	select {
+	case s.streams <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-s.streams }) }, true
+	default:
+		return nil, false
+	}
 }
 
 // SetSampleMax caps how many records a schema derivation reads. Zero restores the default.
