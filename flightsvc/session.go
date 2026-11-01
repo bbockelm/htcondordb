@@ -123,6 +123,16 @@ func (s *Sessions) For(ctx context.Context) (*dbrpc.Client, func(), error) {
 	return client, release, err
 }
 
+// ForScoped is For plus whether this RPC's session sees private attributes.
+//
+// That bit is not derivable from the client: it is a property of the ServeOptions the SERVER
+// side of the loopback was given, which the client never learns. It is reported here because
+// it is the one thing that makes two identities derive different schemas from the same table,
+// so anything caching a derivation has to key on it.
+func (s *Sessions) ForScoped(ctx context.Context) (*dbrpc.Client, bool, func(), error) {
+	return s.forScoped(ctx)
+}
+
 // Identity returns the identity this RPC authenticated as, without opening a session. It is
 // what a prepared statement's handle is bound to, so one identity cannot use another's.
 func (s *Sessions) Identity(ctx context.Context) (string, error) {
@@ -134,17 +144,31 @@ func (s *Sessions) Identity(ctx context.Context) (string, error) {
 	return user, nil
 }
 
+// forWithIdentity is openSession without the privilege bit, for callers that only need the identity.
 func (s *Sessions) forWithIdentity(ctx context.Context) (*dbrpc.Client, string, func(), error) {
+	client, user, _, release, err := s.openSession(ctx)
+	return client, user, release, err
+}
+
+// forScoped is openSession without the identity.
+func (s *Sessions) forScoped(ctx context.Context) (*dbrpc.Client, bool, func(), error) {
+	client, _, private, release, err := s.openSession(ctx)
+	return client, private, release, err
+}
+
+// openSession authenticates, authorizes, and opens one loopback session, reporting the identity it
+// authenticated as and whether the session was served with private attributes included.
+func (s *Sessions) openSession(ctx context.Context) (*dbrpc.Client, string, bool, func(), error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	user, err := s.authn.Authenticate(ctx, md)
 	if err != nil {
-		return nil, "", nil, status.Errorf(codes.Unauthenticated, "%s: %v", s.authn.Name(), err)
+		return nil, "", false, nil, status.Errorf(codes.Unauthenticated, "%s: %v", s.authn.Name(), err)
 	}
 	// An empty user is the anonymous peer, not a failure: the policy below decides whether
 	// it may read, exactly as it does for an anonymous CEDAR peer.
 	addr := peerAddr(ctx)
 	if !s.authz("READ", addr, user) {
-		return nil, "", nil, status.Errorf(codes.PermissionDenied, "%s is not authorized to read",
+		return nil, "", false, nil, status.Errorf(codes.PermissionDenied, "%s is not authorized to read",
 			describeUser(user))
 	}
 
@@ -168,7 +192,7 @@ func (s *Sessions) forWithIdentity(ctx context.Context) (*dbrpc.Client, string, 
 		// leaves that one reading as unknown, which is the safe reading and is what a
 		// networked client would also get. Worth saying out loud, because silence here
 		// is indistinguishable from everything being wired.
-		return nil, "", nil, fmt.Errorf(
+		return nil, "", false, nil, fmt.Errorf(
 			"dbrpc advertises no %v, which a client asks for; the loopback would read them as unknown",
 			missing)
 	}
@@ -179,7 +203,7 @@ func (s *Sessions) forWithIdentity(ctx context.Context) (*dbrpc.Client, string, 
 	s.open[sess] = struct{}{}
 	s.mu.Unlock()
 
-	return client, user, func() {
+	return client, user, opts.IncludePrivate, func() {
 		s.mu.Lock()
 		delete(s.open, sess)
 		s.mu.Unlock()

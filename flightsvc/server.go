@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -63,9 +64,15 @@ const defaultSchemaName = "htcondordb"
 type Server struct {
 	flightsql.BaseServer
 
-	// dbFor returns a client for this RPC and a release to call when the RPC's work --
-	// including any stream it started -- is finished.
-	dbFor func(context.Context) (*dbrpc.Client, func(), error)
+	// dbFor returns a client for this RPC, whether that client's session sees private
+	// attributes, and a release to call when the RPC's work -- including any stream it
+	// started -- is finished.
+	//
+	// The privilege bit comes back with the client because it is decided by the same act
+	// of authorizing it, and because it is the only identity-dependent input to a schema
+	// derivation: an unprivileged type report has the private attributes filtered out, so
+	// a derived schema may not be shared across that line (see schemaCache).
+	dbFor func(context.Context) (*dbrpc.Client, bool, func(), error)
 	alloc memory.Allocator
 	// derive carries the type declarations -- epoch attributes, and the overrides for
 	// attributes whose type inference cannot decide (see arrowtype.Override).
@@ -79,6 +86,8 @@ type Server struct {
 	sessions *Sessions
 	// prep is the live prepared-statement table.
 	prep *prepared
+	// schemas holds recently derived table schemas. Nil or a zero TTL derives every time.
+	schemas *schemaCache
 	// streams admits at most one token per concurrent DoGet stream. Nil means unlimited.
 	//
 	// A cap exists because this runs in the daemon: concurrent wide scans compete for CPU
@@ -117,6 +126,16 @@ func (s *Server) acquireStream() (func(), bool) {
 	}
 }
 
+// SetSchemaTTL caps how long a derived table schema is reused. Zero disables the cache, which
+// derives one per RPC -- what this served before the cache existed.
+func (s *Server) SetSchemaTTL(ttl time.Duration) {
+	if ttl <= 0 {
+		s.schemas = nil
+		return
+	}
+	s.schemas = newSchemaCache(ttl)
+}
+
 // SetSampleMax caps how many records a schema derivation reads. Zero restores the default.
 //
 // Lowering it is how a test reaches the CAPPED case, where the sample is a prefix of the table
@@ -145,7 +164,12 @@ func NewServer(db *dbrpc.Client, derive arrowtype.Options, alloc memory.Allocato
 		alloc = memory.DefaultAllocator
 	}
 	s := &Server{
-		dbFor: func(context.Context) (*dbrpc.Client, func(), error) { return db, func() {}, nil },
+		// A fixed client is one session with one authorization, so its privilege is
+		// whatever that session was served with. This constructor does not know it --
+		// the caller chose it when it built the client -- so the scope is reported as
+		// unprivileged, which is the conservative key: it never shares an entry with a
+		// privileged derivation, and with a single client there is nobody to share with.
+		dbFor: func(context.Context) (*dbrpc.Client, bool, func(), error) { return db, false, func() {}, nil },
 		alloc: alloc, derive: derive, prep: newPrepared(),
 	}
 	if err := s.registerSqlInfo(); err != nil {
@@ -164,7 +188,7 @@ func NewSessionServer(sessions *Sessions, derive arrowtype.Options, alloc memory
 	if alloc == nil {
 		alloc = memory.DefaultAllocator
 	}
-	s := &Server{dbFor: sessions.For, alloc: alloc, derive: derive,
+	s := &Server{dbFor: sessions.ForScoped, alloc: alloc, derive: derive,
 		sessions: sessions, prep: newPrepared()}
 	if err := s.registerSqlInfo(); err != nil {
 		return nil, err
@@ -287,7 +311,7 @@ func (s *Server) GetFlightInfoTables(_ context.Context, cmd flightsql.GetTables,
 // honouring rather than refusing: a catalog browser that cannot see column types is not much
 // of a catalog browser.
 func (s *Server) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	db, release, err := s.dbFor(ctx)
+	db, private, release, err := s.dbFor(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -312,7 +336,7 @@ func (s *Server) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arr
 		if !cmd.GetIncludeSchema() {
 			continue
 		}
-		sch, _, derr := s.tableSchemaWith(ctx, db, name)
+		sch, _, derr := s.tableSchemaWith(ctx, db, name, private)
 		if derr != nil {
 			// A table whose schema cannot be derived is still a table; reporting it
 			// with no schema is more useful than failing the whole listing, which
