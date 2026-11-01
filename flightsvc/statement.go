@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -40,22 +41,107 @@ import (
 // supported.
 // Go's regexp is RE2 and has no backreferences, so the quoted and unquoted forms are spelled
 // as an alternation rather than as a captured quote matched again.
-var selectAllRe = regexp.MustCompile(`(?is)^\s*select\s+\*\s+from\s+(?:"([A-Za-z_][A-Za-z0-9_./-]*)"|([A-Za-z_][A-Za-z0-9_./-]*))\s*;?\s*$`)
+// The accepted grammar: SELECT <cols> FROM <table> [LIMIT n].
+//
+// It grew from `SELECT *` by exactly the argument that made `SELECT *` safe to start with:
+// a column list and a row count contain NO EXPRESSION, so they mean the same thing in every
+// SQL dialect and nothing about them can be reinterpreted when the ANSI front end lands. A
+// WHERE clause, an aggregate, an alias, a function or an ORDER BY would all have semantics to
+// get wrong, so they are still refused.
+//
+// Still a recogniser and not a parser. It accepts a shape or declines; there is no partial
+// understanding in between, which is the property that makes a narrow surface safe rather than
+// merely small.
 
-// parseSelectAll returns the table a statement reads, or an error naming what is supported.
-func parseSelectAll(query string) (string, error) {
-	m := selectAllRe.FindStringSubmatch(query)
+var selectRe = regexp.MustCompile(`(?is)^\s*select\s+(.+?)\s+from\s+(?:"([A-Za-z_][A-Za-z0-9_./-]*)"|([A-Za-z_][A-Za-z0-9_./-]*))(?:\s+limit\s+(\d+))?\s*;?\s*$`)
+
+// identRe is one bare or double-quoted column name, and nothing else: no expression, no alias,
+// no qualification. A list of these is the whole of what a projection may be.
+var identRe = regexp.MustCompile(`^(?:"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))$`)
+
+// query is a recognised statement.
+type query struct {
+	table string
+	// cols is the projection in the order asked for, or nil for SELECT *. Order matters:
+	// `SELECT b, a` must return b then a, because a client reads by position.
+	cols  []string
+	limit int
+}
+
+const unsupportedHint = "this endpoint accepts `SELECT <columns|*> FROM <table> [LIMIT n]` and nothing " +
+	"else yet. A WHERE clause, an aggregate, an alias, a function or an ORDER BY is refused rather " +
+	"than approximated, because a partly-understood query returns rows that look right"
+
+// parseQuery recognises a statement, or returns an error naming what is supported.
+func parseQuery(q string) (query, error) {
+	m := selectRe.FindStringSubmatch(q)
 	if m == nil {
-		return "", fmt.Errorf(
-			"unsupported SQL: this endpoint accepts `SELECT * FROM <table>` and nothing else yet "+
-				"(got %q). Filters, projections, aggregates and joins are refused rather than "+
-				"approximated, because a partly-understood query returns rows that look right",
-			strings.TrimSpace(query))
+		return query{}, fmt.Errorf("unsupported SQL: %s (got %q)", unsupportedHint, strings.TrimSpace(q))
 	}
-	if m[1] != "" {
-		return m[1], nil // the double-quoted form
+	out := query{table: m[2]}
+	if out.table == "" {
+		out.table = m[3]
 	}
-	return m[2], nil
+	if lim := m[4]; lim != "" {
+		n, err := strconv.Atoi(lim)
+		if err != nil {
+			return query{}, fmt.Errorf("unsupported SQL: LIMIT %q is not a row count", lim)
+		}
+		out.limit = n
+	}
+
+	sel := strings.TrimSpace(m[1])
+	if sel == "*" {
+		return out, nil
+	}
+	for _, part := range strings.Split(sel, ",") {
+		part = strings.TrimSpace(part)
+		im := identRe.FindStringSubmatch(part)
+		if im == nil {
+			// Naming the offending term is the difference between a refusal somebody
+			// can act on and one they have to bisect.
+			return query{}, fmt.Errorf(
+				"unsupported SQL: %q is not a plain column name; %s", part, unsupportedHint)
+		}
+		if im[1] != "" {
+			out.cols = append(out.cols, im[1])
+		} else {
+			out.cols = append(out.cols, im[2])
+		}
+	}
+	if len(out.cols) == 0 {
+		return query{}, fmt.Errorf("unsupported SQL: no columns selected")
+	}
+	return out, nil
+}
+
+// project narrows a table's decisions to the requested columns, in the requested order.
+//
+// A requested column with no typed column is REFUSED, naming it and why, rather than omitted.
+// Silently returning fewer columns than asked for is the failure this endpoint exists not to
+// have: a client reads results by position, so a missing column does not shift one value, it
+// shifts every value after it.
+func project(decisions []arrowtype.Decision, cols []string) ([]arrowtype.Decision, error) {
+	if len(cols) == 0 {
+		return decisions, nil
+	}
+	byName := make(map[string]arrowtype.Decision, len(decisions))
+	for _, d := range decisions {
+		byName[strings.ToLower(d.Name)] = d
+	}
+	out := make([]arrowtype.Decision, 0, len(cols))
+	for _, want := range cols {
+		d, ok := byName[strings.ToLower(want)]
+		if !ok {
+			return nil, fmt.Errorf("no such column %q in this table", want)
+		}
+		if d.Verdict != arrowtype.Typed {
+			return nil, fmt.Errorf("column %q has no typed form (%s: %s); it is available as text in the untyped tail",
+				want, d.Reason, d.Detail)
+		}
+		out = append(out, d)
+	}
+	return out, nil
 }
 
 // tableSchema derives a table's Arrow schema from a measurement of what its attributes hold.
@@ -103,15 +189,40 @@ func (s *Server) sampleMax() int {
 }
 
 func (s *Server) GetSchemaStatement(ctx context.Context, cmd flightsql.StatementQuery, _ *flight.FlightDescriptor) (*flight.SchemaResult, error) {
-	table, err := parseSelectAll(cmd.GetQuery())
-	if err != nil {
-		return nil, err
-	}
-	schema, _, err := s.tableSchema(ctx, table)
+	schema, _, err := s.planSchema(ctx, cmd.GetQuery())
 	if err != nil {
 		return nil, err
 	}
 	return &flight.SchemaResult{Schema: flight.SerializeSchema(schema, s.alloc)}, nil
+}
+
+// planSchema recognises a query and returns the schema its rows will carry, projection applied.
+// It is what lets the schema be answered without running anything.
+func (s *Server) planSchema(ctx context.Context, q string) (*arrow.Schema, query, error) {
+	parsed, err := parseQuery(q)
+	if err != nil {
+		return nil, query{}, err
+	}
+	_, decisions, err := s.tableSchema(ctx, parsed.table)
+	if err != nil {
+		return nil, query{}, err
+	}
+	picked, err := project(decisions, parsed.cols)
+	if err != nil {
+		return nil, query{}, err
+	}
+	return schemaOf(picked), parsed, nil
+}
+
+// schemaOf builds the Arrow schema of the typed decisions, in their given order.
+func schemaOf(decisions []arrowtype.Decision) *arrow.Schema {
+	fields := make([]arrow.Field, 0, len(decisions))
+	for _, d := range decisions {
+		if d.Verdict == arrowtype.Typed {
+			fields = append(fields, d.Field)
+		}
+	}
+	return arrow.NewSchema(fields, nil)
 }
 
 // GetFlightInfoStatement answers with the schema BEFORE running anything, which is the whole
@@ -122,11 +233,7 @@ func (s *Server) GetSchemaStatement(ctx context.Context, cmd flightsql.Statement
 // holding per-query state between two RPCs that may not even arrive on the same connection,
 // and the query is what the handle would look up anyway.
 func (s *Server) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	table, err := parseSelectAll(cmd.GetQuery())
-	if err != nil {
-		return nil, err
-	}
-	schema, _, err := s.tableSchema(ctx, table)
+	schema, _, err := s.planSchema(ctx, cmd.GetQuery())
 	if err != nil {
 		return nil, err
 	}
@@ -149,11 +256,12 @@ func (s *Server) GetFlightInfoStatement(ctx context.Context, cmd flightsql.State
 // round trip, and it is the correct trade: a schema in the ticket would be a schema the client
 // could edit, and this one has to match what the encoder will actually produce.
 func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	query := string(ticket.GetStatementHandle())
-	table, err := parseSelectAll(query)
+	stmt := string(ticket.GetStatementHandle())
+	parsed, err := parseQuery(stmt)
 	if err != nil {
 		return nil, nil, err
 	}
+	table := parsed.table
 	// A stream slot first: refusing here costs nothing, while refusing after the schema
 	// derivation would have spent a profile round trip on a request we decline anyway.
 	slot, ok := s.acquireStream()
@@ -166,12 +274,19 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 		slot()
 		return nil, nil, err
 	}
-	schema, decisions, err := s.tableSchemaWith(ctx, db, table)
+	_, allDecisions, err := s.tableSchemaWith(ctx, db, table)
 	if err != nil {
 		release()
 		slot()
 		return nil, nil, err
 	}
+	decisions, err := project(allDecisions, parsed.cols)
+	if err != nil {
+		release()
+		slot()
+		return nil, nil, err
+	}
+	schema := schemaOf(decisions)
 
 	ch := make(chan flight.StreamChunk, 2)
 	go func() {
@@ -211,7 +326,7 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 				return false
 			}
 		}
-		scanErr := db.QueryTableStream(ctx, table, "true", 0, func(row string) bool {
+		scanErr := db.QueryTableStream(ctx, table, "true", parsed.limit, func(row string) bool {
 			// QueryTable streams BRACKETED new-ClassAd text, not old.
 			ad, perr := classad.Parse(row)
 			if perr != nil {
