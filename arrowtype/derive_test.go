@@ -1,6 +1,7 @@
 package arrowtype
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -309,5 +310,87 @@ func TestDeriveAgainstMeasuredShapes(t *testing.T) {
 		if d.Verdict == Typed && d.Field.Type.ID() != c.wantType {
 			t.Errorf("%s: type %v, want %v", c.in.Name, d.Field.Type.ID(), c.wantType)
 		}
+	}
+}
+
+// ptrBool is a helper for the Nullable override, which is a *bool so that "not declared" and
+// "declared false" are distinguishable.
+func ptrBool(b bool) *bool { return &b }
+
+// TestOverrideDecidesWhatInferenceCannot is the case this mechanism exists for. MemoryUsage and
+// Requirements are indistinguishable by shape on a real AP -- both predominantly expressions,
+// both evaluating to one clean kind -- and differ only in what the formula MEANS: MemoryUsage's
+// value is the content, Requirements' text is. No measurement separates them.
+func TestOverrideDecidesWhatInferenceCannot(t *testing.T) {
+	measured := map[string]int{"expr": 1996, "int": 4}
+	opts := Options{Overrides: map[string]Override{
+		"memoryusage":  {Kind: "int"},
+		"requirements": {Exclude: true},
+	}}
+
+	// Without the declaration, both are dropped as expression-valued.
+	if d := Derive(m("MemoryUsage", 2000, 2000, measured), Options{}); d.Verdict != Untyped {
+		t.Fatalf("precondition: MemoryUsage already typed without a declaration (%v)", d.Verdict)
+	}
+
+	got := Derive(m("MemoryUsage", 2000, 2000, measured), opts)
+	if got.Verdict != Typed || got.Field.Type.ID() != arrow.INT64 {
+		t.Errorf("MemoryUsage: %v %v, want a typed int64 column", got.Verdict, got.Field.Type)
+	}
+	if got.Reason != "override-kind" {
+		t.Errorf("MemoryUsage: reason %q, want override-kind so a report shows it was declared", got.Reason)
+	}
+	// The detail must record what the measurement saw, so a declaration that contradicts the
+	// data is visible as a disagreement rather than inferred from an empty column.
+	if !strings.Contains(got.Detail, "expr") {
+		t.Errorf("MemoryUsage: detail %q does not say what was measured", got.Detail)
+	}
+
+	req := Derive(m("Requirements", 2000, 2000, map[string]int{"expr": 1995, "bool": 5}), opts)
+	if req.Verdict != Untyped || req.Reason != "override-excluded" {
+		t.Errorf("Requirements: %v/%s, want Untyped/override-excluded", req.Verdict, req.Reason)
+	}
+}
+
+// TestOverrideWinsOverTheMeasurement: a declaration is not a hint. Forcing a kind the data does
+// not hold is allowed, because the alternative is an admin who cannot correct a bad inference --
+// and it is not silent, because the encoder counts every value it then cannot store.
+func TestOverrideWinsOverTheMeasurement(t *testing.T) {
+	opts := Options{Overrides: map[string]Override{"x": {Kind: "int"}}}
+	d := Derive(m("X", 100, 100, map[string]int{"string": 100}), opts)
+	if d.Verdict != Typed || d.Field.Type.ID() != arrow.INT64 {
+		t.Fatalf("X: %v %v, want the declared int64", d.Verdict, d.Field.Type)
+	}
+	if !strings.Contains(d.Detail, "string") {
+		t.Errorf("detail %q must record that the measurement saw strings", d.Detail)
+	}
+}
+
+func TestOverrideNullabilityAndValidation(t *testing.T) {
+	// Nullability alone: the kind still comes from the measurement.
+	opts := Options{Overrides: map[string]Override{"x": {Nullable: ptrBool(true)}}}
+	d := Derive(m("X", 100, 100, map[string]int{"int": 100}), opts)
+	if d.Field.Type.ID() != arrow.INT64 {
+		t.Errorf("type %v, want int64 from the measurement", d.Field.Type.ID())
+	}
+	if !d.Field.Nullable {
+		t.Error("not nullable, but nullability was declared true")
+	}
+	if !strings.Contains(d.Reason, "override-nullable") {
+		t.Errorf("reason %q should record the declaration", d.Reason)
+	}
+
+	// A declared kind that is not a kind is refused rather than silently ignored: ignoring
+	// it would leave the admin believing a column was fixed when it was not.
+	bad := Options{Overrides: map[string]Override{"x": {Kind: "int64"}}}
+	if d := Derive(m("X", 100, 100, map[string]int{"int": 100}), bad); d.Reason != "override-invalid" {
+		t.Errorf("reason %q, want override-invalid for an unknown kind", d.Reason)
+	}
+}
+
+func TestOverrideNameIsCaseInsensitive(t *testing.T) {
+	opts := Options{Overrides: map[string]Override{"memoryusage": {Exclude: true}}}
+	if d := Derive(m("MeMoRyUsAgE", 100, 100, map[string]int{"int": 100}), opts); d.Verdict != Untyped {
+		t.Error("override missed: ClassAd attribute names are case-insensitive")
 	}
 }

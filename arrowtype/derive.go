@@ -92,8 +92,43 @@ type Decision struct {
 	Detail string
 }
 
+// Override is a declared decision about one attribute, for the cases inference cannot reach.
+//
+// Two attributes on a real AP show why this has to exist. MemoryUsage is an expression in 1996
+// of 2000 records and evaluates to an integer in all of them -- a derivation whose VALUE is the
+// content. Requirements is an expression in 1995 of 2000 and evaluates to a boolean -- a policy
+// whose TEXT is the content, and whose boolean is meaningless without a machine to match
+// against. They are indistinguishable by shape: both predominantly expressions, both evaluating
+// to one clean kind. The difference is semantic, so no amount of measuring separates them and a
+// heuristic that tried would be guessing.
+//
+// So the measurement decides what it can, and this is where the rest is stated. An override is
+// a declaration, not a hint: it wins.
+type Override struct {
+	// Exclude gives the attribute no typed column whatever the measurement says. Its text
+	// still reaches a reader through the tail.
+	Exclude bool
+	// Kind forces the column's type: "int", "real", "bool", "string" or "timestamp".
+	// Empty leaves the type to the measurement.
+	//
+	// Forcing a kind the data does not hold is allowed and is not silent: the encoder
+	// counts every value it then cannot store, and the Decision's Detail records what the
+	// measurement actually saw, so the disagreement is visible rather than inferred from an
+	// unexpectedly empty column.
+	Kind string
+	// Nullable forces nullability; nil leaves it to the measurement. Forcing non-nullable
+	// on a column that turns out to hold a null makes the encoder fail that row rather than
+	// quietly widen the declaration.
+	Nullable *bool
+}
+
 // Options tunes the derivation.
 type Options struct {
+	// Overrides are declared decisions, keyed by attribute name (compared
+	// case-insensitively, as ClassAd names are). They are consulted before the
+	// measurement and they win.
+	Overrides map[string]Override
+
 	// TimeAttrs are attributes whose integer values are unix-epoch seconds, declared rather
 	// than guessed. A match here turns an int or real column into timestamp[s] so downstream
 	// date functions work. Compared case-insensitively, because ClassAd attribute names are
@@ -103,6 +138,23 @@ type Options struct {
 	// falling back to a text column. Off by default: a text column is a faithful
 	// representation and a correctness investigation is what wants the refusal.
 	StrictMixedKinds bool
+}
+
+// override returns the declared decision for an attribute, if any.
+func (o Options) override(name string) (Override, bool) {
+	if len(o.Overrides) == 0 {
+		return Override{}, false
+	}
+	ov, ok := o.Overrides[strings.ToLower(name)]
+	return ov, ok
+}
+
+// kindType maps an override's kind name to its Arrow type.
+func kindType(kind string) (arrow.DataType, bool) {
+	if kind == "timestamp" {
+		return arrow.FixedWidthTypes.Timestamp_s, true
+	}
+	return scalarType(kind)
 }
 
 func (o Options) isTime(name string) bool {
@@ -156,6 +208,52 @@ func dominant(m Measured) string {
 // Derive decides one attribute's Arrow type.
 func Derive(m Measured, opts Options) Decision {
 	names, only := typeClasses(m)
+
+	// A declaration wins over the measurement, and says so in its reason so an EXPLAIN or a
+	// catalog report shows which columns were decided rather than derived.
+	if ov, ok := opts.override(m.Name); ok {
+		if ov.Exclude {
+			return Decision{Name: m.Name, Verdict: Untyped, Reason: "override-excluded",
+				Detail: "excluded by declaration; measured " + measuredAs(m)}
+		}
+		if ov.Kind != "" {
+			dt, valid := kindType(ov.Kind)
+			if !valid {
+				return Decision{Name: m.Name, Verdict: Untyped, Reason: "override-invalid",
+					Detail: "declared kind " + ov.Kind + " is not one of int, real, bool, string, timestamp"}
+			}
+			nullable := m.Present < m.Sampled || m.Nulls > 0
+			if ov.Nullable != nil {
+				nullable = *ov.Nullable
+			}
+			d := typed(m, opts, dt, nullable, "override-kind",
+				"declared as "+ov.Kind+"; measured "+measuredAs(m))
+			return d
+		}
+		if ov.Nullable != nil {
+			// Nullability alone was declared; the kind still comes from the
+			// measurement, so fall through and fix it up afterwards.
+			d := deriveFromMeasurement(m, opts, names, only)
+			if d.Verdict == Typed {
+				d.Field.Nullable = *ov.Nullable
+				d.Reason += "+override-nullable"
+			}
+			return d
+		}
+	}
+	return deriveFromMeasurement(m, opts, names, only)
+}
+
+// measuredAs renders what the measurement saw, for a declaration's detail line: a forced kind
+// the data does not hold should be visible as a disagreement, not inferred from an empty column.
+func measuredAs(m Measured) string {
+	if len(m.ValueClasses) == 0 {
+		return "no values"
+	}
+	return strings.Join(sorted(keys(m.ValueClasses)), ",")
+}
+
+func deriveFromMeasurement(m Measured, opts Options, names []string, only string) Decision {
 
 	// Nothing to type. Either every sampled value was a null, or every one was an expression
 	// whose evaluated kind this measurement does not record -- in both cases declaring a type
