@@ -226,4 +226,13 @@ INSERT INTO demo_events (Key, EventTime) VALUES ('e57_1', 1752014700)
 INSERT INTO demo_events (Key, EventTime) VALUES ('e58_0', 1752015000)
 INSERT INTO demo_events (Key, EventTime) VALUES ('e58_1', 1752015000)
 INSERT INTO demo_events (Key, EventTime) VALUES ('e59_0', 1752015300)
-CREATE MATERIALIZED VIEW demo_ca AS SELECT time_bucket(EventTime, '5m') AS time, COUNT(*) AS metric_events FROM demo_events GROUP BY time_bucket(EventTime, '5m') WITH (grace='1m', retention='30d')
+# No retention. retention is measured against the WALL CLOCK -- it drops any sealed
+# segment whose newest bucket is older than now minus the retention -- while this
+# fixture's EventTimes are fixed 2025-07-08 timestamps, so every bucket is older than
+# any plausible retention and the first seal tick deletes the whole series. That made
+# the E2E test a race: the seal cadence is half the bucket width (150s for a 5m bucket),
+# so it passed only when Playwright reached the panel within ~150s of the daemon
+# starting, and failed whenever a cold Docker build pushed it past that. Retention was
+# deleting the very data the test asserts the live-plus-sealed union returns; sealing is
+# driven by grace, not retention, so dropping it keeps what the test is actually for.
+CREATE MATERIALIZED VIEW demo_ca AS SELECT time_bucket(EventTime, '5m') AS time, COUNT(*) AS metric_events FROM demo_events GROUP BY time_bucket(EventTime, '5m') WITH (grace='1m')
