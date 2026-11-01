@@ -970,15 +970,14 @@ func literalOf(v classad.Value) (string, bool) {
 func (p *joinPlan) join(leftAds, rightAds []*classad.ClassAd) ([]*classad.ClassAd, error) {
 	var out []*classad.ClassAd
 	pairs := 0
-	emit := func(l, r *classad.ClassAd) bool {
+	emit := func(l, r *classad.ClassAd) {
 		row := p.composite(l, r)
 		for _, ex := range p.post {
 			if ex == nil || !isTrue(ex.Eval(row)) {
-				return false
+				return
 			}
 		}
 		out = append(out, row)
-		return true
 	}
 
 	// Hash the right side on the equality keys when there are any; otherwise every left row
@@ -1016,9 +1015,11 @@ func (p *joinPlan) join(leftAds, rightAds []*classad.ClassAd) ([]*classad.ClassA
 			if !p.conditionHolds(l, r) {
 				continue
 			}
-			if emit(l, r) {
-				matched = true
-			}
+			// The pair matched. Whether the row then survives the WHERE residual is a
+			// SEPARATE question, and conflating the two is a wrong answer: a matched row
+			// that WHERE drops must not come back as a null-extended one.
+			matched = true
+			emit(l, r)
 			if len(out) > maxJoinOutputRows {
 				return nil, fmt.Errorf("the join produced more than %d rows; "+
 					"narrow it with WHERE (LIMIT does not help -- the rows are built "+
