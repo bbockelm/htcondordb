@@ -243,14 +243,25 @@ func NewFlightServer(s *Server, alloc memory.Allocator) flight.FlightServer {
 	return flightsql.NewFlightServerWithAllocator(s, alloc)
 }
 
+// Limits are the resource bounds an in-process endpoint needs. Both zero means unlimited,
+// which is what the endpoint did before the limits existed.
+type Limits struct {
+	// StreamBudgetBytes caps the Arrow memory one DoGet stream may hold.
+	StreamBudgetBytes int64
+	// MaxStreams caps concurrent DoGet streams.
+	MaxStreams int
+}
+
 // NewSessionFlightServer is NewFlightServer for a service that resolves a per-identity session
 // on every RPC. One Flight server serves every connection; what differs per RPC is the
 // authorization its reads go through.
-func NewSessionFlightServer(sessions *Sessions, alloc memory.Allocator) (flight.FlightServer, error) {
+func NewSessionFlightServer(sessions *Sessions, alloc memory.Allocator, limits Limits) (flight.FlightServer, error) {
 	srv, err := NewSessionServer(sessions, sessions.Derive(), alloc)
 	if err != nil {
 		return nil, err
 	}
+	srv.SetStreamBudget(limits.StreamBudgetBytes)
+	srv.SetMaxStreams(limits.MaxStreams)
 	return NewFlightServer(srv, alloc), nil
 }
 

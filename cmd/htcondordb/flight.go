@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -27,6 +28,15 @@ import (
 // ONE DIFFERENCE FROM THAT PRECEDENT. The metrics listener's own comment says it "carries no
 // secrets -- storage sizes and timings -- but bind it to a trusted interface". This one carries
 // AD CONTENTS, so a trusted interface is not the control; the authorization policy is.
+//
+// CONFIGURATION:
+//
+//	HTCONDORDB_FLIGHT_ADDRESS          ":9877" -- enables the endpoint
+//	HTCONDORDB_FLIGHT_AUTHENTICATION   OPTIONAL (default) | SCITOKEN | NONE
+//	HTCONDORDB_FLIGHT_SCITOKEN_ISSUERS trusted issuers, required for SCITOKEN
+//	HTCONDORDB_FLIGHT_STREAM_MEMORY    bytes one stream may hold (0 = unlimited)
+//	HTCONDORDB_FLIGHT_MAX_STREAMS      concurrent streams (0 = unlimited)
+//	HTCONDORDB_FLIGHT_TIME_ATTRS       extra epoch-seconds attributes
 //
 // Authentication follows CEDAR rather than being stricter: OPTIONAL by default, which verifies
 // a credential when one is offered and otherwise serves the anonymous identity, leaving
@@ -63,7 +73,13 @@ func startFlightSQL(ctx context.Context, cfg *config.Config, log *logging.Logger
 		grpc.UnaryInterceptor(sessions.UnaryAuthInterceptor()),
 		grpc.StreamInterceptor(sessions.StreamAuthInterceptor()),
 	)
-	fsrv, err := flightsvc.NewSessionFlightServer(sessions, nil)
+	fsrv, err := flightsvc.NewSessionFlightServer(sessions, nil, flightsvc.Limits{
+		// Both default to unlimited when unset, which is what the endpoint did before
+		// the limits existed. An operator who has not configured them gets the old
+		// behaviour rather than a surprise refusal.
+		StreamBudgetBytes: int64(getInt(cfg, "HTCONDORDB_FLIGHT_STREAM_MEMORY")),
+		MaxStreams:        getInt(cfg, "HTCONDORDB_FLIGHT_MAX_STREAMS"),
+	})
 	if err != nil {
 		_ = ln.Close()
 		sessions.Close()
@@ -178,3 +194,18 @@ func getList(cfg *config.Config, key string) []string {
 }
 
 func lower(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+
+// getInt reads a configuration parameter as an integer, 0 when absent or unparseable. A bad
+// value reading as 0 means "unlimited" for the limits above, which is the pre-existing
+// behaviour rather than an accidental clamp -- a typo should not silently throttle the endpoint.
+func getInt(cfg *config.Config, key string) int {
+	raw := strings.TrimSpace(getStr(cfg, key))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
