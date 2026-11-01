@@ -1326,8 +1326,9 @@ this class of bug at all.
    although it **evaluates to an integer in all 2000 sampled ads** (§5.8). The measurement that
    established §5.1 was a one-off script; the server op that would act on it reports stored
    classes. Profiling *evaluated* values is work in `collections`, and it is what makes §5.1
-   true of the schema and not only of the encoder. §14.4 adds that the store already holds those
-   evaluated values, in the computed region beside each columnarized block.
+   true of the schema and not only of the encoder. **The upstream half is built** (§14.6 item 2):
+   `opAttrTypes` now takes a flag that adds the evaluated counts beside the stored ones, under
+   `FeatEvalTypes`. What is left here is `derive.go` reading them, once the dependency is tagged.
 4. **There is no tail column.** §5.6 specifies `SELECT *` as the typed columns plus one `_ad`
    column carrying everything not promoted. `Schema` simply omits every `Untyped` attribute
    (`arrowtype/derive.go:463`), which is the "schema that lies by omission" §5.6 names:
@@ -1510,15 +1511,20 @@ competes as a value class and an expression-dominant attribute is ruled `Untyped
 `MemoryUsage` is absent from ap2001's `history` schema although it evaluates to an integer in all
 2000 sampled ads (§5.8).
 
-The store already knows better. The computed region holds that attribute's evaluated value, with its
-kind, for every qualifying cell of every columnarized segment. A type report built where the computed
-values live would be a statement about what will actually arrive in the column, derived from the whole
-segment rather than a sample — and it is the same move as (b): decide the type where the values are
-typed, rather than reconstructing the decision from text at the top.
+The store already knows better. A type report built where the values are typed would be a statement
+about what will actually arrive in the column, rather than a decision reconstructed from text at the
+top — the same move as (b).
 
 So the two open items converge. A typed value frame needs a declared per-column type to frame
 *against*, and the declared type wants to be derived from evaluated values. Building either one alone
 leaves the other awkward.
+
+**Built, and not where this section expected.** The obvious source was the computed region, which
+holds a qualifying cell's evaluated value with its kind for every columnarized segment. It is the
+wrong source for a type report on two counts: the sampler reads arena records rather than blocks, so
+those values are not on its path; and the region covers only the cells that qualify, so a profile
+built from it would be biased towards the expressions that columnarize. A type decision needs a
+complete distribution over the sampled cells, which is what §14.6 item 2 measures and how.
 
 ### 14.5 The first step is small, and it is in `collections`
 
@@ -1569,9 +1575,56 @@ Two gaps sit on the path and should be closed with it:
 1. ~~The closure plan on `QueryProject`, plus the archive's missing redacted variant (§14.5).~~
    **Done.** 1.58x and half the allocations on the projected scan, the archive variant added, and a
    private-attribute leak in the evaluating redacted projection found and fixed on the way (§14.2).
-2. Profile **evaluated** values for the type report, from the computed region where it exists
-   (§14.4). This is what makes §5.1 true of the schema and not only of the encoder, and it closes
-   §13.3 item 3.
+2. ~~Profile **evaluated** values for the type report (§14.4).~~ **Done upstream** —
+   `AttrTypeProfilesWith(Evaluate: true)` in `collections`, reaching dbrpc as a flag on
+   `opAttrTypes` and `FeatEvalTypes`. Each profile gains a second set of counts over what its
+   cells evaluate to, with the same fields as the stored ones, so a consumer compares them
+   entry by entry. **Blocked here** on the same tag as item 4: `arrowtype` cannot read it until
+   htcondordb's classad dependency carries it, after which `derive.go` reads the evaluated
+   classes and `MemoryUsage` stops being `Untyped`.
+
+   **The computed region turned out to be the wrong place to read it from**, and the reason is
+   worth keeping because §14.4 asserted the opposite. Two facts settle it. The sampler reads
+   arena records, not blocks, so the computed values are not on its path at all; reaching them
+   would mean a second sampler walking columnarized blocks. And the computed region covers only
+   the cells that QUALIFY — pure, references present and unsealed, scalar result — so a profile
+   built from it alone would be silently biased towards the expressions that columnarize, which
+   are not the ones a type decision is hard for. What the measurement needs is a complete
+   distribution over the sampled cells, and the accelerator cannot give one.
+
+   What it does instead is the cheap path the readers already use: an expression cell is decoded
+   on its own and evaluated against a `wireScope` over the record's bytes, with no ClassAd built
+   — the same resolution `QueryProject` performs to serve that attribute, so the report describes
+   the values the value frame will actually produce. A whole-record decode is the fallback, for a
+   cell whose references the scope cannot resolve or that evaluates to an error (a function
+   needing a real scope, `eval()` among them). Measured on a 45-attribute fixture, per sampled
+   record: stored classes alone **4 630 ns**; this **10 400 ns**; taking the decode for every
+   cell instead **17 500 ns** at six times the allocations. So the option roughly doubles the
+   measurement, which is why it is asked for rather than always taken — and why the endpoint's
+   cache (§13.3 item 2) matters more once it is.
+
+   **Two privacy rules came with it, and neither existed before**, because until this option the
+   op never looked through a value at all — it classified nodes, and a sealed node classifies as
+   sealed. Evaluating resolves references, so both had to be added at the source rather than at
+   the filter:
+
+   - A reference to a **private attribute** resolves to undefined, in the resolver, where it is
+     exact — a static walk of the expression would miss a reference reached by selection or
+     subscript. Withholding the input rather than filtering the output is the same choice the
+     redacted read paths make by holding no key.
+   - The connection's **entitlement** now reaches this op: an unprivileged peer's expressions are
+     evaluated with no key, so a sealed value is undefined in the scope. Without it, `Derived =
+     Salary * 2` would have handed that peer `Salary`'s exact bounds under a name the
+     private-attribute filter has no reason to suspect. Pinned by a test that first proves the
+     entitled read does see through the expression, so it cannot pass against a server that
+     evaluates nothing.
+
+   Six mutants were checked to fail named tests: no private withholding, skipping the cells that
+   are not expressions, reporting the stored counts as the evaluated ones, a server that ignores
+   its session's privilege, a server that accepts a flag bit it does not know, and a client that
+   reports an older server's stored-only reply as the answer it asked for. The last two are the
+   mixed-version pair, and they are testable because the test harness strips the flags word off
+   the request frame — which is exactly what an older server reads.
 3. ~~The typed value frame over dbrpc (§14.3b), in the redacted-ops table from its first commit.~~
    **Done** — `opQueryValues` in classad's dbrpc. A column is a kind, a validity bitmap, a dense
    slice of that kind's values, and an exceptions list keyed by row; a uniform column has an empty
