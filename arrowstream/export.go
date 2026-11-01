@@ -127,7 +127,15 @@ func Export(ctx context.Context, c *dbrpc.Client, w io.Writer, opts Options) (*R
 	}
 	// db.AttrTypeProfile is a type alias of collections.AttrTypeProfile, so the report's
 	// profiles feed the adapter directly.
-	schema, decisions := arrowtype.Schema(arrowtype.FromProfiles(rep.Profiles, rep.Sampled), opts.Derive)
+	//
+	// A sample that came back SHORT of what it asked for ran out of records rather than
+	// hitting its cap, so it saw the whole table -- which is the only sound basis for
+	// declaring a column non-nullable. A sample that filled its cap may have missed a
+	// record where an attribute is absent, and a non-nullable column the encoder then
+	// appends a null into is a promise broken to the reader.
+	complete := rep.Sampled < sampleMax
+	schema, decisions := arrowtype.Schema(
+		arrowtype.FromProfilesComplete(rep.Profiles, rep.Sampled, complete), opts.Derive)
 
 	enc := arrowtype.NewEncoder(decisions, opts.Encode)
 	defer enc.Release()

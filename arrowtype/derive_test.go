@@ -7,8 +7,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 )
 
+// m builds a Measured from a COMPLETE sample -- the sample was the whole table. That is the
+// case most of these tests mean, and it is the only one in which a non-nullable column is
+// sound; TestDeriveNullabilityNeedsACompleteSample covers the other.
 func m(name string, sampled, present int, classes map[string]int) Measured {
-	return Measured{Name: name, Sampled: sampled, Present: present, ValueClasses: classes}
+	return Measured{Name: name, Sampled: sampled, Present: present, ValueClasses: classes, Complete: true}
 }
 
 func TestDeriveSingleClass(t *testing.T) {
@@ -54,7 +57,7 @@ func TestDeriveNullability(t *testing.T) {
 		t.Error("absent from 40 records: not nullable, want nullable")
 	}
 
-	stored := Measured{Name: "X", Sampled: 100, Present: 100, Nulls: 10,
+	stored := Measured{Name: "X", Sampled: 100, Present: 100, Nulls: 10, Complete: true,
 		ValueClasses: map[string]int{"int": 90}}
 	if d := Derive(stored, Options{}); !d.Field.Nullable {
 		t.Error("present but holding undefined: not nullable, want nullable")
@@ -392,5 +395,36 @@ func TestOverrideNameIsCaseInsensitive(t *testing.T) {
 	opts := Options{Overrides: map[string]Override{"memoryusage": {Exclude: true}}}
 	if d := Derive(m("MeMoRyUsAgE", 100, 100, map[string]int{"int": 100}), opts); d.Verdict != Untyped {
 		t.Error("override missed: ClassAd attribute names are case-insensitive")
+	}
+}
+
+// TestDeriveNullabilityNeedsACompleteSample: Arrow's nullable flag is a promise to the reader,
+// and a capped sample cannot support it. An attribute present in all 10,000 sampled records may
+// still be absent from the millionth, and the encoder would then append a null into a column
+// declared to have none -- some readers reject that, others trust it and are quietly wrong.
+//
+// It bites only when the table is LARGER than the sample cap, which is why a real export of a
+// 2000-row table under a 10,000-record cap shows nothing wrong: that sample was the table, so
+// its density claims were sound. The bug is latent until the first table that outgrows the cap
+// -- which is every table this is actually for.
+func TestDeriveNullabilityNeedsACompleteSample(t *testing.T) {
+	dense := map[string]int{"int": 100}
+
+	complete := Derive(Measured{Name: "X", Sampled: 100, Present: 100, ValueClasses: dense, Complete: true}, Options{})
+	if complete.Field.Nullable {
+		t.Error("complete sample, nothing missing: nullable, want not")
+	}
+
+	capped := Derive(Measured{Name: "X", Sampled: 100, Present: 100, ValueClasses: dense}, Options{})
+	if !capped.Field.Nullable {
+		t.Error("capped sample: non-nullable, but the sample cannot prove the column is dense")
+	}
+
+	// A declaration still wins: an admin who knows the column is dense may say so.
+	no := false
+	forced := Derive(Measured{Name: "X", Sampled: 100, Present: 100, ValueClasses: dense},
+		Options{Overrides: map[string]Override{"x": {Nullable: &no}}})
+	if forced.Field.Nullable {
+		t.Error("declared non-nullable, but came back nullable")
 	}
 }

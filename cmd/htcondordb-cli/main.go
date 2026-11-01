@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -83,6 +84,18 @@ load subcommand:
   -table <name>       target table (default: ads); created if absent
   -auto               route each ad to a table named for its MyType
   -key <attr>         source attribute used as the primary key (default: Name)
+
+arrow subcommand:
+  htcondordb-cli arrow -table jobs -o jobs.arrows
+  htcondordb-cli arrow -table history -where 'Owner == "alice"' | duckdb -c "..."
+  -table <name>       table to export (default: ads)
+  -o <file>           write the stream here (default: stdout, refused to a terminal)
+  -where <expr>       export only the rows this constraint matches
+  -limit <n>          export at most n rows
+
+  Writes Arrow IPC: DuckDB reads it with read_arrow(), pyarrow with
+  ipc.open_stream. A report of what got no column, and of any value altered
+  or nulled to fit one, goes to stderr so it cannot corrupt the stream.
 
   -version            print version and exit
 
@@ -176,6 +189,11 @@ func run() error {
 	// Subcommand: `load` ingests a ClassAd stream from stdin.
 	if len(fs.args) > 0 && fs.args[0] == "load" {
 		return runLoad(ctx, cfg, addr, fs)
+	}
+
+	// Subcommand: `arrow` writes a table out as an Arrow IPC stream.
+	if len(fs.args) > 0 && fs.args[0] == "arrow" {
+		return runArrow(ctx, cfg, addr, fs)
 	}
 
 	dbc, closeConn, err := connectDB(ctx, cfg, addr)
@@ -275,6 +293,9 @@ type flags struct {
 	loadTable  string // -table: `load`'s target table (default "ads"), or `fsck`'s filter
 	loadAuto   bool   // `load`: route each ad to a table named for its MyType
 	fsckDir    string // `fsck`: database directory to inspect (default: from config)
+	arrowOut   string // `arrow`: file to write the Arrow IPC stream to (default: stdout)
+	arrowWhere string // `arrow`: constraint restricting the exported rows
+	arrowLimit int    // `arrow`: cap on exported rows (0 = all)
 	help       bool
 	debug      bool
 	version    bool
@@ -336,6 +357,23 @@ func parseFlags() *flags {
 			i++
 			if i < len(args) {
 				f.loadTable = args[i]
+			}
+		case "-o", "--o", "-out", "--out":
+			i++
+			if i < len(args) {
+				f.arrowOut = args[i]
+			}
+		case "-where", "--where":
+			i++
+			if i < len(args) {
+				f.arrowWhere = args[i]
+			}
+		case "-limit", "--limit":
+			i++
+			if i < len(args) {
+				if n, err := strconv.Atoi(args[i]); err == nil {
+					f.arrowLimit = n
+				}
 			}
 		case "-auto", "--auto":
 			f.loadAuto = true

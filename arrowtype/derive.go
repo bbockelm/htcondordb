@@ -62,6 +62,31 @@ type Measured struct {
 	Nulls int
 	// LossyAsFloat is how many integer values exceed 2^53 in magnitude.
 	LossyAsFloat int
+	// Complete reports that the sample was the WHOLE table rather than a capped draw
+	// from it. It is what makes a non-nullable column sound.
+	//
+	// Arrow's nullable flag is a promise to the reader, and a sample cannot support it:
+	// an attribute present in every one of 10,000 sampled records may still be absent
+	// from the millionth, and the encoder would then append a null into a column
+	// declared to have none. Some readers check and reject; others trust it and are
+	// quietly wrong. Nothing goes wrong while the sample happens to cover the table,
+	// so this stays invisible until the first table that outgrows the cap. So density is only ever declared when it was observed over
+	// everything -- see FromProfiles, which can tell because a sample that returned
+	// fewer records than it asked for had nothing left to draw.
+	Complete bool
+}
+
+// isNullable reports whether the column must admit nulls.
+//
+// Anything the measurement saw missing or null makes it nullable outright. Everything else
+// hinges on whether the sample WAS the table: over a capped sample, "present in every record
+// I looked at" is not "present in every record", and declaring non-nullable on that basis
+// hands the reader a promise the encoder may then break.
+func isNullable(m Measured) bool {
+	if m.Present < m.Sampled || m.Nulls > 0 {
+		return true
+	}
+	return !m.Complete
 }
 
 // Verdict is what was decided for one attribute.
@@ -222,7 +247,7 @@ func Derive(m Measured, opts Options) Decision {
 				return Decision{Name: m.Name, Verdict: Untyped, Reason: "override-invalid",
 					Detail: "declared kind " + ov.Kind + " is not one of int, real, bool, string, timestamp"}
 			}
-			nullable := m.Present < m.Sampled || m.Nulls > 0
+			nullable := isNullable(m)
 			if ov.Nullable != nil {
 				nullable = *ov.Nullable
 			}
@@ -275,7 +300,7 @@ func deriveFromMeasurement(m Measured, opts Options, names []string, only string
 			Detail: "held as an expression in most records; its text is the useful form, so it stays in the tail"}
 	}
 
-	nullable := m.Present < m.Sampled || m.Nulls > 0
+	nullable := isNullable(m)
 
 	if only != "" {
 		dt, ok := scalarType(only)
