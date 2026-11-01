@@ -47,9 +47,10 @@ import (
 	"strings"
 )
 
-// Kind is a column's type, as the schema declared it. It decides which lowering a comparison
-// gets, which is the §5 type map earning its keep: without declared types there is no way to
-// know whether `=` on this column is the case-sensitive problem or an ordinary number.
+// Kind is a column's type, as the schema derivation declared it. It decides which lowering a
+// comparison gets, which is what makes the lowering decidable at all: without a declared type
+// there is no way to know whether `=` on this column is the case-sensitive problem or an
+// ordinary number.
 type Kind int
 
 const (
@@ -487,10 +488,11 @@ func lowerStringCompare(col, op string, lit *literal, pol polarity) (expr, error
 		"superset of one another, so there is no faithful lowering", op, col)
 }
 
-// checkLiteralKind refuses a comparison whose literal cannot be what the column holds. This is
-// the binder the §5 type map makes possible: SQL rejects a type-invalid comparison when the
-// statement is bound, and doing the same here beats lowering it and letting ClassAd's ERROR
-// quietly filter out every row.
+// checkLiteralKind refuses a comparison whose literal cannot be what the column holds.
+//
+// Having declared column types is what makes this possible at all: SQL rejects a type-invalid
+// comparison when the statement is bound, and doing the same here beats lowering it and letting
+// ClassAd's ERROR quietly filter out every row.
 func checkLiteralKind(col string, kind Kind, lit literal) error {
 	switch kind {
 	case KindString:

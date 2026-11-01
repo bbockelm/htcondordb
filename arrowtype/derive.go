@@ -200,9 +200,9 @@ func (o Options) isTime(name string) bool {
 
 // AN EXPRESSION IS NOT A TYPE, any more than undefined is.
 //
-// It is an unevaluated form that BECOMES a type once evaluated, and the encoder evaluates
-// (§5.1), so a record holding an expression contributes a value of whatever that expression
-// yields -- not a distinct kind the column has to accommodate.
+// It is an unevaluated form that BECOMES a type once evaluated, and the encoder evaluates every
+// value it writes, so a record holding an expression contributes a value of whatever that
+// expression yields -- not a distinct kind the column has to accommodate.
 //
 // Counting it as a competing class is a bug with teeth. Measured on a real AP, RequestMemory is
 // an integer in 1994 records and an expression in ONE; RequestDisk the same; LeaveJobInQueue is

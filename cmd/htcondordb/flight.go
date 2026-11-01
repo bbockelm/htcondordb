@@ -80,8 +80,15 @@ func startFlightSQL(ctx context.Context, cfg *config.Config, log *logging.Logger
 		// Both default to unlimited when unset, which is what the endpoint did before
 		// the limits existed. An operator who has not configured them gets the old
 		// behaviour rather than a surprise refusal.
-		StreamBudgetBytes: int64(getInt(cfg, "HTCONDORDB_FLIGHT_STREAM_MEMORY")),
-		MaxStreams:        getInt(cfg, "HTCONDORDB_FLIGHT_MAX_STREAMS"),
+		//
+		// A MALFORMED value is reported rather than swallowed. Falling back to
+		// unlimited is the only option that cannot wedge startup over a typo, but it
+		// is also the opposite of what an operator who typed a limit asked for, so
+		// doing it silently would leave a daemon running with no ceiling and nothing
+		// to say why. configBytes takes a unit suffix ("512 MiB"), as the other
+		// size-valued knobs do.
+		StreamBudgetBytes: flightBytes(cfg, log, "HTCONDORDB_FLIGHT_STREAM_MEMORY"),
+		MaxStreams:        flightCount(cfg, log, "HTCONDORDB_FLIGHT_MAX_STREAMS"),
 	})
 	if err != nil {
 		_ = ln.Close()
@@ -198,16 +205,33 @@ func getList(cfg *config.Config, key string) []string {
 
 func lower(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
-// getInt reads a configuration parameter as an integer, 0 when absent or unparseable. A bad
-// value reading as 0 means "unlimited" for the limits above, which is the pre-existing
-// behaviour rather than an accidental clamp -- a typo should not silently throttle the endpoint.
-func getInt(cfg *config.Config, key string) int {
+// flightBytes reads a byte-valued limit, accepting a unit suffix, and REPORTS a value it cannot
+// parse instead of quietly leaving the endpoint unlimited.
+//
+// Unlimited is the right fallback -- refusing to start over a typo in an optional knob would
+// take a daemon down for less reason than it fixes -- but it is also the opposite of the
+// operator's intent, which is exactly why it has to be said out loud.
+func flightBytes(cfg *config.Config, log *logging.Logger, key string) int64 {
+	raw := strings.TrimSpace(getStr(cfg, key))
+	n := configBytes(cfg, key)
+	if raw != "" && raw != "0" && n == 0 {
+		log.Error(logging.DestinationGeneral,
+			"unparseable Flight SQL size; serving with no limit", "knob", key, "value", raw)
+	}
+	return n
+}
+
+// flightCount reads a count-valued limit, reporting a malformed or negative value for the same
+// reason flightBytes does.
+func flightCount(cfg *config.Config, log *logging.Logger, key string) int {
 	raw := strings.TrimSpace(getStr(cfg, key))
 	if raw == "" {
 		return 0
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n < 0 {
+		log.Error(logging.DestinationGeneral,
+			"unparseable Flight SQL count; serving with no limit", "knob", key, "value", raw)
 		return 0
 	}
 	return n
