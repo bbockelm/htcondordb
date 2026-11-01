@@ -1100,6 +1100,7 @@ sampled one, and the columnar producer — roughly in that order of value per un
 | Containment (§8.5) | `flightsvc/statement.go`, `server.go` | panic barrier per stream, byte budget, stream cap that refuses rather than queues |
 | Flight SQL method set (§9.2) | `flightsvc/server.go`, `statement.go`, `prepared.go` | catalogs, schemas, tables, table types, statement, prepared + bind |
 | Projected scan, archives included | `flightsvc/statement.go` | the refs-chasing projection op: reaches an archive, pushes the projection down, keeps expressions evaluable |
+| Schema cache, privilege-scoped | `flightsvc/schemacache.go` | stops a derivation per RPC; makes the promised and delivered schema one object within the TTL |
 | SqlInfo conformance | `flightsvc/server.go` | the entries a real driver asks for at connect, one of which failed every ADBC client while Go was green |
 | ANSI → ClassAd lowering (W1, §10) | `ansi/` | the comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, and `?` holes |
 | The same dialect in the REPL | `repl/dialect.go`, `-dialect` | one Arrow-column→SQL-kind mapping serves both front doors (`arrowtype/sqlkinds.go`) |
@@ -1180,15 +1181,29 @@ in the same change (§13.2), and the harness now holds an archive. The lesson is
 the API: a new read surface needs an archive in its tests from the first one, or it cannot see
 this class of bug at all.
 
-1. **The schema is sampled per RPC, not declared.** `tableSchemaWith` profiles up to 10 000
-   records on every statement, every bind and every DoGet, with no cache and no generation
-   (`flightsvc/statement.go:166`). Three consequences. `GetFlightInfoStatement` and
-   `DoGetStatement` sample **independently**, so the schema promised and the schema delivered are
-   two measurements of a moving table. A columnar schema change mid-stream is unguarded, where
-   §5.7 calls for pinning a generation for the life of the stream. And every query pays a profile
-   scan. §5.7's describe-table op — a type map stored beside the columnar schema, sharing its
-   generation counter, overridable by an admin — was not built; what shipped is `opAttrTypes`
-   returning sampled profiles, which is the measurement and not the declaration.
+1. **The schema is sampled, not declared.** §5.7's describe-table op — a per-table type map
+   stored beside the columnar schema, sharing its generation counter, seeded by introspection and
+   overridable by an admin — was not built. What shipped is `opAttrTypes`, returning profiles of a
+   sample: the measurement, not the declaration.
+
+   Two of the three consequences are now closed by a cache (`flightsvc/schemacache.go`, default
+   30s). The repeat scans are gone — a derivation is no longer paid per RPC — and the schema a
+   client is promised and the one it is delivered are the same object within the TTL, where before
+   they were two independent measurements of a moving table and a client trusting the first read
+   the second by position.
+
+   What a cache cannot do is make that a **guarantee**, and this is where the missing generation
+   bites: the entry can expire between the two calls, and there is nothing to pin, because the
+   type report carries profiles and a sample size and no generation counter. Within one stream the
+   schema is fixed by construction — it is derived once, before the scan — so a mid-stream retype
+   is not the exposure; the FlightInfo/DoGet pair is. §5.7's "pin the generation for the life of a
+   stream" wants restating as "pin it for the life of a statement", and it needs classad to
+   publish one.
+
+   The cache is keyed by privilege, which is not a detail: an unprivileged type report has the
+   private attributes filtered out server-side, because an attribute's numeric bounds are a
+   disclosure even where its value is not, so two levels derive different schemas from one table
+   and a shared entry would hand private column names to whoever asked second.
 2. **The type decision is made on the stored form, while the encoder evaluates.**
    `AttrTypeProfiles` classifies wire nodes and states that it evaluates nothing, so `expr`
    competes as a value class and an expression-dominant attribute is ruled `Untyped`
@@ -1227,10 +1242,12 @@ this class of bug at all.
    table has can differ on the same table at the same moment. One kind mapping already serves
    both (`arrowtype/sqlkinds.go`); the sample size should too.
 8. **Then the columnar producer** (§13.2, and §9.3's closing paragraph). It is last because the
-   costs that are not per-value work come off without touching `collections` at all — the whole
-   ad rendered to reach one attribute is already gone, and item 1 takes the profile scan per RPC
-   — and because the comparison has to be against the projected read, not against the string path
-   it replaced, or it will flatter itself.
+   costs that are not per-value work are already off without touching `collections` at all — the
+   whole ad rendered to reach one attribute, and the profile scan per RPC — and because the
+   comparison has to be against the projected read, not against the string path it replaced, or
+   it will flatter itself. What it still wants from item 1 is the *declared* schema: a producer
+   emitting one stable Arrow schema across blocks that vectorize and blocks that do not cannot
+   derive that schema from whichever block it is looking at.
 
 Still deliberately not built: writes, Substrait, transactions and savepoints, key metadata,
 `XdbcTypeInfo`, `CancelFlightInfo` (§9.2), and everything in §11.

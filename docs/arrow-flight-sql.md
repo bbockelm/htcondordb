@@ -140,6 +140,29 @@ A value either knob cannot parse is reported at `ERROR` naming the knob, and the
 with **no** limit. That is the only fallback that cannot wedge startup over a typo, but it is
 also the opposite of what you asked for, which is why it is logged rather than silent.
 
+## The schema cache
+
+Deriving a table's schema samples records and classifies them, and every statement needs one
+twice: once to answer the result shape before anything runs, and once to encode the rows. A
+client that prepares a statement and executes it in a loop would pay that sampling scan on every
+call, inside the daemon.
+
+`HTCONDORDB_FLIGHT_SCHEMA_TTL` (default `30s`) is how long a derived schema is reused. `0`
+disables it.
+
+The trade is staleness, and it is worth knowing which way: **a column that appears in the table
+does not appear in the schema until the entry ages out.** Thirty seconds is short enough that
+this is rarely visible and long enough to collapse a burst. If you are watching a column arrive —
+adding an attribute and immediately querying for it — set the knob to `0`.
+
+Two things it does not change. Entries are scoped to the caller's authorization, so a reader that
+may not see private attributes is never served a schema derived for one that may; the two never
+share an entry. And a cached schema is not a *pinned* one: the entry can expire between the call
+that reports a result's shape and the call that returns its rows, so a client that reads
+`execute_schema` and then trusts it positionally can still, in principle, be handed a different
+shape. Read the schema that arrives with the stream — which is what every Arrow reader does — and
+the question does not come up.
+
 ## Arrow without a server
 
 For a one-off extract there is no need for the endpoint at all — the CLI writes an Arrow IPC

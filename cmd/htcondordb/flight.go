@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"google.golang.org/grpc"
@@ -36,6 +37,7 @@ import (
 //	HTCONDORDB_FLIGHT_SCITOKEN_ISSUERS trusted issuers, required for SCITOKEN
 //	HTCONDORDB_FLIGHT_STREAM_MEMORY    bytes one stream may hold (0 = unlimited)
 //	HTCONDORDB_FLIGHT_MAX_STREAMS      concurrent streams (0 = unlimited)
+//	HTCONDORDB_FLIGHT_SCHEMA_TTL       how long a derived schema is reused (0 = no cache)
 //	HTCONDORDB_FLIGHT_TIME_ATTRS       extra epoch-seconds attributes
 //
 // Authentication follows CEDAR rather than being stricter: OPTIONAL by default, which verifies
@@ -89,6 +91,13 @@ func startFlightSQL(ctx context.Context, cfg *config.Config, log *logging.Logger
 		// size-valued knobs do.
 		StreamBudgetBytes: flightBytes(cfg, log, "HTCONDORDB_FLIGHT_STREAM_MEMORY"),
 		MaxStreams:        flightCount(cfg, log, "HTCONDORDB_FLIGHT_MAX_STREAMS"),
+		// A short schema cache by default. Deriving a schema samples records, and
+		// every statement needs one -- twice, since GetFlightInfo answers the shape
+		// and DoGet builds the encoder -- so a client looping over a prepared
+		// statement was paying a profile scan per call inside the daemon. Short
+		// because the schema follows the table: 30 seconds collapses a burst without
+		// holding yesterday's columns.
+		SchemaTTL: flightSchemaTTL(cfg, log),
 	})
 	if err != nil {
 		_ = ln.Close()
@@ -219,6 +228,33 @@ func flightBytes(cfg *config.Config, log *logging.Logger, key string) int64 {
 			"unparseable Flight SQL size; serving with no limit", "knob", key, "value", raw)
 	}
 	return n
+}
+
+// defaultFlightSchemaTTL is how long a derived table schema is reused when the knob is unset.
+const defaultFlightSchemaTTL = 30 * time.Second
+
+// flightSchemaTTL reads the schema cache's lifetime. An explicit "0" disables the cache and is
+// not an error; anything unparseable falls back to the default and is reported.
+//
+// Note the fallback differs from the size and count knobs above, deliberately. Those fall back
+// to "no limit" because that is what the endpoint did before they existed, so a typo cannot
+// change behaviour. Here the pre-existing behaviour is the EXPENSIVE one, and silently
+// restoring it on a typo would hand an operator who asked for a longer cache a daemon that
+// re-derives every schema on every RPC, with nothing but this log line to say why.
+func flightSchemaTTL(cfg *config.Config, log *logging.Logger) time.Duration {
+	raw := strings.TrimSpace(getStr(cfg, "HTCONDORDB_FLIGHT_SCHEMA_TTL"))
+	if raw == "" {
+		return defaultFlightSchemaTTL
+	}
+	secs, ok := configSeconds(cfg, "HTCONDORDB_FLIGHT_SCHEMA_TTL")
+	if !ok || secs < 0 {
+		log.Error(logging.DestinationGeneral,
+			"unparseable Flight SQL schema cache lifetime; using the default",
+			"knob", "HTCONDORDB_FLIGHT_SCHEMA_TTL", "value", raw,
+			"default", defaultFlightSchemaTTL.String())
+		return defaultFlightSchemaTTL
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // flightCount reads a count-valued limit, reporting a malformed or negative value for the same
