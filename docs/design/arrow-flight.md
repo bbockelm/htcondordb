@@ -3,8 +3,9 @@
 **Status:** ADBC over Arrow Flight SQL is implemented and read-only — type derivation in
 `arrowtype/`, the endpoint in `flightsvc/`, the SQL front end in `ansi/` — and verified in CI
 against the DuckDB CLI and a real ADBC driver. **§13 is the progress record: what is shipped,
-what is left, and why we cannot yet go straight from the vector engine to Arrow.** The transport
-and pushdown designs below (§6, §7) remain a sketch for a rung we did not climb. Measurements in
+what is left, and why we cannot yet go straight from the vector engine to Arrow; §14 answers the
+layer question that record raises — where Arrow should be built, and what should move instead.**
+The transport and pushdown designs below (§6, §7) remain a sketch for a rung we did not climb. Measurements in
 §3 and §5.8 stand as taken.
 **Grounded in:** `repl/sql.go`, `repl/exec.go`, `repl/rowstream.go`, `grafana/pkg/plugin/frame.go`,
 and in classad's `collections/adschema.go`, `collections/vm/vecexec.go`, `dbrpc/proto.go`,
@@ -1293,7 +1294,8 @@ this class of bug at all.
    real AP an attribute's STORED form is an expression far more often than its evaluated kind
    suggests (§5.8) -- so how often the fallback fires decides how much of the 7x survives.
    `BenchmarkWireNativeRead` is in the tree and skips, naming the missing op, until the
-   dependency carries it.
+   dependency carries it. §14.3 argues this is the compatibility path rather than the destination:
+   it leaves the consumer evaluating, where the server is better placed to.
 2. **The schema is sampled, not declared.** §5.7's describe-table op — a per-table type map
    stored beside the columnar schema, sharing its generation counter, seeded by introspection and
    overridable by an admin — was not built. What shipped is `opAttrTypes`, returning profiles of a
@@ -1324,7 +1326,8 @@ this class of bug at all.
    although it **evaluates to an integer in all 2000 sampled ads** (§5.8). The measurement that
    established §5.1 was a one-off script; the server op that would act on it reports stored
    classes. Profiling *evaluated* values is work in `collections`, and it is what makes §5.1
-   true of the schema and not only of the encoder.
+   true of the schema and not only of the encoder. §14.4 adds that the store already holds those
+   evaluated values, in the computed region beside each columnarized block.
 4. **There is no tail column.** §5.6 specifies `SELECT *` as the typed columns plus one `_ad`
    column carrying everything not promoted. `Schema` simply omits every `Untyped` attribute
    (`arrowtype/derive.go:463`), which is the "schema that lies by omission" §5.6 names:
@@ -1361,12 +1364,192 @@ this class of bug at all.
    against a small remainder, and it should be measured against the wire-native read rather than
    against the text path it replaced. What it still wants from item 2 is the *declared* schema: a
    producer emitting one stable Arrow schema across blocks that vectorize and blocks that do not
-   cannot derive that schema from whichever block it is looking at.
+   cannot derive that schema from whichever block it is looking at. §14 revisits the order: the
+   producer is step 5 of §14.6, and what comes before it is what decides whether it is worth
+   building at all.
 
 Still deliberately not built: writes, Substrait, transactions and savepoints, key metadata,
 `XdbcTypeInfo`, `CancelFlightInfo` (§9.2), and everything in §11.
 
-## 14. Parked: the one Airport-only opportunity worth remembering
+## 14. Where Arrow gets built, and what actually has to move
+
+§13.2 measured a read and found 87% of its CPU in a text round trip at the dbrpc boundary, against
+under 10% for the storage read and 3% for the Arrow encoding. That invites a question the earlier
+sections assumed away: the store already holds most of these values in columnar form, so **is dbrpc
+the right layer to materialize at, and should Arrow move closer to the source?**
+
+The answer this section argues for is **the Arrow encoder should not move, and the text should not be
+there.** Those are not the same claim. What has to move down is the *typing and the evaluation*, not
+the encoder — and dbrpc has to stop being a text relay without ceasing to be the thing that decides
+what a reader may see.
+
+### 14.1 What the store actually holds
+
+The premise deserves checking before a plan is built on it, so: **a hot numeric column is physically
+contiguous.** `hotColStart(i)` returns `hotStartW[i] * n` — field *i*'s column begins at a per-field
+offset scaled by the record count, so the uncompressed hot region is column-major, one field's values
+laid end to end. `loadIntBatch` then calls `loadIntsTyped` with `stride == f.width` and says why:
+*"Contiguous, so the stride is the field width."* A width-8 integer column is consecutive `int64`s. A
+real is stored as `math.Float64bits` in the same 8-byte slot, so a float column is a copy rather than
+a conversion. For those fields the premise holds exactly: the bytes are already in Arrow's layout.
+
+Three things qualify it.
+
+- **Widths are fitted; Arrow's are not.** A column is packed to 1, 2, 4, 6 or 8 bytes by
+  `chooseIntWidth`, while Arrow wants one width for the column. A narrow column is therefore a
+  **widening gather** — `loadIntsTyped` is a switch hoisted out of the loop, one machine load per
+  value, fast but linear. This is §5.2's tension restated at the byte level: storage optimizes the
+  bytes stored, Arrow optimizes a column that can be used without decoding.
+- **Only the hot tier is uncompressed.** The hot numeric tier is the top-N fields by accumulated read
+  demand. The rest are per-field contiguous too, but reached through `bc.stream(b, kindColdNum)`, so
+  copy-adjacent only after a decompression.
+- **The attribute the question named behaves differently, and this is the interesting part.**
+  `MemoryUsage` is the expression case, and classad **does** evaluate it when the segment is
+  columnarized (`collections/colcomputed.go`): a cell whose expression is pure, whose references are
+  all present in the record and unsealed, and whose value is a number, string or boolean is computed
+  once at seal time and kept. But the design is explicit that *"the expression stays in the record,
+  exactly as it is today, and the cell stays escaped"* — the computed value lives **beside** the
+  block, as a per-field section of `(n+1) little-endian u32 offsets | the cells' literal nodes,
+  concatenated`. Two loads and no walk, which is tight; but each value is a tagged wire node, so
+  reading one is an O(1) decode rather than a slice of a column.
+
+  That placement is deliberate and worth not fighting: it is *"an accelerator in the strict sense:
+  dropping it costs speed, never an answer."* Leaving the expression in the record is what lets every
+  reader that was never taught about computed values see precisely the bytes it always saw. The
+  qualification rules also mean a cell can decline to be computed — an impure function, a reference
+  the record lacks, a sealed input, an `UNDEFINED`/`ERROR`/NaN result — so a producer must handle a
+  **missing** computed value on a field that is computed in most records of the same block.
+
+**Net: the premise holds.** A literal hot numeric column is memcpy-shaped, a cold one is a
+decompression away, a narrow one is a gather, and an expression-valued one is already evaluated but
+stored as nodes beside the column. "A memory copy is possible" is exactly true of some columns and
+nearly true of the rest.
+
+### 14.2 dbrpc is the wrong layer to materialize at, and the right one to authorize at
+
+Both halves matter, and conflating them is how this gets designed badly.
+
+**Wrong layer to materialize at**, because §13.2 says where the time is. Rendering a record to ClassAd
+source text is 48% of a read and parsing it back is 39%. Neither is work; both exist only because the
+relay renders text its consumer immediately parses. Reassembling at dbrpc records that were columnar
+two layers down is the entire 87%.
+
+**Right layer to authorize at**, and this is the constraint that most shapes the answer — but it costs
+nothing, because the split already exists. Redaction is *already* a storage-layer parameter: every
+scan takes a `redact bool`, `c.evalCtx(redact)` decides whether a sealed value opens, and private
+attributes are dropped inside the projector. dbrpc's job is only to turn a session's privilege into
+that flag. So **moving materialization down does not move policy down.** A producer deeper in the
+stack passes the same flag the text producer passes today, and `dbrpc/redacted_raw_ops_test.go` is the
+table that holds every row-returning read op to it.
+
+That test is also the warning. The paged projection op (`opQueryRawProjSeq`) ignored the session's
+privilege and served the entitled read — private attributes and opened sealed values — to any peer.
+A new read op that is not in that table is the same bug waiting to be rediscovered, which makes
+"joins the existing table" a hard requirement on anything built here rather than a nicety.
+
+### 14.3 Three shapes, and which one to build
+
+**(a) Arrow IPC built in `collections`, shipped through dbrpc as opaque bytes.** The maximal reading
+of "move Arrow closer to the source": build record batches where the match mask and the contiguous
+columns are both in hand, and let dbrpc relay self-describing bytes it never interprets.
+
+Rejected for now, on its own measurement. It buys the 3% that the Arrow encoding costs, and it puts
+arrow-go's +3.1MB (§3) and its release cadence under every classad consumer — the collector, the
+schedd mirror, the CLI — for one consumer's benefit. The dependency objection does have an answer:
+this repo is already multi-module (`collections/`, `db/`, `dbrpc/`, `changefeed/`, `wasmudf/`), so a
+`classad/arrow` module costs non-users nothing, and dbrpc could take a registered encoder so the
+Arrow import lands only in a binary that wants it. That is buildable. It is simply not what the
+numbers ask for first.
+
+**(b) A typed value frame at the dbrpc boundary — the recommendation.** dbrpc stops relaying ClassAd
+source text and relays *evaluated, typed values*, column-major, batched. This deletes the render (48%)
+and the parse (39%) without introducing Arrow anywhere new: the consumer appends typed values to an
+`array.Builder`, which §13.2 measured at 484 ns/row and a tenth of an allocation. Arrow stays where it
+costs 3%, and the frame is useful to consumers that want nothing to do with Arrow — the Grafana
+plugin, which currently parses cells and keeps its own `knownTimeAttrs` (§13.3 item 7), and the DB-API
+cursor, whose `description` still documents itself as "what arrived, not a schema".
+
+**(c) Wire rows decoded by the consumer — already most of the way built, and still worth having.**
+§13.3 item 1: ship the stored nodes, let the consumer read literals with `wire.Ad.LookupByName` +
+`wire.LiteralValue` and evaluate the rest. Measured at 7x, 8x for a literals-only projection.
+
+(b) and (c) differ in *who evaluates*, and that is the whole argument between them. (c) makes the
+consumer evaluate an expression-valued attribute, which it can only do against the ad it was given —
+and §13.2 item 3 already names this as the thing that decides how much of the 7x survives, because on
+a real AP an attribute's stored form is an expression far more often than its evaluated kind suggests
+(§5.8). (b) makes the server evaluate, once, where the record's own reference closure and its
+precomputed values are both to hand. The server is strictly better placed, and §14.4 is why.
+
+They are not exclusive. (c) is the compatibility path and the thing to measure (b) against; (b) is
+where a column should come from.
+
+### 14.4 The thing that has to move is the type decision, not the encoder
+
+§13.3 item 3 reads as a defect in `opAttrTypes`, and it is really a symptom of the layering.
+`AttrTypeProfiles` classifies the **stored form** and states that it evaluates nothing, so `expr`
+competes as a value class and an expression-dominant attribute is ruled `Untyped` — which is why
+`MemoryUsage` is absent from ap2001's `history` schema although it evaluates to an integer in all
+2000 sampled ads (§5.8).
+
+The store already knows better. The computed region holds that attribute's evaluated value, with its
+kind, for every qualifying cell of every columnarized segment. A type report built where the computed
+values live would be a statement about what will actually arrive in the column, derived from the whole
+segment rather than a sample — and it is the same move as (b): decide the type where the values are
+typed, rather than reconstructing the decision from text at the top.
+
+So the two open items converge. A typed value frame needs a declared per-column type to frame
+*against*, and the declared type wants to be derived from evaluated values. Building either one alone
+leaves the other awkward.
+
+### 14.5 The first step is small, and it is in `collections`
+
+`QueryProject` already yields evaluated, typed, wire-native values — `[]classad.Value` aligned with
+the requested attributes, read through `wireScope` without materializing a ClassAd. It is the right
+producer for (b), and it is deliberately slower than it has to be.
+
+It passes **no projection plan at all**, and the comment in `queryProjectAs` explains the cost
+precisely: a plan would be *"~3x, a third of the allocations"* and would silently change answers,
+because a narrowed ad loses exactly the references an expression-valued attribute needs —
+*"`RequestMemory = ProcId*512+7` projected as just RequestMemory loses ProcId and evaluates to
+UNDEFINED. Measured on a columnarized fixture: 14 of 3000 records turned UNDEFINED, with no error
+anywhere."* `TestProjectedAdIsNotEvaluable` pins that and says what would have to change.
+
+What has changed since is that the fix already exists for the *other* readers. A **closure plan**
+(`projPlan.closure`, set by `rawProjPlan` under `chaseRefs`) keeps the narrowed ad only when it is
+self-contained under its projected expressions' references (`adClosed`) and reassembles the record
+when it is not. `QueryRawWireRefs` and `QueryRawProjected` already use it; the evaluating projection
+never adopted it. Giving `QueryProject` a closure plan is a small change that recovers most of that
+3x with the undefined-value hazard closed by construction rather than by avoidance — and the oracle
+for it is a test already in the tree.
+
+It is also the same correction this endpoint already made one layer up, when the Flight scan moved
+onto the refs-chasing projection op for exactly this reason (§13.2).
+
+Two gaps sit on the path and should be closed with it:
+
+- **`ArchiveTable` has no `QueryProjectRedacted`, and neither does `collections.Archive`.** `DB` and
+  `Collection` have one; the archive side stops at `QueryProjectStats`. A value frame over `history`
+  read by an unprivileged peer has nowhere to go, and the shape of that absence is the shape of the
+  `opQueryRawProjSeq` bug.
+- **Anything new joins `redacted_raw_ops_test.go`'s table**, rather than getting a test of its own
+  (§14.2).
+
+### 14.6 Build order
+
+1. The closure plan on `QueryProject`, plus the archive's missing redacted variant (§14.5). Small,
+   local to `collections`/`db`, and it makes the producer for everything below fast enough to be
+   worth exposing.
+2. Profile **evaluated** values for the type report, from the computed region where it exists
+   (§14.4). This is what makes §5.1 true of the schema and not only of the encoder, and it closes
+   §13.3 item 3.
+3. The typed value frame over dbrpc (§14.3b), in the redacted-ops table from its first commit.
+4. `flightsvc` reads it and appends straight to `array.Builder`. The encoder does not change; what
+   reaches it stops being text.
+5. Only then revisit (a). Once 1–4 have landed, what is left of a read is the storage read itself,
+   and a columnar producer can finally be argued against a small, honest remainder rather than
+   against a text path that should never have been in the measurement.
+
+## 15. Parked: the one Airport-only opportunity worth remembering
 
 Not being built (§9), recorded so it is not rediscovered.
 
