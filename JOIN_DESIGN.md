@@ -3,6 +3,91 @@
 **Status:** draft — for discussion, not yet a spec.
 **Scope:** `repl` (parser/planner/executor), `classad/collections` + `dbrpc` (server-side join).
 
+## 0. Progress
+
+Shipped, in flight, and not started. Updated with each merge; the section it points at is
+where the reasoning lives.
+
+### 0.1 The three join algorithms
+
+A join engine is conventionally three algorithms, and which one a query gets is the
+planner's main decision. Here is where each one stands.
+
+| algorithm | applies when | client (`repl`) | store (`db.Join`) |
+|---|---|---|---|
+| **hash join** | the `ON` spine has at least one equality | **done** | **done** |
+| **index-based equi join** | ditto, and the probed side has an index on the key | **done** (key batching, §6.2) | **not started** |
+| **block nested loops** | no usable equality: non-equi `ON`, `CROSS JOIN` | **not started** | **not started** |
+
+Three things that table is saying, which are easy to miss:
+
+- The **hash** path is the only one that is finished on both sides, and it is the one the
+  measurements in §6.2 were taken on.
+- The **index** path exists only on the client, which is the wrong place for it. A client
+  batches the left side's key values into one `in` constraint and lets the server's index
+  resolve them (§6.2, "Key batching"). That works, but the client has to guess whether it
+  is worth doing, from a row count it has to ask for — §6.2's "a client cannot price it".
+  The store knows the index's selectivity for free. The server-side join does **no** index
+  probing at all today: `db.Join` hashes one side and scans the other, whatever the
+  indexes say.
+- There is **no block nested loops anywhere**. An equality-free `ON` falls to naive
+  tuple-at-a-time nested loops over two fully materialized slices, which is both the
+  slowest ordering of the work and unbounded in memory. This matters twice over: it is the
+  fallback algorithm for every non-equi join, *and* it is the loop that §7's zone-map
+  skipping needs in order to skip anything.
+
+### 0.2 By area
+
+| area | § | status |
+|---|---|---|
+| Grammar: `JOIN`/`INNER`/`LEFT`/`CROSS`, `ON`, aliases | 3 | **done** |
+| Refusals with a suggestion: `RIGHT`, `FULL`, `NATURAL`, `USING`, comma-FROM | 3 | **done** |
+| Alias normalization, unqualified-reference refusal | 4 | **done** |
+| Conjunct splitting, outer-join pushdown asymmetry | 5 | **done** |
+| Per-side projection pushdown | 6 | **done** |
+| `LIMIT` pushdown, only when nothing reorders after it | 6 | **done** |
+| Guard rails: per-side, pair and output-row caps | 7a | **done** |
+| `EXPLAIN` over a join | 6 | **done** |
+| `ORDER BY`, `DISTINCT`, `GROUP BY`, aggregates, `HAVING` | 10 | **done** (client-side) |
+| `UNION`, `UNION ALL` over joins | — | **done** (`SETOPS_DESIGN.md`) |
+| `opJoin` (69) + feature advertisement, no probing | 10 | **done**, off by default — see §6.2 |
+| Window functions / `QUALIFY` over a join | — | refused |
+| `INTERSECT`, `EXCEPT` | — | refused |
+| **Joining more than two tables** | 0.3 | refused by `validateJoinTables` |
+| Index-based equi join inside the store | 0.1 | **not started** |
+| Block nested loops | 7 | **not started** |
+| Zone-map block skipping | 7 | **not started** — measure the ceiling first |
+| Vectorized residual / join `ColumnSource` | 6.1 | **not started** |
+| Cost-based planner, join-order choice | 7b | **not started** |
+| Sub-selects in argument position | 7c | out of scope by decision |
+| Server-side aggregates over a join | 10 | **not started** |
+| MATCH: deterministic candidate order | 8.6 | **done** (classad #458) |
+| MATCH: resumable per-autocluster cursors | 8.8 | **not started** |
+| MATCH: single-pass multi-autocluster scan | 8.3 | **not started** |
+| MATCH: rank-bounded block skipping | 8.4 | **not started** |
+| MATCH: resource-side autoclustering | 8.9 | **not started** |
+
+### 0.3 What the remaining work is actually blocked on
+
+Three of the unstarted items are blocked on each other in one chain, and it is worth
+naming because it is not the order the list above suggests:
+
+**Block nested loops → zone skipping → cost-based planner.** Zone skipping (§7) cannot be
+bolted onto the hash path: hashing visits one side whole before it sees the other, so there
+is never a (left block, right block) pair to test a zone predicate against. The pair only
+exists inside a block loop. So the blocked-nested-loop algorithm is not merely the fallback
+for non-equi joins — it is the carrier for the one remaining optimization with a large
+claimed payoff. And a planner that chooses between three algorithms is only worth building
+once there are three.
+
+**Multi-table joins are a planner change, not a parser change.** `parseJoins` already
+consumes any number of `JOIN` clauses and `Statement.Joins` already holds them; the refusal
+is one check in `validateJoinTables`. What is actually missing is downstream: `joinPlan`
+holds exactly a `left` and a `right`, `sidesOf` returns a two-bit mask, and the executor
+pairs two materialized slices. Generalizing those three is the work. Join *order* then
+becomes a real decision for the first time — with two tables there is only one shape — so
+multi-table is also what makes §7b stop being optional.
+
 ## 1. The problem
 
 The SQL layer refuses joins on purpose. `rejectJoins` (`repl/sql.go`) rejects
