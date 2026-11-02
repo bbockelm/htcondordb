@@ -60,7 +60,7 @@ func startFlightSQL(ctx context.Context, cfg *config.Config, log *logging.Logger
 		return nil, err
 	}
 
-	sessions, err := flightsvc.NewSessions(cat, authn, authorize, flightDeriveOptions(cfg))
+	sessions, err := flightsvc.NewSessions(cat, authn, authorize, flightDeriveOptions(cfg, log))
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +172,7 @@ func flightSciToken(cfg *config.Config) (flightsvc.Authenticator, error) {
 // Seeded from the same list the CLI and the Grafana plugin carry, which is the same knowledge
 // written down three times now -- it wants unifying behind the stored type map, and this is
 // the third site that will have to change when that lands.
-func flightDeriveOptions(cfg *config.Config) arrowtype.Options {
+func flightDeriveOptions(cfg *config.Config, log *logging.Logger) arrowtype.Options {
 	opts := arrowtype.Options{TimeAttrs: map[string]bool{}}
 	for name := range knownFlightTimeAttrs {
 		opts.TimeAttrs[name] = true
@@ -180,6 +180,49 @@ func flightDeriveOptions(cfg *config.Config) arrowtype.Options {
 	for _, name := range getList(cfg, "HTCONDORDB_FLIGHT_TIME_ATTRS") {
 		opts.TimeAttrs[lower(name)] = true
 	}
+	// An attribute an admin wants out of the schema whatever the measurement says. The usual
+	// case is one whose TEXT is the content -- a policy expression the derivation happens to
+	// find uniformly boolean -- and no measurement separates that from a derivation whose
+	// value is the content, because the two are the same shape. Excluding it is not hiding
+	// it: the tail column still carries it.
+	for _, name := range getList(cfg, "HTCONDORDB_FLIGHT_EXCLUDE_ATTRS") {
+		if opts.Overrides == nil {
+			opts.Overrides = map[string]arrowtype.Override{}
+		}
+		ov := opts.Overrides[lower(name)]
+		ov.Exclude = true
+		opts.Overrides[lower(name)] = ov
+	}
+	// Forcing a column's type, for the attribute whose declared kind is known and whose
+	// sample happens not to show it. A forced kind the data does not hold is allowed and is
+	// not silent -- the encoder counts every value it then cannot store.
+	for _, spec := range getList(cfg, "HTCONDORDB_FLIGHT_ATTR_KINDS") {
+		name, kind, ok := strings.Cut(spec, ":")
+		name, kind = strings.TrimSpace(name), lower(strings.TrimSpace(kind))
+		if !ok || name == "" || kind == "" {
+			log.Error(logging.DestinationGeneral,
+				"ignoring a Flight SQL attribute kind declaration; want Attribute:kind",
+				"knob", "HTCONDORDB_FLIGHT_ATTR_KINDS", "entry", spec)
+			continue
+		}
+		if !arrowtype.KnownKind(kind) {
+			log.Error(logging.DestinationGeneral,
+				"ignoring a Flight SQL attribute kind declaration; unknown kind",
+				"knob", "HTCONDORDB_FLIGHT_ATTR_KINDS", "entry", spec, "kind", kind,
+				"known", strings.Join(arrowtype.KnownKinds(), ", "))
+			continue
+		}
+		if opts.Overrides == nil {
+			opts.Overrides = map[string]arrowtype.Override{}
+		}
+		ov := opts.Overrides[lower(name)]
+		ov.Kind = kind
+		opts.Overrides[lower(name)] = ov
+	}
+	// Refusing an attribute whose kinds genuinely disagree, rather than serving it as text.
+	// Off by default because a text column is a faithful representation of mixed data; an
+	// operator who would rather hear about it than read it turns this on.
+	opts.StrictMixedKinds = configBool(cfg, "HTCONDORDB_FLIGHT_STRICT_MIXED_KINDS")
 	return opts
 }
 
