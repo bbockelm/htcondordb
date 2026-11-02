@@ -248,6 +248,18 @@ schedd, or a wrong path). A history or epoch file that does not exist has nothin
 and does not hold it back. A missing file is reported as `<Source>FilePresent = false`. A federation hub replicates the row and
 computes freshness from it; see [Federation](federation.md).
 
+### Values too deep to store
+
+The store refuses a value nested more than 1000 levels deep (a chain of 1001 `||` terms with no
+parentheses is the longest an attribute can hold), because no reader could read it back. The
+refusal is permanent, so the sync skips such a value rather than retrying it: on `job_queue.log` it
+drops that one attribute and mirrors the rest of the job (the attribute keeps whatever value the row
+held before); on the history and epoch files it skips the record. Each skip is logged with the key
+and attribute and counted in the collector ad's `<Source>TooDeep` and in
+`htcondordb_sync_too_deep_total{kind,source}`. A history-import job skips such a record and moves
+its cursor past it, counted in `ImportJob_<name>_SkippedTooDeepTotal` and
+`htcondordb_import_job_skipped_too_deep_total{import_job}`.
+
 ## Job resource metrics
 
 `HTCONDORDB_JOB_METRICS = true` turns on a resource-usage time series for running jobs:

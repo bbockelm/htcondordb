@@ -85,6 +85,10 @@ type Stats struct {
 	Schedds  int // schedds imported successfully
 	Failures int // schedds that errored (skipped; others still run)
 	Imported int // records appended
+	// SkippedTooDeep counts records not appended because a value in them nests deeper than the
+	// archive can hold. They are passed over (the cursor advances past them) because the
+	// refusal is permanent: retrying would stop the schedd's import at that record for good.
+	SkippedTooDeep int
 }
 
 func (im *Importer) now() time.Time {
@@ -128,7 +132,8 @@ func (im *Importer) RunLoop(ctx context.Context, j Job) error {
 			im.log().Warn("historyimport: cycle failed", "job", j.Name, "err", err)
 		} else {
 			im.log().Info("historyimport: cycle complete",
-				"job", j.Name, "schedds", st.Schedds, "failures", st.Failures, "imported", st.Imported)
+				"job", j.Name, "schedds", st.Schedds, "failures", st.Failures, "imported", st.Imported,
+				"skipped_too_deep", st.SkippedTooDeep)
 		}
 		if im.OnCycle != nil {
 			im.OnCycle(st, err)
@@ -154,13 +159,14 @@ func (im *Importer) RunJob(ctx context.Context, j Job) (Stats, error) {
 		if err := ctx.Err(); err != nil {
 			return st, err
 		}
-		var n int
+		var n, skipped int
 		if j.Source == SourceEpoch {
-			n, err = im.importEpochSchedd(ctx, j, sd)
+			n, skipped, err = im.importEpochSchedd(ctx, j, sd)
 		} else {
-			n, err = im.importSchedd(ctx, j, sd)
+			n, skipped, err = im.importSchedd(ctx, j, sd)
 		}
 		st.Imported += n
+		st.SkippedTooDeep += skipped
 		if errors.Is(err, dbrpc.ErrTableReadOnly) {
 			// Every schedd would fail the same way: stop the cycle rather than
 			// querying the rest of the pool for records that cannot be stored.
@@ -188,13 +194,12 @@ func (im *Importer) RunJob(ctx context.Context, j Job) (Stats, error) {
 // advanced to the newest record seen and persisted only after the batch lands, so
 // a crash re-imports at most the un-persisted tail (at-least-once), which the
 // recovery dedup then absorbs.
-func (im *Importer) importSchedd(ctx context.Context, j Job, sd ScheddRef) (int, error) {
+func (im *Importer) importSchedd(ctx context.Context, j Job, sd ScheddRef) (imported, skipped int, err error) {
 	since, hasCursor := im.Cur.Get(j.Name, sd.Name)
 	dedup := !hasCursor
 
 	var newest string
-	imported := 0
-	err := im.Src.History(ctx, sd, j.Constraint, since, j.MaxPerCycle, func(ad *classad.ClassAd) error {
+	err = im.Src.History(ctx, sd, j.Constraint, since, j.MaxPerCycle, func(ad *classad.ClassAd) error {
 		id := jobKey(ad)
 		if id == "" {
 			return nil // no ClusterId/ProcId: not a job record, skip
@@ -213,24 +218,43 @@ func (im *Importer) importSchedd(ctx context.Context, j Job, sd ScheddRef) (int,
 		}
 		stamp(ad, sd.Name, im.now())
 		if aerr := im.W.Append(ctx, j.Table, ad); aerr != nil {
+			if im.skipTooDeep(j, sd, id, aerr) {
+				skipped++
+				return nil
+			}
 			return fmt.Errorf("append: %w", aerr)
 		}
 		imported++
 		return nil
 	})
 	if err != nil && !errors.Is(err, errStopScan) {
-		return imported, err
+		return imported, skipped, err
 	}
 
 	if newest != "" && newest != since {
 		if ferr := im.W.Flush(ctx, j.Table); ferr != nil {
-			return imported, fmt.Errorf("flush: %w", ferr)
+			return imported, skipped, fmt.Errorf("flush: %w", ferr)
 		}
 		if serr := im.Cur.Set(j.Name, sd.Name, newest); serr != nil {
-			return imported, fmt.Errorf("persist cursor: %w", serr)
+			return imported, skipped, fmt.Errorf("persist cursor: %w", serr)
 		}
 	}
-	return imported, nil
+	return imported, skipped, nil
+}
+
+// skipTooDeep reports whether an Append error is the archive refusing a record because a value
+// in it nests deeper than it can hold, logging the skip when so. That refusal is permanent -- the
+// same record is refused on every retry -- so the importer must pass over it: returning it as a
+// cycle error would leave the cursor short of the record, and every later cycle would stop on it
+// again, ending that schedd's import for good. Both writers report it the same way
+// (dbrpc.ErrTooDeep is db.ErrTooDeep).
+func (im *Importer) skipTooDeep(j Job, sd ScheddRef, record string, err error) bool {
+	if !errors.Is(err, dbrpc.ErrTooDeep) {
+		return false
+	}
+	im.log().Warn("historyimport: skipping record with a value that nests too deeply to store",
+		"job", j.Name, "schedd", sd.Name, "record", record, "err", err)
+	return true
 }
 
 // stamp writes ScheddName (authoritative, from discovery) and the import time onto

@@ -36,6 +36,11 @@ type SyncStatus struct {
 	// Unapplied counts writes the store refused to compose at all (db.UnappliedError): the update
 	// did not land and is not retried, because retrying cannot succeed.
 	Unapplied int64
+	// TooDeep counts values dropped because they nest deeper than the store can hold
+	// (db.ErrTooDeep): attribute values on the job source, whole records on the history and
+	// epoch sources (an archive record is appended whole or not at all). The refusal is
+	// permanent, so the sync skips the value and carries on rather than wedging on it.
+	TooDeep int64
 
 	// Cumulative wall-clock time the tailer has spent, to localize WHERE a behind tailer's time
 	// goes (surfaced as *_seconds_total counters). CommitSeconds is incremental commits only;
@@ -89,6 +94,7 @@ func (s *JobSync) publishStatus(progressed bool) {
 	st.SetAttrAbsentKey = s.mAbsentKey.Load()
 	st.ReconcileLookupMiss = s.mReconcileLookupMiss.Load()
 	st.Unapplied = s.mUnapplied.Load()
+	st.TooDeep = s.mTooDeep.Load()
 	st.Reconciles = s.mReconciles.Load()
 	st.CommitSeconds = float64(s.mCommitNanos.Load()) / 1e9
 	st.PollSeconds = float64(s.mPollNanos.Load()) / 1e9
@@ -134,6 +140,7 @@ func (s *HistorySync) publishStatus(progressed bool) {
 	size, lag := lagAndFile(s.filename, s.offset)
 	st := SyncStatus{Kind: s.kind, Source: s.filename, Offset: s.offset, FileSize: size, LagBytes: lag, CaughtUp: lag == 0}
 	st.Resyncs, st.LastResync = s.resyncs, s.lastResync
+	st.TooDeep = s.tooDeep.Load()
 	if prev := s.status.Load(); prev != nil {
 		st.LastSync = prev.LastSync
 	}

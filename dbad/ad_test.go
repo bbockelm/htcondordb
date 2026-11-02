@@ -25,7 +25,7 @@ func TestAddAttrs(t *testing.T) {
 		},
 		Sources: []scheddsync.SyncStatus{
 			{Kind: "job_queue.log", Source: "/spool/job_queue.log", Offset: 900, FileSize: 900, LagBytes: 0, CaughtUp: true, LastSync: time.Unix(1_700_000_480, 0)},
-			{Kind: "history", Source: "/spool/history", Offset: 500, FileSize: 700, LagBytes: 200, CaughtUp: false, LastSync: time.Unix(1_700_000_400, 0), Resyncs: 2, LastResync: time.Unix(1_700_000_300, 0)},
+			{Kind: "history", Source: "/spool/history", Offset: 500, FileSize: 700, LagBytes: 200, CaughtUp: false, LastSync: time.Unix(1_700_000_400, 0), Resyncs: 2, LastResync: time.Unix(1_700_000_300, 0), TooDeep: 4},
 		},
 		Now: now,
 	}
@@ -71,6 +71,9 @@ func TestAddAttrs(t *testing.T) {
 	if i("HistoryResyncs") != 2 || !b("HistoryGapDetected") || i("HistoryLastResyncTime") != 1_700_000_300 {
 		t.Errorf("history resync/gap wrong: resyncs=%d gap=%v", i("HistoryResyncs"), b("HistoryGapDetected"))
 	}
+	if i("HistoryTooDeep") != 4 {
+		t.Errorf("HistoryTooDeep = %d, want 4", i("HistoryTooDeep"))
+	}
 	// SecondsSinceSync = Now - LastSync.
 	if got := i("HistorySecondsSinceSync"); got != 100 {
 		t.Errorf("HistorySecondsSinceSync = %d, want 100", got)
@@ -100,7 +103,7 @@ func TestAddAttrsImporters(t *testing.T) {
 		Importers: []ImporterStatus{
 			{Name: "ospool", Running: true, Restarts: 1,
 				LastBeat: time.Unix(1_700_000_470, 0), LastCycle: time.Unix(1_700_000_400, 0),
-				Schedds: 8, Failures: 1, ImportedTotal: 9123},
+				Schedds: 8, Failures: 1, ImportedTotal: 9123, SkippedTooDeepTotal: 6},
 			{Name: "cm-east", Running: false, LastErr: "collector unreachable"},
 		},
 	}
@@ -116,7 +119,7 @@ func TestAddAttrsImporters(t *testing.T) {
 	}
 	if !b("ImportJob_ospool_Running") || i("ImportJob_ospool_Restarts") != 1 ||
 		i("ImportJob_ospool_Schedds") != 8 || i("ImportJob_ospool_Failures") != 1 ||
-		i("ImportJob_ospool_ImportedTotal") != 9123 {
+		i("ImportJob_ospool_ImportedTotal") != 9123 || i("ImportJob_ospool_SkippedTooDeepTotal") != 6 {
 		t.Errorf("ospool gauges wrong")
 	}
 	if i("ImportJob_ospool_LastBeatTime") != 1_700_000_470 || i("ImportJob_ospool_SecondsSinceBeat") != 30 {

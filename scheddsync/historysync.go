@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -86,6 +87,10 @@ type HistorySync struct {
 	resyncs    int64
 	lastResync time.Time
 	status     atomic.Pointer[SyncStatus]
+
+	// tooDeep counts records skipped because a value in them nests deeper than the archive can
+	// hold (db.ErrTooDeep). Published as SyncStatus.TooDeep.
+	tooDeep atomic.Int64
 
 	// resyncReq, when set (via Resync), makes the next Poll re-read the current history file from
 	// its head, deduping against the archive -- so anything the archive is missing is back-filled
@@ -725,6 +730,15 @@ func (s *HistorySync) appendRecord(rec []byte) {
 	// Deferred: the record is durable at the next flushArchive, which runs before any
 	// position covering it is persisted.
 	if err := s.archive.AppendDeferred(ad); err != nil {
+		// Skipped either way -- the tailer must not wedge on one record -- but a too-deep
+		// refusal is permanent and data-shaped, so it is counted apart from a storage failure.
+		if errors.Is(err, db.ErrTooDeep) {
+			s.tooDeep.Add(1)
+			id, _ := s.keyConstraint(ad)
+			s.log.Warn("history: skipping record with a value that nests too deeply to store",
+				"record", id, "err", err.Error())
+			return
+		}
 		s.log.Warn("history: append failed", "err", err.Error())
 	}
 }

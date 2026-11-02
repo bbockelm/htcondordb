@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/PelicanPlatform/classad/db"
 
 	"github.com/bbockelm/golang-htcondor/classadlog"
@@ -156,6 +157,10 @@ type JobSync struct {
 	// sync one -- and the keys are logged so it can be chased.
 	mUnapplied  atomic.Int64
 	mReconciles atomic.Int64
+	// mTooDeep counts attribute values dropped because they nest deeper than the store can hold
+	// (db.ErrTooDeep). The refusal is permanent, so the value is skipped and the rest of the job
+	// is mirrored; the attribute keeps whatever value the row held before.
+	mTooDeep atomic.Int64
 	// mConflicts counts commit ConflictErrors recovered by the rewind-and-retry path (see Poll's
 	// ProbeAddition handling). Observe-only.
 	mConflicts atomic.Int64
@@ -666,7 +671,7 @@ func (s *JobSync) reconcileReload(ctx context.Context, reason string) (err error
 	rec := &reconciler{
 		jobs: s.target, users: s.users, jobsets: s.jobsets, clusters: s.clusters, header: s.header,
 		clusterprivate: s.clusterprivate,
-		seen:           seen, log: s.log, batches: map[*db.DB]*db.Txn{},
+		seen:           seen, log: s.log, tooDeep: &s.mTooDeep, batches: map[*db.DB]*db.Txn{},
 		before: map[*db.DB]map[string]struct{}{
 			s.target:         beforeSet(beforeJobs),
 			s.users:          beforeSet(beforeUsers),
@@ -814,6 +819,7 @@ func (s *JobSync) chainReconciledProcs(seen map[string]struct{}) error {
 		if batch == nil {
 			batch = s.target.Begin()
 		}
+		s.stripTooDeepLogged(key, proc)
 		batch.NewClassAd(key, proc)
 		if n++; n >= reconcileBatch {
 			if err := commit(); err != nil {
@@ -887,6 +893,8 @@ type reconciler struct {
 	// sweep drops the keys the log did not route to THAT table.
 	seen map[*db.DB]map[string]struct{}
 	log  *slog.Logger
+	// tooDeep is the owning JobSync's counter of attribute values dropped as too deep to store.
+	tooDeep *atomic.Int64
 
 	batches map[*db.DB]*db.Txn // one buffered transaction per table touched this batch
 	n       int
@@ -1034,6 +1042,14 @@ func (r *reconciler) flush() error {
 	changed := !hadRow
 	if !hadRow {
 		base = classad.New()
+	}
+	// A value nested too deeply to store would get the whole row refused at commit, leaving the
+	// key's previous row (or none) and losing every other attribute of this run with it. Drop just
+	// that value; the incremental path's refused SetAttribute leaves the same attribute as it was.
+	if names := stripTooDeep(ad); len(names) > 0 {
+		r.tooDeep.Add(int64(len(names)))
+		r.log.Warn("job_queue.log: skipping attributes that nest too deeply to store",
+			"key", key, "attrs", names)
 	}
 	for _, name := range ad.GetAttributes() {
 		expr, ok := ad.Lookup(name)
@@ -1429,9 +1445,17 @@ func (s *JobSync) applyEntry(e *classadlog.LogEntry) error {
 			s.mAbsentKey.Add(1)
 		}
 		if err := tx.SetAttribute(e.Key, e.Name, e.Value); err != nil {
-			// A single malformed value must not abort the whole sync; skip it.
-			s.log.Warn("job_queue.log: skipping unparseable attribute",
-				"key", e.Key, "attr", e.Name, "err", err.Error())
+			// A single bad value must not abort the whole sync; skip it. Two kinds reach here: a
+			// value that does not parse, and one that parses but nests deeper than the store can
+			// read back. Both are refused every time, so neither is retried.
+			if errors.Is(err, db.ErrTooDeep) {
+				s.mTooDeep.Add(1)
+				s.log.Warn("job_queue.log: skipping attribute that nests too deeply to store",
+					"key", e.Key, "attr", e.Name, "err", err.Error())
+			} else {
+				s.log.Warn("job_queue.log: skipping unparseable attribute",
+					"key", e.Key, "attr", e.Name, "err", err.Error())
+			}
 		} else if kids := s.children[e.Key]; len(kids) > 0 {
 			// Propagate a cluster-ad attribute to its chained proc rows in the jobs table (only
 			// cluster ads ever have children).
@@ -1681,7 +1705,38 @@ func (s *JobSync) chainFromParent(jobsTx *db.Txn, procKey, parentKey string) {
 		return
 	}
 	if chainAttrsInto(proc, parent) {
+		s.stripTooDeepLogged(procKey, proc)
 		jobsTx.NewClassAd(procKey, proc)
+	}
+}
+
+// stripTooDeep deletes from ad every attribute whose value nests deeper than the store can hold
+// (wire.MaxDepth) and returns their names. A whole-ad write carrying even one such value is
+// refused outright at Commit -- the key keeps its previous row and every other attribute of the
+// write is lost -- whereas without it the rest of the job lands. Each attribute is measured on its
+// own, the way the store measures it, so every offender is found in one pass.
+func stripTooDeep(ad *classad.ClassAd) []string {
+	var names []string
+	for _, a := range ad.AST().Attributes {
+		if wire.CheckExprDepth(a.Name, a.Value) != nil {
+			names = append(names, a.Name)
+		}
+	}
+	for _, n := range names {
+		ad.Delete(n)
+	}
+	return names
+}
+
+// stripTooDeepLogged is stripTooDeep for a whole-ad write the tailer builds by merging rows it
+// already holds (proc-to-cluster chaining). Every value there passed the store's own check on the
+// way in, so this finds nothing unless a row predates that check; it is here so such a row costs
+// the one attribute rather than the job.
+func (s *JobSync) stripTooDeepLogged(key string, ad *classad.ClassAd) {
+	if names := stripTooDeep(ad); len(names) > 0 {
+		s.mTooDeep.Add(int64(len(names)))
+		s.log.Warn("scheddsync: skipping attributes that nest too deeply to store",
+			"key", key, "attrs", names)
 	}
 }
 

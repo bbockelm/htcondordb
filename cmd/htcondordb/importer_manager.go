@@ -448,15 +448,16 @@ func (m *importerManager) Statuses() []dbad.ImporterStatus {
 			lastErr = e.LastErr
 		}
 		out = append(out, dbad.ImporterStatus{
-			Name:          name,
-			Running:       e.Running,
-			Restarts:      e.Restarts,
-			LastBeat:      beat,
-			LastCycle:     cyc,
-			Schedds:       e.Status.Schedds,
-			Failures:      e.Status.Failures,
-			ImportedTotal: e.Status.ImportedTotal,
-			LastErr:       lastErr,
+			Name:                name,
+			Running:             e.Running,
+			Restarts:            e.Restarts,
+			LastBeat:            beat,
+			LastCycle:           cyc,
+			Schedds:             e.Status.Schedds,
+			Failures:            e.Status.Failures,
+			ImportedTotal:       e.Status.ImportedTotal,
+			SkippedTooDeepTotal: e.Status.SkippedTooDeepTotal,
+			LastErr:             lastErr,
 		})
 	}
 	return out

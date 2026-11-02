@@ -338,7 +338,8 @@ staleness). Per-source detail is in `federation_sources`, which a consumer can w
 
 `/metrics` adds `htcondordb_federate_*`: `events_applied_total`, `identical_skips_total`,
 `resets_total`, `dedup_hits_total`, `missing_identity_total`, `phantom_deletes_total`,
-`undecodable_total`, `below_retention_total` (by table), `rejected_spokes_total` (by reason:
+`undecodable_total`, `below_retention_total`, `too_deep_total` (by table; archive records holding
+a value nested deeper than the hub can store, skipped), `rejected_spokes_total` (by reason:
 `host_mismatch`, `ha_tie`), `retired_total`, `source_staleness_seconds` (by schedd), and `sources`
 (by state). The series are registered on every htcondordb, so a daemon can become a hub on
 reconfig; on one that is not a hub they stay at zero or absent.

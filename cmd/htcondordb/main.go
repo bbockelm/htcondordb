@@ -488,7 +488,9 @@ func run() error {
 
 	// Serve the transport-neutral HTTP/SSE change feed for external, non-CEDAR sinks (opt-in via
 	// HTCONDORDB_CHANGEFEED_ADDRESS, token-gated). No-op when unset.
-	startChangeFeed(ctx, d, cfg, svc)
+	if err := startChangeFeed(ctx, d, cfg, svc); err != nil {
+		return err
+	}
 
 	// Administrative sync control (DBSyncControl): let an operator resync a schedd-sync tailer
 	// (jobs/history) or a managed exporter without a restart -- e.g. `.resync jobs` to heal a
