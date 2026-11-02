@@ -34,7 +34,7 @@ func FromProfile(p collections.AttrTypeProfile, sampled int) Measured {
 // complete sample can support a non-nullable column; see Measured.Complete.
 //
 // EVALUATED CLASSES WIN WHERE THE STORE MEASURED THEM. A profile reports what the cells STORE,
-// and an encoder bound by rule 1 (§5.1: Arrow columns carry evaluated values) puts something
+// and an encoder that carries EVALUATED values rather than stored ones puts something
 // else in the column -- so typing from the stored classes types the wrong thing. The effect is
 // not subtle on real data: MemoryUsage is stored as an expression in 1996 of 2000 history ads
 // and evaluates to an integer in all 2000, and reading the stored classes makes `expr` its

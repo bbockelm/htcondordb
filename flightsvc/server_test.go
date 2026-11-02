@@ -91,7 +91,7 @@ func seed(t *testing.T, d *db.DB, n int) {
 		} else {
 			src += fmt.Sprintf("CpusUsage = %d.25\n", i%3)
 		}
-		// The two shapes §5.1 is about, and they are deliberately both here because they
+		// The two shapes a type decision cannot separate, deliberately both here because they
 		// are indistinguishable by measurement. MemoryUsage is an expression in every ad
 		// whose VALUE is the content: it evaluates to an integer and wants a column.
 		// PeriodicRemove is an expression in every ad whose TEXT is the content: it
