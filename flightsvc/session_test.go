@@ -156,7 +156,7 @@ func TestFlightIsReadOnlyEvenForDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opts := levelOptions(allowLevels("alice", "READ", "WRITE", "DAEMON"), "", "alice")
+	opts := levelOptions(allowLevels("alice", "READ", "WRITE", "DAEMON"), "", "alice", nil)
 	if !opts.ReadOnly {
 		t.Error("a DAEMON peer's session is not read-only")
 	}
