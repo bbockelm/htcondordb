@@ -143,8 +143,8 @@ func project(decisions []arrowtype.Decision, cols []string) ([]arrowtype.Decisio
 			return nil, fmt.Errorf("no such column %q in this table", want)
 		}
 		if d.Verdict != arrowtype.Typed {
-			return nil, fmt.Errorf("column %q has no typed form (%s: %s); it is available as text in the untyped tail",
-				want, d.Reason, d.Detail)
+			return nil, fmt.Errorf("column %q has no typed form (%s: %s); it is available as text in %s",
+				want, d.Reason, d.Detail, arrowtype.TailColumnName)
 		}
 		out = append(out, d)
 	}
@@ -178,7 +178,13 @@ func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table st
 	// sound basis for declaring a column non-nullable.
 	complete := rep.Sampled < max
 	ms := arrowtype.FromProfilesComplete(rep.Profiles, rep.Sampled, complete)
-	schema, decisions := arrowtype.Schema(ms, s.derive)
+	// The tail is this endpoint's contract rather than the host's choice. Without it an
+	// attribute the measurement declined to type is simply absent from the schema, and a
+	// client cannot tell that from an attribute the table does not have -- so a host could
+	// not turn it off without making the schema lie, and there is no reason to let it.
+	derive := s.derive
+	derive.Tail = true
+	schema, decisions := arrowtype.Schema(ms, derive)
 	s.schemas.put(key, schema, decisions)
 	return schema, decisions, nil
 }
@@ -352,6 +358,16 @@ func columnsOf(decisions []arrowtype.Decision) ansi.Columns {
 	return arrowtype.Columns(decisions)
 }
 
+// hasTail reports whether these decisions include the tail column.
+func hasTail(decisions []arrowtype.Decision) bool {
+	for _, d := range decisions {
+		if d.Tail {
+			return true
+		}
+	}
+	return false
+}
+
 // schemaOf builds the Arrow schema of the typed decisions, in their given order.
 func schemaOf(decisions []arrowtype.Decision) *arrow.Schema {
 	fields := make([]arrow.Field, 0, len(decisions))
@@ -438,6 +454,14 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 		return nil, nil, err
 	}
 	schema := schemaOf(decisions)
+	// The tail is built from what the typed columns did NOT take, so it can only be filled
+	// from a whole record: a pushed-down projection would deliver exactly the attributes
+	// that are already columns and leave the tail empty in every row, which is a wrong
+	// answer rather than a slow one. Asking for it therefore turns the projection off.
+	cols := parsed.cols
+	if hasTail(decisions) {
+		cols = nil
+	}
 
 	ch := make(chan flight.StreamChunk, 2)
 	go func() {
@@ -501,7 +525,7 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 		// dbrpc loopback (see session.go), so the server is this same binary and cannot
 		// be a build that lacks the opcode. A fallback here would be untestable code
 		// guarding an impossible case.
-		scanErr := db.QueryRawProjectRefsStream(ctx, table, constraint, parsed.cols, parsed.limit, func(row string) bool {
+		scanErr := db.QueryRawProjectRefsStream(ctx, table, constraint, cols, parsed.limit, func(row string) bool {
 			// The projection ops stream OLD-ClassAd text, not the bracketed form.
 			ad, perr := classad.ParseOld(row)
 			if perr != nil {
