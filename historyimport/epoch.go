@@ -58,7 +58,7 @@ func epochKey(ad *classad.ClassAd, scheddName string) string {
 // cursor T), skipping the record keys already imported there, and appends
 // everything newer; the new cursor is the newest EpochWriteDate seen plus its
 // boundary key set.
-func (im *Importer) importEpochSchedd(ctx context.Context, j Job, sd ScheddRef) (int, error) {
+func (im *Importer) importEpochSchedd(ctx context.Context, j Job, sd ScheddRef) (imported, skipped int, err error) {
 	prev := decodeEpochCursor(func() string { v, _ := im.Cur.Get(j.Name, sd.Name); return v }())
 	prevKeys := make(map[string]bool, len(prev.Keys))
 	for _, k := range prev.Keys {
@@ -74,9 +74,8 @@ func (im *Importer) importEpochSchedd(ctx context.Context, j Job, sd ScheddRef) 
 	maxT := prev.T
 	boundary := map[string]bool{}
 	sawRecord := false
-	imported := 0
 
-	err := im.Src.History(ctx, sd, j.Constraint, since, j.MaxPerCycle, func(ad *classad.ClassAd) error {
+	err = im.Src.History(ctx, sd, j.Constraint, since, j.MaxPerCycle, func(ad *classad.ClassAd) error {
 		wd, ok := ad.EvaluateAttrInt(epochWriteDateAttr)
 		if !ok {
 			return nil // not an epoch record (no write date): skip
@@ -100,13 +99,17 @@ func (im *Importer) importEpochSchedd(ctx context.Context, j Job, sd ScheddRef) 
 		}
 		stamp(ad, sd.Name, im.now())
 		if aerr := im.W.Append(ctx, j.Table, ad); aerr != nil {
+			if im.skipTooDeep(j, sd, key, aerr) {
+				skipped++
+				return nil
+			}
 			return fmt.Errorf("append: %w", aerr)
 		}
 		imported++
 		return nil
 	})
 	if err != nil {
-		return imported, err
+		return imported, skipped, err
 	}
 
 	// Persist only when the stream returned records at/after the cursor; an empty
@@ -118,11 +121,11 @@ func (im *Importer) importEpochSchedd(ctx context.Context, j Job, sd ScheddRef) 
 			keys = append(keys, k)
 		}
 		if ferr := im.W.Flush(ctx, j.Table); ferr != nil {
-			return imported, fmt.Errorf("flush: %w", ferr)
+			return imported, skipped, fmt.Errorf("flush: %w", ferr)
 		}
 		if serr := im.Cur.Set(j.Name, sd.Name, encodeEpochCursor(epochCursor{T: maxT, Keys: keys})); serr != nil {
-			return imported, fmt.Errorf("persist cursor: %w", serr)
+			return imported, skipped, fmt.Errorf("persist cursor: %w", serr)
 		}
 	}
-	return imported, nil
+	return imported, skipped, nil
 }

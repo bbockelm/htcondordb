@@ -1,6 +1,7 @@
 package federate
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -167,6 +168,13 @@ func (s *archiveSink) apply(c replicate.Change) error {
 			}
 		}
 		if err := s.arch.AppendDeferred(c.Ad); err != nil {
+			// A record nested deeper than the archive can hold is refused the same way on every
+			// replay, so failing the session on it would wedge this source at that record. A spoke
+			// on the same storage could not have stored it either; this guards a spoke that can.
+			if errors.Is(err, db.ErrTooDeep) {
+				s.metrics.TooDeep.WithLabelValues(s.table).Inc()
+				break
+			}
 			return err
 		}
 		s.appended = true

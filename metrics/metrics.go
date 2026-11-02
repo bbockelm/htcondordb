@@ -338,6 +338,7 @@ type syncCollector struct {
 	syncLastTime     *prometheus.Desc
 	syncResyncs      *prometheus.Desc
 	syncAbsentKey    *prometheus.Desc
+	syncTooDeep      *prometheus.Desc
 	deltaFallback    *prometheus.Desc
 	syncReconciles   *prometheus.Desc
 	syncCommitSecs   *prometheus.Desc
@@ -353,6 +354,7 @@ type syncCollector struct {
 	impUp            *prometheus.Desc
 	impRestarts      *prometheus.Desc
 	impImported      *prometheus.Desc
+	impTooDeep       *prometheus.Desc
 	impSchedds       *prometheus.Desc
 	impFailures      *prometheus.Desc
 	impLastBeat      *prometheus.Desc
@@ -381,6 +383,8 @@ func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dba
 			"Number of full resyncs the history tailer has performed (a gap/rotation was detected), by kind and source.", sync, nil),
 		syncAbsentKey: prometheus.NewDesc(namespace+"_sync_setattr_absent_key_total",
 			"Set/DeleteAttribute ops the schedd-sync tailer applied to a key not present in its view, by kind and source. Each fabricates an identity-less 'orphan' ad (only the update's attributes); a valid log writes a key's NewClassAd first, so this should be ~0. A climbing value localizes partial-ad churn to updates landing on unresolvable keys.", sync, nil),
+		syncTooDeep: prometheus.NewDesc(namespace+"_sync_too_deep_total",
+			"Values the schedd-sync tailer dropped because they nest deeper than the store can hold, by kind and source: attribute values on the job_queue.log source (the rest of the job is still mirrored), whole records on the history and epoch sources. The refusal is permanent, so the tailer skips the value instead of retrying; a non-zero value names data the mirror does not have.", sync, nil),
 		deltaFallback: prometheus.NewDesc(namespace+"_delta_fallback_total",
 			"Patch writes that did NOT store a delta record, by reason. \"removal\": the write deleted an attribute, which a delta cannot express. \"bound\": the key's chain reached DeltaMax. \"no_base\": no whole record to chain to (a create). \"ineligible\": delta records not in use for the write. \"unreadable_base\": REFUSED -- the key was present but its current record could not be read; before that refusal existed each of these stored the transaction's attributes as a whole record, producing an identity-less row (no ClusterId/JobStatus/Key). A climbing unreadable_base means the store is failing to resolve keys it holds.",
 			[]string{"reason"}, nil),
@@ -413,6 +417,8 @@ func newSyncCollector(sources func() []dbad.StatusSource, exporters func() []dba
 			"Number of times the daemon has restarted this history-import runner (crash or wedged-liveness), by import_job.", imp, nil),
 		impImported: prometheus.NewDesc(namespace+"_import_job_imported_total",
 			"Cumulative history records this runner has imported since it started, by import_job.", imp, nil),
+		impTooDeep: prometheus.NewDesc(namespace+"_import_job_skipped_too_deep_total",
+			"Cumulative history records this runner passed over because a value in them nests deeper than the archive can hold, by import_job. The refusal is permanent, so the runner advances past the record rather than stopping on it; a non-zero value names records the archive does not have.", imp, nil),
 		impSchedds: prometheus.NewDesc(namespace+"_import_job_last_cycle_schedds",
 			"Schedds imported in the runner's last cycle, by import_job.", imp, nil),
 		impFailures: prometheus.NewDesc(namespace+"_import_job_last_cycle_failures",
@@ -453,6 +459,7 @@ func (c *syncCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 			ch <- prometheus.MustNewConstMetric(c.syncResyncs, prometheus.CounterValue, float64(s.Resyncs), s.Kind, s.Source)
 			ch <- prometheus.MustNewConstMetric(c.syncAbsentKey, prometheus.CounterValue, float64(s.SetAttrAbsentKey), s.Kind, s.Source)
+			ch <- prometheus.MustNewConstMetric(c.syncTooDeep, prometheus.CounterValue, float64(s.TooDeep), s.Kind, s.Source)
 			ch <- prometheus.MustNewConstMetric(c.syncReconciles, prometheus.CounterValue, float64(s.Reconciles), s.Kind, s.Source)
 			ch <- prometheus.MustNewConstMetric(c.syncCommitSecs, prometheus.CounterValue, s.CommitSeconds, s.Kind, s.Source)
 			ch <- prometheus.MustNewConstMetric(c.syncPollSecs, prometheus.CounterValue, s.PollSeconds, s.Kind, s.Source)
@@ -490,6 +497,7 @@ func (c *syncCollector) Collect(ch chan<- prometheus.Metric) {
 			g(c.impUp, b2f(im.Running))
 			ch <- prometheus.MustNewConstMetric(c.impRestarts, prometheus.CounterValue, float64(im.Restarts), im.Name)
 			ch <- prometheus.MustNewConstMetric(c.impImported, prometheus.CounterValue, float64(im.ImportedTotal), im.Name)
+			ch <- prometheus.MustNewConstMetric(c.impTooDeep, prometheus.CounterValue, float64(im.SkippedTooDeepTotal), im.Name)
 			g(c.impSchedds, float64(im.Schedds))
 			g(c.impFailures, float64(im.Failures))
 			if !im.LastBeat.IsZero() {

@@ -64,7 +64,7 @@ func TestHandlerExposesSyncExporterAndImporterMetrics(t *testing.T) {
 	sources := func() []dbad.StatusSource {
 		return []dbad.StatusSource{
 			// No Source path -> live-lag recompute leaves the reported values as-is.
-			fakeSource{st: scheddsync.SyncStatus{Kind: "history", Offset: 500, FileSize: 700, LagBytes: 200, CaughtUp: false, LastSync: time.Unix(1_700_000_400, 0), Resyncs: 2}},
+			fakeSource{st: scheddsync.SyncStatus{Kind: "history", Offset: 500, FileSize: 700, LagBytes: 200, CaughtUp: false, LastSync: time.Unix(1_700_000_400, 0), Resyncs: 2, TooDeep: 4}},
 		}
 	}
 	exporters := func() []dbad.ExporterStatus {
@@ -75,7 +75,7 @@ func TestHandlerExposesSyncExporterAndImporterMetrics(t *testing.T) {
 	}
 	importers := func() []dbad.ImporterStatus {
 		return []dbad.ImporterStatus{
-			{Name: "ospool", Running: true, Restarts: 2, ImportedTotal: 9123, Schedds: 8, Failures: 1,
+			{Name: "ospool", Running: true, Restarts: 2, ImportedTotal: 9123, SkippedTooDeepTotal: 6, Schedds: 8, Failures: 1,
 				LastBeat: time.Unix(1_700_000_470, 0), LastCycle: time.Unix(1_700_000_400, 0)},
 			{Name: "cm-east", Running: false, Restarts: 5},
 		}
@@ -93,6 +93,7 @@ func TestHandlerExposesSyncExporterAndImporterMetrics(t *testing.T) {
 		`htcondordb_sync_caught_up{kind="history",source=""} 0`,
 		`htcondordb_sync_behind_seconds_total{kind="history",source=""} `, // present (value grows over time)
 		`htcondordb_sync_resyncs_total{kind="history",source=""} 2`,
+		`htcondordb_sync_too_deep_total{kind="history",source=""} 4`,
 		`htcondordb_sync_commit_seconds_total{kind="history",source=""} 0`,
 		`htcondordb_sync_poll_seconds_total{kind="history",source=""} 0`,
 		`htcondordb_sync_reconcile_seconds_total{kind="history",source=""} 0`,
@@ -105,6 +106,7 @@ func TestHandlerExposesSyncExporterAndImporterMetrics(t *testing.T) {
 		`htcondordb_import_job_up{import_job="ospool"} 1`,
 		`htcondordb_import_job_restarts_total{import_job="ospool"} 2`,
 		`htcondordb_import_job_imported_total{import_job="ospool"} 9123`,
+		`htcondordb_import_job_skipped_too_deep_total{import_job="ospool"} 6`,
 		`htcondordb_import_job_last_cycle_schedds{import_job="ospool"} 8`,
 		`htcondordb_import_job_last_cycle_failures{import_job="ospool"} 1`,
 		`htcondordb_import_job_last_beat_timestamp_seconds{import_job="ospool"} `,

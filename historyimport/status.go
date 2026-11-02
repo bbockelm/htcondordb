@@ -22,7 +22,10 @@ type Status struct {
 	Schedds       int    `json:"schedds"`       // schedds imported in the last cycle
 	Failures      int    `json:"failures"`      // schedds that errored in the last cycle
 	ImportedTotal uint64 `json:"importedTotal"` // cumulative records imported since the runner started
-	LastError     string `json:"lastError,omitempty"`
+	// SkippedTooDeepTotal is the cumulative count of records passed over because a value in them
+	// nests deeper than the archive can hold (see Stats.SkippedTooDeep).
+	SkippedTooDeepTotal uint64 `json:"skippedTooDeepTotal,omitempty"`
+	LastError           string `json:"lastError,omitempty"`
 }
 
 // WriteStatusFile writes s to path atomically (temp + rename).
@@ -97,6 +100,7 @@ func (b *StatusBeater) RecordCycle(st Stats, err error) {
 	b.s.Schedds = st.Schedds
 	b.s.Failures = st.Failures
 	b.s.ImportedTotal += uint64(st.Imported)
+	b.s.SkippedTooDeepTotal += uint64(st.SkippedTooDeep)
 	if err != nil {
 		b.s.LastError = err.Error()
 	} else {

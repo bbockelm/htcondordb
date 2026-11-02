@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
+	"errors"
 	"net"
 	"net/http"
 	"os"
 	"time"
 
 	"github.com/PelicanPlatform/classad/changefeed"
+	"github.com/PelicanPlatform/classad/db"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
@@ -18,7 +21,9 @@ import (
 // startChangeFeed serves the transport-neutral HTTP/SSE change feed
 // (github.com/PelicanPlatform/classad/changefeed) so a standalone, non-CEDAR sink can pull and
 // fan in this database's tables/archives. Opt-in via HTCONDORDB_CHANGEFEED_ADDRESS (e.g. ":9620");
-// token-gated by HTCONDORDB_CHANGEFEED_TOKEN. HTCONDORDB_CHANGEFEED_AGE_ATTR (e.g.
+// token-gated by HTCONDORDB_CHANGEFEED_TOKEN, whose subscribers are unprivileged (sealed values
+// arrive as undefined), and optionally HTCONDORDB_CHANGEFEED_PRIVILEGED_TOKEN, whose subscribers
+// receive sealed values in plaintext. HTCONDORDB_CHANGEFEED_AGE_ATTR (e.g.
 // "EnteredHistoryTime") is stamped as each event's GC timestamp so a sink's ACK advances the
 // source's GC floor.
 //
@@ -30,13 +35,16 @@ import (
 // startup); the optional HTCONDORDB_CHANGEFEED_MIN_AGE_SECONDS sets a guaranteed drain window
 // (Retention.MinAge) before consumed data may be dropped. Hard ceilings (MaxAge/MaxSegments/
 // MaxBytes) still win over the floor, so a slow or absent consumer never grows the store unbounded.
-func startChangeFeed(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service) {
+//
+// It returns an error only for a configuration it must refuse to serve; the daemon does not start.
+func startChangeFeed(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service) error {
 	addr := getStr(cfg, "HTCONDORDB_CHANGEFEED_ADDRESS")
 	if addr == "" {
-		return
+		return nil
 	}
 	log := d.Logger()
 	token := getStr(cfg, "HTCONDORDB_CHANGEFEED_TOKEN")
+	privToken := getStr(cfg, "HTCONDORDB_CHANGEFEED_PRIVILEGED_TOKEN")
 	ageAttr := getStr(cfg, "HTCONDORDB_CHANGEFEED_AGE_ATTR")
 
 	// The GC floor only drains a served archive when its Retention.MinAgeAttr resolves to a
@@ -76,22 +84,17 @@ func startChangeFeed(ctx context.Context, d *daemon.Daemon, cfg *config.Config, 
 		reg.LeaseTTL = time.Duration(s) * time.Second
 	}
 
-	var auth changefeed.Authorizer
-	if token != "" {
-		auth = bearerAuthorizer(token)
-	} else {
-		log.Warn(logging.DestinationGeneral, "change feed served WITHOUT a token (set HTCONDORDB_CHANGEFEED_TOKEN)", "addr", addr)
+	handler, err := changeFeedHandler(svc.Catalog(), token, privToken, reg, ageAttr)
+	if err != nil {
+		return err
 	}
-
-	handler := changefeed.Handler(svc.Catalog(), changefeed.ServerOptions{
-		Auth:     auth,
-		Registry: reg,
-		AgeAttr:  ageAttr,
-	})
+	if token == "" && privToken == "" {
+		log.Warn(logging.DestinationGeneral, "change feed served WITHOUT a token (set HTCONDORDB_CHANGEFEED_TOKEN); every subscriber is unprivileged", "addr", addr)
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Error(logging.DestinationGeneral, "change feed: cannot listen", "addr", addr, "err", err.Error())
-		return
+		return nil
 	}
 	// Publish the actual bound address (covering ":0" dynamic ports) so tooling can discover it.
 	if af := getStr(cfg, "HTCONDORDB_CHANGEFEED_ADDRESS_FILE"); af != "" {
@@ -100,7 +103,8 @@ func startChangeFeed(ctx context.Context, d *daemon.Daemon, cfg *config.Config, 
 		}
 	}
 	srv := &http.Server{Handler: handler}
-	log.Info(logging.DestinationGeneral, "serving change feed", "addr", ln.Addr().String(), "token", token != "")
+	log.Info(logging.DestinationGeneral, "serving change feed", "addr", ln.Addr().String(),
+		"token", token != "", "privileged_token", privToken != "")
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Error(logging.DestinationGeneral, "change feed listener stopped", "err", err.Error())
@@ -114,18 +118,69 @@ func startChangeFeed(ctx context.Context, d *daemon.Daemon, cfg *config.Config, 
 	// Reap expired subscriber leases, surface the per-table GC floor for observability, and (when
 	// ageAttr is set) enforce it as each served archive's runtime GC watermark.
 	go changeFeedFloorLoop(ctx, d, svc, reg, ageAttr)
+	return nil
 }
 
-// bearerAuthorizer authorizes a change-feed request iff it carries the given bearer token, taking
-// the src label and subscriber id from the query (the token only authorizes).
-func bearerAuthorizer(token string) changefeed.Authorizer {
-	want := "Bearer " + token
-	return func(r *http.Request) (src, sub string, ok bool) {
-		if r.Header.Get("Authorization") != want {
-			return "", "", false
-		}
-		return r.URL.Query().Get("src"), r.URL.Query().Get("subscriber"), true
+// changeFeedHandler is the feed served on HTCONDORDB_CHANGEFEED_ADDRESS, gated by the two tokens
+// (see changeFeedAuthorizer).
+func changeFeedHandler(cat *db.Catalog, token, privToken string, reg changefeed.Registry, ageAttr string) (http.Handler, error) {
+	authorize, err := changeFeedAuthorizer(token, privToken)
+	if err != nil {
+		return nil, err
 	}
+	return changefeed.Handler(cat, changefeed.ServerOptions{
+		Authorize: authorize,
+		Registry:  reg,
+		AgeAttr:   ageAttr,
+	}), nil
+}
+
+// errChangeFeedTokensEqual refuses a privileged token that is the unprivileged one: every holder of
+// the shared token would be served sealed values in plaintext, which is the opposite of what
+// configuring two tokens asks for.
+var errChangeFeedTokensEqual = errors.New("change feed: HTCONDORDB_CHANGEFEED_PRIVILEGED_TOKEN must differ from HTCONDORDB_CHANGEFEED_TOKEN")
+
+// changeFeedAuthorizer builds the feed's authorizer from its two bearer tokens. A request bearing
+// token is admitted unprivileged: each event is decoded without the data key, so sealed values
+// arrive as undefined and a constraint naming a private attribute is refused. One bearing
+// privToken is admitted privileged and receives sealed values in plaintext. Either may be empty;
+// with both empty it returns nil, which the feed serves to everyone, unprivileged. The src label
+// and subscriber id come from the query (a token only authorizes).
+//
+// The comparisons take time independent of the header's contents, so a caller probing for a token
+// cannot learn it a byte at a time from response latency (a length mismatch returns at once, which
+// tells it only the token's length).
+func changeFeedAuthorizer(token, privToken string) (changefeed.GrantAuthorizer, error) {
+	if privToken != "" && privToken == token {
+		return nil, errChangeFeedTokensEqual
+	}
+	if token == "" && privToken == "" {
+		return nil, nil
+	}
+	return func(r *http.Request) (changefeed.Grant, bool) {
+		got := []byte(r.Header.Get("Authorization"))
+		g := changefeed.Grant{Src: r.URL.Query().Get("src"), Subscriber: r.URL.Query().Get("subscriber")}
+		// Both are compared on every request so the time taken does not say which one matched.
+		priv := bearerMatches(got, privToken)
+		unpriv := bearerMatches(got, token)
+		switch {
+		case priv:
+			g.Privileged = true
+			return g, true
+		case unpriv:
+			return g, true
+		}
+		return changefeed.Grant{}, false
+	}, nil
+}
+
+// bearerMatches reports whether header is "Bearer <token>", comparing in constant time. An empty
+// token matches nothing.
+func bearerMatches(header []byte, token string) bool {
+	if token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare(header, []byte("Bearer "+token)) == 1
 }
 
 // changeFeedFloorLoop periodically evicts dead subscribers, logs each served table's GC floor (min

@@ -196,6 +196,10 @@ var unreadableReasons = []struct{ reason, suffix string }{
 	// so a non-zero count there means writes are being dropped that a retry would have landed.
 	{"delta-chain-broken", "ChainBroken"},
 	{"delta-index-pending", "IndexPending"},
+	// A write from a session not entitled to the data key (an unprivileged dbrpc client) that
+	// needed the whole record, refused because the record holds a sealed value that only the key
+	// can carry forward. Not storage damage: the writer lacks the privilege to rewrite that row.
+	{"sealed-needs-key", "SealedNeedsKey"},
 }
 
 // ExporterStatus is one change-data exporter's health as the daemon's exporter manager sees it:
@@ -227,7 +231,10 @@ type ImporterStatus struct {
 	Schedds       int       // schedds imported in the last cycle
 	Failures      int       // schedds that errored in the last cycle
 	ImportedTotal uint64    // cumulative records imported since the runner started
-	LastErr       string
+	// SkippedTooDeepTotal is the cumulative count of records the runner passed over because a
+	// value in them nests deeper than the archive can hold.
+	SkippedTooDeepTotal uint64
+	LastErr             string
 }
 
 // AddAttrs augments a daemon-produced base ad with the HTCondorDB-specific attributes: the
@@ -339,6 +346,7 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 		ad.InsertAttr(p+"Reconciles", s.Reconciles)
 		ad.InsertAttr(p+"ReconcileLookupMiss", s.ReconcileLookupMiss)
 		ad.InsertAttr(p+"Unapplied", s.Unapplied)
+		ad.InsertAttr(p+"TooDeep", s.TooDeep)
 		if !s.LastSync.IsZero() {
 			ad.InsertAttr(p+"LastSyncTime", s.LastSync.Unix())
 			secs := int64(in.Now.Sub(s.LastSync).Seconds())
@@ -389,6 +397,7 @@ func AddAttrs(ad *classad.ClassAd, in Input) {
 		ad.InsertAttr(p+"Schedds", int64(im.Schedds))
 		ad.InsertAttr(p+"Failures", int64(im.Failures))
 		ad.InsertAttr(p+"ImportedTotal", int64(im.ImportedTotal))
+		ad.InsertAttr(p+"SkippedTooDeepTotal", int64(im.SkippedTooDeepTotal))
 		if !im.LastBeat.IsZero() {
 			ad.InsertAttr(p+"LastBeatTime", im.LastBeat.Unix())
 			secs := int64(in.Now.Sub(im.LastBeat).Seconds())

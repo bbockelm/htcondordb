@@ -18,6 +18,7 @@ type Metrics struct {
 	PhantomDeletes   *prometheus.CounterVec // labels: table -- rows a Reset replay did not re-send
 	Undecodable      *prometheus.CounterVec // labels: table -- changes whose ad could not be decoded
 	BelowRetention   *prometheus.CounterVec // labels: table -- replayed records the hub's cap already dropped
+	TooDeep          *prometheus.CounterVec // labels: table -- archive records nested too deeply to store
 	RejectedSpokes   *prometheus.CounterVec // labels: reason
 	Retired          prometheus.Counter
 	SourceStaleness  *prometheus.GaugeVec // labels: schedd
@@ -49,6 +50,8 @@ func NewMetrics() *Metrics {
 			"Replicated upserts whose ad could not be decoded, by table. A mutable table keeps the row it holds for the key; an archive skips the record.", "table"),
 		BelowRetention: cv("below_retention_total",
 			"Archive records of a Reset replay not appended because they are older than anything the hub's capped archive still holds for that AP (the cap already dropped them), by table.", "table"),
+		TooDeep: cv("too_deep_total",
+			"Archive records not appended because a value in them nests deeper than the hub can store, by table. The refusal is permanent, so the record is skipped rather than failing the session.", "table"),
 		RejectedSpokes: cv("rejected_spokes_total",
 			"Spoke ads not paired with a schedd, by reason (host_mismatch, ha_tie); counted per discovery pass.", "reason"),
 		Retired: prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Subsystem: sub, Name: "retired_total",
@@ -77,7 +80,7 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 
 func (m *Metrics) collectors() []prometheus.Collector {
 	return []prometheus.Collector{m.EventsApplied, m.IdenticalSkips, m.Resets, m.DedupHits, m.MissingIdentity,
-		m.PhantomDeletes, m.Undecodable, m.BelowRetention, m.RejectedSpokes, m.Retired, m.SourceStaleness, m.SourcesByState}
+		m.PhantomDeletes, m.Undecodable, m.BelowRetention, m.TooDeep, m.RejectedSpokes, m.Retired, m.SourceStaleness, m.SourcesByState}
 }
 
 // setStaleness publishes the per-source staleness gauges, dropping sources no longer present or
