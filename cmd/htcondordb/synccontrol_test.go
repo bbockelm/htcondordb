@@ -36,7 +36,16 @@ func TestExporterResyncClearsStateAndRestarts(t *testing.T) {
 	go m.reconcileLoop(ctx, s, done)
 
 	// Launched once and marked running (so its child-cancel is published).
-	waitForCount(t, countFile, 1, 3*time.Second)
+	//
+	// The deadline is a FAILURE bound, not a sleep: waitForCount polls at 10ms and returns as
+	// soon as the count is there, which on a healthy run is one reconcile tick. So a generous
+	// bound costs a passing run nothing and only delays a genuine failure -- and 3 seconds was
+	// not generous. What it waits for is a fork/exec of a shell script, which has no upper
+	// bound related to anything this test is about, and it was the tightest wait in this
+	// family by half while its siblings allow 5 and 8 seconds for TWO launches. It failed
+	// twice in full-suite runs, where twenty packages compete for the machine, and passed
+	// every time in isolation.
+	waitForCount(t, countFile, 1, 20*time.Second)
 	waitFor2(t, func() bool {
 		for _, st := range m.Statuses() {
 			if st.Name == "jobs" && st.Running {
@@ -51,7 +60,7 @@ func TestExporterResyncClearsStateAndRestarts(t *testing.T) {
 	}
 
 	// The child is stopped and relaunched (a second launch appears)...
-	waitForCount(t, countFile, 2, 5*time.Second)
+	waitForCount(t, countFile, 2, 20*time.Second)
 	// ...and the cursor was cleared so the relaunch re-exports from the start.
 	waitFor2(t, func() bool {
 		b, ok, _ := cat.LoadExporterState("jobs")
