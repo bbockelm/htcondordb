@@ -130,6 +130,19 @@ type Decision struct {
 	Tail bool
 }
 
+// DefaultSampleMax is how many records a type derivation reads.
+//
+// It lives here rather than beside each caller because the number is part of the ANSWER, not a
+// per-caller tuning knob: the schema is a declaration about a whole table, and two front doors
+// that sample differently believe the table has different columns. They did. The endpoint read
+// 10000 and the REPL dialect read 2000 while its comment said the two matched, so the same
+// table could present one set of columns over ADBC and another in the REPL at the same moment.
+//
+// The size itself is set by what the minority kinds look like on a real AP: the attributes
+// whose typing matters most had their second kind in well under 1% of records, so a sample has
+// to be large to see one at all.
+const DefaultSampleMax = 10000
+
 // TailColumnName is the column that carries the attributes no typed column covers.
 //
 // The leading underscore is deliberate: a ClassAd attribute name cannot begin with one, so this

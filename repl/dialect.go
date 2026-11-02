@@ -85,10 +85,11 @@ func (e *Executor) lowerPredicate(table, predicate string) (string, error) {
 	return lowered, nil
 }
 
-// ansiSampleMax bounds the records the type derivation reads. The same cap the Flight SQL
-// endpoint uses by default: large enough that a heterogeneous attribute shows both of its
-// shapes, small enough to stay interactive.
-const ansiSampleMax = 2000
+// ansiSampleMax bounds the records the type derivation reads. It is the shared default rather
+// than a number of its own, because a dialect that sampled differently from the Flight endpoint
+// would disagree with it about which columns the table has -- which is what happened while this
+// read 2000 and claimed to match.
+const ansiSampleMax = arrowtype.DefaultSampleMax
 
 // applyDialect rewrites a statement's predicates for the session's dialect, before anything
 // executes. One place, so every path downstream -- the scan, EXPLAIN, a DELETE's selector --
