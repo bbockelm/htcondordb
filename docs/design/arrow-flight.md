@@ -538,6 +538,8 @@ listener should be on by default when the TCP one is not.
 | SqlInfo conformance | `flightsvc/server.go` | the entries a real driver asks for at connect, one of which failed every ADBC client while Go was green |
 | ANSI → ClassAd lowering (§8) | `ansi/` | the comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, and `?` holes |
 | The same dialect in the REPL | `repl/dialect.go`, `-dialect` | one Arrow-column→SQL-kind mapping serves both front doors |
+| Result-column typing | `repl/arrowcols.go` | the SELECT list typed against a table's declarations; shared, so the two front doors cannot disagree about what a query returns |
+| Arrow output in the REPL | `repl/arrowout.go`, `.format arrow` | a SELECT's result as Arrow IPC; refuses a terminal |
 
 **Prepared statements with bound parameters** are served. Two decisions in that increment are
 worth keeping, both arrived at by trying the obvious thing first:
@@ -675,8 +677,23 @@ Ordered by value per unit of work.
 
 2. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
    parses cells and keeps its own `knownTimeAttrs`; the DB-API cursor still documents
-   `description` as "what arrived, not a schema". There is no `arrow()` on the Python client and
-   no `.arrow` in the REPL. All of it is nearly free now that the encoder exists.
+   `description` as "what arrived, not a schema". Both need typed columns to reach them over
+   their own transports, so neither is the "nearly free" job this item used to claim — the
+   plugin runs in Grafana's process and would have to derive the schema itself through
+   `AttrTypeProfiles`, which is real work rather than wiring. `arrow()` on the Python client is
+   the same shape. **`.format arrow` in the REPL is done** (`repl/arrowout.go`): a SELECT's
+   result as an Arrow IPC stream, refusing a terminal because it is binary and every other
+   format here is text. Three sources, because the honest typed form of each result differs —
+   `SELECT *` encodes the ads against the table's schema with the tail, a projection evaluates
+   each item per ad through the same `RowStreamer` the other formats use, and an aggregate,
+   which has no ads, parses its cells back from display text against their declared types.
+
+   **The branch order is load-bearing and nothing ordinary proves it.** Routing a projection
+   through the aggregate branch passes every type and value assertion, because an ordinary
+   fixture round-trips through text unchanged. What separates them is an attribute whose VALUE
+   is the word `undefined`, which the display form also uses to spell "no value": read from the
+   ad it is that string, parsed back from text it is a null. That is also a standing limitation
+   of the aggregate branch, stated here rather than discovered.
 
 3. **Then the columnar producer.** Last, and for a measured reason rather than an argued one:
    what is left of a read is the storage read itself, and it should be measured against the

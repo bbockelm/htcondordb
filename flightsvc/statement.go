@@ -21,6 +21,7 @@ import (
 
 	"github.com/bbockelm/htcondordb/ansi"
 	"github.com/bbockelm/htcondordb/arrowtype"
+	"github.com/bbockelm/htcondordb/repl"
 )
 
 // The statement surface: one shape, and a refusal for everything else.
@@ -309,7 +310,7 @@ func (s *Server) planAnalytic(ctx context.Context, an *analytic) (plan, error) {
 	if err != nil {
 		return plan{}, err
 	}
-	decisions, err := analyticDecisions(an.st, table)
+	decisions, err := repl.ArrowDecisions(an.st, table)
 	if err != nil {
 		return plan{}, err
 	}
@@ -546,7 +547,7 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args, pinne
 		// The executor carries its own predicate, lowered by the ANSI dialect when it
 		// runs, so there is no constraint to build here and the columns come from the
 		// SELECT list rather than from the table.
-		decisions, err = analyticDecisions(an.st, allDecisions)
+		decisions, err = repl.ArrowDecisions(an.st, allDecisions)
 	} else {
 		constraint, err = constraintFor(parsed, allDecisions, bound)
 		if err == nil {
