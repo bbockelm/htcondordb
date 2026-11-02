@@ -136,7 +136,7 @@ func (it SelectItem) windowText() string {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString(t.Item.header())
+		b.WriteString(t.Item.Header())
 		if t.Desc {
 			b.WriteString(" DESC")
 		}
@@ -193,7 +193,7 @@ func rejectWindowInWhere(st *Statement) error {
 		if it.Alias != "" {
 			named[strings.ToLower(it.Alias)] = it.Alias
 		}
-		named[strings.ToLower(it.header())] = it.header()
+		named[strings.ToLower(it.Header())] = it.Header()
 	}
 	for _, a := range q.ReadAttrs() {
 		if name, ok := named[strings.ToLower(a)]; ok {
@@ -220,7 +220,7 @@ func validateQualify(st *Statement) error {
 		if it.Window == "" {
 			continue
 		}
-		inScope[strings.ToLower(it.header())] = true
+		inScope[strings.ToLower(it.Header())] = true
 		if it.Alias != "" {
 			inScope[strings.ToLower(it.Alias)] = true
 		}
@@ -392,7 +392,7 @@ func qualifyKeep(st *Statement, ads []*classad.ClassAd, win [][]string) ([]*clas
 			if it.Window == "" {
 				continue
 			}
-			setLiteral(scope, it.header(), win[i][j])
+			setLiteral(scope, it.Header(), win[i][j])
 			if it.Alias != "" {
 				setLiteral(scope, it.Alias, win[i][j])
 			}
@@ -429,7 +429,7 @@ func (e *Executor) execSelectWindow(st *Statement) (*Result, error) {
 	res := &Result{IsSelect: true}
 	compiled := make([]*classad.Expr, len(st.Items))
 	for j, it := range st.Items {
-		res.Columns = append(res.Columns, it.header())
+		res.Columns = append(res.Columns, it.Header())
 		if it.Window == "" && it.Expr != "" {
 			ex, perr := classad.ParseExpr(it.Expr)
 			if perr != nil {
@@ -463,9 +463,9 @@ func (e *Executor) execSelectWindow(st *Statement) (*Result, error) {
 	if len(st.OrderBy) > 0 {
 		idxs := make([]int, len(st.OrderBy))
 		for k, t := range st.OrderBy {
-			idx := columnIndex(res.Columns, t.Item.header())
+			idx := columnIndex(res.Columns, t.Item.Header())
 			if idx < 0 {
-				return nil, fmt.Errorf("ORDER BY %s is not a selected column", t.Item.header())
+				return nil, fmt.Errorf("ORDER BY %s is not a selected column", t.Item.Header())
 			}
 			idxs[k] = idx
 		}

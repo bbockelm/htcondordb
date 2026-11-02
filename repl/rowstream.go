@@ -47,7 +47,7 @@ func (e *Executor) RowStreamer(st *Statement) ([]string, func(*classad.ClassAd) 
 	columns := make([]string, len(st.Items))
 	compiled := make([]*classad.Expr, len(st.Items))
 	for j, it := range st.Items {
-		columns[j] = it.header()
+		columns[j] = it.Header()
 		if it.Expr != "" {
 			ex, err := classad.ParseExpr(it.Expr)
 			if err != nil {

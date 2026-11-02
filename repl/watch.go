@@ -121,7 +121,7 @@ func (s *session) watchHeader(console io.Writer, st *Statement) {
 	cols := make([]string, 0, len(st.Items)+2)
 	cols = append(cols, "event", "Key")
 	for _, it := range st.Items {
-		cols = append(cols, it.header())
+		cols = append(cols, it.Header())
 	}
 	fmt.Fprintln(console, watchRow(cols))
 }
@@ -166,7 +166,7 @@ func (s *session) watchEmit(console io.Writer, st *Statement, filter *db.Constra
 	cells := make([]string, 0, len(st.Items)+2)
 	cells = append(cells, kind, ev.Key)
 	for _, it := range st.Items {
-		cells = append(cells, valueDisplay(ad.EvaluateAttr(it.header())))
+		cells = append(cells, valueDisplay(ad.EvaluateAttr(it.Header())))
 	}
 	fmt.Fprintln(console, watchRow(cells))
 	return true
