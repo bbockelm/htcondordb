@@ -22,6 +22,12 @@ func tailValues(t *testing.T, q string) ([]string, *arrow.Schema) {
 	t.Helper()
 	cl, _, done := harness(t, 12)
 	t.Cleanup(done)
+	return tailValuesFrom(t, cl, q)
+}
+
+// tailValuesFrom is tailValues against a client the caller already has.
+func tailValuesFrom(t *testing.T, cl *flightsql.Client, q string) ([]string, *arrow.Schema) {
+	t.Helper()
 	ctx := context.Background()
 
 	info, err := cl.Execute(ctx, q)

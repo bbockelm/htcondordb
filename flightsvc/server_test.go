@@ -28,6 +28,13 @@ import (
 // layer would hide the layers disagreeing, and the point of this test is that they do not.
 func harness(t *testing.T, rows int) (*flightsql.Client, *Server, func()) {
 	t.Helper()
+	return harnessWith(t, rows, arrowtype.Options{TimeAttrs: map[string]bool{"qdate": true}})
+}
+
+// harnessWith is harness with the type declarations given, so a test can pose the case that
+// only a declaration settles.
+func harnessWith(t *testing.T, rows int, derive arrowtype.Options) (*flightsql.Client, *Server, func()) {
+	t.Helper()
 	d, err := db.Open("")
 	if err != nil {
 		t.Fatal(err)
@@ -41,9 +48,7 @@ func harness(t *testing.T, rows int) (*flightsql.Client, *Server, func()) {
 	}()
 	dbc := dbrpc.NewClient(dbrpc.NewStreamConn(cc))
 
-	svc, err := NewServer(dbc, arrowtype.Options{
-		TimeAttrs: map[string]bool{"qdate": true},
-	}, nil)
+	svc, err := NewServer(dbc, derive, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +82,25 @@ func seed(t *testing.T, d *db.DB, n int) {
 		} else {
 			src += fmt.Sprintf("CpusUsage = %d.25\n", i%3)
 		}
+		// The two shapes §5.1 is about, and they are deliberately both here because they
+		// are indistinguishable by measurement. MemoryUsage is an expression in every ad
+		// whose VALUE is the content: it evaluates to an integer and wants a column.
+		// PeriodicRemove is an expression in every ad whose TEXT is the content: it
+		// evaluates to a perfectly good boolean that means nothing to anyone, and it wants
+		// the tail. Nothing in the data tells them apart.
+		src += fmt.Sprintf("ResidentSetSize = %d\n", 1024*(1+i%37))
+		src += "MemoryUsage = (ResidentSetSize + 1023) / 1024\n"
+		src += "PeriodicRemove = JobStatus =?= 5\n"
+		// An integer in most ads and an ERROR in one in seven, so the column is typed and
+		// the error cells have to be handled rather than being absent from the fixture.
+		// Both encoder entry points null an error, and they must agree on it: the text path
+		// evaluates here and the value path evaluates in the store, so this is the cell
+		// where an undefined/error distinction could silently diverge.
+		src += "Ratio = 100 / (ClusterId % 7)\n"
+		src += "JobStatus = 2\n"
+		// Requirements is the third shape: an expression that cannot be evaluated here at
+		// all, because it names a target there is none of. It evaluates to undefined in
+		// every ad, so it stays untyped on the measurement alone.
 		src += "Requirements = TARGET.Cpus >= RequestCpus\n"
 		ad, err := classad.ParseOld(src)
 		if err != nil {
@@ -228,6 +252,11 @@ func assertSeededTypes(t *testing.T, schema *arrow.Schema) {
 		"RequestMemory": arrow.INT64,     // one stray expression must not make it text
 		"CpusUsage":     arrow.FLOAT64,   // int/real mix widens
 		"QDate":         arrow.TIMESTAMP, // declared epoch
+		// Stored as an expression in EVERY ad, and an integer in every ad once
+		// evaluated. The stored classes make `expr` its dominant class and give it no
+		// column at all; the evaluated ones are what this column exists to prove the
+		// derivation reads.
+		"MemoryUsage": arrow.INT64,
 	}
 	for name, wantType := range want {
 		i := schema.FieldIndices(name)
@@ -240,7 +269,61 @@ func assertSeededTypes(t *testing.T, schema *arrow.Schema) {
 		}
 	}
 	if len(schema.FieldIndices("Requirements")) != 0 {
-		t.Error("Requirements got a column; it is a policy expression and belongs in the tail")
+		t.Error("Requirements got a column; it evaluates to undefined in every ad here")
+	}
+}
+
+// TestAPolicyExpressionIsIndistinguishableByMeasurement is the uncomfortable half of typing from
+// evaluated values, recorded as a test so nobody tries to fix it with a heuristic.
+//
+// PeriodicRemove and MemoryUsage are the same SHAPE: an expression in every ad, evaluating to
+// one clean kind in every ad. One of them wants a column and the other wants its text, and the
+// difference is semantic -- which of the value and the expression a reader is after. Measured on
+// a real AP, Requirements evaluates to a boolean in 1685 of 2000 ads, so even "it does not
+// evaluate cleanly" does not separate them.
+//
+// So the measurement types both, and the one that should not be typed is EXCLUDED by
+// declaration. This test pins both directions: without the declaration the meaningless column is
+// there, and with it the attribute's text is in the tail rather than gone.
+func TestAPolicyExpressionIsIndistinguishableByMeasurement(t *testing.T) {
+	ctx := context.Background()
+
+	cl, _, done := harness(t, 20)
+	defer done()
+	schema, err := clientSchemaOf(ctx, cl, "SELECT * FROM "+dbrpc.DefaultTable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := schema.FieldIndices("PeriodicRemove")
+	if len(i) == 0 {
+		t.Fatal("PeriodicRemove got no column; the fixture no longer poses the problem")
+	}
+	if got := schema.Field(i[0]).Type.ID(); got != arrow.BOOL {
+		t.Fatalf("PeriodicRemove is %v, want bool -- it evaluates cleanly, which is the point", got)
+	}
+
+	excl, _, doneExcl := harnessWith(t, 20, arrowtype.Options{
+		TimeAttrs: map[string]bool{"qdate": true},
+		Overrides: map[string]arrowtype.Override{"periodicremove": {Exclude: true}},
+	})
+	defer doneExcl()
+	schema, err = clientSchemaOf(ctx, excl, "SELECT * FROM "+dbrpc.DefaultTable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(schema.FieldIndices("PeriodicRemove")) != 0 {
+		t.Error("the declared exclusion did not remove the column")
+	}
+	// Excluded is not hidden: the whole reason excluding is acceptable is that the text
+	// still arrives.
+	if len(schema.FieldIndices(arrowtype.TailColumnName)) == 0 {
+		t.Fatal("no tail column to carry the excluded attribute")
+	}
+	tails, _ := tailValuesFrom(t, excl, "SELECT * FROM "+dbrpc.DefaultTable)
+	for row, text := range tails {
+		if !strings.Contains(text, "PeriodicRemove") {
+			t.Fatalf("row %d: the excluded attribute is not in the tail either: %s", row, text)
+		}
 	}
 }
 
