@@ -219,50 +219,60 @@ func (s *Server) sampleMax() int {
 }
 
 func (s *Server) GetSchemaStatement(ctx context.Context, cmd flightsql.StatementQuery, _ *flight.FlightDescriptor) (*flight.SchemaResult, error) {
-	schema, _, err := s.planSchema(ctx, cmd.GetQuery())
+	p, err := s.planStatement(ctx, cmd.GetQuery())
 	if err != nil {
 		return nil, err
 	}
-	return &flight.SchemaResult{Schema: flight.SerializeSchema(schema, s.alloc)}, nil
+	return &flight.SchemaResult{Schema: flight.SerializeSchema(p.schema, s.alloc)}, nil
 }
 
-// planSchema recognises a query and returns the schema its rows will carry, projection applied.
-// It is what lets the schema be answered without running anything.
+// plan is everything a statement can be answered with before any rows are read: the shape of
+// its result, the shape of its parameters, the query it came from, and the NAME of that result
+// shape (see pin.go), which is what lets a later fetch prove it is delivering what was promised.
+type plan struct {
+	schema *arrow.Schema
+	params *arrow.Schema
+	parsed query
+	// fp names schema. Carried to the client in the ticket and checked back at the fetch.
+	fp string
+}
+
+// planStatement recognises a query and returns the schema its rows will carry, projection
+// applied. It is what lets the schema be answered without running anything.
 //
 // A WHERE clause does NOT change the schema: it selects rows, and the columns a table offers
 // are a property of the table. Deriving the schema from a predicate's matches instead would
 // make it vary by query and a consumer's cached catalog worthless. It is still lowered here,
 // so a predicate this endpoint cannot serve is refused when the schema is asked for rather
 // than surfacing only once rows are fetched.
-func (s *Server) planSchema(ctx context.Context, q string) (*arrow.Schema, query, error) {
-	schema, _, parsed, err := s.planStatement(ctx, q)
-	return schema, parsed, err
-}
-
-// planStatement is planSchema plus the parameter schema, which only a prepare needs. One
-// implementation so a prepared statement cannot disagree with a direct one about what a query
-// means or which columns it returns.
 //
-// The parameter schema is built from the DECLARED column types, so a client binds what it would
-// read: a placeholder against a timestamp column takes a timestamp, not the integer underneath.
-func (s *Server) planStatement(ctx context.Context, q string) (*arrow.Schema, *arrow.Schema, query, error) {
+// One implementation, so a prepared statement cannot disagree with a direct one about what a
+// query means or which columns it returns. The parameter schema only a prepare needs, and it
+// is built from the DECLARED column types, so a client binds what it would read: a placeholder
+// against a timestamp column takes a timestamp, not the integer underneath.
+func (s *Server) planStatement(ctx context.Context, q string) (plan, error) {
 	parsed, err := parseQuery(q)
 	if err != nil {
-		return nil, nil, query{}, err
+		return plan{}, err
 	}
 	_, decisions, err := s.tableSchema(ctx, parsed.table)
 	if err != nil {
-		return nil, nil, query{}, err
+		return plan{}, err
 	}
 	tmpl, err := templateFor(parsed, decisions)
 	if err != nil {
-		return nil, nil, query{}, err
+		return plan{}, err
 	}
 	picked, err := project(decisions, parsed.cols)
 	if err != nil {
-		return nil, nil, query{}, err
+		return plan{}, err
 	}
-	return schemaOf(picked), paramSchema(tmpl, decisions), parsed, nil
+	// The fingerprint names the RESULT columns rather than the table's whole decision list.
+	// That is what the client was told and what it reads by position; a column appearing
+	// elsewhere in the table changes neither, and refusing over it would make a busy table
+	// unqueryable for the sake of a promise nobody made.
+	return plan{schema: schemaOf(picked), params: paramSchema(tmpl, decisions), parsed: parsed,
+		fp: arrowtype.Fingerprint(picked)}, nil
 }
 
 // paramSchema describes the placeholders, in order.
@@ -399,18 +409,21 @@ func schemaOf(decisions []arrowtype.Decision) *arrow.Schema {
 // holding per-query state between two RPCs that may not even arrive on the same connection,
 // and the query is what the handle would look up anyway.
 func (s *Server) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	schema, _, err := s.planSchema(ctx, cmd.GetQuery())
+	p, err := s.planStatement(ctx, cmd.GetQuery())
 	if err != nil {
 		return nil, err
 	}
-	ticket, err := flightsql.CreateStatementQueryTicket([]byte(cmd.GetQuery()))
+	// The handle carries the query AND the name of the schema just promised, so the fetch
+	// can prove it is delivering that schema rather than a later measurement of a table
+	// that moved in between (pin.go).
+	ticket, err := flightsql.CreateStatementQueryTicket([]byte(pinnedHandle(p.fp, cmd.GetQuery())))
 	if err != nil {
 		return nil, err
 	}
 	return &flight.FlightInfo{
 		Endpoint:         []*flight.FlightEndpoint{{Ticket: &flight.Ticket{Ticket: ticket}}},
 		FlightDescriptor: desc,
-		Schema:           flight.SerializeSchema(schema, s.alloc),
+		Schema:           flight.SerializeSchema(p.schema, s.alloc),
 		TotalRecords:     -1,
 		TotalBytes:       -1,
 	}, nil
@@ -420,16 +433,19 @@ func (s *Server) GetFlightInfoStatement(ctx context.Context, cmd flightsql.State
 //
 // The schema is derived again here rather than carried in the ticket. That is a second profile
 // round trip, and it is the correct trade: a schema in the ticket would be a schema the client
-// could edit, and this one has to match what the encoder will actually produce.
+// could edit, and this one has to match what the encoder will actually produce. What the ticket
+// does carry is the NAME of the schema the client was promised, which it cannot usefully edit
+// -- an invented name refuses its own request and nothing else (pin.go).
 func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	return s.doGetQuery(ctx, string(ticket.GetStatementHandle()), nil)
+	fp, stmt := parsePinnedHandle(string(ticket.GetStatementHandle()))
+	return s.doGetQuery(ctx, stmt, nil, fp)
 }
 
 // doGetQuery is the one scan implementation, shared by a direct statement and a prepared one.
 // Two copies would drift, and the drift would be invisible: a prepared statement returning
 // subtly different rows from the same SQL run directly is the kind of bug nobody reports
 // because nobody compares.
-func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args, pinned string) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	parsed, err := parseQuery(stmt)
 	if err != nil {
 		return nil, nil, err
@@ -461,6 +477,14 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 	}
 	decisions, err := project(allDecisions, parsed.cols)
 	if err != nil {
+		release()
+		slot()
+		return nil, nil, err
+	}
+	// What was promised is what gets delivered, or nothing is. This is the last point at
+	// which the two can still be compared: past it the encoder is built and the client is
+	// reading buffers by position.
+	if err := checkPin(pinned, decisions); err != nil {
 		release()
 		slot()
 		return nil, nil, err
