@@ -578,6 +578,7 @@ listener should be on by default when the TCP one is not.
 | The same dialect in the REPL | `repl/dialect.go`, `-dialect` | one Arrow-column→SQL-kind mapping serves both front doors |
 | Result-column typing | `repl/arrowcols.go` | the SELECT list typed against a table's declarations; shared, so the two front doors cannot disagree about what a query returns |
 | Arrow output in the REPL | `repl/arrowout.go`, `.format arrow` | a SELECT's result as Arrow IPC; refuses a terminal |
+| Declared types in Grafana | `grafana/pkg/plugin/decisions.go` | the plugin reads the store's own column types instead of parsing cells; one bad cell no longer retypes a column |
 
 **Prepared statements with bound parameters** are served. Two decisions in that increment are
 worth keeping, both arrived at by trying the obvious thing first:
@@ -708,13 +709,32 @@ the old way.
 
 Ordered by value per unit of work.
 
-1. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
-   parses cells and keeps its own `knownTimeAttrs`; the DB-API cursor still documents
-   `description` as "what arrived, not a schema". Both need typed columns to reach them over
-   their own transports, so neither is the "nearly free" job this item used to claim — the
-   plugin runs in Grafana's process and would have to derive the schema itself through
-   `AttrTypeProfiles`, which is real work rather than wiring. `arrow()` on the Python client is
-   the same shape. **`.format arrow` in the REPL is done** (`repl/arrowout.go`): a SELECT's
+1. **One of the three type guesses §4 set out to replace is still there.** The DB-API cursor
+   documents `description` as "what arrived, not a schema", and there is no `arrow()` on the
+   Python client. Both want typed columns to reach them over the Python transport, which is
+   real work rather than the wiring this item used to claim.
+
+   **The Grafana plugin is done** (`grafana/pkg/plugin/decisions.go`). It derives the table's
+   columns through `repl.Executor.TableDecisions` — the same derivation the endpoint publishes —
+   types the frame from them, and only falls back to parsing cells where no declaration covers
+   a column. Cached per table on the endpoint's own 30s TTL, because a dashboard refreshes
+   several panels on a timer and each would otherwise put a sampling scan through the daemon.
+
+   **What it fixes is worth naming, because the old code looks reasonable.** `numberFieldFrom`
+   bailed on the *first* non-numeric cell, so a column that is a number in 999 rows and holds
+   one unparseable value in the thousandth became a **string field** — and a Grafana graph of a
+   string field is an empty panel. Which cell poisons it depends on the time range the panel
+   happens to be showing, so the same dashboard renders on Monday and not on Tuesday. With a
+   declared type the bad cell is a gap and the column is still a number.
+
+   The epoch attribute list was written down twice, in two modules, and the copies had already
+   drifted. It is now `arrowtype.DefaultTimeAttrs`, which both read; the plugin adds the one
+   entry that is genuinely its own, since a column literally named `time` is a Grafana
+   convention rather than anything about HTCondor. An explicit TimeField in the panel still
+   outranks both the declaration and the guess, because that control exists precisely to
+   nominate an integer column as the time axis.
+
+   **`.format arrow` in the REPL is done** (`repl/arrowout.go`): a SELECT's
    result as an Arrow IPC stream, refusing a terminal because it is binary and every other
    format here is text. Three sources, because the honest typed form of each result differs —
    `SELECT *` encodes the ads against the table's schema with the tail, a projection evaluates

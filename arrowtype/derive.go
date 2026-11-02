@@ -577,3 +577,25 @@ func KindName(dt arrow.DataType) (string, bool) {
 	}
 	return "", false
 }
+
+// DefaultTimeAttrs are the HTCondor attributes stored as unix-epoch SECONDS, lowercased.
+//
+// Nothing can infer this from the values -- an integer is an integer -- so it is declared, and
+// it is declared HERE because more than one consumer needs the same answer. The Flight endpoint
+// advertises these columns as `timestamp[s]` so date functions work downstream; the Grafana
+// plugin renders them on a time axis. Two copies of this list would let a column graph as a
+// time in one place and as a large integer in the other, which is the divergence this package
+// exists to remove.
+//
+// A fresh map each call, because a caller adds its own to it: the configured attributes are
+// ADDED to these rather than replacing them, so an operator naming one extra attribute does not
+// silently lose QDate.
+func DefaultTimeAttrs() map[string]bool {
+	return map[string]bool{
+		"qdate": true, "jobstartdate": true, "jobcurrentstartdate": true,
+		"enteredcurrentstatus": true, "completiondate": true, "lastheardfrom": true,
+		"daemonstarttime": true, "lastmatchtime": true, "joblaststartdate": true,
+		"shadowbday": true, "enteredcurrentactivity": true, "mycurrenttime": true,
+		"lastbenchmark": true,
+	}
+}

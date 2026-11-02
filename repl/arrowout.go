@@ -118,8 +118,19 @@ func withTail(table []arrowtype.Decision) []arrowtype.Decision {
 	return append(out, arrowtype.TailDecision())
 }
 
-// tableDecisions derives a table's Arrow columns, the same way the ANSI dialect and the Flight
+// TableDecisions derives a table's Arrow columns, the same way the ANSI dialect and the Flight
 // endpoint do. One derivation, so a column means the same thing however it is reached.
+//
+// Exported because a THIRD consumer needs it: the Grafana plugin, which has been re-deriving
+// types by parsing result cells and bailing on the first non-numeric one. That guess is what
+// this returns the declaration for -- and a guess made in a separate module is one that drifts
+// from the endpoint's answer without either side being able to see it.
+//
+// It costs a profile round trip, so a caller that runs it per request should cache it.
+func (e *Executor) TableDecisions(table string) ([]arrowtype.Decision, error) {
+	return e.tableDecisions(table)
+}
+
 func (e *Executor) tableDecisions(table string) ([]arrowtype.Decision, error) {
 	if table == "" {
 		return nil, fmt.Errorf("no table to read types from")

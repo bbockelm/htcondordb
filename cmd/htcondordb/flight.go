@@ -179,14 +179,13 @@ func flightSciToken(cfg *config.Config) (flightsvc.Authenticator, error) {
 // flightDeriveOptions carries the type declarations into the endpoint: which attributes are
 // epoch seconds, and the per-attribute overrides for the decisions type inference cannot make.
 //
-// Seeded from the same list the CLI and the Grafana plugin carry, which is the same knowledge
-// written down three times now -- it wants unifying behind the stored type map, and this is
-// the third site that will have to change when that lands.
+// The epoch attributes come from arrowtype, which is where the Grafana plugin reads them too.
+// They were written down twice, in two modules, and the second copy had drifted -- so a column
+// could graph as a time in one place and as a large integer in the other.
 func flightDeriveOptions(cfg *config.Config, log *logging.Logger) arrowtype.Options {
-	opts := arrowtype.Options{TimeAttrs: map[string]bool{}}
-	for name := range knownFlightTimeAttrs {
-		opts.TimeAttrs[name] = true
-	}
+	opts := arrowtype.Options{TimeAttrs: arrowtype.DefaultTimeAttrs()}
+	// Configured attributes are ADDED rather than replacing the built-ins: an operator
+	// naming one extra must not silently lose QDate.
 	for _, name := range getList(cfg, "HTCONDORDB_FLIGHT_TIME_ATTRS") {
 		opts.TimeAttrs[lower(name)] = true
 	}
@@ -266,14 +265,6 @@ var knownFlightPolicyExprs = map[string]bool{
 	"periodichold": true, "periodicrelease": true, "periodicremove": true,
 	"onexithold": true, "onexitremove": true, "leavejobinqueue": true,
 	"isowner": true, "withinresourcelimits": true,
-}
-
-var knownFlightTimeAttrs = map[string]bool{
-	"qdate": true, "jobstartdate": true, "jobcurrentstartdate": true,
-	"enteredcurrentstatus": true, "completiondate": true, "lastheardfrom": true,
-	"daemonstarttime": true, "lastmatchtime": true, "joblaststartdate": true,
-	"shadowbday": true, "enteredcurrentactivity": true, "mycurrenttime": true,
-	"lastbenchmark": true,
 }
 
 // getList reads a configuration parameter as a list, split on commas and whitespace, the way
