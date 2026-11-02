@@ -4,14 +4,19 @@
 // every connection.
 //
 // One authenticated CEDAR connection carries an entire dbrpc multiplex. The
-// access level is decided once, at connection time, from the authenticated
-// identity, bounded by the credential's authorization limits (a token's
-// "condor:/<LEVEL>" scopes; see effectiveLevel):
+// access level is decided once, at connection time: the highest level the
+// ALLOW_/DENY_ tables grant the authenticated identity, bounded by the
+// credential's authorization limits (a token's "condor:/<LEVEL>" scopes), so a
+// READ-scoped token gets READ whatever ALLOW_DAEMON says (see effectiveLevel):
 //
 //   - READ  -> read-only, and every ad returned has its private (secret)
-//     attributes stripped (claim ids, capabilities, transfer keys).
-//   - WRITE -> full read/write, private attributes visible.
-//   - DAEMON -> WRITE plus the HA/replication surface (separate commands).
+//     attributes stripped (claim ids, capabilities, transfer keys); a
+//     constraint that references one is refused.
+//   - WRITE -> read/write of ads in tables no in-process writer owns; private
+//     attributes are still stripped, and administrative actions are refused.
+//   - DAEMON -> WRITE plus private attributes, the administrative table
+//     actions (indexes, encryption, truncate, retention, ...), and the
+//     HA/replication surface (separate commands).
 //
 // The level is recomputed per connection, so a reconfigure that changes the
 // ALLOW_/DENY_ tables takes effect on the next connection without a restart.
