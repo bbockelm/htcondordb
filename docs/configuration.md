@@ -14,6 +14,23 @@ so overriding just the host cannot lose to a configured address file. Every
 client in the tree resolves through `locate.Daemon`, and the daemon publishes to
 `locate.AddressFilePath`, so a redirect moves both halves together.
 
+### The certificate name in the advertised address
+
+The address the daemon publishes — to the collector, and to its address file —
+carries an `alias=<fqdn>` parameter naming the host an SSL client should check
+the daemon's certificate against. It matters because behind shared port the
+address host is the shared-port server's IP, and HTCondor host certificates
+carry DNS names and no IP SANs: without the alias, a client that found the
+daemon through the collector has only that IP to verify and SSL authentication
+fails the certificate check.
+
+The name is `HOST_ALIAS`, which defaults to `$(FULL_HOSTNAME)` — the same knob
+and the same default the C++ daemons use — so an ordinary host needs no
+configuration. Set `HOST_ALIAS` where the certificate is issued under some other
+name, such as a load balancer or a CNAME clients reach the host by. The
+advertised address is logged at startup, so the alias in effect is visible
+there.
+
 ## Knobs
 
 | Knob | Default | Meaning |

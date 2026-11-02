@@ -88,14 +88,15 @@ func detectHA(cfg *config.Config) (*haRuntime, error) {
 // start launches any background HA machinery: a follower's replicator, or (in
 // consistent mode) the raft coordinator and its CEDAR command handlers. srv is
 // the command server the raft/control handlers are registered on (before Serve);
-// advertise is this daemon's externally reachable command address. It returns
-// immediately; background work runs until ctx is cancelled.
-func (h *haRuntime) start(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, srv *cedarserver.Server, advertise string) error {
+// advertise is this daemon's externally reachable command address, and nodeAddr the
+// same address without the certificate alias, which names this node to raft. It
+// returns immediately; background work runs until ctx is cancelled.
+func (h *haRuntime) start(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, srv *cedarserver.Server, advertise, nodeAddr string) error {
 	switch {
 	case h.mode == modeLeaderFollower && h.role == "follower":
 		return h.startFollower(ctx, d, cfg, svc)
 	case h.mode == modeConsistent:
-		return h.startConsistent(ctx, d, cfg, svc, srv, advertise)
+		return h.startConsistent(ctx, d, cfg, svc, srv, advertise, nodeAddr)
 	default:
 		return nil
 	}
@@ -165,10 +166,14 @@ func followerCursorFile(cfg *config.Config) string {
 // transport and control command handlers, and starts consensus. Reads are served
 // locally on every node (read-only); writes are proposed to raft and committed by
 // quorum, with non-leaders redirecting clients to the leader.
-func (h *haRuntime) startConsistent(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, srv *cedarserver.Server, advertise string) error {
+func (h *haRuntime) startConsistent(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, srv *cedarserver.Server, advertise, nodeAddr string) error {
 	nodeID := strings.TrimSpace(getStr(cfg, "HTCONDORDB_NODE_ID"))
 	if nodeID == "" {
-		nodeID = advertise
+		// nodeAddr, not advertise: a node's raft identity must not move when something
+		// about how it is *reached* changes. The certificate alias is one such thing --
+		// attaching it renamed every self-joined node on upgrade, leaving the old names
+		// in the configuration as unreachable voters.
+		nodeID = nodeAddr
 	}
 	peers, err := parsePeers(getStr(cfg, "HTCONDORDB_RAFT_PEERS"))
 	if err != nil {

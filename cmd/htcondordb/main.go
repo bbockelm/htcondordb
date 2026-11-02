@@ -30,6 +30,7 @@ import (
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
+	"github.com/bbockelm/cedar/addresses"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	htcondor "github.com/bbockelm/golang-htcondor"
@@ -525,7 +526,7 @@ func run() error {
 	// Start any background HA machinery (a follower's replicator, or the raft
 	// coordinator and its command handlers in consistent mode).
 	defer ha.close()
-	if err := ha.start(ctx, d, cfg, svc, srv, advertisedAddr(d, ln)); err != nil {
+	if err := ha.start(ctx, d, cfg, svc, srv, advertisedAddr(d, ln), rawAdvertisedAddr(d, ln)); err != nil {
 		return err
 	}
 
@@ -735,12 +736,76 @@ func splitAttrs(s string) []string {
 }
 
 // advertisedAddr is the daemon's externally reachable command address: the
-// shared-port sinful under condor_master, else the plain listen address.
+// shared-port sinful under condor_master, else the plain listen address, with
+// alias=<fqdn> attached (see withAlias).
 func advertisedAddr(d *daemon.Daemon, ln net.Listener) string {
+	return withAlias(rawAdvertisedAddr(d, ln), d.Config())
+}
+
+// rawAdvertisedAddr is the reachable address before the alias is attached.
+func rawAdvertisedAddr(d *daemon.Daemon, ln net.Listener) string {
 	if sinful, ok := d.AdvertisedSinful(); ok {
 		return sinful
 	}
 	return ln.Addr().String()
+}
+
+// withAlias attaches the sinful "alias" parameter to a command address, naming the host an
+// SSL client should check the daemon's certificate against. Without it a client that reached
+// us through the collector has only the address host to verify, and behind shared port that
+// host is the IP of the shared-port server: host certificates carry DNS names and no IP SANs,
+// so every SSL authentication from off the machine fails the certificate check (issue #292).
+//
+// The alias is HOST_ALIAS, which parameter defaults make $(FULL_HOSTNAME), so an ordinary
+// host needs no configuration and one serving a certificate under some other name (a load
+// balancer, a CNAME) sets HOST_ALIAS and is believed. This is what the C++ daemons write --
+// Sock::get_sinful and SharedPortEndpoint both set the alias from HOST_ALIAS and nothing
+// else -- so the address htcondordb advertises now verifies the way a schedd's does.
+//
+// An address that already carries an alias is left alone, as is an alias that is not a
+// hostname.
+func withAlias(addr string, cfg *config.Config) string {
+	if cfg == nil || strings.TrimSpace(addr) == "" {
+		return addr
+	}
+	info, err := addresses.ParseSinful(addr)
+	if err != nil || info.Alias != "" {
+		return addr
+	}
+	alias := strings.TrimSpace(getStr(cfg, "HOST_ALIAS"))
+	if !isHostname(alias) {
+		return addr
+	}
+
+	// Appended textually rather than re-rendered from the parsed parameters: cedar parses a
+	// sinful but does not serialize one, and the rest of the address -- addrs=, ccbid=, the
+	// %XX escapes already in it -- must survive byte for byte.
+	core := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(addr), "<"), ">")
+	sep := "?"
+	if strings.ContainsRune(core, '?') {
+		sep = "&"
+	}
+	return core + sep + "alias=" + alias
+}
+
+// isHostname reports whether s is usable as a sinful alias: a name of DNS characters, which
+// are also the characters that need no %XX escaping inside an address. Whether the name is
+// the right one is the administrator's business, but a value holding '?', '&' or '=' would
+// make the whole address parse as something else, so it is dropped instead -- the advertised
+// address is logged at startup, so an alias that went missing is visible there.
+func isHostname(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '.', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // writeAddressFile publishes the command address to HTCONDORDB_ADDRESS_FILE
