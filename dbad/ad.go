@@ -196,6 +196,12 @@ var unreadableReasons = []struct{ reason, suffix string }{
 	// so a non-zero count there means writes are being dropped that a retry would have landed.
 	{"delta-chain-broken", "ChainBroken"},
 	{"delta-index-pending", "IndexPending"},
+	// A sealed record this reader held no key for. It is NOT damage: an unprivileged read
+	// of an encrypted table reaches it by design, so a non-zero count here is a statement
+	// about who was reading, not about the store. It is published beside the others because
+	// an operator looking at a rising unreadable count has to be able to tell the two apart,
+	// and because a reason classad emits with nowhere to land is counted into nothing.
+	{"sealed-needs-key", "SealedNeedsKey"},
 }
 
 // ExporterStatus is one change-data exporter's health as the daemon's exporter manager sees it:
