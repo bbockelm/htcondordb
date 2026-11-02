@@ -349,6 +349,13 @@ text (simplest) or `map<utf8, utf8>` (queryable from DuckDB, larger). This falls
 base-schema-plus-cold-tail layout we already have, preserves source text for everything not
 promoted, and gives users a correct escape hatch rather than a schema that lies by omission.
 
+**Built**, as `utf8` holding a bracketed ClassAd — bracketed rather than the newline-separated
+old form because this is one cell of one row, and a self-delimiting value survives a CSV or
+Parquet export that a multi-line one does not. §13.3 item 4 records what building it settled,
+including the one thing this paragraph did not anticipate: that the tail has to be the
+complement of the COLUMNS rather than of the table's schema, which makes it incompatible with
+projection pushdown in the same query.
+
 ### 5.7 Where the declaration lives, and how it invalidates
 
 Per the decision to keep this with the columnar info: a **per-table Arrow type map**,
@@ -1287,15 +1294,29 @@ this class of bug at all.
    literal-valued attributes.
 
    Two pieces, in order. **Upstream:** `opQueryRawWire` skips the text form and did not serve an
-   archive, so adopting it would have re-broken `history` -- classad PR #477 adds the archive
-   case, and this wants the tag. **Here:** an encoder that reads a wire node directly
-   (`wire.Ad.LookupByName` + `wire.LiteralValue`) and falls back to an evaluator for a node that
-   is not a literal. The fallback is the part with a real design question in it, because on a
-   real AP an attribute's STORED form is an expression far more often than its evaluated kind
-   suggests (§5.8) -- so how often the fallback fires decides how much of the 7x survives.
-   `BenchmarkWireNativeRead` is in the tree and skips, naming the missing op, until the
-   dependency carries it. §14.3 argues this is the compatibility path rather than the destination:
-   it leaves the consumer evaluating, where the server is better placed to.
+   archive, so adopting it would have re-broken `history`. **Shipped in classad v0.35.0**, and
+   `BenchmarkWireNativeRead` stops skipping. The scan alone, on a 20 000-record columnarized
+   archive with a six-column projection, medians of three: **15 067 ns/row for the text
+   projection against 2 555 for the wire rows, 5.9x**, at 557k allocations against 799k.
+
+   **Here:** an encoder that reads a wire node directly (`wire.Ad.LookupByName` +
+   `wire.LiteralValue`) and falls back to an evaluator for a node that is not a literal. The
+   fallback was the part with a real design question in it, because on a real AP an attribute's
+   STORED form is an expression far more often than its evaluated kind suggests (§5.8) -- so how
+   often the fallback fires decides how much of the win survives.
+
+   **Measured, and the answer is "every row".** The same benchmark's extract arms report
+   fall-throughs per row: a projection of literal-valued attributes is **0** and costs 617
+   ns/row, and the same projection with `MemoryUsage` in it is **1.000** and costs 1 040. Not
+   "often" -- always, because that attribute is stored as an expression in every ad, which is
+   what §5.8 says it is on a real AP too. A wire-native encoder would therefore null the column
+   in every row, or re-implement ClassAd evaluation in the consumer to avoid it.
+
+   That settles §14.3's argument with a number rather than a preference: the wire path is the
+   compatibility path, not the destination. It leaves the consumer evaluating, and the one
+   column most worth having is the one it cannot serve without doing so. The typed value frame
+   (§14.3b) evaluates where the record's reference closure and its precomputed values already
+   are, which is why its expression arm costs the same as its literal arm and this one does not.
 2. **The schema is sampled, not declared.** §5.7's describe-table op — a per-table type map
    stored beside the columnar schema, sharing its generation counter, seeded by introspection and
    overridable by an admin — was not built. What shipped is `opAttrTypes`, returning profiles of a
@@ -1329,12 +1350,39 @@ this class of bug at all.
    true of the schema and not only of the encoder. **The upstream half is built** (§14.6 item 2):
    `opAttrTypes` now takes a flag that adds the evaluated counts beside the stored ones, under
    `FeatEvalTypes`. What is left here is `derive.go` reading them, once the dependency is tagged.
-4. **There is no tail column.** §5.6 specifies `SELECT *` as the typed columns plus one `_ad`
-   column carrying everything not promoted. `Schema` simply omits every `Untyped` attribute
-   (`arrowtype/derive.go:463`), which is the "schema that lies by omission" §5.6 names:
-   `Requirements`, whose *text* is the only useful form of it, is invisible over ADBC rather
-   than preserved. Until item 3 lands, so is `MemoryUsage` — and those two failures look
-   identical from a client, which is the argument for building the tail column first.
+4. ~~**There is no tail column.**~~ **Done.** §5.6's `_ad` is built: `arrowtype.TailDecision()`
+   is a `Decision` like any other, so schema building, projection by name and the encoder's
+   field list all handle it without a special case, and `Options.Tail` appends it last so a
+   client reading by position is unaffected by turning it on. The Flight endpoint sets it
+   unconditionally — a host that could switch it off could only switch the schema back to
+   lying — and the cell is the row's attributes that no typed column took, as a bracketed
+   ClassAd, null when there are none.
+
+   Three things it settled that were not obvious from the specification:
+
+   - **It had to be the complement of the COLUMNS, not of the table's schema**, and that
+     interacts with projection pushdown. `SELECT Owner, _ad` with the projection pushed down
+     delivers exactly the attributes that are already columns, so every tail would be empty —
+     a wrong answer that looks like a table with nothing left over rather than like a failure.
+     Asking for the tail therefore turns the projection off, which is a real cost and is the
+     cost the query asked for.
+   - **It keeps the STORED form.** Evaluating on the way in would discard the only thing the
+     column is for: an attribute lands here precisely because its evaluated form was not worth
+     a column, and `Requirements` evaluates to a boolean that means nothing without a machine
+     to match against.
+   - **It changed what an untyped attribute means for privacy.** Before, the encoder dropped
+     anything with no column, so a private attribute that reached this process was discarded on
+     the way out whatever the session was — by accident, not by policy. The tail keeps
+     everything, so the stripping now has to be real. It is, and it is the loopback's: an
+     unprivileged dbrpc session never puts the attribute in the row. That is the property
+     routing Flight through dbrpc exists to buy, and it is exactly the kind of property that
+     stops holding the moment something downstream starts keeping what it used to throw away —
+     so it is now pinned by a test that searches a READ peer's whole batch for the value, with
+     a DAEMON peer proving the fixture has one to withhold.
+
+   Three mutants were checked to fail named tests: a tail that repeats every attribute, a
+   projection that stays pushed down when the tail is asked for, and an empty ad written where
+   a null belongs.
 5. **Overrides and strictness are implemented and unreachable.** `arrowtype.Options.Overrides`
    and `StrictMixedKinds` are tested, and the daemon wires only `TimeAttrs`
    (`cmd/htcondordb/flight.go:167`). An admin can declare an epoch attribute, but cannot force a

@@ -3,6 +3,7 @@ package arrowtype
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -124,6 +125,13 @@ type Encoder struct {
 	opts     EncodeOptions
 	rows     int
 	released bool
+
+	// tail is the index of the tail column, or -1. typed is the folded names the tail must
+	// NOT repeat -- the columns of this encoder, not of the table, because the tail's
+	// promise is "what you did not get as a column" and that is what the reader can check.
+	tail  int
+	typed map[string]bool
+	tbuf  []byte // reused across rows; the tail's text is copied by the builder
 }
 
 // NewEncoder prepares an encoder for the typed columns of decisions. Untyped decisions are
@@ -138,9 +146,16 @@ func NewEncoder(decisions []Decision, opts EncodeOptions) *Encoder {
 	var fields []arrow.Field
 	var attrs []string
 	var stats []ColumnStats
+	tail := -1
+	typed := map[string]bool{}
 	for _, d := range decisions {
 		if d.Verdict != Typed {
 			continue
+		}
+		if d.Tail {
+			tail = len(fields)
+		} else {
+			typed[strings.ToLower(d.Name)] = true
 		}
 		fields = append(fields, d.Field)
 		attrs = append(attrs, d.Name)
@@ -153,6 +168,8 @@ func NewEncoder(decisions []Decision, opts EncodeOptions) *Encoder {
 		builder: array.NewRecordBuilder(alloc, schema),
 		stats:   stats,
 		opts:    opts,
+		tail:    tail,
+		typed:   typed,
 	}
 }
 
@@ -180,12 +197,52 @@ func (e *Encoder) Stats() []ColumnStats { return e.stats }
 func (e *Encoder) Append(ad *classad.ClassAd) error {
 	var firstErr error
 	for i, attr := range e.attrs {
+		if i == e.tail {
+			e.appendTail(i, ad)
+			continue
+		}
 		if err := e.appendCell(i, attr, ad); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	e.rows++
 	return firstErr
+}
+
+// appendTail writes the row's attributes that no typed column took, as a bracketed ClassAd.
+//
+// It renders the STORED form of each one, not an evaluated value, which is the whole reason the
+// column is text: the attributes that land here are the ones whose evaluated form was not worth
+// a column, and for Requirements -- the archetype -- the expression IS the content.
+//
+// A row with nothing left over gets a null rather than an empty ad. "There was nothing else" is
+// a fact about the row, and an empty ad reads as a value that happens to be empty; null is the
+// one a reader can filter on without parsing.
+func (e *Encoder) appendTail(i int, ad *classad.ClassAd) {
+	b := e.builder.Field(i).(*array.StringBuilder)
+	st := &e.stats[i]
+	e.tbuf = e.tbuf[:0]
+	n := 0
+	for _, a := range ad.AST().Attributes {
+		if a == nil || e.typed[strings.ToLower(a.Name)] {
+			continue
+		}
+		if n == 0 {
+			e.tbuf = append(e.tbuf, '[', ' ')
+		} else {
+			e.tbuf = append(e.tbuf, ';', ' ')
+		}
+		e.tbuf = append(e.tbuf, a.String()...)
+		n++
+	}
+	if n == 0 {
+		b.AppendNull()
+		st.Nulls[CauseAbsent]++
+		return
+	}
+	e.tbuf = append(e.tbuf, ' ', ']')
+	b.BinaryBuilder.Append(e.tbuf)
+	st.Direct++
 }
 
 func (e *Encoder) appendCell(i int, attr string, ad *classad.ClassAd) error {

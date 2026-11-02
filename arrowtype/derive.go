@@ -124,6 +124,43 @@ type Decision struct {
 	Reason string
 	// Detail is a human sentence explaining this attribute's case.
 	Detail string
+	// Tail marks the one column that carries what the others do not. It is not an
+	// attribute: its cell is built from whatever the row holds that no typed column took,
+	// so an encoder fills it from the complement rather than by looking its Name up.
+	Tail bool
+}
+
+// TailColumnName is the column that carries the attributes no typed column covers.
+//
+// The leading underscore is deliberate: a ClassAd attribute name cannot begin with one, so this
+// column cannot collide with a real attribute however a table evolves.
+const TailColumnName = "_ad"
+
+// TailDecision is the tail column, as a Decision so that every path which already handles
+// columns handles it -- schema building, projection by name, the encoder's field list.
+//
+// WHY THE SCHEMA NEEDS IT. Without a tail, an attribute with no typed column is simply absent
+// from the schema, and a client cannot tell "this table has no such attribute" from "this
+// attribute exists and we declined to type it". Those are different facts with different
+// remedies, and the second one is common: Requirements is an expression in almost every ad and
+// its TEXT is the only useful form of it, so the column it deserves is this one.
+//
+// It is utf8 holding a bracketed ClassAd. Bracketed rather than the newline-separated old form
+// because this is one cell of one row: a self-delimiting value survives a CSV or Parquet export
+// that a multi-line one does not.
+func TailDecision() Decision {
+	return Decision{
+		Name:    TailColumnName,
+		Verdict: Typed,
+		Tail:    true,
+		Field: arrow.Field{
+			Name:     TailColumnName,
+			Type:     arrow.BinaryTypes.String,
+			Nullable: true,
+		},
+		Reason: "tail",
+		Detail: "every attribute of the row that no typed column covers, as ClassAd text",
+	}
 }
 
 // Override is a declared decision about one attribute, for the cases inference cannot reach.
@@ -172,6 +209,10 @@ type Options struct {
 	// falling back to a text column. Off by default: a text column is a faithful
 	// representation and a correctness investigation is what wants the refusal.
 	StrictMixedKinds bool
+	// Tail appends the TailDecision column, so the schema covers what it does not type.
+	// Off by default so that a caller which only wants the typed columns -- a measurement,
+	// a catalog listing that costs per column -- does not have to strip one.
+	Tail bool
 }
 
 // override returns the declared decision for an attribute, if any.
@@ -463,6 +504,13 @@ func Schema(ms []Measured, opts Options) (*arrow.Schema, []Decision) {
 		if d.Verdict == Typed {
 			fields = append(fields, d.Field)
 		}
+	}
+	// Last, so the typed columns keep the order the measurement gave them and a client
+	// reading by position is unaffected by whether the tail is there.
+	if opts.Tail {
+		d := TailDecision()
+		decisions = append(decisions, d)
+		fields = append(fields, d.Field)
 	}
 	return arrow.NewSchema(fields, nil), decisions
 }
