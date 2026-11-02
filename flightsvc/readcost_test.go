@@ -350,6 +350,116 @@ func benchReadStages(b *testing.B, rows int, columnar bool) {
 		perRow(b)
 	})
 
+	// values-scan: the same store work on the TYPED path -- the scan, its projection, the
+	// evaluation, the column packing and the loopback transfer, with no text in it. Against
+	// "scan" above this is what deleting the render was worth inside the store; against
+	// "values-encode" below it is how the remaining CPU divides between the store and this
+	// process, which is the number that decides whether a columnar producer has anything
+	// left to win.
+	b.Run("values-scan", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			n := 0
+			if err := st.client.QueryValuesStream(ctx, "history", "true", benchProjection, 0, false,
+				func(vb *dbrpc.ValueBatch) bool { n += vb.Rows; return true }); err != nil {
+				b.Fatal(err)
+			}
+			if n != rows {
+				b.Fatalf("%d rows, want %d", n, rows)
+			}
+		}
+		perRow(b)
+	})
+
+	// values-encode: the scan above PLUS this process turning those values into Arrow. The
+	// gap between the two is everything a columnar producer could still remove on this side
+	// of the loopback -- the per-cell ValueAt and the builder appends -- and it is the whole
+	// of the upside, because the store's own work is the other arm and a producer does not
+	// make the storage read cheaper.
+	b.Run("values-encode", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			enc := arrowtype.NewEncoder(projected, arrowtype.EncodeOptions{})
+			n := 0
+			if err := st.client.QueryValuesStream(ctx, "history", "true", benchProjection, 0, false,
+				func(vb *dbrpc.ValueBatch) bool {
+					for row := range vb.Rows {
+						vals := make([]classad.Value, len(vb.Cols))
+						for col := range vb.Cols {
+							vals[col] = vb.ValueAt(col, row)
+						}
+						_ = enc.AppendValues(vals)
+						if enc.Rows() >= batchRows {
+							rec := enc.NewRecord()
+							n += int(rec.NumRows())
+							rec.Release()
+						}
+					}
+					return true
+				}); err != nil {
+				b.Fatal(err)
+			}
+			if enc.Rows() > 0 {
+				rec := enc.NewRecord()
+				n += int(rec.NumRows())
+				rec.Release()
+			}
+			enc.Release()
+			if n != rows {
+				b.Fatalf("%d encoded, want %d", n, rows)
+			}
+		}
+		perRow(b)
+	})
+
+	// values-encode-seq: the same work as values-encode, reading each batch COLUMN-MAJOR with
+	// a running dense index instead of calling ValueAt per cell.
+	//
+	// ValueAt recounts the validity bitmap from row 0 on every call, so consuming a whole
+	// batch through it is quadratic in the batch size. That is a property of the accessor and
+	// not of the data, and the gap between these two arms is the whole of it -- which is why
+	// it is measured rather than argued, and why the first split of this cost attributed to
+	// "turning values into Arrow" what was really an O(n^2) walk.
+	b.Run("values-encode-seq", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			enc := arrowtype.NewEncoder(projected, arrowtype.EncodeOptions{})
+			n := 0
+			vals := make([]classad.Value, len(benchProjection))
+			cells := make([][]classad.Value, len(benchProjection))
+			if err := st.client.QueryValuesStream(ctx, "history", "true", benchProjection, 0, false,
+				func(vb *dbrpc.ValueBatch) bool {
+					for col := range vb.Cols {
+						cells[col] = unpackColumn(&vb.Cols[col], vb.Rows, cells[col][:0])
+					}
+					for row := range vb.Rows {
+						for col := range vb.Cols {
+							vals[col] = cells[col][row]
+						}
+						_ = enc.AppendValues(vals)
+						if enc.Rows() >= batchRows {
+							rec := enc.NewRecord()
+							n += int(rec.NumRows())
+							rec.Release()
+						}
+					}
+					return true
+				}); err != nil {
+				b.Fatal(err)
+			}
+			if enc.Rows() > 0 {
+				rec := enc.NewRecord()
+				n += int(rec.NumRows())
+				rec.Release()
+			}
+			enc.Release()
+			if n != rows {
+				b.Fatalf("%d encoded, want %d", n, rows)
+			}
+		}
+		perRow(b)
+	})
+
 	// e2e: the whole endpoint over gRPC. NOT a sum of the arms above and not comparable to
 	// them by subtraction -- the scan, the encode and the client's decode run concurrently,
 	// which is why this is the number a user feels and the others are the CPU it costs.
@@ -566,4 +676,37 @@ func appendLiteral(bld array.Builder, lit wire.Literal) {
 	default:
 		bld.AppendNull()
 	}
+}
+
+// unpackColumn expands one packed column into per-row values in a single forward pass, keeping
+// a running dense index rather than recounting the bitmap for each row.
+func unpackColumn(c *dbrpc.ValueColumn, rows int, dst []classad.Value) []classad.Value {
+	dense, exc := 0, 0
+	for row := range rows {
+		if c.Valid[row>>3]&(1<<(uint(row)&7)) == 0 {
+			for exc < len(c.Exceptions) && c.Exceptions[exc].Row < row {
+				exc++
+			}
+			if exc < len(c.Exceptions) && c.Exceptions[exc].Row == row {
+				dst = append(dst, c.Exceptions[exc].Value)
+			} else {
+				dst = append(dst, classad.NewUndefinedValue())
+			}
+			continue
+		}
+		switch c.Kind {
+		case dbrpc.KindInt:
+			dst = append(dst, classad.NewIntValue(c.Ints[dense]))
+		case dbrpc.KindReal:
+			dst = append(dst, classad.NewRealValue(c.Reals[dense]))
+		case dbrpc.KindBool:
+			dst = append(dst, classad.NewBoolValue(c.Bools[dense]))
+		case dbrpc.KindString:
+			dst = append(dst, classad.NewStringValue(c.Strs[dense]))
+		default:
+			dst = append(dst, classad.NewErrorValue())
+		}
+		dense++
+	}
+	return dst
 }

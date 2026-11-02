@@ -550,12 +550,21 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 func (s *Server) scanInto(ctx context.Context, db *dbrpc.Client, enc *arrowtype.Encoder,
 	table, constraint string, cols []string, limit int, flush func() bool) error {
 	if !enc.HasTail() && len(enc.Attrs()) > 0 {
+		vals := make([]classad.Value, len(enc.Attrs()))
+		cells := make([][]classad.Value, len(enc.Attrs()))
 		return db.QueryValuesStream(ctx, table, constraint, enc.Attrs(), limit, false,
 			func(b *dbrpc.ValueBatch) bool {
+				// Column-major, one forward pass each, rather than ValueAt per cell.
+				// ValueAt recounts the validity bitmap from row 0 every call, so reading a
+				// whole batch through it is quadratic in the batch size -- measured at
+				// 6257 ns/row against 2254 for this, on a read whose store side is 2213.
+				// The entire difference was the accessor, not the work.
+				for col := range b.Cols {
+					cells[col] = unpackValueColumn(&b.Cols[col], b.Rows, cells[col][:0])
+				}
 				for row := range b.Rows {
-					vals := make([]classad.Value, len(b.Cols))
 					for col := range b.Cols {
-						vals[col] = b.ValueAt(col, row)
+						vals[col] = cells[col][row]
 					}
 					_ = enc.AppendValues(vals) // non-strict: counted, not fatal
 					if enc.Rows() >= batchRows && !flush() {
@@ -592,6 +601,46 @@ func (s *Server) scanInto(ctx context.Context, db *dbrpc.Client, enc *arrowtype.
 		}
 		return true
 	})
+}
+
+// unpackValueColumn expands one packed column into per-row values in a single forward pass,
+// carrying a running dense index and a running exception index rather than searching for each.
+//
+// It belongs upstream beside the batch it unpacks, and should be deleted when dbrpc offers a
+// sequential reader; it lives here because the quadratic accessor is the only one that exists
+// and the cost of using it is most of a read.
+//
+// dst is appended to and returned so the caller can reuse one slice per column across batches.
+func unpackValueColumn(c *dbrpc.ValueColumn, rows int, dst []classad.Value) []classad.Value {
+	dense, exc := 0, 0
+	for row := range rows {
+		if row>>3 >= len(c.Valid) || c.Valid[row>>3]&(1<<(uint(row)&7)) == 0 {
+			// Exceptions are in ascending Row order, so the cursor only moves forward.
+			for exc < len(c.Exceptions) && c.Exceptions[exc].Row < row {
+				exc++
+			}
+			if exc < len(c.Exceptions) && c.Exceptions[exc].Row == row {
+				dst = append(dst, c.Exceptions[exc].Value)
+			} else {
+				dst = append(dst, classad.NewUndefinedValue())
+			}
+			continue
+		}
+		switch c.Kind {
+		case dbrpc.KindInt:
+			dst = append(dst, classad.NewIntValue(c.Ints[dense]))
+		case dbrpc.KindReal:
+			dst = append(dst, classad.NewRealValue(c.Reals[dense]))
+		case dbrpc.KindBool:
+			dst = append(dst, classad.NewBoolValue(c.Bools[dense]))
+		case dbrpc.KindString:
+			dst = append(dst, classad.NewStringValue(c.Strs[dense]))
+		default:
+			dst = append(dst, classad.NewErrorValue())
+		}
+		dense++
+	}
+	return dst
 }
 
 // batchRows matches arrowstream's default, for the same reason sampleMax does.
