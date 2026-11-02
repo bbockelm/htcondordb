@@ -3,6 +3,205 @@
 **Status:** draft — for discussion, not yet a spec.
 **Scope:** `repl` (parser/planner/executor), `classad/collections` + `dbrpc` (server-side join).
 
+## 0. Progress
+
+Shipped, in flight, and not started. Updated with each merge; the section it points at is
+where the reasoning lives.
+
+### 0.1 The three join algorithms
+
+A join engine is conventionally three algorithms, and which one a query gets is the
+planner's main decision. Here is where each one stands.
+
+| algorithm | applies when | client (`repl`) | store (`db.Join`) |
+|---|---|---|---|
+| **hash join** | the `ON` spine has at least one equality | **done** | **done** |
+| **index-based equi join** | ditto, and the probed side has a built index on the key | **done** (key batching, §6.2) | **done**, awaiting a classad release |
+| **block nested loops** | no usable equality: non-equi `ON`, `CROSS JOIN` | **declined**; the per-pair allocation it would have masked is fixed instead (§0.5) | **not started** — §7's carrier |
+
+Three things that table is saying, which are easy to miss:
+
+- The **hash** path is the oldest and the one every measurement in §6.2 was taken on. It is
+  also the wrong shape for a selective join against a large table, because it reads one side
+  whole to build buckets the other side will mostly never probe.
+- The **index** path now exists on both sides, and the two are not the same thing. The
+  client folds its key values into one `in` constraint and hopes the server has an index to
+  resolve it with; it cannot see the index set, and prices the trade from a row count it
+  must ask for, which describes the whole table rather than the scan. The store decides from
+  three numbers it holds for free — whether an index is **built**, how many rows the hashed
+  side holds, and how many segments it spans — and that third number is the one that makes
+  the decision correct rather than plausible. §0.1's own measurement: 23x faster at 16 keys,
+  11x at 32, then **3x slower at 64** and 29x slower at 256, with the crossover predicted by
+  comparing `segments × keys` against the row count and by nothing simpler.
+- **Block nested loops still exists nowhere**, but the reason to want it has narrowed to one.
+  §0.5 measured the equality-free loop and found its per-pair cost flat across a 16x change
+  in working-set size, which is the opposite of what a locality problem looks like — so
+  blocking it on the client has nothing to attack, and is declined. In the store it remains
+  the only loop that ever holds a (left block, right block) pair, which is what §7's zone
+  skipping needs in order to skip anything. That argument is about the pair **count** and
+  survives §0.5 untouched.
+
+### 0.2 By area
+
+| area | § | status |
+|---|---|---|
+| Grammar: `JOIN`/`INNER`/`LEFT`/`CROSS`, `ON`, aliases | 3 | **done** |
+| Refusals with a suggestion: `RIGHT`, `FULL`, `NATURAL`, `USING`, comma-FROM | 3 | **done** |
+| Alias normalization, unqualified-reference refusal | 4 | **done** |
+| Conjunct splitting, outer-join pushdown asymmetry | 5 | **done** |
+| Per-side projection pushdown | 6 | **done** |
+| `LIMIT` pushdown, only when nothing reorders after it | 6 | **done** |
+| Guard rails: per-side, pair and output-row caps | 7a | **done** |
+| `EXPLAIN` over a join | 6 | **done** |
+| `ORDER BY`, `DISTINCT`, `GROUP BY`, aggregates, `HAVING` | 10 | **done** (client-side) |
+| `UNION`, `UNION ALL` over joins | — | **done** (`SETOPS_DESIGN.md`) |
+| `opJoin` (69) + feature advertisement, no probing | 10 | **done**, off by default — see §6.2 |
+| Window functions / `QUALIFY` over a join | — | refused |
+| `INTERSECT`, `EXCEPT` | — | refused |
+| **Joining more than two tables** | 0.4 | **done** (client-side, left-deep, up to 8) |
+| Index-based equi join inside the store | §0.1 | **done** in classad, awaiting a release |
+| `LEFT JOIN` anti-join correctness | 0.4 | **fixed** in both implementations |
+| Block nested loops | 7 | **not started** |
+| Zone-map block skipping | 7 | **not started** — measure the ceiling first |
+| Vectorized residual / join `ColumnSource` | 6.1 | **not started** |
+| Cost-based planner, join-order choice | 7b | **not started** |
+| Sub-selects in argument position | 7c | out of scope by decision |
+| Server-side aggregates over a join | 10 | **not started** |
+| MATCH: deterministic candidate order | 8.6 | **done** (classad #458) |
+| MATCH: resumable per-autocluster cursors | 8.8 | **not started** |
+| MATCH: single-pass multi-autocluster scan | 8.3 | **not started** |
+| MATCH: rank-bounded block skipping | 8.4 | **not started** |
+| MATCH: resource-side autoclustering | 8.9 | **not started** |
+
+### 0.3 What the remaining work is actually blocked on
+
+Three of the unstarted items are blocked on each other in one chain, and it is worth
+naming because it is not the order the list above suggests:
+
+**Block nested loops → zone skipping → cost-based planner.** Zone skipping (§7) cannot be
+bolted onto the hash path: hashing visits one side whole before it sees the other, so there
+is never a (left block, right block) pair to test a zone predicate against. The pair only
+exists inside a block loop. So the blocked-nested-loop algorithm is not merely the fallback
+for non-equi joins — it is the carrier for the one remaining optimization with a large
+claimed payoff. And a planner that chooses between three algorithms is only worth building
+once there are three.
+
+§0.5 measures the equality-free loop and concludes that the CLIENT-side half of that chain is
+not worth building. The store-side half still is, for a reason the measurement does not
+touch.
+
+**Multi-table joins turned out to be a planner change, not a parser change** -- and are
+now done; 0.4 records the shape. Join *order* became a real decision in the process, which
+is what makes 7b stop being optional rather than merely desirable.
+
+### 0.4 Multi-table joins: the shape, and what it cost
+
+The plan is **left-deep**: `sides[0]` is the `FROM` table and each step folds in one more.
+`a JOIN b ON ... JOIN c ON ...` is `(a x b) x c`, which is the only shape SQL's syntax can
+express without parentheses, and the composite-ad model carries it for free -- a row gains a
+member per step and every predicate stays an ordinary ClassAd expression over one ad. An
+n-way join is therefore the two-way join run n-1 times, not a second algorithm.
+
+Three things generalized cleanly, and one did not:
+
+- **The side mask was already n-wide.** `sidesOf` built `1 << side` from the start, so
+  classifying a conjunct across eight tables needed no new code -- only replacing the
+  `sideLeft`/`sideRight`/`sideBoth` constants that had been reading the mask two bits at a
+  time.
+- **The pushdown rules compose along the chain.** An `ON` conjunct reading only the table
+  its own step folds in pushes to that scan for `INNER` and `LEFT` alike (both push to the
+  *inner* side); one reading only a table already in the row pushes only when the step is
+  `INNER`. A `WHERE` conjunct pushes to any side that is not null-extendable, and in a
+  left-deep chain a side is null-extendable exactly when **its own** step is a `LEFT` join
+  -- every earlier table is preserved by every later step, so being preserved once is being
+  preserved throughout. That last sentence is why the rule is one comparison and not a walk.
+- **Key batching generalized for nothing.** It narrows a scan to the key values its input
+  actually holds; since every step's input is a composite row, the third and fourth tables
+  get it on the same terms as the second.
+- **The equality halves ended up in different scopes**, which is the one asymmetry a reader
+  has to hold. The half reading the accumulated row keeps its aliases, because `a.ClusterId`
+  is a select over the row's `a` member and at the third step it might read `a` or `b`; the
+  half reading the new table is stripped to a bare path. The wire needs a third form -- the
+  accumulated half *stripped* -- which only exists when that half reads the first table
+  alone, and that is also how the planner decides a pair cannot be sent to a store whose
+  opcode carries two sides.
+
+**A forward reference is refused.** An `ON` clause naming a table a later step folds in is
+an error, not a deferral: SQL does not allow it, and deferring it would silently answer a
+different question.
+
+**`MY` and `TARGET` are refused past two tables.** They mean the first and second tables,
+which is a guess about which pair was meant once there are three. The aliases are in the
+`FROM` clause; the error says to use them.
+
+**What the restructure found.** Separating "did this pair match the `ON` clause" from "did
+the row survive `WHERE`" exposed a correctness bug in the shipped two-table join, and in the
+store's join by the same mechanism. `emit()` formed the row, applied the `WHERE` residual,
+and returned whether a row came out; the caller read that as *"this pair matched"*. So a
+pair satisfying `ON` but failing `WHERE` left `matched` false, the left row was
+null-extended, and the residual was re-evaluated against the null-extended row -- where
+`h.Key =?= undefined` is true. The row the filter had just rejected was replaced by one it
+accepted, and the anti-join idiom reported every left row instead of the unmatched ones.
+
+Both implementations had it, which is why the differential test comparing them never fired.
+**A second implementation is an oracle only for what it does differently.** The test that
+catches it states SQL's semantics directly.
+
+### 0.5 The equality-free loop, measured — and why it is not blocked
+
+Everything measured before this was an equi join. An equality-free `ON` — every non-equi
+join, every `CROSS JOIN` — falls to a different loop: each accumulated row against every
+row of the next table, tuple at a time, with both sides materialized. `BenchmarkJoinNonEqui`
+prices it against the hash path over the same data, with the fetch baseline subtracted so
+what is left is the pairing:
+
+| n | arm | pairs | pairing | per pair |
+|---|---|---|---|---|
+| 256 | band (`h.ClusterId > e.ClusterId && < +5`) | 131,072 | 111.0 ms | **0.847 µs** |
+| 1024 | band | 2,097,152 | 1806.3 ms | **0.861 µs** |
+| 256 | expanding (nearly every pair survives) | 131,072 | 152.4 ms | 1.16 µs |
+
+**The per-pair cost is flat across a 16x change in pair count and working-set size** —
+0.847 µs against 0.861 µs. That one number settles the client-side question. Blocking an
+inner loop exists to improve locality and cut inner-side re-reads, and both would show up
+here as a per-pair cost that GROWS as the inner side stops fitting in cache. It does not
+grow. There is nothing for blocking to attack.
+
+What the 0.85 µs actually is: per candidate pair the loop allocates a composite ClassAd and
+evaluates the condition against it. A surviving pair costs about 0.3 µs more, which is the
+output row. So the optimization the measurement pointed at was **not** blocking the loop but
+**not allocating a row per candidate** — reuse one composite to test the condition and
+allocate only on survival.
+
+**That is now done, and it was worth less than this section first claimed.** The draft said
+the allocation was "most of the 0.85 µs". Measured:
+
+| arm | per pair before | after | |
+|---|---|---|---|
+| band, n=1024 (2.1M pairs) | 0.875 µs | 0.650 µs | **1.34x** |
+| band, n=256 (131k pairs) | 0.820 µs | 0.636 µs | **1.27x** |
+| equi | — | — | 1.01x |
+| expanding | — | — | 1.02x |
+
+So the allocation was about **a quarter** of the per-pair cost, not most of it: ~0.20 µs of
+~0.85 µs. The remaining ~0.64 µs is the condition evaluation itself, which is the work the
+join exists to do. The equi arm does not move because the hash narrows candidates to about
+one per row, leaving nothing to amortize; the expanding arm does not move because nearly
+every candidate survives and takes its row with it, which is the case the reuse cannot help
+by construction. Both of those are the mechanism confirming itself from the sides where it
+should do nothing.
+
+**This does not retire §7.** Zone skipping still needs a block loop, in the store, and for a
+reason none of the above measures: a zone predicate rejects a whole block of the inner side
+without forming its pairs at all. That attacks the pair COUNT, where everything in this
+section attacks the per-pair cost. A client cannot do it — it cannot see blocks — and the
+hash path cannot carry it. So the chain in §0.3 survives with its first link moved into the
+store.
+
+The band arm's predicate is a band, not an impossibility, on purpose: an arm that keeps zero
+rows measures only rejection while reading as "selective". The first draft of this benchmark
+had exactly that, and the fixture now fails the benchmark rather than reporting it.
+
 ## 1. The problem
 
 The SQL layer refuses joins on purpose. `rejectJoins` (`repl/sql.go`) rejects
@@ -323,6 +522,76 @@ server. The client would have to pay a round trip to ask before it could plan, a
 answer it got would still be a whole-table count where the server could decide per segment
 from zone maps. The cap was the honest thing to do with the information a client had. It need not stay that
 way, because the information is obtainable.
+
+#### Measured again, once the store could join: the wire argument is conditional
+
+The tables above price the gap between joining over a connection and joining in-process, and
+§10 Phase 3 took that as the case for moving the pairing into the store. Built and measured,
+it does not follow. The same statement through two executors over the same store, differing
+only in whether the handshake advertises the join, best of both arm orders:
+
+| left keys | shape | client-side | in the store | |
+|---|---|---|---|---|
+| 400 | 4 attributes | 13.7 ms | 19.0 ms | **1.39x SLOWER** |
+| 2048 | 4 attributes | 69.3 ms | 93.6 ms | **1.35x slower** |
+| 8192 | 4 attributes | 283 ms | 396 ms | **1.40x slower** |
+| 400 | `SELECT *` | 82.9 ms | 85.4 ms | 1.03x slower |
+| 2048 | `SELECT *` | 436 ms | 458 ms | 1.05x slower |
+| 8192 | `SELECT *` | 1755 ms | 1839 ms | 1.05x slower |
+
+**A joined row carries both sides, so a join that EXPANDS moves more data than its inputs.**
+Each history row here matches two epoch rows, so the composite output repeats the history ad
+once per output row. Counting attribute-values per cluster, with two right rows per left row:
+
+| shape | client ships | store ships | |
+|---|---|---|---|
+| narrow (2 attrs each side) | 2 + 2·2 = **6** | 2·(2+2) = **8** | 1.33x more |
+| `SELECT *` (40 + 16 attrs) | 40 + 2·16 = **72** | 2·(40+16) = **112** | 1.56x more |
+
+1.33x more data, 1.40x slower: the arithmetic and the clock agree, so the mechanism is not in
+doubt. The `SELECT *` rows move more data still and show less of it, because at that width
+other costs dominate the ratio.
+
+**What was wrong with the reasoning.** §6.2 compared "both sides shipped whole" against
+"joined rows shipped" and treated the second as the smaller. That holds only when the join
+is SELECTIVE -- when fewer rows come out than went in. For a 1:N join the left side is
+duplicated per output row and the comparison inverts. The earlier tables are not wrong about
+what they measured; they measured the cost of the wire, not the cost of the join, and the
+join changes how many rows cross it.
+
+**What this does not undermine.** Block-level zone skipping is still unreachable from a
+client, and that was always the larger prize (§7); a selective join should still win, and the
+single-side materialization is a real memory improvement either way. What it undermines is
+the claim that moving the pairing into the store is a win *by itself*.
+
+**And the selective regime, measured rather than assumed.** The paragraph above says a
+selective join "should still win", which would have been the same mistake a third time. With
+a sparse right side -- one epoch row per fiftieth cluster, so the join filters instead of
+expanding -- best of both arm orders:
+
+| left rows | joined rows out | client-side | in the store | |
+|---|---|---|---|---|
+| 2048 | 40 | 21.6 ms | 19.2 ms | 1.13x faster |
+| 8192 | 163 | 90.3 ms | 76.8 ms | **1.18x faster** |
+
+So the direction does flip with the expansion ratio, which is the mechanism confirming itself
+from the other side. But the win is ~1.15x, not the ~2.2x the wire comparison implied, and
+the reason is instructive: both arms still SCAN the left side inside the store, and at these
+sizes that scan dominates. Removing the ship only moves the smaller term. The earlier tables
+isolated the ship by holding the scan constant, which is a fair way to price a wire and a
+misleading way to price a query.
+
+**What that leaves.** Moving the pairing is worth ~1.15x where it helps and -1.4x where it
+hurts. The case for executing a join in the store therefore rests on §7 -- block-level zone
+skipping, which attacks the scan rather than the ship, and which a client cannot do at all --
+and not on the pairing's location. That was always described as the larger prize; it is now
+the only one.
+
+**So the decision is a cost decision**, and it needs the expansion ratio -- output rows over
+input rows -- which is the same NDV estimate §7b says is missing. Until something can make
+that estimate the server-side join is off by default, behind `ExecConfig.ServerSideJoin`,
+with this measurement as the reason. A flag rather than deleted code, because the path has to
+be exercised and re-measured as the rest of Phase 3 lands.
 
 #### Pricing it with the one number that was missing
 
@@ -910,13 +1179,14 @@ vectorized residual (§8.2) land here and land **first**: same machinery as the 
 path, but with no `TargetScope`, no composite ad and no outer-join asymmetry to get wrong.
 Measure `RecordsReassembled` before building.
 
-**Phase 3 — `opJoin` (opcode 69).** Justified by §6.2 and by §7, on two grounds that the
+**Phase 3 — `opJoin` (opcode 69).** Was justified by §6.2 and by §7, on two grounds that the
 MATCH measurement of §8.2 neither supports nor undermines: the wire and per-row rebuild cost
 a flat ~2.2x on a narrow projection and ~4.2x on `SELECT *`, before any network; and the
 access-path decisions need statistics that only the server holds. Block skipping is not
 merely slower from a client — it is unreachable, so all of §7 is server-only by construction
 rather than by preference. Same new-opcode-plus-`ErrXUnsupported`-fallback pattern `opTopK`
-and `opArchiveAggregateStats` use, so an older server degrades to Phase 1.
+and `opArchiveAggregateStats` use, so an older server degrades to Phase 1. The wire ground did not survive being built and
+measured; see "Measured again, once the store could join" in §6.
 
 Phase 3 is being built in increments, and the first one deliberately leaves out most of
 what this section describes. What it contains, and why:
