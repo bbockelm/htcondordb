@@ -513,42 +513,7 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 				return false
 			}
 		}
-		// The REFS-CHASING projection op, for three reasons that happen to coincide.
-		//
-		// It reaches an ARCHIVE. The plain query op does not -- it refuses one by
-		// design and says so -- so reading `history`, the table most queries are about,
-		// used to fail after the endpoint had already listed it and derived its schema.
-		// The projection op serves a mutable table, a view's backing and an archive
-		// alike.
-		//
-		// It PUSHES THE PROJECTION DOWN, inside the decode walk: a non-projected
-		// attribute is never rendered, and a projection the hot header covers is served
-		// from the hot header alone. Before this, `SELECT Owner FROM jobs` pulled every
-		// attribute of every matching ad and this encoder dropped the rest on the floor.
-		//
-		// And it chases the projected expressions' REFERENCES, which this encoder needs
-		// because it EVALUATES. `MemoryUsage` projected without the siblings it is
-		// written over evaluates to undefined, so the plain projection op would turn a
-		// perfectly good integer column into nulls -- correct for a relay forwarding
-		// text, wrong for anything that evaluates. parsed.cols is nil for SELECT *,
-		// which the op reads as "no projection": every attribute, as before.
-		//
-		// No fallback to the non-refs op. Every Flight read goes through the in-process
-		// dbrpc loopback (see session.go), so the server is this same binary and cannot
-		// be a build that lacks the opcode. A fallback here would be untestable code
-		// guarding an impossible case.
-		scanErr := db.QueryRawProjectRefsStream(ctx, table, constraint, cols, parsed.limit, func(row string) bool {
-			// The projection ops stream OLD-ClassAd text, not the bracketed form.
-			ad, perr := classad.ParseOld(row)
-			if perr != nil {
-				return true
-			}
-			_ = enc.Append(ad) // non-strict: coercions and nulls are counted, not fatal
-			if enc.Rows() >= batchRows {
-				return flush()
-			}
-			return true
-		})
+		scanErr := s.scanInto(ctx, db, enc, table, constraint, cols, parsed.limit, flush)
 		if scanErr != nil {
 			ch <- flight.StreamChunk{Err: scanErr}
 			return
@@ -556,6 +521,77 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 		flush()
 	}()
 	return schema, ch, nil
+}
+
+// scanInto fills enc from the store, flushing a batch whenever one is full.
+//
+// TWO PRODUCERS, and which one runs is decided by whether the encoder has a tail column.
+//
+// The typed value stream is the one worth having: it evaluates in the store, where the record's
+// reference closure and its precomputed values already are, and ships results column-major. The
+// text projection renders every record to ClassAd source for this process to parse straight
+// back, which measured as the large majority of a read's CPU -- work that is not work, only the
+// cost of a relay between two halves of the same daemon.
+//
+// It cannot serve a TAIL, and that is a property of the op rather than a gap in the wiring: the
+// value stream returns one column per REQUESTED attribute, as values, and the tail is the
+// complement of a whole record in its stored form. Neither the set nor the form is available
+// there. So SELECT * keeps the text path for as long as its schema carries a tail, and an
+// explicit projection -- which is what a client aggregating or joining actually issues -- takes
+// the fast one.
+//
+// No fallback for a server that lacks the opcode. Every Flight read goes through the in-process
+// dbrpc loopback, so the server is this same binary; a fallback would be untestable code
+// guarding an impossible case, which is the mistake the refs-chasing projection already
+// documents here.
+//
+// redact is false because it asks for redaction BEYOND the session's: an unprivileged
+// connection is redacted whatever it passes, and a privileged one is entitled to what it reads.
+func (s *Server) scanInto(ctx context.Context, db *dbrpc.Client, enc *arrowtype.Encoder,
+	table, constraint string, cols []string, limit int, flush func() bool) error {
+	if !enc.HasTail() && len(enc.Attrs()) > 0 {
+		return db.QueryValuesStream(ctx, table, constraint, enc.Attrs(), limit, false,
+			func(b *dbrpc.ValueBatch) bool {
+				for row := range b.Rows {
+					vals := make([]classad.Value, len(b.Cols))
+					for col := range b.Cols {
+						vals[col] = b.ValueAt(col, row)
+					}
+					_ = enc.AppendValues(vals) // non-strict: counted, not fatal
+					if enc.Rows() >= batchRows && !flush() {
+						return false
+					}
+				}
+				return true
+			})
+	}
+	// The REFS-CHASING projection op, for three reasons that happen to coincide.
+	//
+	// It reaches an ARCHIVE. The plain query op does not -- it refuses one by design and says
+	// so -- so reading `history`, the table most queries are about, used to fail after the
+	// endpoint had already listed it and derived its schema.
+	//
+	// It PUSHES THE PROJECTION DOWN, inside the decode walk: a non-projected attribute is
+	// never rendered, and a projection the hot header covers is served from the hot header
+	// alone.
+	//
+	// And it chases the projected expressions' REFERENCES, which this encoder needs because
+	// it EVALUATES. MemoryUsage projected without the siblings it is written over evaluates
+	// to undefined, so the plain projection op would turn a perfectly good integer column
+	// into nulls -- correct for a relay forwarding text, wrong for anything that evaluates.
+	// cols is nil for SELECT *, which the op reads as "no projection": every attribute.
+	return db.QueryRawProjectRefsStream(ctx, table, constraint, cols, limit, func(row string) bool {
+		// The projection ops stream OLD-ClassAd text, not the bracketed form.
+		ad, perr := classad.ParseOld(row)
+		if perr != nil {
+			return true
+		}
+		_ = enc.Append(ad) // non-strict: coercions and nulls are counted, not fatal
+		if enc.Rows() >= batchRows {
+			return flush()
+		}
+		return true
+	})
 }
 
 // batchRows matches arrowstream's default, for the same reason sampleMax does.

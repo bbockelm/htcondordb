@@ -321,6 +321,12 @@ func TestArchivePredicateAndLimit(t *testing.T) {
 // TestProjectionReachesTheStore asserts the pushdown itself. The rows look identical whether
 // or not the projection crossed the wire -- the schema narrows them either way -- so the
 // assertion is on what the store was asked for.
+//
+// It also pins WHICH op each query shape reaches, because the two produce the same rows and
+// differ by an order of magnitude. An explicit projection takes the typed value stream, which
+// evaluates in the store and never renders a record to text. SELECT * cannot: its schema
+// carries a tail, and the tail is the complement of a whole record in its STORED form, which a
+// stream of the projected attributes' VALUES has neither the set nor the form of.
 func TestProjectionReachesTheStore(t *testing.T) {
 	h, cleanup := catalogHarness(t)
 	defer cleanup()
@@ -328,8 +334,8 @@ func TestProjectionReachesTheStore(t *testing.T) {
 	recs := h.rows(t, "SELECT Owner, ClusterId FROM jobs")
 	release(recs)
 	q := h.lastScan(t, "jobs")
-	if q.Op != "QueryRawProjectRefs" {
-		t.Errorf("scan op = %q, want QueryRawProjectRefs", q.Op)
+	if q.Op != "QueryValues" {
+		t.Errorf("scan op = %q, want QueryValues -- an explicit projection must not pay for the text relay", q.Op)
 	}
 	if q.Projection != 2 {
 		t.Errorf("projection = %d attributes, want 2; 0 means every attribute of every ad crossed the wire", q.Projection)
@@ -341,6 +347,8 @@ func TestProjectionReachesTheStore(t *testing.T) {
 	release(star)
 	if q := h.lastScan(t, "jobs"); q.Projection != 0 {
 		t.Errorf("SELECT *: projection = %d, want 0", q.Projection)
+	} else if q.Op != "QueryRawProjectRefs" {
+		t.Errorf("SELECT * scan op = %q, want QueryRawProjectRefs -- the tail needs whole records", q.Op)
 	}
 }
 

@@ -2,7 +2,9 @@
 
 **Status:** ADBC over Arrow Flight SQL is implemented and read-only — type derivation in
 `arrowtype/`, the endpoint in `flightsvc/`, the SQL front end in `ansi/` — and verified in CI
-against the DuckDB CLI and a real ADBC driver. **§13 is the progress record: what is shipped,
+against the DuckDB CLI and a real ADBC driver. **The text round trip is gone from a projected
+read** (§14.6 item 4): the scan ships typed, evaluated values and the encoder appends them, 2.06x
+end to end and 6.5x fewer allocations. **§13 is the progress record: what is shipped,
 what is left, and why we cannot yet go straight from the vector engine to Arrow; §14 answers the
 layer question that record raises — where Arrow should be built, and what should move instead.**
 The transport and pushdown designs below (§6, §7) remain a sketch for a rung we did not climb. Measurements in
@@ -212,6 +214,12 @@ use. Same source of truth, different objective function.
 `nodeKind` (`collections/adschema.go:139`) classifies a computed expression as `akNone` — it is
 not a storable scalar, so an expression-valued attribute is an **escape**, held in the record
 rather than the fixed slot. For Arrow we evaluate it and encode the result.
+
+**True of the schema as well as the encoder, since §13.3 item 3.** For a long time only the
+encoder obeyed this: the type report classified what the cells STORED, so an expression-valued
+attribute was ruled untypeable and got no column for the encoder to fill. The evaluation also
+moved: it now happens in the store, where the record's reference closure and its precomputed
+values already are, rather than in this process after a render and a reparse (§14.6 items 3–4).
 
 This has three consequences worth stating:
 
@@ -1340,16 +1348,27 @@ this class of bug at all.
    private attributes filtered out server-side, because an attribute's numeric bounds are a
    disclosure even where its value is not, so two levels derive different schemas from one table
    and a shared entry would hand private column names to whoever asked second.
-3. **The type decision is made on the stored form, while the encoder evaluates.**
-   `AttrTypeProfiles` classifies wire nodes and states that it evaluates nothing, so `expr`
-   competes as a value class and an expression-dominant attribute is ruled `Untyped`
-   (`arrowtype/derive.go:315`). On ap2001's `history` that drops `MemoryUsage` from the schema
-   although it **evaluates to an integer in all 2000 sampled ads** (§5.8). The measurement that
-   established §5.1 was a one-off script; the server op that would act on it reports stored
-   classes. Profiling *evaluated* values is work in `collections`, and it is what makes §5.1
-   true of the schema and not only of the encoder. **The upstream half is built** (§14.6 item 2):
-   `opAttrTypes` now takes a flag that adds the evaluated counts beside the stored ones, under
-   `FeatEvalTypes`. What is left here is `derive.go` reading them, once the dependency is tagged.
+3. ~~**The type decision is made on the stored form, while the encoder evaluates.**~~ **Done.**
+   `FromProfile` reads the evaluated counts where the store measured them, and the endpoint asks
+   for them (`AttrTypeProfilesEvaluated`), falling back to the stored ones only against a peer
+   that has said it cannot. `MemoryUsage` — stored as an expression in 1996 of 2000 history ads
+   and an integer in all 2000 — now gets its `int64` column. §5.1 is finally true of the schema
+   and not only of the encoder.
+
+   **It also makes the declaration in §5.1's corollary mandatory rather than advisory**, and
+   that is the part worth recording. Typing from evaluated values types `Requirements` too:
+   §5.8 measured it evaluating to a boolean in 1685 of 2000 ads, so it is not rescued by
+   evaluating badly — it gets a perfectly good column of 85% meaningless booleans and 15% null.
+   It is the same SHAPE as `MemoryUsage`, and the difference is which of the value and the
+   expression a reader is after, which no measurement reaches. So the daemon now seeds the
+   policy expressions as excluded (`knownFlightPolicyExprs`: `Requirements`, `Rank`, `START`,
+   the `Periodic*` and `OnExit*` family, `IsOwner`, `WithinResourceLimits`), the way it seeds
+   the epoch attributes, and the knob adds to that rather than replacing it. Excluding is not
+   hiding: item 4's tail carries the text, which is the only reason excluding is an acceptable
+   answer at all — the two changes had to land together.
+
+   A test states the indistinguishability as a property rather than leaving it to a comment, so
+   nobody later tries to fix it with a heuristic.
 4. ~~**There is no tail column.**~~ **Done.** §5.6's `_ad` is built: `arrowtype.TailDecision()`
    is a `Decision` like any other, so schema building, projection by name and the encoder's
    field list all handle it without a special case, and `Options.Tail` appends it last so a
@@ -1715,8 +1734,41 @@ Two gaps sit on the path and should be closed with it:
    It joined `redacted_raw_ops_test.go`'s table in the same commit, and the three mutants that
    matter were checked to fail named tests: a column kind that always declines, a server that
    accepts a flag bit it does not know, and a server that ignores its session's privilege.
-4. `flightsvc` reads it and appends straight to `array.Builder`. The encoder does not change; what
-   reaches it stops being text.
+4. ~~`flightsvc` reads it and appends straight to `array.Builder`.~~ **Done.** The encoder did not
+   change: `Encoder.AppendValues` runs the same coercion, counting and null rules as `Append`, so
+   a row encoded from values and the same row encoded from its ad land in the same column with
+   the same type. What stopped being text is what reaches it.
+
+   **Measured end to end over gRPC**, which is the number a user feels rather than the CPU it
+   costs — same fixture, same process, the only difference being which op the scan uses:
+
+   | | ns/row | allocations | bytes |
+   |---|---|---|---|
+   | text projection, parsed back | 13 485 | 2 522 081 | 250 MB |
+   | typed value stream | **6 536** | **385 807** | **42 MB** |
+   | | **2.06x** | **6.5x** | **5.9x** |
+
+   The e2e figure is diluted on purpose: it includes gRPC and the client's own Arrow decode,
+   neither of which this changes, so the server-side reduction is much larger than 2.06x. The
+   allocation count is the cleaner signal of what was deleted.
+
+   **`SELECT *` does not take this path, and the reason is structural rather than unfinished.**
+   The value stream returns one column per REQUESTED attribute, as values; the tail column
+   (§13.3 item 4) is the complement of a whole record in its STORED form, and the stream has
+   neither the set nor the form. So the two are mutually exclusive, and the endpoint picks by
+   whether the schema carries a tail: an explicit projection — what a client aggregating or
+   joining actually issues — takes the fast path, and `SELECT *` keeps the text one. Pinned by a
+   test that asserts which op each query shape reaches, because the rows are identical either
+   way and the costs differ by 2x.
+
+   Closing that gap means a frame that can carry a record's residue alongside the typed columns,
+   which is an upstream change rather than a wiring one, and it is the first thing to want next.
+
+   **Two consequences of the shape, both worth knowing.** A projected value cannot distinguish
+   an ABSENT attribute from one that evaluated to undefined, because a projection yields
+   undefined for both; each is still a null, so the column is identical and what is lost is the
+   `CauseAbsent`/`CauseUndefined` split in the stats. And `AppendValues` refuses an encoder that
+   has a tail rather than leaving a ragged batch, which `NewRecord` would panic on.
 5. ~~**The expression fallback.**~~ **Done, and it was the largest win of the three.**
 
    The problem, measured: projecting `MemoryUsage` reassembled **20 000 of 20 000** records against
