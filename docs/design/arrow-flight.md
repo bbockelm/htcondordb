@@ -531,6 +531,7 @@ listener should be on by default when the TCP one is not.
 | Containment (§6.4) | `flightsvc/statement.go`, `server.go` | panic barrier per stream, byte budget, stream cap that refuses rather than queues |
 | Flight SQL method set | `flightsvc/server.go`, `statement.go`, `prepared.go` | catalogs, schemas, tables, table types, statement, prepared + bind |
 | Typed value scan | `flightsvc/statement.go` | `opQueryValues`: evaluate in the store, ship columns, append to Arrow — no text |
+| Aggregates, GROUP BY, ORDER BY, DISTINCT (§7.4) | `flightsvc/analytic.go` | the `repl` executor, with result columns typed from the SELECT list |
 | Projected scan, archives included | `flightsvc/statement.go` | the refs-chasing projection op reaches an archive, pushes the projection down, keeps expressions evaluable |
 | Schema cache, privilege-scoped | `flightsvc/schemacache.go` | stops a derivation per RPC |
 | Admin type overrides | `cmd/htcondordb/flight.go` | `HTCONDORDB_FLIGHT_EXCLUDE_ATTRS`, `_ATTR_KINDS`, `_STRICT_MIXED_KINDS`, `_TIME_ATTRS` |
@@ -667,24 +668,17 @@ the old way.
 
 Ordered by value per unit of work.
 
-1. **The SQL surface is a recogniser, not an executor.** `parseQuery` (`flightsvc/statement.go`)
-   is one regexp; an aggregate, `GROUP BY`, `ORDER BY`, a `JOIN`, a set operation or a function is
-   refused rather than approximated. The `repl` executor does all of them, and the server-side
-   TopK and the archive `GROUP BY` already exist underneath — so a DuckDB user aggregating pool
-   data pulls every row to do locally what the store could have answered. This is the largest
-   remaining piece and the one that most changes what the endpoint is *for*.
-
-2. **The declared type map** (§5.7). The pin makes schema drift visible; the declaration is what
+1. **The declared type map** (§5.7). The pin makes schema drift visible; the declaration is what
    makes it rare, and it is what a columnar producer needs, since a producer emitting one Arrow
    schema across blocks that vectorize and blocks that do not cannot derive that schema from
    whichever block it is looking at.
 
-3. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
+2. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
    parses cells and keeps its own `knownTimeAttrs`; the DB-API cursor still documents
    `description` as "what arrived, not a schema". There is no `arrow()` on the Python client and
    no `.arrow` in the REPL. All of it is nearly free now that the encoder exists.
 
-4. **Then the columnar producer.** Last, and for a measured reason rather than an argued one:
+3. **Then the columnar producer.** Last, and for a measured reason rather than an argued one:
    what is left of a read is the storage read itself, and it should be measured against the
    wire-native read rather than against the text path it replaced. The remaining blockers are all
    inside `collections`:
@@ -729,6 +723,79 @@ Ordered by value per unit of work.
 
 **Still deliberately not built:** writes, Substrait, transactions and savepoints, key metadata,
 `XdbcTypeInfo`, `CancelFlightInfo`, scalar/table UDFs, `ALTER TABLE`.
+
+### 7.4 The analytic path
+
+`SELECT <cols> FROM t [WHERE] [LIMIT]` is a scan with a filter, so the endpoint serves it by
+scanning. An aggregate, a `GROUP BY`, an `ORDER BY` or a `DISTINCT` is not: the value of a row
+depends on the other rows, so somebody has to hold the result set. `repl`'s executor already
+does all of it, with the server-side TopK and the archive's own `GROUP BY` underneath, and the
+endpoint used to refuse the lot — so a client wanting `COUNT(*) GROUP BY Owner` pulled every row
+and counted them locally, over an endpoint whose store could have answered.
+
+Two things make this more than routing, and both are about the schema.
+
+**The result schema is not the table's.** `COUNT(*)` is an int64 column no attribute produced;
+`AVG(x)` is a float64 whatever `x` is; `MIN`/`MAX`/`SUM` and `time_bucket` take their column's
+own declared type; a window function is a count. So the columns are typed from the **SELECT
+list**, against the table's declarations — which is what makes answering GetFlightInfo without
+executing possible at all, and that is a protocol requirement rather than an optimization.
+Everything is nullable except a count, which is defined for every group, zero included.
+
+**The executor returns display text.** `repl.Result.Rows` is `[][]string`, so a cell is parsed
+on the way into Arrow — the text round trip the scan path just finished deleting. It is
+acceptable here and not there for a reason worth stating: an aggregate result is group rows
+rather than table rows, and the parse is against a **declared** type rather than an inferred
+one, so it cannot silently retype a column the way inference does. A cell that does not parse as
+its declared type is a null, not a string. If an analytic result ever grows large enough for the
+parse to matter, the fix is a typed row API out of `repl`, not a heuristic here.
+
+**Read-only, structurally.** Only `StmtSelect` reaches the executor, checked before anything
+else. The executor also runs INSERT, UPDATE, DELETE and DDL, and the endpoint's read-only
+promise must not depend on the ANSI front end happening to refuse those spellings.
+
+Three limits, each deliberate:
+
+- **A JOIN or a set operation is refused**, the same refusal the REPL's ANSI dialect gives and
+  for the same reason: a bare column could belong to either side, and typing it from the first
+  table's declarations would type it from the wrong one.
+- **No bound parameters.** The executor parses once and holds a ClassAd predicate thereafter, so
+  a placeholder would have to be substituted before parsing, and the schema is promised before
+  that. Such a statement still *prepares* — preparing is how a client learns its SQL will work,
+  and this SQL will — and reports an empty parameter schema; binding to it is refused at the
+  bind, saying so, rather than at the fetch saying "unsupported SQL" about a statement the same
+  endpoint just prepared.
+- **A computed expression becomes `utf8`.** Its value cannot be typed from a measurement — nothing
+  measured `CurrentTime - QDate` — so it takes the answer the tail column takes: text, which is
+  faithful for any ClassAd value. Refusing instead would make this endpoint strictly less capable
+  than the REPL for a shape the REPL answers correctly. The cost is that arithmetic downstream
+  sees a string, and the declared type map is what would fix it.
+
+The executor materializes the whole result before the first cell reaches Arrow, because that is
+what an aggregate *is*. The stream cap and byte budget apply around it, but the executor's own
+working set is not bounded by them, so a `GROUP BY` over a high-cardinality attribute is the
+shape to watch — the same way it is in the REPL.
+
+**An aggregate is a disclosure channel of its own shape**, and building this found a hole that
+the scan path does not have. Nobody has to see a value to learn it: `SELECT ClaimId, COUNT(*)
+GROUP BY ClaimId` names every distinct value as a group key, `MIN`/`MAX` report two of them
+exactly, and `COUNT(DISTINCT x)` reports the cardinality. The closure is the same one the scan
+relies on — an unprivileged peer's type report does not carry a private attribute, so there is
+no column to type against — but it only holds if every column the statement NAMES is resolved,
+not only the ones it projects. The first implementation resolved the projected ones, which let
+a READ peer through on `COUNT(DISTINCT ClaimId)` (a count's result type does not depend on its
+argument, so the argument was never looked at), on `GROUP BY` and `ORDER BY` over a column that
+is never printed, and on `HAVING MAX(ClaimId) > 'a'`. Caught by a test with a DAEMON arm proving
+the fixture has something to withhold. The refusal says the column is not there, which is what
+it also says about a column that genuinely is not there — naming it as private would answer the
+question the refusal exists to refuse.
+
+**The mutant that mattered** was the executor keeping its default dialect. ClassAd's `==` folds
+case and ANSI's `=` does not, so an analytic query whose predicate took the default would answer
+a different question — same columns, same types, more rows — and no type assertion anywhere
+would catch it. Six were checked to fail named tests: that one, AVG typed from its column, a
+non-SELECT admitted to the executor, an unparseable cell retyped to a string instead of nulled,
+a nullable COUNT, and bound values silently ignored.
 
 ## 8. The ANSI dialect
 

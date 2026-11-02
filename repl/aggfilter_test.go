@@ -165,7 +165,7 @@ func TestAggregateFilterParse(t *testing.T) {
 	if it.AggFilter != "JobStatus == 2" {
 		t.Errorf("filter = %q, want the SQL `=` translated", it.AggFilter)
 	}
-	if h := it.header(); !strings.Contains(h, "FILTER (WHERE") {
+	if h := it.Header(); !strings.Contains(h, "FILTER (WHERE") {
 		t.Errorf("header = %q, want the filter shown", h)
 	}
 

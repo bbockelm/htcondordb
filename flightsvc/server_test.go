@@ -350,11 +350,10 @@ func TestUnsupportedSQLIsRefused(t *testing.T) {
 	defer done()
 	ctx := context.Background()
 
-	// Shape refusals: must name what is accepted.
+	// Shape refusals: must name what is accepted. An aggregate, an alias, a function and an
+	// ORDER BY used to be in this list and are now served by the executor (analytic.go);
+	// what is left is what the endpoint genuinely cannot do.
 	for _, q := range []string{
-		`SELECT COUNT(*) FROM ads`,
-		`SELECT Owner AS who FROM ads`,
-		`SELECT upper(Owner) FROM ads`,
 		`SELECT * FROM ads ORDER BY QDate`,
 		`SELECT * FROM a JOIN b ON a.x = b.x`,
 		`DELETE FROM ads`,

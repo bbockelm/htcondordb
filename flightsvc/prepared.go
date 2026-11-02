@@ -332,6 +332,14 @@ func (s *Server) DoPutPreparedStatementQuery(ctx context.Context, cmd flightsql.
 func (s *Server) bindCheck(ctx context.Context, stmt string, vals []any) (string, query, error) {
 	parsed, err := parseQuery(stmt)
 	if err != nil {
+		if _, aerr := parseAnalytic(stmt); aerr == nil {
+			// It prepared, because the executor serves it; it just has nowhere to
+			// put a value. Reporting the scan recogniser's grammar here would tell
+			// a client its statement is unsupported, which it is not.
+			return "", query{}, status.Errorf(codes.InvalidArgument,
+				"this statement takes no parameters (its parameter schema is empty); "+
+					"inline the value instead of binding it")
+		}
 		return "", query{}, err
 	}
 	_, decisions, err := s.tableSchema(ctx, parsed.table)

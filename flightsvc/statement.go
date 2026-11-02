@@ -74,9 +74,11 @@ type query struct {
 	limit int
 }
 
-const unsupportedHint = "this endpoint accepts `SELECT <columns|*> FROM <table> [WHERE <predicate>] " +
-	"[LIMIT n]`. An aggregate, an alias, a function or an ORDER BY is refused rather than " +
-	"approximated, because a partly-understood query returns rows that look right"
+const unsupportedHint = "this endpoint accepts a read-only SELECT over one table: columns, " +
+	"aggregates, GROUP BY, HAVING, ORDER BY, DISTINCT and LIMIT, as in " +
+	"`SELECT <columns|*> FROM <table> [WHERE <predicate>] [LIMIT n]`. A JOIN, a set " +
+	"operation, and anything that writes are refused rather than approximated, because a " +
+	"partly-understood query returns rows that look right"
 
 // parseQuery recognises a statement, or returns an error naming what is supported.
 func parseQuery(q string) (query, error) {
@@ -235,6 +237,11 @@ type plan struct {
 	parsed query
 	// fp names schema. Carried to the client in the ticket and checked back at the fetch.
 	fp string
+	// an is set when the simple recogniser refused the statement and the executor took
+	// it instead (analytic.go). Its decisions are typed from the SELECT list rather than
+	// from the table, so they travel with it.
+	an        *analytic
+	decisions []arrowtype.Decision
 }
 
 // planStatement recognises a query and returns the schema its rows will carry, projection
@@ -253,7 +260,22 @@ type plan struct {
 func (s *Server) planStatement(ctx context.Context, q string) (plan, error) {
 	parsed, err := parseQuery(q)
 	if err != nil {
-		return plan{}, err
+		// The scan recogniser refused. That is not the same as "not SQL": an
+		// aggregate, a GROUP BY or an ORDER BY is a statement the executor serves,
+		// so it gets a second reading before the refusal stands (analytic.go).
+		an, aerr := parseAnalytic(q)
+		if aerr != nil {
+			if _, shape := aerr.(*unsupportedShape); shape {
+				// It IS SQL, and it is a shape this endpoint does not serve.
+				// More use to a reader than "a regexp did not match".
+				return plan{}, aerr
+			}
+			return plan{}, err
+		}
+		// From here the statement is the executor's, so ITS complaints are the ones
+		// worth reporting -- "no such column Frob" rather than the scan recogniser's
+		// list of shapes, which is an answer to a question the client did not ask.
+		return s.planAnalytic(ctx, an)
 	}
 	_, decisions, err := s.tableSchema(ctx, parsed.table)
 	if err != nil {
@@ -272,7 +294,33 @@ func (s *Server) planStatement(ctx context.Context, q string) (plan, error) {
 	// elsewhere in the table changes neither, and refusing over it would make a busy table
 	// unqueryable for the sake of a promise nobody made.
 	return plan{schema: schemaOf(picked), params: paramSchema(tmpl, decisions), parsed: parsed,
-		fp: arrowtype.Fingerprint(picked)}, nil
+		fp: arrowtype.Fingerprint(picked), decisions: picked}, nil
+}
+
+// planAnalytic plans a statement the scan recogniser refused, by typing the SELECT list
+// against the table's own declarations.
+//
+// It takes no parameters. A prepared statement with a `?` in an aggregate query would need
+// the bound value to reach `repl`'s parser, which parses once and holds a ClassAd predicate
+// thereafter -- so binding would mean re-planning per execution, and the schema is promised
+// before that. Refusing is honest and the client can inline the value.
+func (s *Server) planAnalytic(ctx context.Context, an *analytic) (plan, error) {
+	_, table, err := s.tableSchema(ctx, an.st.Table)
+	if err != nil {
+		return plan{}, err
+	}
+	decisions, err := analyticDecisions(an.st, table)
+	if err != nil {
+		return plan{}, err
+	}
+	return plan{
+		schema:    schemaOf(decisions),
+		params:    arrow.NewSchema(nil, nil),
+		parsed:    query{table: an.st.Table, limit: an.st.Limit},
+		fp:        arrowtype.Fingerprint(decisions),
+		an:        an,
+		decisions: decisions,
+	}, nil
 }
 
 // paramSchema describes the placeholders, in order.
@@ -446,9 +494,19 @@ func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQ
 // subtly different rows from the same SQL run directly is the kind of bug nobody reports
 // because nobody compares.
 func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args, pinned string) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	parsed, err := parseQuery(stmt)
-	if err != nil {
-		return nil, nil, err
+	parsed, perr := parseQuery(stmt)
+	var an *analytic
+	if perr != nil {
+		// Same two-reading rule as the plan: a shape the scan cannot answer may still
+		// be one the executor can (analytic.go).
+		var aerr error
+		if an, aerr = parseAnalytic(stmt); aerr != nil {
+			if _, shape := aerr.(*unsupportedShape); shape {
+				return nil, nil, aerr
+			}
+			return nil, nil, perr
+		}
+		parsed = query{table: an.st.Table, limit: an.st.Limit}
 	}
 	table := parsed.table
 	// A stream slot first: refusing here costs nothing, while refusing after the schema
@@ -469,13 +527,32 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args, pinne
 		slot()
 		return nil, nil, err
 	}
-	constraint, err := constraintFor(parsed, allDecisions, bound)
-	if err != nil {
-		release()
-		slot()
-		return nil, nil, err
+	var constraint string
+	var decisions []arrowtype.Decision
+	if an != nil {
+		// A bound value cannot reach the executor: it parses the statement once and
+		// holds a ClassAd predicate thereafter, so a placeholder would have to be
+		// substituted before parsing and the schema is promised before that. The
+		// prepare reports an EMPTY parameter schema, so a client that bound anything
+		// bound it to a statement that said it takes none -- which is a client bug
+		// worth naming rather than a value worth ignoring.
+		if bound != nil && len(bound.vals) > 0 {
+			release()
+			slot()
+			return nil, nil, status.Errorf(codes.InvalidArgument,
+				"%d value(s) were bound to an aggregate or ordered statement, which takes "+
+					"no parameters here; inline the value", len(bound.vals))
+		}
+		// The executor carries its own predicate, lowered by the ANSI dialect when it
+		// runs, so there is no constraint to build here and the columns come from the
+		// SELECT list rather than from the table.
+		decisions, err = analyticDecisions(an.st, allDecisions)
+	} else {
+		constraint, err = constraintFor(parsed, allDecisions, bound)
+		if err == nil {
+			decisions, err = project(allDecisions, parsed.cols)
+		}
 	}
-	decisions, err := project(allDecisions, parsed.cols)
 	if err != nil {
 		release()
 		slot()
@@ -537,7 +614,15 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args, pinne
 				return false
 			}
 		}
-		scanErr := s.scanInto(ctx, db, enc, table, constraint, cols, parsed.limit, flush)
+		var scanErr error
+		if an != nil {
+			// One batch: an aggregate's whole result is materialized by the
+			// executor before any of it can be correct, so there is nothing to
+			// stream and a flush per batch would only split a small table.
+			scanErr = s.runAnalytic(ctx, db, an, enc, decisions)
+		} else {
+			scanErr = s.scanInto(ctx, db, enc, table, constraint, cols, parsed.limit, flush)
+		}
 		if scanErr != nil {
 			ch <- flight.StreamChunk{Err: scanErr}
 			return

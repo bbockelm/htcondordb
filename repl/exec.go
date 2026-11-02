@@ -541,13 +541,13 @@ func viewSpecFromSelect(st *Statement) (db.ViewSpec, error) {
 			if err != nil {
 				return db.ViewSpec{}, err
 			}
-			metrics = append(metrics, db.ViewMetric{Func: fn, Arg: it.Col, Alias: it.header()})
+			metrics = append(metrics, db.ViewMetric{Func: fn, Arg: it.Col, Alias: it.Header()})
 			continue
 		}
 		// A time_bucket(attr, 'w') group column carries its width, so the view groups
 		// by the floored timestamp -- a continuous aggregate (time series) rather than a
 		// current-state gauge.
-		groups = append(groups, db.ViewGroupCol{Attr: it.Col, Alias: it.header(), BucketWidth: it.BucketWidth})
+		groups = append(groups, db.ViewGroupCol{Attr: it.Col, Alias: it.Header(), BucketWidth: it.BucketWidth})
 	}
 	if len(metrics) == 0 {
 		return db.ViewSpec{}, fmt.Errorf("a materialized view requires at least one aggregate (COUNT, SUM, or AVG)")
@@ -622,7 +622,7 @@ func viewAggFunc(name string) (db.ViewAggFunc, error) {
 func renderViewSelect(sel *Statement) string {
 	items := make([]string, 0, len(sel.Items))
 	for _, it := range sel.Items {
-		items = append(items, it.header())
+		items = append(items, it.Header())
 	}
 	return fmt.Sprintf("SELECT %s FROM %s GROUP BY %s",
 		strings.Join(items, ", "), sel.Table, strings.Join(sel.GroupBy, ", "))
@@ -1498,7 +1498,7 @@ func (e *Executor) renderSelectRows(st *Statement, limited []*classad.ClassAd) (
 	// "CurrentTime - EnteredHistoryTime"); a plain column is rendered by attribute name.
 	compiled := make([]*classad.Expr, len(st.Items))
 	for j, it := range st.Items {
-		res.Columns = append(res.Columns, it.header())
+		res.Columns = append(res.Columns, it.Header())
 		if it.Expr != "" {
 			ex, perr := classad.ParseExpr(it.Expr)
 			if perr != nil {
@@ -2250,7 +2250,7 @@ func dedupeAds(ads []*classad.ClassAd) []*classad.ClassAd {
 func sortAds(ads []*classad.ClassAd, terms []OrderTerm) error {
 	for _, t := range terms {
 		if t.Item.IsAggregate() {
-			return fmt.Errorf("cannot ORDER BY the aggregate %s in a non-aggregate query", t.Item.header())
+			return fmt.Errorf("cannot ORDER BY the aggregate %s in a non-aggregate query", t.Item.Header())
 		}
 	}
 	sort.SliceStable(ads, func(i, j int) bool {
@@ -2273,9 +2273,9 @@ func sortAds(ads []*classad.ClassAd, terms []OrderTerm) error {
 func sortRows(res *Result, terms []OrderTerm) error {
 	idxs := make([]int, len(terms))
 	for k, t := range terms {
-		idx := columnIndex(res.Columns, t.Item.header())
+		idx := columnIndex(res.Columns, t.Item.Header())
 		if idx < 0 {
-			return fmt.Errorf("ORDER BY %s is not a selected column", t.Item.header())
+			return fmt.Errorf("ORDER BY %s is not a selected column", t.Item.Header())
 		}
 		idxs[k] = idx
 	}

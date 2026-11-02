@@ -80,8 +80,9 @@ func TestPreparedStatementValidatesAtPrepareTime(t *testing.T) {
 	ctx := context.Background()
 
 	for _, q := range []string{
-		`SELECT COUNT(*) FROM ` + dbrpc.DefaultTable,
+		`DELETE FROM ` + dbrpc.DefaultTable,
 		`SELECT * FROM ` + dbrpc.DefaultTable + ` WHERE Owner > 'R'`,
+		`SELECT MAX(NoSuchColumn) FROM ` + dbrpc.DefaultTable,
 		`SELECT NoSuchColumn FROM ` + dbrpc.DefaultTable,
 		`SELECT * FROM nosuchtable`,
 	} {

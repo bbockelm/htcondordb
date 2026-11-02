@@ -1118,7 +1118,7 @@ func (e *Executor) renderJoinRows(st *Statement, p *joinPlan, rows []*classad.Cl
 	}
 	compiled := make([]*classad.Expr, len(items))
 	for j, it := range items {
-		res.Columns = append(res.Columns, it.header())
+		res.Columns = append(res.Columns, it.Header())
 		src := it.Expr
 		if src == "" {
 			src = it.Col
@@ -1213,7 +1213,7 @@ func sortJoinAds(rows []*classad.ClassAd, terms []OrderTerm) error {
 	compiled := make([]*classad.Expr, len(terms))
 	for i, t := range terms {
 		if t.Item.IsAggregate() {
-			return fmt.Errorf("cannot ORDER BY the aggregate %s in a non-aggregate query", t.Item.header())
+			return fmt.Errorf("cannot ORDER BY the aggregate %s in a non-aggregate query", t.Item.Header())
 		}
 		src := t.Item.Expr
 		if src == "" {
