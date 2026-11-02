@@ -143,13 +143,23 @@ class TestHeterogeneousColumns:
         assert by_key["b"] is True
         assert by_key["u"] is None
 
-    def test_description_is_a_hint_from_the_first_non_null_row(self, connection, mixed):
-        # ClassAd has no column schema, so type_code describes what arrived first, not a
-        # contract. Documented in Cursor.description; pinned here so it is not mistaken
-        # for a guarantee.
+    def test_description_describes_the_column_not_the_first_row(self, connection, mixed):
+        # This used to read "a hint from the first non-null row", and pinned type_code as
+        # whatever arrived first rather than as a contract. It is a contract now: the
+        # server declares the column's type from a sample of the table, and an attribute
+        # that genuinely holds both numbers and strings is declared as the one type that
+        # can carry either.
+        #
+        # The assertion stays a membership test on purpose. Which of the two a mixed
+        # column lands on is a property of the derivation's widening rules, not of this
+        # driver, and pinning it here would make a change over there fail in the wrong
+        # file. What this file is for is that the answer no longer depends on row order.
         cursor = connection.cursor()
+        first = connection.cursor()
         cursor.execute(f"SELECT V FROM {mixed} ORDER BY Key")
+        first.execute(f"SELECT V FROM {mixed} ORDER BY Key DESC")
         assert cursor.description[0][1] in (htcondordb.NUMBER, htcondordb.STRING)
+        assert cursor.description[0][1] == first.description[0][1]
 
 
 class TestProjectionKeepsExpressionDependencies:

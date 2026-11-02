@@ -579,6 +579,7 @@ listener should be on by default when the TCP one is not.
 | Result-column typing | `repl/arrowcols.go` | the SELECT list typed against a table's declarations; shared, so the two front doors cannot disagree about what a query returns |
 | Arrow output in the REPL | `repl/arrowout.go`, `.format arrow` | a SELECT's result as Arrow IPC; refuses a terminal |
 | Declared types in Grafana | `grafana/pkg/plugin/decisions.go` | the plugin reads the store's own column types instead of parsing cells; one bad cell no longer retypes a column |
+| Declared types in the DB-API | `capi/coltypes.go` | `column_types` in the result header; `description` is a schema and costs no fetch |
 
 **Prepared statements with bound parameters** are served. Two decisions in that increment are
 worth keeping, both arrived at by trying the obvious thing first:
@@ -709,10 +710,21 @@ the old way.
 
 Ordered by value per unit of work.
 
-1. **One of the three type guesses §4 set out to replace is still there.** The DB-API cursor
-   documents `description` as "what arrived, not a schema", and there is no `arrow()` on the
-   Python client. Both want typed columns to reach them over the Python transport, which is
-   real work rather than the wiring this item used to claim.
+1. **The type guesses §4 set out to replace are gone.**
+
+   **The DB-API cursor reports a schema** (`capi/coltypes.go`, `python/htcondordb/cursor.py`).
+   `description` used to infer each column's `type_code` from the first non-null value, which
+   failed three distinct ways: a column whose first row was an integer and whose second was a
+   string reported INTEGER; a column null all the way down reported `None`, making an absent
+   attribute and a typed column with no values in this result indistinguishable; and reading
+   *metadata* forced I/O, because a type could only come from data — the opposite of what
+   PEP 249 expects. The types now travel in the result header, derived by the same path the
+   endpoint publishes and cached per connection. A library too old to report them falls back to
+   the old inference, and an absent list is distinguishable from a per-column empty string, so
+   "no types reported" and "this column has no type" stay different answers.
+
+   `arrow()` on the Python client is the remaining piece of §9.4's rung-0 pair; `repl.WriteArrow`
+   is the encoder it would call.
 
    **The Grafana plugin is done** (`grafana/pkg/plugin/decisions.go`). It derives the table's
    columns through `repl.Executor.TableDecisions` — the same derivation the endpoint publishes —
