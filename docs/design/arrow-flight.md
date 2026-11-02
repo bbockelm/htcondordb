@@ -48,8 +48,8 @@ are different goals.
 | **3** | Airport (Flight + custom `DoAction`s) | rung 1 + msgpack + DuckDB's expression JSON | DuckDB only | **DuckDB's planner**, pushed to us |
 
 **We built 0 and 2.** Rung 0's pieces — the type contract and the encoder — are prerequisites
-for rung 2 that happen to be independently useful, so they ship as `htcondordb-cli arrow` and
-`arrowstream/` rather than as a milestone. Rung 1 falls out of rung 2. Rung 3 is the only route
+for rung 2 that happen to be independently useful, and they ship as `htcondordb-cli arrow`,
+`arrowstream/`, `.format arrow` in the REPL and `Connection.arrow()` in Python. Rung 1 falls out of rung 2. Rung 3 is the only route
 to DuckDB `ATTACH` with planner pushdown, and it is the most coupled option on every axis: a
 custom msgpack protocol, a community extension, an expression serialization DuckDB reserves the
 right to change in any release, and a server role reduced to dumb scan source — our constraint
@@ -609,6 +609,7 @@ listener should be on by default when the TCP one is not.
 | Arrow output in the REPL | `repl/arrowout.go`, `.format arrow` | a SELECT's result as Arrow IPC; refuses a terminal |
 | Declared types in Grafana | `grafana/pkg/plugin/decisions.go` | the plugin reads the store's own column types instead of parsing cells; one bad cell no longer retypes a column |
 | Declared types in the DB-API | `capi/coltypes.go` | `column_types` in the result header; `description` is a schema and costs no fetch |
+| Arrow from the Python client | `capi/arrow.go`, `Connection.arrow` | rung 0 over the existing CEDAR session; `arrow_bytes` needs no pyarrow |
 
 **Prepared statements with bound parameters** are served. Two decisions in that increment are
 worth keeping, both arrived at by trying the obvious thing first:
@@ -737,9 +738,7 @@ the old way.
 
 ### 7.3 What is left
 
-Ordered by value per unit of work.
-
-1. **The type guesses §4 set out to replace are gone.**
+**The type guesses §4 set out to replace are gone.**
 
    **The DB-API cursor reports a schema** (`capi/coltypes.go`, `python/htcondordb/cursor.py`).
    `description` used to infer each column's `type_code` from the first non-null value, which
@@ -752,8 +751,18 @@ Ordered by value per unit of work.
    the old inference, and an absent list is distinguishable from a per-column empty string, so
    "no types reported" and "this column has no type" stay different answers.
 
-   `arrow()` on the Python client is the remaining piece of §9.4's rung-0 pair; `repl.WriteArrow`
-   is the encoder it would call.
+   **`arrow()` on the Python client is done** (`capi/arrow.go`, `Connection.arrow` and
+   `Connection.arrow_bytes`). That completes rung 0: a client with no gRPC, no port to open and
+   no second authentication path reaches the encoder over the CEDAR session it already has.
+   `arrow_bytes` is the primitive and needs no pyarrow — write it to a file for DuckDB's
+   `read_arrow()`, or hand it to another process; `arrow()` is the table.
+
+   Two things it settled. The result is **binary**, so it does not use the C-string convention
+   the rest of the C API uses: an IPC stream contains NUL bytes by construction, so a `char *`
+   return truncates it silently and at a different offset for every query. And a write is
+   **refused from the parse, not after `Exec`** — a DELETE passed to `arrow_bytes` would
+   otherwise delete and then report that it could not be rendered, which is an error the caller
+   sees and a row they do not get back.
 
    **The Grafana plugin is done** (`grafana/pkg/plugin/decisions.go`). It derives the table's
    columns through `repl.Executor.TableDecisions` — the same derivation the endpoint publishes —
@@ -789,7 +798,7 @@ Ordered by value per unit of work.
    ad it is that string, parsed back from text it is a null. That is also a standing limitation
    of the aggregate branch, stated here rather than discovered.
 
-2. **Then the columnar producer.** Last, and for a measured reason rather than an argued one:
+1. **The columnar producer**, which is now the only item left. For a measured reason rather than an argued one:
    what is left of a read is the storage read itself, and it should be measured against the
    wire-native read rather than against the text path it replaced. The remaining blockers are all
    inside `collections`:
