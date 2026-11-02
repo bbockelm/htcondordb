@@ -3,8 +3,9 @@
 **Status:** ADBC over Arrow Flight SQL is implemented and read-only — type derivation in
 `arrowtype/`, the endpoint in `flightsvc/`, the SQL front end in `ansi/` — and verified in CI
 against the DuckDB CLI and a real ADBC driver. **The text round trip is gone from a projected
-read** (§14.6 item 4): the scan ships typed, evaluated values and the encoder appends them, 2.06x
-end to end and 6.5x fewer allocations. **§13 is the progress record: what is shipped,
+read** (§14.6 item 4): the scan ships typed, evaluated values and the encoder appends them, 6.2x
+end to end and 6.9x fewer allocations. What is left of such a read is the storage scan itself,
+which is what §13.2's question is now actually about. **§13 is the progress record: what is shipped,
 what is left, and why we cannot yet go straight from the vector engine to Arrow; §14 answers the
 layer question that record raises — where Arrow should be built, and what should move instead.**
 The transport and pushdown designs below (§6, §7) remain a sketch for a rung we did not climb. Measurements in
@@ -1126,25 +1127,44 @@ producer comes after those, and §13.2 says why in numbers.
 
 ### 13.2 Are we at the point of going straight from the vector engine to Arrow?
 
-**No, and the gap is wider than plumbing.** What one row costs today:
+**Closer than this section used to say, and the remaining gap is entirely inside `collections`.**
+Re-measured after §14.6 item 4; what one row of a PROJECTED read costs now:
 
 ```
-columnar segment → render ad text (classad) → dbrpc frame → classad.Parse (flightsvc)
-    → evaluate attribute by attribute → array.Builder.Append → Arrow buffer
+columnar segment → evaluate in the store → packed value columns → dbrpc frame
+    → AppendValues → Arrow buffer
 ```
 
-`doGetQuery` reads through `db.QueryTableStream` and parses each row with `classad.Parse`
-(`flightsvc/statement.go:474`). Columns are rebuilt a cell at a time out of text that was
-columnar two hops earlier.
+No text anywhere, and the cost divides sharply. Store side (scan, projection, evaluation, column
+packing, loopback transfer) **2 213 ns/row**; everything this process adds on top of it to reach
+Arrow buffers, **41 ns/row**. End to end over gRPC, 2 234.
 
-Four things stand between that and a column handed straight out of the vector engine, and three
-of them are in classad rather than here.
+So **~98% of a projected read is the storage scan**, and a columnar producer's entire upside is
+in making that number smaller. There is nothing left to win on the consumer side — which is the
+condition §14.6 item 6 said to wait for, now reached rather than argued.
+
+The four blockers this section listed were written against the text path. Re-checked against the
+engine as it stands, measured on a 20 000-record columnarized fixture with a job-ad shape:
+
+**Gone: vectorization declining per block.** `blocks: vector=53 declined=0 churn=0 pruned=0
+empty=0 rowWindows=1`. Not one block fell back. Blocker 3 was a real concern when written and
+does not fire on this shape; it remains a correctness constraint on the producer (one stable
+schema across tiers) rather than a performance one.
+
+**Gone: the dbrpc text boundary, and redaction with it.** `opQueryValues` IS a columnar, typed
+frame, and because it lives inside the dbrpc server the private-attribute stripping and the
+private-constraint gate hold by construction. What remains is that its producer is
+`QueryProjectStats` — per record. The server packs those columns **one row at a time** and then
+ships them column-major. So this is no longer "design a columnar protocol and re-solve
+redaction"; it is "put a vector producer behind a wire format that already exists".
+
+**Still missing, and the real work:**
 
 1. **There is no column-out API, and no selection.** `blockVecSource.LoadColumn`
    (classad `collections/colvec.go:104`) is private, and the only exported vectorized entries
-   are `VectorEvalCount` and its grouped sibling — a count, and group accumulators. Nothing
-   hands back a `vm.Vec`, and nothing applies the match mask to produce the *surviving* rows'
-   values. The grouped path is the precedent to copy rather than a thing to extend: it reads the
+   are `VectorEvalCount`, `ColumnarEvalCount` and the grouped aggregates — counts and group
+   accumulators. Nothing hands back a `vm.Vec`, and nothing applies the match mask to produce
+   the *surviving* rows' values. The compaction is genuinely new code, a gather per kind. The grouped path is the precedent to copy rather than a thing to extend: it reads the
    group and aggregate columns through the block's columns **in every tier**, including tiers
    where the predicate fell back to per-record evaluation, exactly so that group identity cannot
    depend on which tier answered (`collections/colvecgroup.go`). A column producer needs the same
@@ -1163,13 +1183,24 @@ of them are in classad rather than here.
    others reassemble row-wise (§5.7). That is a feature of the storage layer — a schema change
    costs a slope rather than a cliff — and it is the constraint that makes this more than an
    encoder.
-4. **dbrpc has no columnar frame, and the loopback is what buys redaction.** A columnar producer
-   inside `collections` would still render to text at the dbrpc boundary, so the win would stop
-   there. And the encoder *requires* ads already reduced to the reader's view and cannot check it
-   (`arrowtype/encode.go`); that holds today **by construction**, because every Flight read goes
-   through the dbrpc server's own private-attribute stripping and private-constraint gate
-   (`flightsvc/session.go`). Any path that bypasses dbrpc has to carry both with it, or Arrow
+4. ~~**dbrpc has no columnar frame, and the loopback is what buys redaction.**~~ **Closed** —
+   see above. The caution it carried still stands and now applies to the producer rather than to
+   the frame: the encoder *requires* values already reduced to the reader's view and cannot check
+   it (`arrowtype/encode.go`), which holds because every Flight read goes through the dbrpc
+   server's own stripping and gate. A vector producer must sit INSIDE that boundary too, or Arrow
    becomes the private-attribute oracle `private_gate.go` exists to prevent.
+
+5. **The computed region is a precomputed location, not a column.** Measured on the fixture
+   above, per block: `ResidentSetSize` and `JobStatus` are escape-free in 53 of 53 blocks, so a
+   raw contiguous width-native vector is available for them today. `MemoryUsage` is escape-free
+   in **0 of 53**, with **19 717 of 19 717 cells escaped**. It vectorizes — `fixEscapes` reads
+   the computed region, which is why the aggregates can see it — but `escapeFree` is false, so it
+   can never take the `rawColumn` path and instead repairs every single record one at a time.
+
+   This is the difference between a loop and a memcpy, on exactly the attributes anyone wants.
+   Making a computed cell an ordinary column value rather than an escape with a literal beside
+   it would put `MemoryUsage` in `ResidentSetSize`'s shape, and it is the single change that
+   most increases what a column producer could hand out.
 
 **And what would it be worth? Measured, and it is not what the plan assumed.**
 
@@ -1744,13 +1775,22 @@ Two gaps sit on the path and should be closed with it:
 
    | | ns/row | allocations | bytes |
    |---|---|---|---|
-   | text projection, parsed back | 13 485 | 2 522 081 | 250 MB |
-   | typed value stream | **6 536** | **385 807** | **42 MB** |
-   | | **2.06x** | **6.5x** | **5.9x** |
+   | text projection, parsed back | 13 882 | 2 522 920 | 251 MB |
+   | typed value stream | **2 234** | **365 927** | **41 MB** |
+   | | **6.2x** | **6.9x** | **6.1x** |
 
-   The e2e figure is diluted on purpose: it includes gRPC and the client's own Arrow decode,
-   neither of which this changes, so the server-side reduction is much larger than 2.06x. The
-   allocation count is the cleaner signal of what was deleted.
+   **The first version of this table said 2.06x, and it was measuring the consumer rather than
+   the change.** `ValueBatch.ValueAt` recounts the validity bitmap from row 0 on every call, so
+   reading a whole batch through it is quadratic in the batch size — and it is the obvious way
+   to read one. Walking each column once with a running dense index instead took the same read
+   from 6 257 to 2 254 ns/row. Nothing about the op or the data changed; the accessor was three
+   quarters of the cost.
+
+   It is worth recording how it was caught, because the green tests could not: the arms that
+   split a read's cost put the store's own scan at 2 213 ns/row and the whole read at 6 257,
+   which made "turning values into Arrow" cost seven times what turning ADS into Arrow had cost
+   (519 ns/row). A component getting dramatically slower while doing strictly less work is not a
+   result, it is a bug report.
 
    **`SELECT *` does not take this path, and the reason is structural rather than unfinished.**
    The value stream returns one column per REQUESTED attribute, as values; the tail column
