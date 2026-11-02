@@ -52,7 +52,8 @@ func columnStrings(t *testing.T, cl *flightsql.Client, q string, names []string)
 //
 // MemoryUsage is in the projection deliberately: it is an expression in every ad, so the value
 // path gets it evaluated in the store and the text path evaluates it here. That is the pair
-// most likely to disagree, and the one the whole §5.1 argument rests on.
+// most likely to disagree, and the one that decides whether an expression-valued attribute
+// gets a typed column at all.
 func TestValuePathAgreesWithTheTextPath(t *testing.T) {
 	cl, _, done := harness(t, 60)
 	defer done()

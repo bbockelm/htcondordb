@@ -140,7 +140,7 @@ func testLogger(t *testing.T) *logging.Logger {
 	return l
 }
 
-// TestFlightOverridesAreReachable is §13.3's "implemented and unreachable": arrowtype has had
+// TestFlightOverridesAreReachable covers an "implemented and unreachable" gap: arrowtype has had
 // Overrides and StrictMixedKinds since it was written, and the daemon wired only TimeAttrs, so
 // an admin could declare an epoch attribute and nothing else.
 //
