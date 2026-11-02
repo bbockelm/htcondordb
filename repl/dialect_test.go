@@ -4,6 +4,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/bbockelm/htcondordb/arrowtype"
 )
 
 // seedDialect writes ads whose Owner values differ only in case, which is the whole point: the
@@ -283,5 +285,20 @@ func TestANSIDialectOnAnArchive(t *testing.T) {
 		t.Error("string ordering was accepted on an archive")
 	} else if !strings.Contains(err.Error(), "case-insensitively") {
 		t.Errorf("error %q is not the ansi refusal", err)
+	}
+}
+
+// TestDialectSamplesLikeTheEndpoint pins the agreement rather than the number.
+//
+// The schema is a declaration about a whole table, so two front doors that sample differently
+// believe the table has different columns -- a rare attribute shows up in one and not the
+// other, and the same table presents one shape over ADBC and another here at the same moment.
+// That was the state: this read 2000, the endpoint read 10000, and the comment here said they
+// matched. A constant of its own is how that happens, so the test is that there isn't one.
+func TestDialectSamplesLikeTheEndpoint(t *testing.T) {
+	if ansiSampleMax != arrowtype.DefaultSampleMax {
+		t.Fatalf("the dialect samples %d records and a type derivation samples %d; "+
+			"the two front doors would disagree about which columns the table has",
+			ansiSampleMax, arrowtype.DefaultSampleMax)
 	}
 }

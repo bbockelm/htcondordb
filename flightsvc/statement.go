@@ -189,10 +189,10 @@ func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table st
 	return schema, decisions, nil
 }
 
-// defaultSampleMax is how many records a schema derivation looks at. Matches arrowstream's
-// default: the schema a client sees through the catalog and the schema it gets from a query
-// have to agree, and they will not if the two paths sample differently.
-const defaultSampleMax = 10000
+// defaultSampleMax is how many records a schema derivation looks at: the shared default, so the
+// schema a client sees through the catalog, the one it gets from a query, and the one the REPL
+// derives are all the same declaration about the same table.
+const defaultSampleMax = arrowtype.DefaultSampleMax
 
 // sampleMax is the server's effective cap. It is a field rather than a constant so a test can
 // make the CAPPED case reachable: with the default, any fixture small enough to run quickly is

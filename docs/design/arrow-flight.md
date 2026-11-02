@@ -1402,10 +1402,12 @@ this class of bug at all.
    (`python/htcondordb/cursor.py:523`). There is no `arrow()` on the Python client and no
    `.arrow` in the REPL, both of which §9.4 asked for as nearly free once the encoder existed.
    The encoder exists.
-8. **The two front doors sample different amounts.** The REPL's ANSI dialect profiles 2000
-   records (`repl/dialect.go:91`), the endpoint 10 000, so the set of columns each believes the
-   table has can differ on the same table at the same moment. One kind mapping already serves
-   both (`arrowtype/sqlkinds.go`); the sample size should too.
+8. ~~**The two front doors sample different amounts.**~~ **Done.** `arrowtype.DefaultSampleMax`
+   is the one number, and the dialect, the endpoint and the exporter all reference it. There
+   were three definitions, two agreeing at 10 000 and the REPL's at 2000 under a comment
+   claiming it matched the endpoint -- which is how this kind of divergence survives, since
+   nothing is wrong at either site on its own. Pinned by a test whose assertion is that the
+   dialect has no constant of its own.
 9. **Then the columnar producer** (§13.2, and §9.3's closing paragraph). Last, and for a
    measured reason rather than an argued one: once item 1 has deleted the text round trip, what
    is left of a read is the storage read itself at **under 10% of today's CPU**, and the columnar
