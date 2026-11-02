@@ -199,8 +199,19 @@ func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table st
 	// not turn it off without making the schema lie, and there is no reason to let it.
 	derive := s.derive
 	derive.Tail = true
-	schema, decisions := arrowtype.Schema(ms, derive)
+	_, decisions := arrowtype.Schema(ms, derive)
+	// The declaration outranks the measurement, and appends to itself whatever the
+	// measurement found that it had not seen (declared.go). Without this the published
+	// schema moves with the sample: a column retypes, a new attribute lands in the middle
+	// of the order, and a client holding a cached catalog is holding something that was
+	// true once.
+	decisions = s.declared.reconcile(table, decisions, private)
+	schema := schemaOf(decisions)
 	s.schemas.put(key, schema, decisions)
+	// Off the read path: a derivation that extended the declaration writes it, and a
+	// failure to write is reported rather than failing the read, because the file is a
+	// stability optimization and never a correctness dependency.
+	s.declared.flush()
 	return schema, decisions, nil
 }
 
@@ -776,6 +787,16 @@ type Settings struct {
 	// which is what this served before the cache existed; a host that wants the cache has
 	// to ask for it, because the right answer depends on how fast its tables change.
 	SchemaTTL time.Duration
+	// SchemaFile is where each table's declared columns are kept across restarts
+	// (declared.go). Empty declares in memory for this process only, which is what an
+	// in-memory store gets and is still enough to stop a schema moving between two RPCs
+	// of one session. A path gets the half a cache cannot do: a column keeps its position
+	// after a restart, so a consumer's cached catalog stays valid.
+	SchemaFile string
+	// Warn reports a condition an operator should know about but that must not fail a
+	// request -- an unwritable declaration, a column kind a newer build wrote. Nil
+	// discards them, which is what an embedder with no logger gets.
+	Warn func(string)
 	// Version is the host's own version, reported to a client as
 	// FLIGHT_SQL_SERVER_VERSION. Empty leaves the placeholder, which matters because
 	// ADBC's adbc_get_info() asks for this entry by name and reads an unregistered one as
@@ -812,6 +833,7 @@ func applySettings(srv *Server, set Settings) error {
 	srv.SetStreamBudget(set.StreamBudgetBytes)
 	srv.SetMaxStreams(set.MaxStreams)
 	srv.SetSchemaTTL(set.SchemaTTL)
+	srv.SetSchemaDeclaration(set.SchemaFile, set.Warn)
 	return srv.SetVersion(set.Version)
 }
 

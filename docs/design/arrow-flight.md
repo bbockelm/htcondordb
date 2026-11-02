@@ -329,17 +329,54 @@ server-side, because an attribute's numeric bounds are a disclosure even where i
 so two levels derive different schemas from one table and a shared entry would hand private
 column names to whoever asked second.
 
-**Not built: the declaration itself.** The pin makes instability *visible*; it does not make the
-schema stable. A table that keeps gaining attributes keeps refusing fetches planned a moment
-earlier, correctly and uselessly. What is still wanted is a stored, admin-overridable type map,
-with the epoch-to-timestamp mapping as a declaration rather than a guess — `knownTimeAttrs` in
-the Grafana plugin is the right instinct with the wrong mechanism. Seeding it is already
-half-written: `knownFlightPolicyExprs` and the `HTCONDORDB_FLIGHT_*` overrides are a declaration
-in config rather than in storage. The describe-table op it would ride on wants, per attribute,
-`{kind-after-evaluation, exact integer min/max, unsigned, presence fraction, escape fraction by
-cause, cardinality estimate}`, and requires exporting kind information out of `collections`
-(`adKind` is package-private today). Cardinality and range come from the value-index histograms
-the planner already maintains.
+**Built: the declaration** (`flightsvc/declared.go`). The pin makes instability *visible*; this
+is what makes it rare. Every schema published is otherwise MEASURED — a sample of a table still
+being written to, re-taken whenever the cache expires — which is sound for one read and wrong
+for everything a consumer does with a catalog.
+
+**The rule is monotone: a declaration is a floor, not a ceiling.** A declared column keeps its
+type and its position for as long as the declaration stands; the measurement cannot retype it
+and an admin can. An attribute nobody has declared is typed by measurement and **appended**,
+never inserted. A declared column whose attribute has vanished from the sample stays, as a
+column of nulls, because dropping it would renumber everything after it.
+
+The consequence is the one that matters: **a schema a client cached is always a prefix of the
+current one.** A positional reader cannot be made to read the wrong column by anything that
+happens to the table; at worst it does not know about a new column at the end.
+
+Four things worth recording:
+
+- **One column is exempt, deliberately.** The tail is not an attribute — it is this endpoint's
+  own column — and it is always last, so appending an attribute moves it. A client reading the
+  tail by position must re-read the schema; one reading it by name, which is what a special
+  column deserves, is unaffected. Putting it first would make *turning the tail on* shift every
+  other column, which is worse.
+- **It records only what an unprivileged reader could already list.** The file is shared by
+  every reader of the table, so writing down a column only a DAEMON peer can see would both
+  leak the attribute's name to whoever can read the file and publish a column READ peers cannot
+  fill. A privileged reader's extra columns are served and not recorded.
+- **Never a correctness dependency.** An unreadable file starts from the measurement; an
+  unwritable one declares for this process only. Both warn, because the symptom of a silent
+  reset — clients re-fetching catalogs — points nowhere near here. A daemon with no on-disk
+  directory gets the in-process half, which still stops a schema moving between two RPCs of one
+  session.
+- **Bounded.** Attribute names come from the data, and a pool that puts a job id in one would
+  grow the file without limit. Past the cap, attributes are still *served* — the cap bounds what
+  is written down, never what a client is shown — and their positions simply stop surviving a
+  restart.
+
+`HTCONDORDB_FLIGHT_SCHEMA_FILE` chooses the path; the default is beside the database, which is
+where it belongs, since it describes that database's tables and is meaningless without them.
+`none` turns persistence off for a host that would rather re-measure.
+
+**Still wanted from the original plan:** the epoch-to-timestamp mapping as a declaration rather
+than a guess — `knownTimeAttrs` in the Grafana plugin is the right instinct with the wrong
+mechanism — and the describe-table op the declaration could be *seeded* from, which wants per
+attribute `{kind-after-evaluation, exact integer min/max, unsigned, presence fraction, escape
+fraction by cause, cardinality estimate}` and requires exporting kind information out of
+`collections` (`adKind` is package-private today). What ships now seeds itself from the ordinary
+type report instead, which is enough to make the schema stable and not enough to narrow an
+integer column.
 
 ### 5.8 Measured: what ap2001 actually holds
 
@@ -534,6 +571,7 @@ listener should be on by default when the TCP one is not.
 | Aggregates, GROUP BY, ORDER BY, DISTINCT (§7.4) | `flightsvc/analytic.go` | the `repl` executor, with result columns typed from the SELECT list |
 | Projected scan, archives included | `flightsvc/statement.go` | the refs-chasing projection op reaches an archive, pushes the projection down, keeps expressions evaluable |
 | Schema cache, privilege-scoped | `flightsvc/schemacache.go` | stops a derivation per RPC |
+| Declared columns (§5.7) | `flightsvc/declared.go`, `HTCONDORDB_FLIGHT_SCHEMA_FILE` | a column keeps its type and position across samples and restarts; new attributes append |
 | Admin type overrides | `cmd/htcondordb/flight.go` | `HTCONDORDB_FLIGHT_EXCLUDE_ATTRS`, `_ATTR_KINDS`, `_STRICT_MIXED_KINDS`, `_TIME_ATTRS` |
 | SqlInfo conformance | `flightsvc/server.go` | the entries a real driver asks for at connect, one of which failed every ADBC client while Go was green |
 | ANSI → ClassAd lowering (§8) | `ansi/` | the comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, and `?` holes |
@@ -670,12 +708,7 @@ the old way.
 
 Ordered by value per unit of work.
 
-1. **The declared type map** (§5.7). The pin makes schema drift visible; the declaration is what
-   makes it rare, and it is what a columnar producer needs, since a producer emitting one Arrow
-   schema across blocks that vectorize and blocks that do not cannot derive that schema from
-   whichever block it is looking at.
-
-2. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
+1. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
    parses cells and keeps its own `knownTimeAttrs`; the DB-API cursor still documents
    `description` as "what arrived, not a schema". Both need typed columns to reach them over
    their own transports, so neither is the "nearly free" job this item used to claim — the
@@ -695,7 +728,7 @@ Ordered by value per unit of work.
    ad it is that string, parsed back from text it is a null. That is also a standing limitation
    of the aggregate branch, stated here rather than discovered.
 
-3. **Then the columnar producer.** Last, and for a measured reason rather than an argued one:
+2. **Then the columnar producer.** Last, and for a measured reason rather than an argued one:
    what is left of a read is the storage read itself, and it should be measured against the
    wire-native read rather than against the text path it replaced. The remaining blockers are all
    inside `collections`:
@@ -724,6 +757,10 @@ Ordered by value per unit of work.
      record one at a time. That is the difference between a loop and a memcpy, on exactly the
      attributes anyone wants, and making a computed cell an ordinary column value is the single
      change that most increases what a column producer could hand out.
+
+   What it wanted from the declaration it now has: a producer emitting one Arrow schema across
+   blocks that vectorize and blocks that do not cannot derive that schema from whichever block
+   it is looking at, and it no longer has to — the schema is declared before the scan starts.
 
    One blocker that was on this list is **gone**: vectorization declining per block. Measured on
    the same fixture, `blocks: vector=53 declined=0 churn=0 pruned=0 empty=0 rowWindows=1` — not
