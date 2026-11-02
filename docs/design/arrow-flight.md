@@ -1,7 +1,11 @@
 # Design sketch: Arrow output, and how far up the Flight stack to climb
 
-**Status:** the type-inference layer (§5) is implemented in `arrowtype/`; the Flight and transport
-sections below remain a sketch. Measurements in §3 stand as taken.
+**Status:** ADBC over Arrow Flight SQL is implemented and read-only — type derivation in
+`arrowtype/`, the endpoint in `flightsvc/`, the SQL front end in `ansi/` — and verified in CI
+against the DuckDB CLI and a real ADBC driver. **§13 is the progress record: what is shipped,
+what is left, and why we cannot yet go straight from the vector engine to Arrow.** The transport
+and pushdown designs below (§6, §7) remain a sketch for a rung we did not climb. Measurements in
+§3 and §5.8 stand as taken.
 **Grounded in:** `repl/sql.go`, `repl/exec.go`, `repl/rowstream.go`, `grafana/pkg/plugin/frame.go`,
 and in classad's `collections/adschema.go`, `collections/vm/vecexec.go`, `dbrpc/proto.go`,
 `db/aggregate.go`. Binary sizes in §3 are measured, not estimated; §3.1 says how.
@@ -1072,7 +1076,297 @@ difference. So assert on:
 Keep the integration suite inside the usual runtime budget; DuckDB-in-the-loop tests run on
 demand, not on every push.
 
-## 13. Parked: the one Airport-only opportunity worth remembering
+## 13. Progress: what is shipped, and what is left
+
+ADBC works end to end. A client connects, browses the catalog, is given a typed schema without
+executing anything, and reads `SELECT <cols|*> FROM <table> [WHERE <predicate>] [LIMIT n]` as
+Arrow batches, with `?` parameters bound through a prepared statement. Two *external* clients
+check it in CI rather than arrow-go checking itself (§12): the DuckDB CLI through `nanoarrow`,
+and `adbc_driver_flightsql` through gRPC.
+
+What is left is not transport. It is **breadth of SQL**, a **declared** schema rather than a
+sampled one, and getting the store's records here without a text round trip — which §13.2
+measures at **87% of a read's CPU**, against 3% for the Arrow encoding everyone assumed was the
+cost and under 10% for the storage read a columnar producer would accelerate. The columnar
+producer comes after those, and §13.2 says why in numbers.
+
+### 13.1 Shipped
+
+| | Where | Note |
+|---|---|---|
+| Type derivation (§5.1–§5.5) | `arrowtype/derive.go` | evaluate, coerce, widen int/real on exact bounds, text fallback |
+| Row encoder (§5.1) | `arrowtype/encode.go` | per-column coercion counters; the caller owes it redacted ads |
+| Memory budget | `arrowtype/budget.go` | an allocator that panics, turned into one failed request |
+| Serverless export (rung 0) | `arrowstream/`, `htcondordb-cli arrow` | an `.arrows` file, read by DuckDB's `read_arrow()` |
+| In-process gRPC (§8) | `cmd/htcondordb/flight.go`, `flightsvc/session.go` | opt-in listener; a dbrpc loopback per connection |
+| Authentication and authorization (§8.3–§8.4) | `flightsvc/authn.go`, `session.go` | token or anonymous → CEDAR's own `Authorizer`; READ-only whatever the peer holds |
+| Containment (§8.5) | `flightsvc/statement.go`, `server.go` | panic barrier per stream, byte budget, stream cap that refuses rather than queues |
+| Flight SQL method set (§9.2) | `flightsvc/server.go`, `statement.go`, `prepared.go` | catalogs, schemas, tables, table types, statement, prepared + bind |
+| Projected scan, archives included | `flightsvc/statement.go` | the refs-chasing projection op: reaches an archive, pushes the projection down, keeps expressions evaluable |
+| Schema cache, privilege-scoped | `flightsvc/schemacache.go` | stops a derivation per RPC; makes the promised and delivered schema one object within the TTL |
+| SqlInfo conformance | `flightsvc/server.go` | the entries a real driver asks for at connect, one of which failed every ADBC client while Go was green |
+| ANSI → ClassAd lowering (W1, §10) | `ansi/` | the comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, and `?` holes |
+| The same dialect in the REPL | `repl/dialect.go`, `-dialect` | one Arrow-column→SQL-kind mapping serves both front doors (`arrowtype/sqlkinds.go`) |
+
+### 13.2 Are we at the point of going straight from the vector engine to Arrow?
+
+**No, and the gap is wider than plumbing.** What one row costs today:
+
+```
+columnar segment → render ad text (classad) → dbrpc frame → classad.Parse (flightsvc)
+    → evaluate attribute by attribute → array.Builder.Append → Arrow buffer
+```
+
+`doGetQuery` reads through `db.QueryTableStream` and parses each row with `classad.Parse`
+(`flightsvc/statement.go:474`). Columns are rebuilt a cell at a time out of text that was
+columnar two hops earlier.
+
+Four things stand between that and a column handed straight out of the vector engine, and three
+of them are in classad rather than here.
+
+1. **There is no column-out API, and no selection.** `blockVecSource.LoadColumn`
+   (classad `collections/colvec.go:104`) is private, and the only exported vectorized entries
+   are `VectorEvalCount` and its grouped sibling — a count, and group accumulators. Nothing
+   hands back a `vm.Vec`, and nothing applies the match mask to produce the *surviving* rows'
+   values. The grouped path is the precedent to copy rather than a thing to extend: it reads the
+   group and aggregate columns through the block's columns **in every tier**, including tiers
+   where the predicate fell back to per-record evaluation, exactly so that group identity cannot
+   depend on which tier answered (`collections/colvecgroup.go`). A column producer needs the same
+   property for values.
+2. **A column handed out aliases the block.** `loadStr` deliberately does not copy — one
+   allocation per record made a string predicate slower than the row path — and the dictionary is
+   **per block** and fold-sorted. So a producer either copies, or pins the block for the life of
+   the batch; and an Arrow `DictionaryArray` cannot span blocks without remapping codes. Sealed
+   is not alive, which is the same lifetime question that has already bitten a read taken off a
+   segment here.
+3. **Vectorization declines per block, by design.** `vecSplit` (`collections/colvec.go:42`)
+   counts blocks served as vectors, blocks the executor declined (a string column, an expression
+   in the cold tail, Elvis), mostly-superseded blocks where evaluating every record is wasted
+   work, zone-pruned blocks, and windows with no columnar block at all. A producer therefore has
+   to emit **one stable Arrow schema** across a stream in which some blocks arrive columnar and
+   others reassemble row-wise (§5.7). That is a feature of the storage layer — a schema change
+   costs a slope rather than a cliff — and it is the constraint that makes this more than an
+   encoder.
+4. **dbrpc has no columnar frame, and the loopback is what buys redaction.** A columnar producer
+   inside `collections` would still render to text at the dbrpc boundary, so the win would stop
+   there. And the encoder *requires* ads already reduced to the reader's view and cannot check it
+   (`arrowtype/encode.go`); that holds today **by construction**, because every Flight read goes
+   through the dbrpc server's own private-attribute stripping and private-constraint gate
+   (`flightsvc/session.go`). Any path that bypasses dbrpc has to carry both with it, or Arrow
+   becomes the private-attribute oracle `private_gate.go` exists to prevent.
+
+**And what would it be worth? Measured, and it is not what the plan assumed.**
+
+`BenchmarkReadStages` (`flightsvc/readcost_test.go`) reads a 20 000-ad archive projected to six
+columns, with the per-segment columnar accelerator off and on. Medians of five runs, ns per row,
+Apple M2 Pro:
+
+| | record tier | columnar tier | allocs/row |
+|---|---|---|---|
+| store scan + projection + **render** + loopback | 10 719 | **9 437** | 40 |
+| ClassAd text parse | 6 518 | **6 434** | 86 |
+| evaluate + Arrow append | 500 | **484** | 0.1 |
+| end-to-end over gRPC *(overlapped, not a sum)* | 15 618 | **13 773** | — |
+
+The stages are measured **in isolation**, not cumulatively, and the parse arm is the control that
+says so: it is the same text in both tiers and it measured the same, 6 518 against 6 515. An
+earlier cumulative version of this benchmark was non-monotone — the full gRPC read came out faster
+than a strict subset of its own work — because the dbrpc loopback serves from its own goroutine,
+so a "scan, then parse in the yield" arm runs the two concurrently and subtracting them attributes
+nothing. The end-to-end arm still overlaps by design; it is the number a user feels, and the
+others are the CPU it costs.
+
+**That first table hides its own answer, and a first reading of it got this wrong.** The top row
+is labelled "scan + projection + render + loopback" and was then reasoned about as if it were all
+*scan* — irreducible storage work — which produced a ceiling of 1.74x for ever removing the parse
+and the encode. Splitting the row apart kills that conclusion.
+
+**What "render" means here**, since the word is doing real work: a stored record is binary —
+inline attribute names and typed value nodes, each a tag byte plus a varint or a length-prefixed
+string. The text projection op walks each matched record and builds ClassAd SOURCE TEXT from it,
+literally the bytes `Owner = "user43"\nClusterId = 1029\n…`, which then crosses dbrpc as a string
+for the consumer to parse back. The wire op produces no text at all: it assembles a
+self-contained row by copying the stored nodes.
+
+`BenchmarkWireNativeRead` runs the same query both ways — same constraint, same matching, same
+projection, same reference closure, same loopback, a yield that only counts — and the wire scan
+costs **1 610 ns/row against the text projection's 9 437**, 5.9x less, over tight spreads (1.1%
+and 3.0% across five runs). The render was 83% of what the scan appeared to cost.
+
+**And that 83% is CPU, not payload.** The obvious alternative explanation is that the text form
+is simply bigger, so more bytes cross the pipe. Measured on the same records and projection, it
+is **156.3 bytes/row against 139.8 — a ratio of 1.12x**. Sixteen extra bytes a row through an
+in-process pipe is worth nanoseconds, so it accounts for well under 1% of the gap. What the text
+path is spending is the per-attribute work of FORMATTING: decode the node, turn an integer into
+decimal digits or a string into a quoted and escaped literal, write `Name = value\n`. The wire
+path copies the node's bytes instead.
+
+So the real attribution of a read, on the columnar tier, is:
+
+| | ns/row | share |
+|---|---|---|
+| **render each record to text** | 7 827 | **47.9%** |
+| **ClassAd parse it back** | 6 434 | **39.3%** |
+| storage read + projection + loopback | 1 610 | 9.8% |
+| evaluate + Arrow append | 484 | 3.0% |
+
+**Render and parse are 87% of a read's CPU, and neither is work.** Both exist only because the
+relay renders text that the consumer immediately parses back.
+
+Four things follow.
+
+1. **The Arrow encoder is not the cost** — 3% of CPU and a tenth of an allocation per row, with
+   an expression-valued column among the six deliberately, since that is the case that must
+   evaluate rather than read. "Go straight from the vector engine to Arrow" is barely about
+   Arrow.
+2. **Reading values straight off the wire row is 7x.** A wire row is an inline-names ad:
+   `wire.Ad.LookupByName` finds one attribute's node bytes and `wire.LiteralValue` decodes a
+   scalar from them, so a value reaches an Arrow builder with no render and no ClassAd between.
+   Measured: **2 326 ns/row against 16 355 today, and 8 allocations a row against 88.** For a
+   projection of literal-valued attributes only, 2 043 — **8x**.
+3. **But that figure is a ceiling, not a promise.** The benchmark appends a null where a node is
+   not a literal and counts those (`fellthrough/row`); a real encoder must EVALUATE there, and on
+   this fixture `MemoryUsage` is an expression in every ad. A projection that includes an
+   expression-valued attribute pays for an evaluator on every row of it, and §5.8 says that on a
+   real AP such attributes are common in the stored form even though their evaluated kind is
+   uniform. The hybrid — literals read from the node, expressions evaluated — is the design, and
+   its real-world speedup sits between the 8x of the literals-only arm and whatever the evaluator
+   costs.
+4. **The columnar accelerator is worth 1.12x on a materializing read**, against the multiples it
+   earns on `COUNT` and `GROUP BY`. Not a disappointment: the vectorized engine's demonstrated
+   wins are on **match-only** work, where the answer is a count or a few group rows and nothing is
+   materialized. A readout that materializes every projected attribute of every matching record is
+   a different workload.
+
+So the columnar producer is still not the next thing to build, but for a better reason than the
+first reading gave: **87% of a read is a text round trip that no columnar work is needed to
+delete**, and the storage read it would actually accelerate is under 10%. Build the wire-native
+read first; whatever is left over is what the vectorized engine has to argue against.
+
+**What this does not establish.** One machine, one dataset, one read shape: six columns out of a
+34-field schema. A wider projection moves work toward the scan and away from the per-record
+overheads; `SELECT *` more so. The archive here was columnarized on demand in one pass with every
+sealed segment covered, where a production table carries a backlog and an uncovered segment reads
+the old way. And the wire-native figure does not evaluate expressions, as item 3 says — it is the
+literal path's cost, measured, plus a fall-through count.
+
+**The first step was not columnar at all, and it is taken.** The scan no longer pulls whole ads
+as bracketed text: `QueryRawProjectRefsStream` applies the projection *inside* the decode walk,
+so a non-projected attribute is never rendered and a projection the hot header covers is served
+from the hot header alone. Refs-chasing rather than the plain projection op because this encoder
+evaluates — `MemoryUsage` projected without the siblings it is written over evaluates to
+undefined, which turns a good integer column into nulls. The same change made archive tables
+readable (§13.3).
+
+`QueryRawWireStream` goes further and skips the text form altogether; a wire-form read measured
+12.8x end to end elsewhere in this tree, which is the same reason §9.3 insists the columnar
+encoder be measured against it and not against the string path. But it is **blocked upstream**,
+not merely next: `opQueryRawWire` is not served from an archive — probed directly, it answers
+*"QueryRawWire is not served from an archive; use QueryRawProject, which does read one"* — so
+adopting it today would re-break `history`. It needs the archive case added in classad first.
+
+### 13.3 What is left
+
+Ordered by value per unit of work, not by position in the stack.
+
+**One item came off this list while the section was being written**, because writing it down is
+what found it: `SELECT * FROM history` returned an error. The endpoint listed the archive table,
+derived its schema (776 bytes of it), and then failed the read, because `opQuery` refuses an
+archive by design and says so. Nothing caught it: every Flight test ran against a single mutable
+table, and the one test that mentioned an archive name only checked that the *recogniser* accepts
+a `/`. Moving the scan onto the refs-chasing projection op fixed it and pushed the projection down
+in the same change (§13.2), and the harness now holds an archive. The lesson is the fixture, not
+the API: a new read surface needs an archive in its tests from the first one, or it cannot see
+this class of bug at all.
+
+1. **The text round trip, which is 87% of a read.** Rendering each record to text is 48% of a
+   read's CPU and parsing it back is a further 39%, at 86 allocations per row (§13.2) — and
+   neither is work, only the cost of a relay that renders what its consumer immediately parses.
+   Reading values straight off the wire row measured **7x** end to end, 8x for a projection of
+   literal-valued attributes.
+
+   Two pieces, in order. **Upstream:** `opQueryRawWire` skips the text form and did not serve an
+   archive, so adopting it would have re-broken `history` -- classad PR #477 adds the archive
+   case, and this wants the tag. **Here:** an encoder that reads a wire node directly
+   (`wire.Ad.LookupByName` + `wire.LiteralValue`) and falls back to an evaluator for a node that
+   is not a literal. The fallback is the part with a real design question in it, because on a
+   real AP an attribute's STORED form is an expression far more often than its evaluated kind
+   suggests (§5.8) -- so how often the fallback fires decides how much of the 7x survives.
+   `BenchmarkWireNativeRead` is in the tree and skips, naming the missing op, until the
+   dependency carries it.
+2. **The schema is sampled, not declared.** §5.7's describe-table op — a per-table type map
+   stored beside the columnar schema, sharing its generation counter, seeded by introspection and
+   overridable by an admin — was not built. What shipped is `opAttrTypes`, returning profiles of a
+   sample: the measurement, not the declaration.
+
+   Two of the three consequences are now closed by a cache (`flightsvc/schemacache.go`, default
+   30s). The repeat scans are gone — a derivation is no longer paid per RPC — and the schema a
+   client is promised and the one it is delivered are the same object within the TTL, where before
+   they were two independent measurements of a moving table and a client trusting the first read
+   the second by position.
+
+   What a cache cannot do is make that a **guarantee**, and this is where the missing generation
+   bites: the entry can expire between the two calls, and there is nothing to pin, because the
+   type report carries profiles and a sample size and no generation counter. Within one stream the
+   schema is fixed by construction — it is derived once, before the scan — so a mid-stream retype
+   is not the exposure; the FlightInfo/DoGet pair is. §5.7's "pin the generation for the life of a
+   stream" wants restating as "pin it for the life of a statement", and it needs classad to
+   publish one.
+
+   The cache is keyed by privilege, which is not a detail: an unprivileged type report has the
+   private attributes filtered out server-side, because an attribute's numeric bounds are a
+   disclosure even where its value is not, so two levels derive different schemas from one table
+   and a shared entry would hand private column names to whoever asked second.
+3. **The type decision is made on the stored form, while the encoder evaluates.**
+   `AttrTypeProfiles` classifies wire nodes and states that it evaluates nothing, so `expr`
+   competes as a value class and an expression-dominant attribute is ruled `Untyped`
+   (`arrowtype/derive.go:315`). On ap2001's `history` that drops `MemoryUsage` from the schema
+   although it **evaluates to an integer in all 2000 sampled ads** (§5.8). The measurement that
+   established §5.1 was a one-off script; the server op that would act on it reports stored
+   classes. Profiling *evaluated* values is work in `collections`, and it is what makes §5.1
+   true of the schema and not only of the encoder.
+4. **There is no tail column.** §5.6 specifies `SELECT *` as the typed columns plus one `_ad`
+   column carrying everything not promoted. `Schema` simply omits every `Untyped` attribute
+   (`arrowtype/derive.go:463`), which is the "schema that lies by omission" §5.6 names:
+   `Requirements`, whose *text* is the only useful form of it, is invisible over ADBC rather
+   than preserved. Until item 3 lands, so is `MemoryUsage` — and those two failures look
+   identical from a client, which is the argument for building the tail column first.
+5. **Overrides and strictness are implemented and unreachable.** `arrowtype.Options.Overrides`
+   and `StrictMixedKinds` are tested, and the daemon wires only `TimeAttrs`
+   (`cmd/htcondordb/flight.go:167`). An admin can declare an epoch attribute, but cannot force a
+   column's type or ask to be refused rather than handed a text fallback. Configuration, not
+   design.
+6. **The SQL surface is a recogniser, not the executor.** `parseQuery`
+   (`flightsvc/statement.go:81`) is one regexp; an aggregate, `GROUP BY`, `ORDER BY`, a `JOIN`, a
+   set operation or a function is refused rather than approximated. The `repl` executor does all
+   of them, and the server-side TopK and the archive `GROUP BY` already exist underneath — so a
+   DuckDB user aggregating pool data currently pulls every row to do it locally, over an endpoint
+   whose store could have answered. This is the largest remaining piece of W1 and the one that
+   most changes what the endpoint is *for*; §9.2's note that the method set sits "over the
+   existing `repl` executor" describes the intent, not the code.
+7. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
+   parses cells and keeps its own `knownTimeAttrs` (`grafana/pkg/plugin/frame.go:15`), and the
+   DB-API cursor still documents `description` as "what arrived, not a schema"
+   (`python/htcondordb/cursor.py:523`). There is no `arrow()` on the Python client and no
+   `.arrow` in the REPL, both of which §9.4 asked for as nearly free once the encoder existed.
+   The encoder exists.
+8. **The two front doors sample different amounts.** The REPL's ANSI dialect profiles 2000
+   records (`repl/dialect.go:91`), the endpoint 10 000, so the set of columns each believes the
+   table has can differ on the same table at the same moment. One kind mapping already serves
+   both (`arrowtype/sqlkinds.go`); the sample size should too.
+9. **Then the columnar producer** (§13.2, and §9.3's closing paragraph). Last, and for a
+   measured reason rather than an argued one: once item 1 has deleted the text round trip, what
+   is left of a read is the storage read itself at **under 10% of today's CPU**, and the columnar
+   accelerator is worth 1.12x on a read that materializes rows. So the producer has to argue
+   against a small remainder, and it should be measured against the wire-native read rather than
+   against the text path it replaced. What it still wants from item 2 is the *declared* schema: a
+   producer emitting one stable Arrow schema across blocks that vectorize and blocks that do not
+   cannot derive that schema from whichever block it is looking at.
+
+Still deliberately not built: writes, Substrait, transactions and savepoints, key metadata,
+`XdbcTypeInfo`, `CancelFlightInfo` (§9.2), and everything in §11.
+
+## 14. Parked: the one Airport-only opportunity worth remembering
 
 Not being built (§9), recorded so it is not rediscovered.
 

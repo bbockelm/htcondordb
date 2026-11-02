@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -153,17 +154,21 @@ func project(decisions []arrowtype.Decision, cols []string) ([]arrowtype.Decisio
 // tableSchema derives a table's Arrow schema from a measurement of what its attributes hold.
 // It returns the decisions too, so a caller can report which attributes got no column.
 func (s *Server) tableSchema(ctx context.Context, table string) (*arrow.Schema, []arrowtype.Decision, error) {
-	db, release, err := s.dbFor(ctx)
+	db, private, release, err := s.dbFor(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer release()
-	return s.tableSchemaWith(ctx, db, table)
+	return s.tableSchemaWith(ctx, db, table, private)
 }
 
 // tableSchemaWith is tableSchema on a client the caller already holds, so a handler that makes
 // several calls on one session does not open a session per call.
-func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table string) (*arrow.Schema, []arrowtype.Decision, error) {
+func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table string, private bool) (*arrow.Schema, []arrowtype.Decision, error) {
+	key := schemaKey{table: table, private: private}
+	if schema, decisions, ok := s.schemas.get(key); ok {
+		return schema, decisions, nil
+	}
 	max := s.sampleMax()
 	rep, err := db.AttrTypeProfiles(ctx, table, max)
 	if err != nil {
@@ -174,6 +179,7 @@ func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table st
 	complete := rep.Sampled < max
 	ms := arrowtype.FromProfilesComplete(rep.Profiles, rep.Sampled, complete)
 	schema, decisions := arrowtype.Schema(ms, s.derive)
+	s.schemas.put(key, schema, decisions)
 	return schema, decisions, nil
 }
 
@@ -408,12 +414,12 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 		return nil, nil, status.Errorf(codes.ResourceExhausted,
 			"too many concurrent Flight streams (limit %d); retry shortly", cap(s.streams))
 	}
-	db, release, err := s.dbFor(ctx)
+	db, private, release, err := s.dbFor(ctx)
 	if err != nil {
 		slot()
 		return nil, nil, err
 	}
-	_, allDecisions, err := s.tableSchemaWith(ctx, db, table)
+	_, allDecisions, err := s.tableSchemaWith(ctx, db, table, private)
 	if err != nil {
 		release()
 		slot()
@@ -471,9 +477,33 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 				return false
 			}
 		}
-		scanErr := db.QueryTableStream(ctx, table, constraint, parsed.limit, func(row string) bool {
-			// QueryTable streams BRACKETED new-ClassAd text, not old.
-			ad, perr := classad.Parse(row)
+		// The REFS-CHASING projection op, for three reasons that happen to coincide.
+		//
+		// It reaches an ARCHIVE. The plain query op does not -- it refuses one by
+		// design and says so -- so reading `history`, the table most queries are about,
+		// used to fail after the endpoint had already listed it and derived its schema.
+		// The projection op serves a mutable table, a view's backing and an archive
+		// alike.
+		//
+		// It PUSHES THE PROJECTION DOWN, inside the decode walk: a non-projected
+		// attribute is never rendered, and a projection the hot header covers is served
+		// from the hot header alone. Before this, `SELECT Owner FROM jobs` pulled every
+		// attribute of every matching ad and this encoder dropped the rest on the floor.
+		//
+		// And it chases the projected expressions' REFERENCES, which this encoder needs
+		// because it EVALUATES. `MemoryUsage` projected without the siblings it is
+		// written over evaluates to undefined, so the plain projection op would turn a
+		// perfectly good integer column into nulls -- correct for a relay forwarding
+		// text, wrong for anything that evaluates. parsed.cols is nil for SELECT *,
+		// which the op reads as "no projection": every attribute, as before.
+		//
+		// No fallback to the non-refs op. Every Flight read goes through the in-process
+		// dbrpc loopback (see session.go), so the server is this same binary and cannot
+		// be a build that lacks the opcode. A fallback here would be untestable code
+		// guarding an impossible case.
+		scanErr := db.QueryRawProjectRefsStream(ctx, table, constraint, parsed.cols, parsed.limit, func(row string) bool {
+			// The projection ops stream OLD-ClassAd text, not the bracketed form.
+			ad, perr := classad.ParseOld(row)
 			if perr != nil {
 				return true
 			}
@@ -511,6 +541,10 @@ type Settings struct {
 	StreamBudgetBytes int64
 	// MaxStreams caps concurrent DoGet streams. Zero is unlimited.
 	MaxStreams int
+	// SchemaTTL is how long a derived table schema is reused. Zero derives one per RPC,
+	// which is what this served before the cache existed; a host that wants the cache has
+	// to ask for it, because the right answer depends on how fast its tables change.
+	SchemaTTL time.Duration
 	// Version is the host's own version, reported to a client as
 	// FLIGHT_SQL_SERVER_VERSION. Empty leaves the placeholder, which matters because
 	// ADBC's adbc_get_info() asks for this entry by name and reads an unregistered one as
@@ -531,12 +565,23 @@ func NewSessionFlightServer(sessions *Sessions, alloc memory.Allocator, set Sett
 	if err != nil {
 		return nil, err
 	}
-	srv.SetStreamBudget(set.StreamBudgetBytes)
-	srv.SetMaxStreams(set.MaxStreams)
-	if err := srv.SetVersion(set.Version); err != nil {
+	if err := applySettings(srv, set); err != nil {
 		return nil, err
 	}
 	return NewFlightServer(srv, alloc), nil
+}
+
+// applySettings is separate, and tested separately, because a setting that parses and never
+// reaches what it configures is a silent no-op: the host looks configured, every request keeps
+// the old behaviour, and nothing says so. That has happened twice in this work -- a CLI flag
+// and this struct's own Version field -- so the wiring is a named function with a test that
+// reads every field back off the server rather than a sequence of calls inside a constructor
+// whose return value hides them.
+func applySettings(srv *Server, set Settings) error {
+	srv.SetStreamBudget(set.StreamBudgetBytes)
+	srv.SetMaxStreams(set.MaxStreams)
+	srv.SetSchemaTTL(set.SchemaTTL)
+	return srv.SetVersion(set.Version)
 }
 
 // streamPanicError turns a recovered panic into the error a client sees.

@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bbockelm/golang-htcondor/logging"
 )
@@ -88,5 +89,41 @@ func TestFlightTimeAttrs(t *testing.T) {
 	// With the knob unset the built-in set must still be there.
 	if bare := flightDeriveOptions(mkSyncCfg(t, "")); !bare.TimeAttrs["qdate"] {
 		t.Error("QDate is lost when the knob is unset")
+	}
+}
+
+// TestFlightSchemaTTL: the schema cache's lifetime is the one Flight knob whose malformed-value
+// fallback is NOT "no limit", and the difference is deliberate.
+//
+// The size and count knobs fall back to unlimited because that is what the endpoint did before
+// they existed, so a typo cannot change behaviour. Here the pre-existing behaviour is the
+// expensive one -- a profile scan per RPC -- so falling back to it on a typo would hand an
+// operator who asked for a longer cache exactly the cost they were trying to avoid, with
+// nothing but a log line to say why. So a bad value keeps the default, and an explicit 0 is
+// honoured: disabling the cache is a legitimate thing to ask for.
+func TestFlightSchemaTTL(t *testing.T) {
+	logger, err := logging.New(&logging.Config{OutputPath: "stderr", SkipGlobalInstall: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", defaultFlightSchemaTTL},
+		{"0", 0},
+		{"5", 5 * time.Second},
+		{"90s", 90 * time.Second},
+		{"2m", 2 * time.Minute},
+		{"1h", time.Hour},
+		// Malformed or negative: the default, and the operator is told.
+		{"soon", defaultFlightSchemaTTL},
+		{"-30", defaultFlightSchemaTTL},
+		{"30 seconds", defaultFlightSchemaTTL},
+	} {
+		cfg := mkSyncCfg(t, "HTCONDORDB_FLIGHT_SCHEMA_TTL = "+c.raw+"\n")
+		if got := flightSchemaTTL(cfg, logger); got != c.want {
+			t.Errorf("schema TTL %q -> %v, want %v", c.raw, got, c.want)
+		}
 	}
 }
