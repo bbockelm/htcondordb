@@ -174,14 +174,45 @@ func TestFlightOverridesAreReachable(t *testing.T) {
 	// column would be a declaration the operator never made.
 	bad := flightDeriveOptions(mkSyncCfg(t,
 		"HTCONDORDB_FLIGHT_ATTR_KINDS = NoColon, ImageSize:intt, :real\n"), testLogger(t))
-	if len(bad.Overrides) != 0 {
-		t.Errorf("a malformed kind declaration produced overrides: %v", bad.Overrides)
+	if _, ok := bad.Overrides["imagesize"]; ok {
+		t.Errorf("a malformed kind declaration produced an override: %v", bad.Overrides["imagesize"])
 	}
 
-	// And with none of the knobs set there are no overrides at all, so the default
-	// behaviour is the measurement's.
-	if bare := flightDeriveOptions(mkSyncCfg(t, ""), testLogger(t)); len(bare.Overrides) != 0 || bare.StrictMixedKinds {
-		t.Errorf("unset knobs produced %v / strict=%v", bare.Overrides, bare.StrictMixedKinds)
+	// With none of the knobs set, the seeded policy expressions are the only overrides and
+	// strictness is off, so the rest of the schema is the measurement's.
+	bare := flightDeriveOptions(mkSyncCfg(t, ""), testLogger(t))
+	if !bare.Overrides["requirements"].Exclude {
+		t.Error("Requirements is not excluded by default; a pool's schema would carry a column of meaningless booleans")
+	}
+	if bare.StrictMixedKinds {
+		t.Error("strictness is on by default")
+	}
+	for name := range bare.Overrides {
+		if !knownFlightPolicyExprs[name] {
+			t.Errorf("unset knobs produced an override for %q, which is not a seeded policy expression", name)
+		}
+	}
+}
+
+// TestFlightOverridePrecedence: a contradictory configuration has to resolve the same way every
+// time, not by which loop ran last.
+//
+// Naming a kind is an explicit "this should be a column", so it beats a seeded DEFAULT
+// exclusion -- otherwise the default silently outranks the declaration, which is the no-op this
+// knob exists to avoid. Naming an exclusion is an explicit "do not", so it beats everything,
+// because between two explicit declarations the conservative one should win.
+func TestFlightOverridePrecedence(t *testing.T) {
+	// A kind for a seeded policy expression: typed, as asked.
+	opts := flightDeriveOptions(mkSyncCfg(t, "HTCONDORDB_FLIGHT_ATTR_KINDS = Requirements:string\n"), testLogger(t))
+	if ov := opts.Overrides["requirements"]; ov.Exclude || ov.Kind != "string" {
+		t.Errorf("Requirements is %+v; a named kind must clear the default exclusion", ov)
+	}
+
+	// Both, for the same attribute: excluded.
+	opts = flightDeriveOptions(mkSyncCfg(t, "HTCONDORDB_FLIGHT_ATTR_KINDS = ImageSize:int\n"+
+		"HTCONDORDB_FLIGHT_EXCLUDE_ATTRS = ImageSize\n"), testLogger(t))
+	if ov := opts.Overrides["imagesize"]; !ov.Exclude {
+		t.Errorf("ImageSize is %+v; a named exclusion must win over a named kind", ov)
 	}
 }
 

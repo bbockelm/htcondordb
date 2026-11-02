@@ -32,15 +32,31 @@ func FromProfile(p collections.AttrTypeProfile, sampled int) Measured {
 
 // FromProfileComplete is FromProfile told whether the sample covered the whole table. Only a
 // complete sample can support a non-nullable column; see Measured.Complete.
+//
+// EVALUATED CLASSES WIN WHERE THE STORE MEASURED THEM. A profile reports what the cells STORE,
+// and an encoder bound by rule 1 (§5.1: Arrow columns carry evaluated values) puts something
+// else in the column -- so typing from the stored classes types the wrong thing. The effect is
+// not subtle on real data: MemoryUsage is stored as an expression in 1996 of 2000 history ads
+// and evaluates to an integer in all 2000, and reading the stored classes makes `expr` its
+// dominant class and leaves it with no column at all.
+//
+// The evaluated counts are absent from a store too old to measure them, and then the stored
+// ones are all there is. That is the OLD answer rather than a degraded one, so a caller that
+// needs the evaluated types asks for them explicitly and hears about it (dbrpc's
+// ErrEvalTypesUnsupported) rather than inferring their absence from a schema missing columns.
 func FromProfileComplete(p collections.AttrTypeProfile, sampled int, complete bool) Measured {
+	counts := p.AttrValueCounts
+	if p.Evaluated != nil {
+		counts = *p.Evaluated
+	}
 	return Measured{
 		Name:         p.Name,
 		Sampled:      sampled,
 		Present:      p.Present,
 		Complete:     complete,
-		ValueClasses: p.ValueClasses(),
-		Nulls:        p.Nulls(),
-		LossyAsFloat: p.IntsLossyAsFloat,
+		ValueClasses: counts.ValueClasses(),
+		Nulls:        counts.Nulls(),
+		LossyAsFloat: counts.IntsLossyAsFloat,
 	}
 }
 

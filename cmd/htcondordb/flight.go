@@ -180,22 +180,37 @@ func flightDeriveOptions(cfg *config.Config, log *logging.Logger) arrowtype.Opti
 	for _, name := range getList(cfg, "HTCONDORDB_FLIGHT_TIME_ATTRS") {
 		opts.TimeAttrs[lower(name)] = true
 	}
-	// An attribute an admin wants out of the schema whatever the measurement says. The usual
-	// case is one whose TEXT is the content -- a policy expression the derivation happens to
-	// find uniformly boolean -- and no measurement separates that from a derivation whose
-	// value is the content, because the two are the same shape. Excluding it is not hiding
-	// it: the tail column still carries it.
-	for _, name := range getList(cfg, "HTCONDORDB_FLIGHT_EXCLUDE_ATTRS") {
+	// Three passes, and the ORDER is the precedence rule. The seeds are a default, a named
+	// kind is an explicit "type this" that beats a default, and a named exclusion is an
+	// explicit "do not" that beats everything -- so a contradictory configuration resolves
+	// the conservative way rather than by which loop happened to run last.
+	override := func(name string, set func(*arrowtype.Override)) {
 		if opts.Overrides == nil {
 			opts.Overrides = map[string]arrowtype.Override{}
 		}
 		ov := opts.Overrides[lower(name)]
-		ov.Exclude = true
+		set(&ov)
 		opts.Overrides[lower(name)] = ov
+	}
+
+	// The policy expressions, excluded by default for the reason the knob below exists: an
+	// attribute whose TEXT is the content, which the derivation cannot tell from one whose
+	// VALUE is the content because the two are the same shape. Measured on a real AP,
+	// Requirements evaluates to a boolean in 1685 of 2000 ads -- so it would get a column,
+	// and that column would be 85% meaningless booleans and 15% null.
+	//
+	// Seeded rather than left to every deployment to discover, the same way the epoch
+	// attributes are. Excluding is not hiding: the text still arrives in the tail column.
+	for name := range knownFlightPolicyExprs {
+		override(name, func(ov *arrowtype.Override) { ov.Exclude = true })
 	}
 	// Forcing a column's type, for the attribute whose declared kind is known and whose
 	// sample happens not to show it. A forced kind the data does not hold is allowed and is
 	// not silent -- the encoder counts every value it then cannot store.
+	//
+	// Naming a kind also clears a DEFAULT exclusion: it is an unambiguous statement that this
+	// attribute should be a column, and a seeded default that quietly outranked it would be
+	// the silent no-op this whole knob exists to avoid.
 	for _, spec := range getList(cfg, "HTCONDORDB_FLIGHT_ATTR_KINDS") {
 		name, kind, ok := strings.Cut(spec, ":")
 		name, kind = strings.TrimSpace(name), lower(strings.TrimSpace(kind))
@@ -212,18 +227,35 @@ func flightDeriveOptions(cfg *config.Config, log *logging.Logger) arrowtype.Opti
 				"known", strings.Join(arrowtype.KnownKinds(), ", "))
 			continue
 		}
-		if opts.Overrides == nil {
-			opts.Overrides = map[string]arrowtype.Override{}
-		}
-		ov := opts.Overrides[lower(name)]
-		ov.Kind = kind
-		opts.Overrides[lower(name)] = ov
+		override(name, func(ov *arrowtype.Override) { ov.Kind, ov.Exclude = kind, false })
+	}
+	// An attribute an admin wants out of the schema whatever the measurement says, and
+	// whatever else was declared about it.
+	for _, name := range getList(cfg, "HTCONDORDB_FLIGHT_EXCLUDE_ATTRS") {
+		override(name, func(ov *arrowtype.Override) { ov.Exclude = true })
 	}
 	// Refusing an attribute whose kinds genuinely disagree, rather than serving it as text.
 	// Off by default because a text column is a faithful representation of mixed data; an
 	// operator who would rather hear about it than read it turns this on.
 	opts.StrictMixedKinds = configBool(cfg, "HTCONDORDB_FLIGHT_STRICT_MIXED_KINDS")
 	return opts
+}
+
+// knownFlightPolicyExprs are the attributes whose EXPRESSION is what anyone wants, so a typed
+// column of what they evaluate to is worse than no column: it answers a question nobody asked
+// and hides the one thing that was useful. They are HTCondor's matchmaking and lifecycle
+// policy, where an expression evaluated outside the context it was written for is meaningless
+// rather than wrong -- Requirements with no machine to match against, PeriodicRemove with no
+// elapsed time.
+//
+// Being a declaration is the point, not a shortcoming. The same shape with the opposite answer
+// is MemoryUsage, an expression in nearly every ad whose evaluated integer IS the content, and
+// nothing in the data tells the two apart.
+var knownFlightPolicyExprs = map[string]bool{
+	"requirements": true, "rank": true, "start": true,
+	"periodichold": true, "periodicrelease": true, "periodicremove": true,
+	"onexithold": true, "onexitremove": true, "leavejobinqueue": true,
+	"isowner": true, "withinresourcelimits": true,
 }
 
 var knownFlightTimeAttrs = map[string]bool{

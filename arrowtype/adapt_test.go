@@ -17,7 +17,9 @@ func TestFromProfileDropsNullClasses(t *testing.T) {
 	p := collections.AttrTypeProfile{
 		Name:    "Site",
 		Present: 2000,
-		Classes: map[string]int{"string": 25, "undefined": 1974, "error": 1},
+		AttrValueCounts: collections.AttrValueCounts{
+			Classes: map[string]int{"string": 25, "undefined": 1974, "error": 1},
+		},
 	}
 	m := FromProfile(p, 2000)
 
@@ -45,10 +47,12 @@ func TestFromProfileDropsNullClasses(t *testing.T) {
 // the adapter passed the entire suite until this existed.)
 func TestFromProfilePropagatesLossyCount(t *testing.T) {
 	p := collections.AttrTypeProfile{
-		Name:             "BytesSent",
-		Present:          100,
-		Classes:          map[string]int{"int": 50, "real": 50},
-		IntsLossyAsFloat: 3,
+		Name:    "BytesSent",
+		Present: 100,
+		AttrValueCounts: collections.AttrValueCounts{
+			Classes:          map[string]int{"int": 50, "real": 50},
+			IntsLossyAsFloat: 3,
+		},
 	}
 	m := FromProfile(p, 100)
 	if m.LossyAsFloat != 3 {
@@ -69,9 +73,9 @@ func TestFromProfilePropagatesLossyCount(t *testing.T) {
 
 func TestFromProfilesPreservesOrder(t *testing.T) {
 	in := []collections.AttrTypeProfile{
-		{Name: "A", Present: 10, Classes: map[string]int{"int": 10}},
-		{Name: "B", Present: 5, Classes: map[string]int{"int": 5}},
-		{Name: "C", Present: 1, Classes: map[string]int{"int": 1}},
+		{Name: "A", Present: 10, AttrValueCounts: collections.AttrValueCounts{Classes: map[string]int{"int": 10}}},
+		{Name: "B", Present: 5, AttrValueCounts: collections.AttrValueCounts{Classes: map[string]int{"int": 5}}},
+		{Name: "C", Present: 1, AttrValueCounts: collections.AttrValueCounts{Classes: map[string]int{"int": 1}}},
 	}
 	got := FromProfiles(in, 10)
 	for i, want := range []string{"A", "B", "C"} {

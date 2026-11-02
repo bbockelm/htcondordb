@@ -170,7 +170,19 @@ func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table st
 		return schema, decisions, nil
 	}
 	max := s.sampleMax()
-	rep, err := db.AttrTypeProfiles(ctx, table, max)
+	// The EVALUATED classes, because this endpoint's encoder evaluates: an attribute a pool
+	// stores as an expression is an integer in the column, and typing it from the stored
+	// classes rules it untypeable and gives it no column at all. MemoryUsage is that
+	// attribute on a real history table.
+	//
+	// A store too old to measure them answers the plain request, successfully, with the
+	// stored classes -- which is a different answer, not a lesser one, so it is taken only
+	// when the peer has said it cannot do better. The endpoint still works against such a
+	// store; it just publishes the schema it published before.
+	rep, err := db.AttrTypeProfilesEvaluated(ctx, table, max)
+	if errors.Is(err, dbrpc.ErrEvalTypesUnsupported) {
+		rep, err = db.AttrTypeProfiles(ctx, table, max)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
