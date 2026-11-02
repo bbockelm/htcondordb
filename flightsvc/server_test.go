@@ -35,6 +35,15 @@ func harness(t *testing.T, rows int) (*flightsql.Client, *Server, func()) {
 // only a declaration settles.
 func harnessWith(t *testing.T, rows int, derive arrowtype.Options) (*flightsql.Client, *Server, func()) {
 	t.Helper()
+	cl, svc, _, done := harnessWithStore(t, rows, derive)
+	return cl, svc, done
+}
+
+// harnessWithStore is harnessWith plus the store underneath, for a test that has to change the
+// table while the endpoint is serving it -- which is the only way to pose a schema that moves
+// between two RPCs, and there is no faking it at a layer above.
+func harnessWithStore(t *testing.T, rows int, derive arrowtype.Options) (*flightsql.Client, *Server, *db.DB, func()) {
+	t.Helper()
 	d, err := db.Open("")
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +74,7 @@ func harnessWith(t *testing.T, rows int, derive arrowtype.Options) (*flightsql.C
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cl, svc, func() { cl.Close(); gsrv.Stop(); dbc.Close(); dbSrv.Close(); d.Close() }
+	return cl, svc, d, func() { cl.Close(); gsrv.Stop(); dbc.Close(); dbSrv.Close(); d.Close() }
 }
 
 func seed(t *testing.T, d *db.DB, n int) {

@@ -383,6 +383,16 @@ Per the decision to keep this with the columnar info: a **per-table Arrow type m
 progress must keep the type it announced — pin the generation for the life of a stream and let
 the next one pick up the new map.
 
+**Built, with the generation replaced by a content hash** (`arrowtype.Fingerprint`,
+`flightsvc/pin.go`; §13.3 item 2 has the reasoning and the mutants). Two corrections to the
+paragraph above, both found by building it. *Within* a stream the schema was never at risk: it
+is derived once, before the scan, so the exposure is the FlightInfo/DoGet pair and the pin is
+for the life of a **statement**, not of a stream. And a generation counter is the wrong shape
+for a schema nobody declares — there is no owner to bump it, and a re-derivation that changes
+nothing would have to leave it alone, which is a content hash with extra steps. The declaration
+below is still wanted; what it buys is now narrower and clearer, namely that the refusal this
+pin produces stays rare.
+
 **New dbrpc op** (next free opcode is 66; highest in use is `opArchiveAggregateStats = 65`,
 `dbrpc/proto.go:244`): *describe table*, returning per attribute
 `{kind-after-evaluation, exact integer min/max, unsigned, presence fraction, escape fraction
@@ -1361,24 +1371,55 @@ this class of bug at all.
    overridable by an admin — was not built. What shipped is `opAttrTypes`, returning profiles of a
    sample: the measurement, not the declaration.
 
-   Two of the three consequences are now closed by a cache (`flightsvc/schemacache.go`, default
-   30s). The repeat scans are gone — a derivation is no longer paid per RPC — and the schema a
-   client is promised and the one it is delivered are the same object within the TTL, where before
-   they were two independent measurements of a moving table and a client trusting the first read
-   the second by position.
+   **The exposure that mattered most is now closed, by a different mechanism than the one
+   specified.** Flight answers a query in two RPCs: one promises a shape, the other delivers
+   rows. They derived the schema independently from a moving table, so a column appearing
+   between them did not shift one value for a client reading by position — it shifted every
+   value after it, and nothing in the protocol said so. A cache
+   (`flightsvc/schemacache.go`, default 30s) made the two reads usually agree, which stops the
+   repeat profile scans and makes the common case one object; it cannot make agreement a
+   guarantee, because the entry can expire in between.
 
-   What a cache cannot do is make that a **guarantee**, and this is where the missing generation
-   bites: the entry can expire between the two calls, and there is nothing to pin, because the
-   type report carries profiles and a sample size and no generation counter. Within one stream the
-   schema is fixed by construction — it is derived once, before the scan — so a mid-stream retype
-   is not the exposure; the FlightInfo/DoGet pair is. §5.7's "pin the generation for the life of a
-   stream" wants restating as "pin it for the life of a statement", and it needs classad to
-   publish one.
+   What closes it is naming the schema and checking the name at delivery
+   (`arrowtype.Fingerprint`, `flightsvc/pin.go`). `GetFlightInfo` puts the fingerprint of the
+   schema it just promised into the ticket; `DoGet` re-derives, compares, and refuses with
+   `FAILED_PRECONDITION` and an instruction to re-plan rather than serving rows under a
+   superseded shape. A prepared statement carries the same pin in its server-side entry, re-set
+   by every call that reports a schema — fixing it at prepare would start refusing a working
+   statement half an hour later for a column the client never asked about, which is a worse
+   failure than the one being prevented.
+
+   **A content hash rather than a counter, and the substitution is not a shortcut.** A counter
+   has to be owned and bumped by whoever changes the thing, and a schema derived from a sample
+   has no such owner — the table's writers do not know they changed it. A hash needs no state,
+   agrees across processes and restarts, and has the property a counter does not: a
+   re-derivation that produces the same schema produces the same name, so an unchanged table
+   never invalidates anything. That is also what §6's rung-3 catalog wants to hash.
+
+   **The name travels, not the schema.** The ticket is in the client's hands, so anything in it
+   is something the client can edit. A fingerprint it invents cannot make this server produce a
+   shape of its choosing; the only reachable outcome is a refusal of its own request. Carrying
+   the decisions themselves would hand that control over, which is why the ticket still holds no
+   more than a name for them.
+
+   **What is still missing is the declaration itself**, and it is now the whole of this item.
+   The pin makes instability *visible*; it does not make the schema stable. A table that keeps
+   gaining attributes will keep refusing fetches planned a moment earlier, correctly and
+   uselessly. A stored, admin-overridable type map is what makes the refusal rare — and it is
+   the thing item 9 cannot do without, because a producer emitting one Arrow schema across
+   blocks that vectorize and blocks that do not cannot derive that schema from whichever block
+   it is looking at. Seeding it is already half-written: `knownFlightPolicyExprs` and the
+   `HTCONDORDB_FLIGHT_*` overrides (item 5) are a declaration in config rather than in storage.
 
    The cache is keyed by privilege, which is not a detail: an unprivileged type report has the
    private attributes filtered out server-side, because an attribute's numeric bounds are a
    disclosure even where its value is not, so two levels derive different schemas from one table
    and a shared entry would hand private column names to whoever asked second.
+
+   Six mutants were checked to fail named tests: a check that always passes, a ticket that
+   carries no pin, a truncated handle whose remainder is run as SQL, a fingerprint blind to
+   nullability, a prepared statement that reports a schema without re-pinning, and a hash that
+   joins its parts without length-prefixing them.
 3. ~~**The type decision is made on the stored form, while the encoder evaluates.**~~ **Done.**
    `FromProfile` reads the evaluated counts where the store measured them, and the endpoint asks
    for them (`AttrTypeProfilesEvaluated`), falling back to the stored ones only against a peer
