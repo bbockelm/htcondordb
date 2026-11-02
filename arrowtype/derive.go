@@ -34,6 +34,7 @@
 package arrowtype
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -235,6 +236,18 @@ func (o Options) override(name string) (Override, bool) {
 	}
 	ov, ok := o.Overrides[strings.ToLower(name)]
 	return ov, ok
+}
+
+// KnownKinds lists the kind names an Override may force, for a caller validating configuration
+// before it reaches the derivation. An unknown kind is otherwise ignored silently, which from an
+// operator's side looks exactly like a declaration that was honoured and had no effect.
+func KnownKinds() []string { return []string{"int", "real", "bool", "string", "timestamp"} }
+
+// KnownKind reports whether kind is one KnownKinds lists. It compares exactly: a kind is a
+// fixed token, not an attribute name, so case is not folded here and a caller that accepts
+// mixed case folds it before asking.
+func KnownKind(kind string) bool {
+	return slices.Contains(KnownKinds(), kind)
 }
 
 // kindType maps an override's kind name to its Arrow type.

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bbockelm/golang-htcondor/logging"
+	"github.com/bbockelm/htcondordb/arrowtype"
 )
 
 // TestFlightLimitsParsing: the limits are the endpoint's only protection against a query that
@@ -70,7 +71,7 @@ func TestFlightLimitsParsing(t *testing.T) {
 // lose QDate.
 func TestFlightTimeAttrs(t *testing.T) {
 	cfg := mkSyncCfg(t, "HTCONDORDB_FLIGHT_TIME_ATTRS = MyCustomTime, Another_Time\n")
-	opts := flightDeriveOptions(cfg)
+	opts := flightDeriveOptions(cfg, testLogger(t))
 
 	for _, name := range []string{"QDate", "qdate", "CompletionDate", "JobStartDate"} {
 		if !opts.TimeAttrs[strings.ToLower(name)] {
@@ -87,7 +88,7 @@ func TestFlightTimeAttrs(t *testing.T) {
 	}
 
 	// With the knob unset the built-in set must still be there.
-	if bare := flightDeriveOptions(mkSyncCfg(t, "")); !bare.TimeAttrs["qdate"] {
+	if bare := flightDeriveOptions(mkSyncCfg(t, ""), testLogger(t)); !bare.TimeAttrs["qdate"] {
 		t.Error("QDate is lost when the knob is unset")
 	}
 }
@@ -125,5 +126,79 @@ func TestFlightSchemaTTL(t *testing.T) {
 		if got := flightSchemaTTL(cfg, logger); got != c.want {
 			t.Errorf("schema TTL %q -> %v, want %v", c.raw, got, c.want)
 		}
+	}
+}
+
+// testLogger is a logger a config reader can warn through, since a malformed declaration is
+// reported rather than failing startup.
+func testLogger(t *testing.T) *logging.Logger {
+	t.Helper()
+	l, err := logging.New(&logging.Config{OutputPath: "stderr", SkipGlobalInstall: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+// TestFlightOverridesAreReachable is §13.3's "implemented and unreachable": arrowtype has had
+// Overrides and StrictMixedKinds since it was written, and the daemon wired only TimeAttrs, so
+// an admin could declare an epoch attribute and nothing else.
+//
+// The exclusion is the one worth having first. Requirements and MemoryUsage are the same SHAPE
+// -- both expressions in almost every ad, both evaluating to one clean kind -- and differ only
+// in whether the value or the text is the content, which no measurement separates. Excluding
+// one is not hiding it: the tail carries its text.
+func TestFlightOverridesAreReachable(t *testing.T) {
+	cfg := mkSyncCfg(t, "HTCONDORDB_FLIGHT_EXCLUDE_ATTRS = Requirements, Env\n"+
+		"HTCONDORDB_FLIGHT_ATTR_KINDS = ImageSize:int, Score:real\n"+
+		"HTCONDORDB_FLIGHT_STRICT_MIXED_KINDS = true\n")
+	opts := flightDeriveOptions(cfg, testLogger(t))
+
+	for _, name := range []string{"requirements", "env"} {
+		if !opts.Overrides[name].Exclude {
+			t.Errorf("%s was not excluded", name)
+		}
+	}
+	if got := opts.Overrides["imagesize"].Kind; got != "int" {
+		t.Errorf("ImageSize kind is %q, want int", got)
+	}
+	if got := opts.Overrides["score"].Kind; got != "real" {
+		t.Errorf("Score kind is %q, want real", got)
+	}
+	if !opts.StrictMixedKinds {
+		t.Error("strict mixed kinds was not enabled")
+	}
+
+	// A malformed or unknown declaration is dropped with a warning, not silently honoured
+	// as something else and not fatal to startup. Honouring "ImageSize:intt" as a string
+	// column would be a declaration the operator never made.
+	bad := flightDeriveOptions(mkSyncCfg(t,
+		"HTCONDORDB_FLIGHT_ATTR_KINDS = NoColon, ImageSize:intt, :real\n"), testLogger(t))
+	if len(bad.Overrides) != 0 {
+		t.Errorf("a malformed kind declaration produced overrides: %v", bad.Overrides)
+	}
+
+	// And with none of the knobs set there are no overrides at all, so the default
+	// behaviour is the measurement's.
+	if bare := flightDeriveOptions(mkSyncCfg(t, ""), testLogger(t)); len(bare.Overrides) != 0 || bare.StrictMixedKinds {
+		t.Errorf("unset knobs produced %v / strict=%v", bare.Overrides, bare.StrictMixedKinds)
+	}
+}
+
+// TestKnownKindsMatchTheDerivation keeps the validator and the thing it validates in step. A
+// kind this list accepts and kindType does not would be accepted at startup and then ignored,
+// which is the silent-no-op the validation exists to prevent.
+func TestKnownKindsMatchTheDerivation(t *testing.T) {
+	for _, kind := range arrowtype.KnownKinds() {
+		opts := arrowtype.Options{Overrides: map[string]arrowtype.Override{"x": {Kind: kind}}}
+		_, decisions := arrowtype.Schema([]arrowtype.Measured{{
+			Name: "X", Sampled: 10, Present: 10, ValueClasses: map[string]int{"int": 10},
+		}}, opts)
+		if len(decisions) == 0 || decisions[0].Verdict != arrowtype.Typed {
+			t.Errorf("kind %q is accepted by KnownKinds but produced %+v", kind, decisions)
+		}
+	}
+	if arrowtype.KnownKind("intt") {
+		t.Error("KnownKind accepts a kind the derivation does not know")
 	}
 }

@@ -1383,11 +1383,18 @@ this class of bug at all.
    Three mutants were checked to fail named tests: a tail that repeats every attribute, a
    projection that stays pushed down when the tail is asked for, and an empty ad written where
    a null belongs.
-5. **Overrides and strictness are implemented and unreachable.** `arrowtype.Options.Overrides`
-   and `StrictMixedKinds` are tested, and the daemon wires only `TimeAttrs`
-   (`cmd/htcondordb/flight.go:167`). An admin can declare an epoch attribute, but cannot force a
-   column's type or ask to be refused rather than handed a text fallback. Configuration, not
-   design.
+5. ~~**Overrides and strictness are implemented and unreachable.**~~ **Done.**
+   `HTCONDORDB_FLIGHT_EXCLUDE_ATTRS`, `HTCONDORDB_FLIGHT_ATTR_KINDS` (`Attribute:kind`) and
+   `HTCONDORDB_FLIGHT_STRICT_MIXED_KINDS` reach `arrowtype.Options`. The exclusion is the one
+   worth having first, and it only became honest with item 4: `Override.Exclude` has always
+   said "its text still reaches a reader through the tail", and until the tail existed that
+   sentence was false.
+
+   A malformed or unknown kind is logged and ignored rather than failing startup, and
+   `arrowtype.KnownKinds` is what the daemon validates against -- the alternative is the
+   silent no-op this item is an instance of, where a declaration is accepted at startup and
+   then does nothing, which from an operator's side is indistinguishable from one that was
+   honoured and had no effect.
 6. **The SQL surface is a recogniser, not the executor.** `parseQuery`
    (`flightsvc/statement.go:81`) is one regexp; an aggregate, `GROUP BY`, `ORDER BY`, a `JOIN`, a
    set operation or a function is refused rather than approximated. The `repl` executor does all
