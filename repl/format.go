@@ -22,6 +22,9 @@ const (
 	FormatClassAdOld
 	// FormatClassAdNew emits each ad in new (bracketed) ClassAd format.
 	FormatClassAdNew
+	// FormatArrow emits the result as an Arrow IPC stream. Binary, so it refuses a
+	// terminal: see (*session).writeArrow.
+	FormatArrow
 )
 
 // ParseFormat parses a `.format` argument.
@@ -35,8 +38,11 @@ func ParseFormat(s string) (Format, error) {
 		return FormatClassAdOld, nil
 	case "classad-new", "new":
 		return FormatClassAdNew, nil
+	case "arrow", "arrows", "ipc":
+		return FormatArrow, nil
 	default:
-		return FormatTable, fmt.Errorf("unknown format %q (want table, json, classad, or classad-new)", s)
+		return FormatTable, fmt.Errorf(
+			"unknown format %q (want table, json, classad, classad-new, or arrow)", s)
 	}
 }
 
@@ -46,6 +52,8 @@ func (f Format) String() string {
 		return "json"
 	case FormatClassAdOld:
 		return "classad"
+	case FormatArrow:
+		return "arrow"
 	case FormatClassAdNew:
 		return "classad-new"
 	default:
