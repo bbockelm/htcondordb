@@ -132,6 +132,17 @@ type Encoder struct {
 	tail  int
 	typed map[string]bool
 	tbuf  []byte // reused across rows; the tail's text is copied by the builder
+
+	// Scratch buffers for the column-wise append (columns.go), grown to the widest batch and
+	// reused. They are the saving: one buffer per kind instead of a boxed value per cell.
+	scValid []bool
+	scI64   []int64
+	scF64   []float64
+	scStr   []string
+	scBool  []bool
+	scTS    []arrow.Timestamp
+	// colBatches counts the batches taken column-wise (see ColumnBatches).
+	colBatches int
 }
 
 // NewEncoder prepares an encoder for the typed columns of decisions. Untyped decisions are
