@@ -699,7 +699,15 @@ func (s *Server) scanInto(ctx context.Context, db *dbrpc.Client, enc *arrowtype.
 		vals := make([]classad.Value, len(enc.Attrs()))
 		cells := make([][]classad.Value, len(enc.Attrs()))
 		colv := make([]arrowtype.ColumnValues, len(enc.Attrs()))
-		return db.QueryValuesStream(ctx, table, constraint, enc.Attrs(), limit, false,
+		// ASK FOR DICTIONARY STRING COLUMNS. A pool's Owner, a site name, a status text:
+		// storage holds these as a per-block dictionary and the plain wire form expanded
+		// them to one string per row, on both sides. The decoder expands the dictionary
+		// into the same slice, so nothing below this had to change except knowing the kind.
+		//
+		// It is a request, not a demand: against a server too old to advertise it the flag
+		// is not set and the plain form arrives, which this reads just as well.
+		return db.QueryValuesStreamOpts(ctx, table, constraint, enc.Attrs(), limit, false,
+			dbrpc.ValueStreamOptions{Dictionary: true},
 			func(b *dbrpc.ValueBatch) bool {
 				// COLUMN-WISE where the values can go into the builders as they are: the
 				// relay already carries dense typed arrays, and boxing each cell into a
@@ -828,7 +836,10 @@ func columnValuesOf(c *dbrpc.ValueColumn, rows int, out *arrowtype.ColumnValues)
 		out.Reals = c.Reals
 	case dbrpc.KindBool:
 		out.Bools = c.Bools
-	case dbrpc.KindString:
+	case dbrpc.KindString, dbrpc.KindStringDict:
+		// Both forms land in the same Strs slice: the dictionary is expanded at decode by
+		// copying string HEADERS into it, so the only difference upstream is how many
+		// distinct strings were ever allocated.
 		out.Strs = c.Strs
 	default:
 		return false
