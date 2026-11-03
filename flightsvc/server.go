@@ -88,10 +88,11 @@ type Server struct {
 	prep *prepared
 	// schemas holds recently derived table schemas. Nil or a zero TTL derives every time.
 	schemas *schemaCache
-	// declared pins each table's published columns and their order, so a schema a client
-	// cached stays a prefix of the current one (see declared.go). Nil publishes the
-	// measurement unchanged, which is what this endpoint did before it existed.
-	declared *declarations
+	// types remembers what each table's columns were measured to be, so a schema a client
+	// cached stays a prefix of the current one and its types move only on evidence (see
+	// columntypes.go). Nil publishes the measurement unchanged, which is what this endpoint
+	// did before it existed.
+	types *typeMemory
 	// streams admits at most one token per concurrent DoGet stream. Nil means unlimited.
 	//
 	// A cap exists because this runs in the daemon: concurrent wide scans compete for CPU
@@ -140,14 +141,18 @@ func (s *Server) SetSchemaTTL(ttl time.Duration) {
 	s.schemas = newSchemaCache(ttl)
 }
 
-// SetSchemaDeclaration points the server at a file holding each table's declared columns, so
-// their types and positions survive a restart. An empty path declares in memory only.
+// SetColumnTypeMemory points the server at the file where it remembers each table's measured
+// column types, so they and their order survive a restart. An empty path remembers in memory only.
 //
-// Always sets a declaration, even with no path: the monotone rule is what keeps a published
-// schema from moving under a client, and a server that applied it only when persistence was
-// configured would behave differently in the two cases for no reason a user could see.
-func (s *Server) SetSchemaDeclaration(path string, warn func(string)) {
-	s.declared = newDeclarations(path, warn)
+// Always sets a memory, even with no path: holding a column's position and type steady is what
+// keeps a published schema from moving under a client, and a server that did it only when
+// persistence was configured would behave differently in the two cases for no reason a user
+// could see.
+//
+// warn reports a problem; note reports an adopted schema change, which is an ordinary event an
+// operator should still see go past (see typeMemory.note). Either may be nil.
+func (s *Server) SetColumnTypeMemory(path string, warn, note func(string)) {
+	s.types = newTypeMemory(path, warn, note)
 }
 
 // SetSampleMax caps how many records a schema derivation reads. Zero restores the default.

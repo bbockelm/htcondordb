@@ -104,9 +104,16 @@ func startFlightSQL(ctx context.Context, cfg *config.Config, log *logging.Logger
 		// is what a consumer caching a catalog needs. Beside the database rather than
 		// in a directory of its own: it describes that database's tables and is
 		// meaningless without them, so the two should be backed up and moved together.
-		SchemaFile: flightSchemaFile(cfg, log),
+		ColumnTypeFile: flightColumnTypeFile(cfg, log),
 		Warn: func(m string) {
 			log.Warn(logging.DestinationGeneral, m)
+		},
+		// A schema generation moving is not a problem, and logging it as one teaches an
+		// operator to ignore it. It is logged at all because a column changing type is the
+		// one schema event that can make a consumer's cached catalog wrong about a VALUE,
+		// and the daemon log is where an operator would look after noticing that.
+		Note: func(m string) {
+			log.Info(logging.DestinationGeneral, m)
 		},
 	})
 	if err != nil {
@@ -306,17 +313,20 @@ func flightBytes(cfg *config.Config, log *logging.Logger, key string) int64 {
 	return n
 }
 
-// flightSchemaFile resolves where the declared column list is kept.
+// flightColumnTypeFile resolves where the endpoint remembers each table's measured column types.
 //
-// HTCONDORDB_FLIGHT_SCHEMA_FILE if set; otherwise beside the database, which is the only
-// durable directory this daemon is given. An in-memory database has no such directory and gets
-// no file -- the declaration then lives for the process, which still keeps a schema still
-// within one session and is the most that can be promised with nowhere to write.
+// NOT A KNOB TO TUNE. It goes beside the database, which is the only durable directory this
+// daemon is given, and an operator has no reason to move it or to think about it: it holds no
+// policy, only what the endpoint measured, and losing it costs a re-measurement rather than an
+// answer. An in-memory database has no such directory and gets no file -- the memory then lives
+// for the process, which still holds a schema steady within one session and is the most that can
+// be promised with nowhere to write.
 //
-// An explicit "none" turns persistence off with a database directory present, for a host that
-// would rather re-measure than keep state it has to reason about.
-func flightSchemaFile(cfg *config.Config, log *logging.Logger) string {
-	if v, ok := cfg.Get("HTCONDORDB_FLIGHT_SCHEMA_FILE"); ok {
+// HTCONDORDB_FLIGHT_COLUMN_TYPES_FILE overrides the path and "none" turns persistence off, for a
+// host that would rather re-measure than keep state it has to reason about. Both exist for the
+// host that has to, not for the operator who should not have to.
+func flightColumnTypeFile(cfg *config.Config, log *logging.Logger) string {
+	if v, ok := cfg.Get("HTCONDORDB_FLIGHT_COLUMN_TYPES_FILE"); ok {
 		v = strings.TrimSpace(v)
 		if strings.EqualFold(v, "none") {
 			return ""
@@ -332,7 +342,7 @@ func flightSchemaFile(cfg *config.Config, log *logging.Logger) string {
 				"they will be re-measured after a restart")
 		return ""
 	}
-	return filepath.Join(dir, "flight-schema.json")
+	return filepath.Join(dir, "flight-column-types.json")
 }
 
 // defaultFlightSchemaTTL is how long a derived table schema is reused when the knob is unset.
