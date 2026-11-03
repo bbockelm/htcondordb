@@ -17,7 +17,7 @@ planner's main decision. Here is where each one stands.
 |---|---|---|---|
 | **hash join** | the `ON` spine has at least one equality | **done** | **done** |
 | **index-based equi join** | ditto, and the probed side has a built index on the key | **done** (key batching, §6.2) | **done**, awaiting a classad release |
-| **block nested loops** | no usable equality: non-equi `ON`, `CROSS JOIN` | **declined**; the per-pair allocation it would have masked is fixed instead (§0.5) | **not started** — §7's carrier |
+| **block nested loops** | no usable equality: non-equi `ON`, `CROSS JOIN` | **declined**; the per-pair allocation it would have masked is fixed instead (§0.5) | **declined** — built, measured flat, backed out (§0.6) |
 
 Three things that table is saying, which are easy to miss:
 
@@ -33,13 +33,14 @@ Three things that table is saying, which are easy to miss:
   the decision correct rather than plausible. §0.1's own measurement: 23x faster at 16 keys,
   11x at 32, then **3x slower at 64** and 29x slower at 256, with the crossover predicted by
   comparing `segments × keys` against the row count and by nothing simpler.
-- **Block nested loops still exists nowhere**, but the reason to want it has narrowed to one.
-  §0.5 measured the equality-free loop and found its per-pair cost flat across a 16x change
-  in working-set size, which is the opposite of what a locality problem looks like — so
-  blocking it on the client has nothing to attack, and is declined. In the store it remains
-  the only loop that ever holds a (left block, right block) pair, which is what §7's zone
-  skipping needs in order to skip anything. That argument is about the pair **count** and
-  survives §0.5 untouched.
+- **Block nested loops exists nowhere, and the reasons to want it are now both gone.**
+  §0.5 measured the equality-free loop on the client and found its per-pair cost flat across
+  a 16x change in working-set size, which is the opposite of what a locality problem looks
+  like. §0.6 then built the tiled loop in the store, measured it flat at every block size
+  from 8 to 512, and backed it out — along with a 1.81x locality finding of my own that
+  turned out to be the fixture measuring itself. The second reason to want it was that only
+  a block loop ever holds a (left block, right block) pair, which is what §7's zone skipping
+  needs; §0.6 measured that ceiling too, and the index probe already reaches it.
 
 ### 0.2 By area
 
@@ -49,7 +50,7 @@ Three things that table is saying, which are easy to miss:
 | Refusals with a suggestion: `RIGHT`, `FULL`, `NATURAL`, `USING`, comma-FROM | 3 | **done** |
 | Alias normalization, unqualified-reference refusal | 4 | **done** |
 | Conjunct splitting, outer-join pushdown asymmetry | 5 | **done** |
-| Per-side projection pushdown | 6 | **done** |
+| Per-side projection pushdown | 6 | **done** — client, and inside the store too (classad #502) |
 | `LIMIT` pushdown, only when nothing reorders after it | 6 | **done** |
 | Guard rails: per-side, pair and output-row caps | 7a | **done** |
 | `EXPLAIN` over a join | 6 | **done** |
@@ -61,34 +62,42 @@ Three things that table is saying, which are easy to miss:
 | **Joining more than two tables** | 0.4 | **done** (client-side, left-deep, up to 8) |
 | Index-based equi join inside the store | §0.1 | **done** in classad, awaiting a release |
 | `LEFT JOIN` anti-join correctness | 0.4 | **fixed** in both implementations |
-| Block nested loops | 7 | **not started** |
-| Zone-map block skipping | 7 | **not started** — measure the ceiling first |
+| Block nested loops | 7 | **declined on both sides** — §0.5 for the client, §0.6 for the store |
+| Zone-map block skipping | 7 | **declined** — the ceiling was measured and the index probe already reaches it (§0.6) |
 | Vectorized residual / join `ColumnSource` | 6.1 | **not started** |
 | Cost-based planner, join-order choice | 7b | **not started** |
 | Sub-selects in argument position | 7c | out of scope by decision |
-| Server-side aggregates over a join | 10 | **not started** |
+| Server-side aggregates over a join | 10 | **done** (classad #500) |
 | MATCH: deterministic candidate order | 8.6 | **done** (classad #458) |
 | MATCH: resumable per-autocluster cursors | 8.8 | **not started** |
 | MATCH: single-pass multi-autocluster scan | 8.3 | **not started** |
 | MATCH: rank-bounded block skipping | 8.4 | **not started** |
 | MATCH: resource-side autoclustering | 8.9 | **not started** |
 
-### 0.3 What the remaining work is actually blocked on
+### 0.3 The chain that was blocking the remaining work, and how it dissolved
 
-Three of the unstarted items are blocked on each other in one chain, and it is worth
-naming because it is not the order the list above suggests:
+This section used to name a chain — **block nested loops → zone skipping → cost-based
+planner** — and argue that the first was the carrier for the second. The argument was that
+zone skipping (§7) cannot be bolted onto the hash path, because hashing visits one side whole
+before it sees the other and so never holds a (left block, right block) pair to test a zone
+predicate against. The pair only exists inside a block loop. That reasoning was sound. It is
+also now moot, in both of its links, and each link was cut by a measurement rather than by a
+decision.
 
-**Block nested loops → zone skipping → cost-based planner.** Zone skipping (§7) cannot be
-bolted onto the hash path: hashing visits one side whole before it sees the other, so there
-is never a (left block, right block) pair to test a zone predicate against. The pair only
-exists inside a block loop. So the blocked-nested-loop algorithm is not merely the fallback
-for non-equi joins — it is the carrier for the one remaining optimization with a large
-claimed payoff. And a planner that chooses between three algorithms is only worth building
-once there are three.
+**Link one: block loops do not help, on either side.** §0.5 measured the client's
+equality-free loop and found its per-pair cost flat. §0.6 built the store's tiled loop and
+found the same, and in the process retracted a locality finding of mine that was the fixture
+measuring itself.
 
-§0.5 measures the equality-free loop and concludes that the CLIENT-side half of that chain is
-not worth building. The store-side half still is, for a reason the measurement does not
-touch.
+**Link two: zone skipping has no ceiling left to reach.** §0.6 measured what a range probe
+could prune beyond what the index probe already prunes, on the shape that motivated it — an
+archive whose key correlates with insertion order, joined against a recent window. The answer
+is nothing: the disjunction the index probe already emits prunes exactly as much as a range
+conjunct would.
+
+So the only survivor of that chain is the **cost-based planner (§7b)**, and it is no longer
+blocked on anything. It now chooses between two algorithms rather than three, which is a
+smaller job than this section used to describe.
 
 **Multi-table joins turned out to be a planner change, not a parser change** -- and are
 now done; 0.4 records the shape. Join *order* became a real decision in the process, which
@@ -172,6 +181,82 @@ evaluates the condition against it. A surviving pair costs about 0.3 µs more, w
 output row. So the optimization the measurement pointed at was **not** blocking the loop but
 **not allocating a row per candidate** — reuse one composite to test the condition and
 allocate only on survival.
+
+### 0.6 The store's two locality claims, measured — both negative
+
+§0.5 settled the client. The same two questions were open for the store, and both have now
+been measured. Both came back negative, and one of them cost a retraction.
+
+**Does the Cartesian loop want tiling?** No. With no usable equality the right side is held
+whole and the left streamed over it, so the held side is walked once per left row — the
+classic shape for blocking an inner loop. With the per-pair work and the selectivity held
+constant, the per-pair cost is flat across a **262x** change in how much is held:
+
+| held rows | 125 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 32768 |
+|---|---|---|---|---|---|---|---|---|
+| ns/pair | 227.7 | 225.3 | 224.9 | 223.8 | 222.8 | 221.2 | 222.3 | 225.4 |
+
+2.9% end to end. The tiled loop was built, swept from 8 to 512 rows per block, measured flat
+at every size, and backed out.
+
+**A retraction, and what it is worth keeping for.** An earlier version of that benchmark used
+`r.V >= l.Lo && r.V < l.Hi` and showed a 1.81x rise with the held side — exactly the cache
+effect blocking exists to fix. It was an artifact. With few rows held, almost every left row
+has an `Lo` past the whole right range, so the first comparison is false and the condition
+**short-circuits after one operand**; with many held it is almost always true and both
+operands run. The shapes were never doing equal work per pair, and the difference in how much
+of the condition ran was read as locality.
+
+Three things were tried against that wrong conclusion before the fixture was suspected, and
+two of them *raised* confidence in it: disabling the GC left the rise intact, so it was not
+collection cost, and a read-only baseline accounted for under 15 ns of a 179 ns spread, so it
+was not the larger shapes reading more rows. What exposed it was building the tiling and
+finding it indifferent at every block size — transposing the loop takes the right side from
+2M touches to 32K, and a real locality problem could not have been indifferent to that.
+
+The lesson is narrower than "benchmarks lie": **a condition whose cost or selectivity varies
+with the shape measures the fixture, not the loop.** The control now uses `r.Sel == l.Sel`
+with the same modulus on both sides — one comparison per pair whatever the shape, and the
+same fraction of pairs surviving.
+
+**Would zone maps prune more than the index probe already does?** No. `planIndexProbe`
+narrows the hashed side to the keys the streamed side holds and expresses that as a pure
+disjunction, `attr == v1 || attr == v2 || ...`. A disjunction prunes a segment only when its
+zone map rules out **every** alternative, so the worry was that a key set spread across the
+range keeps every segment. A range conjunct over the same keys — `attr >= min && attr <= max`
+— is implied by the disjunction, adds no rows, and is a top-level AND probe, which is the
+shape zone pruning can use.
+
+Measured on the real shape — an archive whose `ClusterId` correlates with insertion order,
+joined against a side covering a recent window — the disjunction prunes **52 of 56 segments**,
+and adding the range conjunct prunes **52 of 56**. Identical. The disjunctive plan already
+prunes through `zoneExcludesGroups`, which rules a segment out when every alternative is
+ruled out, and for a key set that IS a contiguous window that is every segment outside it.
+
+Scattered keys prune nothing, which is the honest other half: a join key uncorrelated with
+insertion order gets no pruning from either shape. That is a property of the data, not of the
+probe, and no range conjunct fixes it.
+
+### 0.7 What the store-side join gained after those measurements
+
+With both locality questions closed negative, the measured win moved to what the join
+**reads** rather than how it loops. Three changes in classad, in order:
+
+- **Read only the attributes the join uses** (#502). Each side is read with a projection
+  covering the output, the `ON` terms, the residual `WHERE`, each equality half, and the
+  transitive closure of every expression among them. Any term the analysis cannot account
+  for in full abandons the projection for that side and reads whole ads — declining costs
+  speed, guessing costs the answer. 1.76x, with a quarter of the allocations.
+- **Filter on the sides, not on the projected row** (#504). A correctness fix, and the one
+  most likely to have bitten a real query: a residual `WHERE` was evaluated against the
+  output row, so `WHERE e.MemoryUsage > 1000` read `undefined` and matched nothing whenever
+  the caller had not also asked to *see* `MemoryUsage`. No error, no rows.
+- **Carry the rows as the bytes the store produced** (#515, in flight). A row becomes a
+  ClassAd only when something needs more than its wire bytes can answer. 20% fewer
+  allocations.
+
+The pattern across all three is the same one §0.5 landed on for the client: the join's cost
+was never the loop.
 
 **That is now done, and it was worth less than this section first claimed.** The draft said
 the allocation was "most of the 0.85 µs". Measured:
@@ -632,6 +717,17 @@ measurement, and conflating the two would risk a regression to chase an improvem
 site whose data disagrees needs somewhere to change it.
 
 ## 7. Block-looping and zone-map block skipping
+
+> **Status: both halves of this section were measured and declined. See §0.6.** The block
+> loop was built, swept from 8 to 512 rows per block, measured flat at every size and backed
+> out; the zone-map ceiling turned out to be already reached by the disjunction
+> `planIndexProbe` emits, which prunes 52 of 56 segments where a range conjunct also prunes
+> 52 of 56. The reasoning below is kept because it is still the right reasoning — it is what
+> made the two questions worth measuring, and the hierarchy §7.1 records is accurate and used
+> elsewhere. What it is not is a plan.
+>
+> The part of this section that remains live is **MATCH** (§8.4, rank-bounded block
+> skipping), which is a different access shape and was not what §0.6 measured.
 
 This is where a join inside the store beats any join above it, and it is only reachable
 from inside `collections`: a client cannot see block metadata. It is therefore a
