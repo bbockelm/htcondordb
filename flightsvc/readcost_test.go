@@ -164,7 +164,12 @@ func benchArchive(b *testing.B, rows int, columnar bool) *benchStack {
 		_ = srv.ServeConnOpts(dbrpc.NewStreamConn(sc),
 			dbrpc.ServeOptions{ReadOnly: true, Privileged: true, IncludePrivate: true})
 	}()
-	client := dbrpc.NewClient(dbrpc.NewStreamConn(cc))
+	// WITH the peer's advertisement, as the production loopback builds it
+	// (loopbackPeerAttrs). Without it the client reads every feature that postdates
+	// advertisement as absent and silently takes the fallback -- so a feature-gated
+	// improvement measures as exactly zero here while working in the daemon.
+	client := dbrpc.NewClient(dbrpc.NewStreamConn(cc),
+		dbrpc.WithPeerSessionAttrs(dbrpc.ServerSessionAttrs()))
 
 	svc, err := NewServer(client, benchDerive, nil)
 	if err != nil {
