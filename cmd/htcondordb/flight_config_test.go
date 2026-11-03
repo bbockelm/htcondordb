@@ -235,7 +235,7 @@ func TestKnownKindsMatchTheDerivation(t *testing.T) {
 	}
 }
 
-// TestFlightSchemaFile: where the declared column list lives decides whether a consumer's
+// TestFlightColumnTypeFile: where the declared column list lives decides whether a consumer's
 // cached catalog survives a restart, so the default has to be a real path whenever there is a
 // directory to put one in -- and must not invent one when there is not.
 func TestFlightSchemaFile(t *testing.T) {
@@ -245,26 +245,26 @@ func TestFlightSchemaFile(t *testing.T) {
 	// that database's tables and is meaningless without them.
 	dir := t.TempDir()
 	cfg := mkSyncCfg(t, "HTCONDORDB_DIR = "+dir+"\n")
-	if got, want := flightSchemaFile(cfg, log), filepath.Join(dir, "flight-schema.json"); got != want {
+	if got, want := flightColumnTypeFile(cfg, log), filepath.Join(dir, "flight-column-types.json"); got != want {
 		t.Errorf("default path %q, want %q", got, want)
 	}
 
 	// An explicit path wins.
-	cfg = mkSyncCfg(t, "HTCONDORDB_DIR = "+dir+"\nHTCONDORDB_FLIGHT_SCHEMA_FILE = /tmp/elsewhere.json\n")
-	if got := flightSchemaFile(cfg, log); got != "/tmp/elsewhere.json" {
+	cfg = mkSyncCfg(t, "HTCONDORDB_DIR = "+dir+"\nHTCONDORDB_FLIGHT_COLUMN_TYPES_FILE = /tmp/elsewhere.json\n")
+	if got := flightColumnTypeFile(cfg, log); got != "/tmp/elsewhere.json" {
 		t.Errorf("explicit path gave %q", got)
 	}
 
 	// "none" turns persistence off deliberately, which is different from having nowhere
 	// to write: a host that would rather re-measure than keep state can say so.
-	cfg = mkSyncCfg(t, "HTCONDORDB_DIR = "+dir+"\nHTCONDORDB_FLIGHT_SCHEMA_FILE = none\n")
-	if got := flightSchemaFile(cfg, log); got != "" {
+	cfg = mkSyncCfg(t, "HTCONDORDB_DIR = "+dir+"\nHTCONDORDB_FLIGHT_COLUMN_TYPES_FILE = none\n")
+	if got := flightColumnTypeFile(cfg, log); got != "" {
 		t.Errorf("none gave %q, want no file", got)
 	}
 
 	// No directory at all: no file, rather than a path relative to wherever the daemon
 	// happens to have been started.
-	if got := flightSchemaFile(mkSyncCfg(t, ""), log); got != "" {
+	if got := flightColumnTypeFile(mkSyncCfg(t, ""), log); got != "" {
 		t.Errorf("with no database directory the path is %q, want none", got)
 	}
 }

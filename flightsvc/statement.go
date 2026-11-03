@@ -200,18 +200,20 @@ func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table st
 	derive := s.derive
 	derive.Tail = true
 	_, decisions := arrowtype.Schema(ms, derive)
-	// The declaration outranks the measurement, and appends to itself whatever the
-	// measurement found that it had not seen (declared.go). Without this the published
-	// schema moves with the sample: a column retypes, a new attribute lands in the middle
-	// of the order, and a client holding a cached catalog is holding something that was
-	// true once.
-	decisions = s.declared.reconcile(table, decisions, private)
-	schema := schemaOf(decisions)
+	// What the endpoint has settled on for this table outranks a single sample, and the
+	// memory appends to itself whatever the measurement found that it had not seen
+	// (columntypes.go). Without this the published schema moves with the sample: a column
+	// retypes on one stray value, a new attribute lands in the middle of the order, and a
+	// client holding a cached catalog is holding something that was true once. A type that
+	// has genuinely changed still moves -- after successive derivations agree -- and when it
+	// does, the generation below says so.
+	decisions = s.types.reconcile(table, decisions, private)
+	schema := tableSchemaOf(decisions, table, s.types.generation(table))
 	s.schemas.put(key, schema, decisions)
 	// Off the read path: a derivation that extended the declaration writes it, and a
 	// failure to write is reported rather than failing the read, because the file is a
 	// stability optimization and never a correctness dependency.
-	s.declared.flush()
+	s.types.flush()
 	return schema, decisions, nil
 }
 
@@ -459,6 +461,29 @@ func schemaOf(decisions []arrowtype.Decision) *arrow.Schema {
 		}
 	}
 	return arrow.NewSchema(fields, nil)
+}
+
+// tableSchemaOf is schemaOf for a TABLE's schema, carrying the table's identity and schema
+// generation in the Arrow schema's own metadata.
+//
+// It rides in the metadata because that is the one place every client already reads. A consumer
+// that cached a catalog can tell "this is the schema I have" from "this moved" by comparing one
+// integer, on a fetch it was making anyway -- no side call, no second endpoint to learn, and it
+// survives the Arrow IPC stream to whatever reads the file at the other end.
+//
+// The generation answers a different question from the fingerprint (fingerprint.go). The
+// fingerprint names a schema's CONTENT, which is what the pin needs: it agrees across processes
+// and restarts and says nothing about history. The generation counts ADOPTED CHANGES to the
+// table, which is what a person asking "did this change, and when" needs, and only exists
+// because the endpoint now remembers the table's columns and therefore knows.
+func tableSchemaOf(decisions []arrowtype.Decision, table string, generation int64) *arrow.Schema {
+	base := schemaOf(decisions)
+	md := arrow.MetadataFrom(map[string]string{
+		"htcondordb.table":             table,
+		"htcondordb.schema_generation": strconv.FormatInt(generation, 10),
+		"htcondordb.schema_version":    arrowtype.Fingerprint(decisions),
+	})
+	return arrow.NewSchema(base.Fields(), &md)
 }
 
 // GetFlightInfoStatement answers with the schema BEFORE running anything, which is the whole
@@ -787,16 +812,23 @@ type Settings struct {
 	// which is what this served before the cache existed; a host that wants the cache has
 	// to ask for it, because the right answer depends on how fast its tables change.
 	SchemaTTL time.Duration
-	// SchemaFile is where each table's declared columns are kept across restarts
-	// (declared.go). Empty declares in memory for this process only, which is what an
-	// in-memory store gets and is still enough to stop a schema moving between two RPCs
-	// of one session. A path gets the half a cache cannot do: a column keeps its position
-	// after a restart, so a consumer's cached catalog stays valid.
-	SchemaFile string
+	// ColumnTypeFile is where the endpoint remembers each table's measured column types
+	// across restarts (columntypes.go). Empty remembers in memory for this process only,
+	// which is what an in-memory store gets and is still enough to stop a schema moving
+	// between two RPCs of one session. A path gets the half a cache cannot do: a column
+	// keeps its position and its settled type after a restart, so a consumer's cached
+	// catalog stays valid.
+	ColumnTypeFile string
 	// Warn reports a condition an operator should know about but that must not fail a
-	// request -- an unwritable declaration, a column kind a newer build wrote. Nil
+	// request -- an unwritable column-type file, a column kind a newer build wrote. Nil
 	// discards them, which is what an embedder with no logger gets.
+	//
+	// Note reports an ordinary event worth seeing go past rather than a problem: a table's
+	// schema generation moving because a column retyped. Separate from Warn because a host
+	// logs the two at different levels, and a schema change logged as a warning is one an
+	// operator learns to ignore.
 	Warn func(string)
+	Note func(string)
 	// Version is the host's own version, reported to a client as
 	// FLIGHT_SQL_SERVER_VERSION. Empty leaves the placeholder, which matters because
 	// ADBC's adbc_get_info() asks for this entry by name and reads an unregistered one as
@@ -833,7 +865,7 @@ func applySettings(srv *Server, set Settings) error {
 	srv.SetStreamBudget(set.StreamBudgetBytes)
 	srv.SetMaxStreams(set.MaxStreams)
 	srv.SetSchemaTTL(set.SchemaTTL)
-	srv.SetSchemaDeclaration(set.SchemaFile, set.Warn)
+	srv.SetColumnTypeMemory(set.ColumnTypeFile, set.Warn, set.Note)
 	return srv.SetVersion(set.Version)
 }
 
