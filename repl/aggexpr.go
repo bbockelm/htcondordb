@@ -140,10 +140,36 @@ func (p *aggProjector) row(group, values []string) []string {
 		case it.IsAggregate():
 			row[i] = at(values, p.aggAt[i])
 		default:
-			row[i] = at(group, p.groupAt[i])
+			row[i] = groupDisplay(at(group, p.groupAt[i]))
 		}
 	}
 	return row
+}
+
+// groupDisplay turns a group label into an output cell.
+//
+// A group label is FAITHFUL: it is the key the store grouped on as well as the name it
+// reports, so a string arrives quoted and that is the whole of what keeps the string "4"
+// out of the group of the number 4. A cell is DISPLAY, where every other string in a result
+// row appears unquoted, so the quotes come off here -- through the ClassAd parser rather
+// than by trimming, since a string holding a quote or a backslash is escaped inside them.
+//
+// A label that is not a quoted string is passed through unchanged, which covers the numbers
+// and bare `undefined` the store sends and the already-display labels the client-side
+// grouping paths build.
+func groupDisplay(label string) string {
+	if len(label) < 2 || label[0] != '"' {
+		return label
+	}
+	ex, err := classad.ParseExpr(label)
+	if err != nil {
+		return label
+	}
+	if v := ex.Eval(classad.New()); v.IsString() {
+		s, _ := v.StringValue()
+		return s
+	}
+	return label
 }
 
 // scope builds the ClassAd an expression item is evaluated against: its own aggregates bound

@@ -119,8 +119,13 @@ func TestArchiveBucketedPushdownAvailable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("non-numeric count %q", r.Values[0])
 		}
-		if got := want[r.Group[1]+"|"+r.Group[0]]; got != n {
-			t.Errorf("%s|%s = %d, want %d", r.Group[1], r.Group[0], n, got)
+		// Straight off the client, so the group label is the store's faithful rendering
+		// rather than the display cell ExecString produces: a string arrives quoted. The
+		// reference is keyed through the same renderer the executor uses, so this test
+		// pins the counts and not the spelling.
+		day, owner := groupDisplay(r.Group[1]), groupDisplay(r.Group[0])
+		if got := want[day+"|"+owner]; got != n {
+			t.Errorf("%s|%s = %d, want %d", day, owner, n, got)
 		}
 		total += n
 	}

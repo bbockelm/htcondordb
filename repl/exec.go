@@ -65,18 +65,29 @@ type ExecConfig struct {
 
 	// ServerSideJoin asks the store to pair a join's rows, when it advertises that it can.
 	//
-	// OFF BY DEFAULT, because measured it is not yet a win. A joined row carries both sides,
-	// so a join that EXPANDS -- each left row matching several right rows -- repeats the left
-	// ad once per output row and the result is larger than the two inputs were. Against two
-	// tables with two right rows per left row the store's join moved 1.33x more data on a
-	// narrow projection and ran 1.4x slower end to end; the client's own join ships each side
-	// exactly once.
+	// STILL OFF BY DEFAULT, but no longer for the reason it was. It was off because the
+	// store's join ran 1.4x slower end to end at two right rows per left row. That is gone:
+	// the store now reads only the attributes the join uses, carries its rows as the bytes
+	// storage produced rather than as decoded ads, and answers with wire-form rows batched
+	// many per frame instead of one rendered row per frame. Re-measured over the same
+	// statement and store, sweeping the expansion factor k from 0.25 to 8 right rows per left
+	// row, the store is faster at every k -- 1.0x to 1.3x with both arms reading wire rows,
+	// and 1.9x to 5.1x over archives, where the client's side reads come back as rendered
+	// text because an archive has no wire row stream.
 	//
-	// The reasoning it was built on holds only for a SELECTIVE join, where fewer rows come out
-	// than went in. Deciding between them needs an estimate of that ratio, which is the
-	// cost-based planning this does not have yet -- so the choice is a flag until something
-	// can make it, and the flag exists so the path can be exercised and measured rather than
-	// sitting unused.
+	// WHAT STILL ARGUES THE OTHER WAY IS BYTES, and only bytes. A joined row carries both
+	// sides, so an expanding join repeats the left ad once per output row: with k right rows
+	// per left row and per-side widths l and r the store ships |L|*k*(l+r) against the
+	// client's |L|*(l + k*r), below 1 exactly when k < 1. That crossover is at k=1 whatever
+	// the widths, and no encoding moves it, because an encoding scales both arms alike.
+	// Measured in the store, the store moves 0.63x the bytes at k=0.25 and 1.36x at k=8.
+	//
+	// So the trade is now 1.0-5x less CPU against up to ~1.36x more bytes, and which wins
+	// depends on the link. The measurement above is over an in-memory pipe, which prices
+	// those bytes at nearly nothing; a bandwidth-constrained link does not. That is a
+	// deployment property rather than a statement property, so it stays a flag -- but the
+	// default should follow whichever side the deployments that matter sit on, and on a local
+	// or well-provisioned link that is the store.
 	ServerSideJoin bool
 }
 

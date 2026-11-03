@@ -201,8 +201,21 @@ var unreadableReasons = []struct{ reason, suffix string }{
 	// can carry forward. Not storage damage: the writer lacks the privilege to rewrite that row.
 	// Published beside the others because a reason classad emits with nowhere to land is counted
 	// into nothing, and an operator watching a rising unreadable count has to tell the two apart.
+	//
+	// RETIRED: the store now re-seals those values itself, so the condition cannot arise and the
+	// count stays at zero. Still published, because an attribute that disappears reads as
+	// undefined to a dashboard querying it, which is not the same answer as zero.
 	{"sealed-needs-key", "SealedNeedsKey"},
+	// A value the store seals could not be sealed, so the record was never encoded. Like
+	// SealedNeedsKey this is a refusal rather than damage, but it is the key failing rather than
+	// the writer lacking it -- a store showing these has a crypto fault, not a privilege one.
+	{"seal-failed", "SealFailed"},
 }
+
+// retiredReasons are reason names this package still publishes that classad no longer emits. They
+// are kept as permanent zeroes rather than dropped, and listed here so the name check can tell a
+// reason classad retired from one it renamed -- the second is a bug, the first is not.
+var retiredReasons = map[string]bool{"sealed-needs-key": true}
 
 // ExporterStatus is one change-data exporter's health as the daemon's exporter manager sees it:
 // what the daemon knows (running, restarts) plus the child's last-reported progress. It lets an
