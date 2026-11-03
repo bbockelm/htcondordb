@@ -35,6 +35,7 @@ func TestUnreadableReasonsReachTheAd(t *testing.T) {
 		"DeltaUnreadableChainBaseDecode":  0,
 		"DeltaUnreadableChainPatchDecode": 0,
 		"DeltaUnreadableSealedNeedsKey":   0,
+		"DeltaUnreadableSealFailed":       0,
 	} {
 		got, ok := ad.EvaluateAttrInt(name)
 		if !ok {
@@ -66,8 +67,22 @@ func TestReasonNamesMatchClassad(t *testing.T) {
 			t.Errorf("classad reports reason %q, which this package does not publish", reason)
 		}
 	}
-	if len(known) != len(names) {
-		t.Errorf("publishing %d reasons, classad has %d: %v vs %v", len(known), len(names), known, names)
+	// The other direction: a name published here that classad does not emit is either a reason
+	// classad retired (fine -- it stays as a permanent zero) or one it renamed under this
+	// package's feet, which would leave the new name counted into nothing.
+	emits := map[string]bool{}
+	for _, reason := range names {
+		emits[reason] = true
+	}
+	for reason := range known {
+		if !emits[reason] && !retiredReasons[reason] {
+			t.Errorf("publishing reason %q, which classad does not emit and is not listed as retired", reason)
+		}
+	}
+	for reason := range retiredReasons {
+		if emits[reason] {
+			t.Errorf("reason %q is listed as retired, but classad still emits it", reason)
+		}
 	}
 }
 

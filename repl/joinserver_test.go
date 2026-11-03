@@ -128,6 +128,16 @@ func TestServerSideJoinAgreesWithTheClientSideJoin(t *testing.T) {
 		`SELECT j.Owner, COUNT(*) FROM jobs j JOIN hist h ON j.ClusterId == h.ClusterId GROUP BY j.Owner`,
 		`SELECT * FROM jobs j JOIN hist h ON j.ClusterId == h.ClusterId`,
 		`SELECT j.Owner, h.ExitCode FROM jobs j JOIN hist h ON j.ClusterId == h.ClusterId && h.ExitCode > 0`,
+		// A residual WHERE: it names both sides, so it can be pushed to neither and has to be
+		// evaluated against the pair. The matrix otherwise only has filters that reach a side.
+		//
+		// Note what this does NOT reach. The store used to apply such a filter to the
+		// PROJECTED row, so a filter over an attribute the projection left out silently
+		// matched nothing. The planner here scans WHERE into both side projections, so
+		// j.Cpus and h.ExitCode cross even though the SELECT names neither -- which is why
+		// these two queries answered correctly before the store was fixed as well as after.
+		`SELECT j.Owner FROM jobs j JOIN hist h ON j.ClusterId == h.ClusterId WHERE j.Cpus > h.ExitCode`,
+		`SELECT j.Owner FROM jobs j LEFT JOIN hist h ON j.ClusterId == h.ClusterId WHERE j.Cpus > h.ExitCode`,
 	}
 	for _, q := range queries {
 		t.Run(shortName(q), func(t *testing.T) {
