@@ -1923,9 +1923,14 @@ func (e *Executor) joinWireRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool
 // here. Kept for every server that does not carry the wire-form stream.
 func (e *Executor) joinTextRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool, error) {
 	var rows []*classad.ClassAd
+	var parseErr error
 	err := e.c.Join(e.opCtx(), req, func(row string) bool {
 		ad, perr := classad.Parse(row)
 		if perr != nil {
+			// Stopping the stream without recording why ends it the same way a caller that
+			// had seen enough does: the rows read so far come back as a complete answer, and
+			// a join that lost a row in transit renders as one that matched fewer.
+			parseErr = fmt.Errorf("joined row did not parse: %w", perr)
 			return false
 		}
 		rows = append(rows, ad)
@@ -1933,6 +1938,9 @@ func (e *Executor) joinTextRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool
 	})
 	if errors.Is(err, dbrpc.ErrJoinUnsupported) {
 		return nil, false, nil // join it here, as before
+	}
+	if parseErr != nil {
+		return nil, false, parseErr
 	}
 	if err != nil {
 		return nil, false, err
