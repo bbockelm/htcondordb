@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -703,4 +704,222 @@ func BenchmarkJoinNonEqui(b *testing.B) {
 		}
 		fix.cleanup()
 	}
+}
+
+// WHERE THE STORE-SIDE JOIN STOPS BEING WORTH IT, IN TIME.
+//
+// ExecConfig.ServerSideJoin is off on the strength of one measurement at two right rows per
+// left row: the store moved 1.33x more data and ran 1.4x slower end to end. The BYTES half
+// has since been settled in classad and is not re-derived here. With k right rows per left
+// row and per-side projected widths l and r the server ships |L|*k*(l+r) -- the left ad once
+// per output row -- against the client's |L|*(l + k*r), a ratio below 1 exactly when k < 1.
+// The crossover is at k=1, independent of l and r, and no encoding moves it.
+//
+// The TIME half was open, and it is the half that needed this package. The classad
+// measurement's client arm hand-rolls an int-keyed hash join; a fetch-only arm priced the
+// gap at 16% of that arm at k=0.25 and 37% at k=8, so a general join two or three times more
+// expensive than a map would flip the comparison at most k. The join here IS that general
+// one: a ClassAd hash join over composite ads, behind the shipped planner, the shipped
+// key-batch decision and the shipped rendering.
+//
+// SO BOTH ARMS ARE ExecString. The question is what a statement costs, and the planning,
+// the pairing, the ordering and the rendering are all part of that; an arm that stopped at
+// the rows would be comparing a finished answer with an unfinished one. The two executors
+// reach the SAME store over the same kind of connection and differ in one thing: whether the
+// handshake advertises the join.
+//
+// TWO LEFT SIZES, because they are two PLANS and not two sizes. Key batching folds the left
+// side's keys into the right scan and gives up past maxJoinKeyBatch (512) distinct keys, so
+// at 400 left rows the client arm reads a slice of the right table and at 2048 it reads the
+// whole thing. Measuring only above the cutoff would credit the store with a narrowing the
+// client arm was denied.
+//
+// Allocations are the number to read first. This machine runs at high load and its timings
+// move between runs; the allocation counts do not.
+
+// newExpansionJoinFixture builds `left` history rows and k epoch rows per history row, with
+// k allowed to be fractional: k=0.25 means one epoch row for every four jobs, which is the
+// SELECTIVE direction -- the one the store is supposed to win.
+//
+// ops records what the server was actually asked to run, so the server arm can be required
+// to have used the wire reply rather than quietly measuring the text one.
+func newExpansionJoinFixture(b testing.TB, left int, k float64, archive bool) (*joinBenchFixture, *opRecorder, int) {
+	b.Helper()
+	cat, err := db.OpenCatalog(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	// addHistory/addEpoch hide which kind of table this is; everything below is the same.
+	var addHistory, addEpoch func(ad *classad.ClassAd, key string)
+	if archive {
+		cfg := func(zone []string) db.ArchiveConfig {
+			return db.ArchiveConfig{SegmentSize: 1 << 16, ValueAttrs: []string{"ClusterId"}, ZoneAttrs: zone}
+		}
+		hist, herr := cat.CreateArchiveTable("history", cfg([]string{"CompletionDate"}))
+		if herr != nil {
+			b.Fatal(herr)
+		}
+		epoch, eerr := cat.CreateArchiveTable("epoch", cfg(nil))
+		if eerr != nil {
+			b.Fatal(eerr)
+		}
+		addHistory = func(ad *classad.ClassAd, _ string) {
+			if aerr := hist.Append(ad); aerr != nil {
+				b.Fatal(aerr)
+			}
+		}
+		addEpoch = func(ad *classad.ClassAd, _ string) {
+			if aerr := epoch.Append(ad); aerr != nil {
+				b.Fatal(aerr)
+			}
+		}
+	} else {
+		hist, herr := cat.CreateTable("history")
+		if herr != nil {
+			b.Fatal(herr)
+		}
+		epoch, eerr := cat.CreateTable("epoch")
+		if eerr != nil {
+			b.Fatal(eerr)
+		}
+		addHistory = func(ad *classad.ClassAd, key string) {
+			if werr := hist.Put(key, ad); werr != nil {
+				b.Fatal(werr)
+			}
+		}
+		addEpoch = func(ad *classad.ClassAd, key string) {
+			if werr := epoch.Put(key, ad); werr != nil {
+				b.Fatal(werr)
+			}
+		}
+	}
+	rows := 0
+	for i := 1; i <= left; i++ {
+		addHistory(benchHistoryAd(i), fmt.Sprint(i))
+		n := int(float64(i)*k) - int(float64(i-1)*k)
+		for inst := 0; inst < n; inst++ {
+			addEpoch(benchEpochAd(i, inst), fmt.Sprintf("%d.%d", i, inst))
+			rows++
+		}
+	}
+	s := dbrpc.NewServerCatalog(cat)
+	ops := &opRecorder{}
+	dial := func(advertise bool) *dbrpc.Client {
+		cp, sp := net.Pipe()
+		go func() {
+			_ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{
+				Privileged: true,
+				QueryLog:   func(q dbrpc.QueryLog) { ops.add(q.Op) },
+			})
+		}()
+		conn := dbrpc.NewStreamConn(cp)
+		if advertise {
+			return dbrpc.NewClient(conn, dbrpc.WithPeerSessionAttrs(s.SessionAttrs()))
+		}
+		return dbrpc.NewClient(conn)
+	}
+	c, sc := dial(false), dial(true)
+	return &joinBenchFixture{
+		cat:     cat,
+		exec:    NewExecutor(c, ExecConfig{}),
+		srvExec: NewExecutor(sc, ExecConfig{ServerSideJoin: true}),
+		cleanup: func() { c.Close(); sc.Close(); s.Close(); cat.Close() },
+	}, ops, rows
+}
+
+// expansionJoinSQL is a narrow projection: the shape the original decision was taken on, and
+// the one where the composite row's repetition of the left ad is least diluted by width.
+const expansionJoinSQL = `SELECT h.ClusterId, h.Owner, e.RunInstanceId, e.ExitCode ` +
+	`FROM history h JOIN epoch e ON h.ClusterId == e.ClusterId`
+
+// BenchmarkJoinExpansionCrossover is the CONTROLLED comparison, over mutable tables.
+//
+// Mutable rather than archive on purpose, and this is the confound the archive sweep below
+// exists to name. A read of a mutable table takes the wire row stream; an archive has no wire
+// row stream (wireEligible excludes it), so the client arm's two side reads come back as
+// rendered text while the store-side arm's reply is wire rows either way. Over archives the
+// two arms therefore differ in the ENCODING as well as in where the pairing happened, and a
+// comparison that moves two things cannot attribute the difference to one. Over mutable
+// tables both arms carry wire rows and the only remaining difference is the pairing.
+func BenchmarkJoinExpansionCrossover(b *testing.B) {
+	benchJoinExpansion(b, false, []int{400, 2048}, []float64{0.25, 0.5, 1, 2, 4, 8})
+}
+
+// BenchmarkJoinExpansionArchive is the same sweep over ARCHIVE tables, which is what a
+// history-to-epoch join actually reads. It measures the shipped paths as they stand, so its
+// numbers include the encoding gap named above rather than isolating the pairing: the client
+// arm pays a render and a parse per row that the store-side arm does not. Read it as what the
+// two code paths cost today, not as what the pairing costs.
+func BenchmarkJoinExpansionArchive(b *testing.B) {
+	benchJoinExpansion(b, true, []int{400, 2048}, []float64{0.25, 0.5, 1, 2, 4, 8})
+}
+
+func benchJoinExpansion(b *testing.B, archive bool, lefts []int, ks []float64) {
+	sql := expansionJoinSQL
+	for _, left := range lefts {
+		for _, k := range ks {
+			fix, ops, want := newExpansionJoinFixture(b, left, k, archive)
+
+			// Agreement before timing, and evidence of which path each arm took. Two arms
+			// that answer differently cannot be compared, and a server arm that fell back
+			// to the text reply would be measured as the wire one.
+			ops.reset()
+			sres, err := fix.srvExec.ExecString(sql)
+			if err != nil {
+				b.Fatalf("left=%d k=%g in-store: %v", left, k, err)
+			}
+			cres, err := fix.exec.ExecString(sql)
+			if err != nil {
+				b.Fatalf("left=%d k=%g client-side: %v", left, k, err)
+			}
+			if len(sres.Rows) != want || len(cres.Rows) != want {
+				b.Fatalf("left=%d k=%g: in-store %d rows, client-side %d, expected %d",
+					left, k, len(sres.Rows), len(cres.Rows), want)
+			}
+			// The same rows, not merely the same number of them: an arm that returned the
+			// right count of the wrong rows would otherwise be timed as the fast one.
+			sortRowsForCompare(sres)
+			sortRowsForCompare(cres)
+			if render(sres) != render(cres) {
+				b.Fatalf("left=%d k=%g: the two arms returned different rows", left, k)
+			}
+			if got := ops.waitOpsB(b, 1); got[0] != "JoinWire" {
+				b.Fatalf("left=%d k=%g: the in-store arm's first op was %q, not JoinWire -- it "+
+					"fell back and this would measure the text reply: %v", left, k, got[0], got)
+			}
+
+			for round := 0; round < 2; round++ {
+				arms := []struct {
+					name string
+					exec *Executor
+				}{{"in-store", fix.srvExec}, {"client-side", fix.exec}}
+				// A Go benchmark's first arm warms the page cache and the allocator for the
+				// second, so the order is flipped between rounds and the two readings of
+				// each arm bracket that effect rather than hiding it.
+				if round%2 == 1 {
+					arms[0], arms[1] = arms[1], arms[0]
+				}
+				for _, arm := range arms {
+					b.Run(fmt.Sprintf("left=%d/k=%g/rows=%d/r%d/%s", left, k, want, round, arm.name),
+						func(b *testing.B) {
+							b.ReportAllocs()
+							for b.Loop() {
+								if _, err := arm.exec.ExecString(sql); err != nil {
+									b.Fatal(err)
+								}
+							}
+						})
+				}
+			}
+			fix.cleanup()
+		}
+	}
+}
+
+// sortRowsForCompare puts a result's rows in a canonical order, since neither arm promises
+// one without ORDER BY and the agreement check is about WHICH rows, not their sequence.
+func sortRowsForCompare(r *Result) {
+	sort.Slice(r.Rows, func(i, j int) bool {
+		return fmt.Sprint(r.Rows[i]) < fmt.Sprint(r.Rows[j])
+	})
 }

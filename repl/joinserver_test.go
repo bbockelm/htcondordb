@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
@@ -24,6 +25,21 @@ import (
 // the client-side join is already tested against literals, and an oracle that is the other
 // implementation cannot drift from the thing under test by accident.
 func newJoinPair(t *testing.T) (server, client *Executor, serverOps, clientOps *opRecorder, cleanup func()) {
+	t.Helper()
+	s, closeCat := newJoinCatalog(t)
+	mk := func(advertise bool, ops *opRecorder) *Executor {
+		attrs := s.SessionAttrs()
+		if !advertise {
+			attrs = nil
+		}
+		return joinExecutor(t, s, attrs, true, ops)
+	}
+	serverOps, clientOps = &opRecorder{}, &opRecorder{}
+	return mk(true, serverOps), mk(false, clientOps), serverOps, clientOps, closeCat
+}
+
+// newJoinCatalog builds the two-table fixture and puts a server in front of it.
+func newJoinCatalog(t *testing.T) (*dbrpc.Server, func()) {
 	t.Helper()
 	cat, err := db.OpenCatalog(t.TempDir())
 	if err != nil {
@@ -59,24 +75,30 @@ func newJoinPair(t *testing.T) (server, client *Executor, serverOps, clientOps *
 	put(hist, "e", `[ ExitCode = 42 ]`)
 
 	s := dbrpc.NewServerCatalog(cat)
-	mk := func(advertise bool, ops *opRecorder) *Executor {
-		cp, sp := net.Pipe()
-		go func() {
-			_ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{
-				Privileged: true,
-				QueryLog:   func(q dbrpc.QueryLog) { ops.add(q.Op) },
-			})
-		}()
-		conn := dbrpc.NewStreamConn(cp)
-		if advertise {
-			// What the application carries over CEDAR. Without it the client cannot know
-			// the server joins, and correctly declines to ask.
-			return NewExecutor(dbrpc.NewClient(conn, dbrpc.WithPeerSessionAttrs(s.SessionAttrs())), ExecConfig{ServerSideJoin: true})
-		}
+	return s, func() { s.Close(); cat.Close() }
+}
+
+// joinExecutor dials one connection to s and wraps it in an Executor.
+//
+// attrs is what the application carries over CEDAR; nil is a peer that advertised nothing,
+// which the client must read as "cannot join" rather than as "unknown". privileged is the
+// server's view of the connection, which decides both what it will show and -- for a join
+// asked for as whole ads -- whether the wire-form reply is available at all.
+func joinExecutor(t *testing.T, s *dbrpc.Server, attrs map[string]string, privileged bool, ops *opRecorder) *Executor {
+	t.Helper()
+	cp, sp := net.Pipe()
+	go func() {
+		_ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{
+			Privileged: privileged,
+			QueryLog:   func(q dbrpc.QueryLog) { ops.add(q.Op) },
+		})
+	}()
+	conn := dbrpc.NewStreamConn(cp)
+	if attrs == nil {
 		return NewExecutor(dbrpc.NewClient(conn), ExecConfig{})
 	}
-	serverOps, clientOps = &opRecorder{}, &opRecorder{}
-	return mk(true, serverOps), mk(false, clientOps), serverOps, clientOps, func() { s.Close(); cat.Close() }
+	return NewExecutor(dbrpc.NewClient(conn, dbrpc.WithPeerSessionAttrs(attrs)),
+		ExecConfig{ServerSideJoin: true})
 }
 
 // opRecorder notes which ops a server was actually asked to run, which is the only direct
@@ -107,6 +129,39 @@ func (r *opRecorder) reset() {
 	r.mu.Lock()
 	r.ops = nil
 	r.mu.Unlock()
+}
+
+func (r *opRecorder) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.ops...)
+}
+
+// waitOps blocks until the server has logged n ops, and returns them.
+//
+// A server logs an op as its handler returns, which is after it has written the reply -- so
+// the client's call can return first and the log read straight after it is empty. Reading it
+// without waiting is a test that passes on timing. Waiting for a KNOWN count rather than for
+// a quiet interval is what keeps the assertion exact: the statements below issue a fixed
+// number of ops, and one more would be a second request this test is not expecting.
+func (r *opRecorder) waitOps(t *testing.T, n int) []string {
+	t.Helper()
+	return r.waitOpsB(t, n)
+}
+
+// waitOpsB is waitOps for a benchmark, which has no *testing.T.
+func (r *opRecorder) waitOpsB(t testing.TB, n int) []string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := r.all(); len(got) >= n {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waited for %d server op(s), saw %v", n, r.all())
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestServerSideJoinAgreesWithTheClientSideJoin(t *testing.T) {
@@ -199,12 +254,18 @@ func TestServerSideJoinIsActuallyUsed(t *testing.T) {
 	if _, err := client.ExecString(q); err != nil {
 		t.Fatal(err)
 	}
-	if !serverOps.saw("Join") {
-		t.Errorf("the advertising executor issued no Join: saw %v.\nThe differential matrix "+
-			"would then be comparing the client-side join against itself.", serverOps.ops)
+	// Either join opcode counts: which reply form is used is the next test's question, and
+	// this one is only asking whether the pairing crossed to the store at all.
+	sops := serverOps.waitOps(t, 1)
+	if !serverOps.saw("Join") && !serverOps.saw("JoinWire") {
+		t.Errorf("the advertising executor issued no join: saw %v.\nThe differential matrix "+
+			"would then be comparing the client-side join against itself.", sops)
 	}
-	if clientOps.saw("Join") {
-		t.Errorf("the non-advertising executor issued a Join: saw %v", clientOps.ops)
+	// The non-advertising executor reads the two sides, so it logs ops of its own; waiting
+	// for those is what makes "it issued no join" a statement about a finished request.
+	cops := clientOps.waitOps(t, 2)
+	if clientOps.saw("Join") || clientOps.saw("JoinWire") {
+		t.Errorf("the non-advertising executor issued a join: saw %v", cops)
 	}
 }
 

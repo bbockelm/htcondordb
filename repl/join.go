@@ -49,6 +49,7 @@ import (
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 )
@@ -1651,8 +1652,12 @@ func (e *Executor) describeJoinPlan(st *Statement) []string {
 			len(st.GroupBy), len(aggCallOrder(st))))
 	}
 	if e.serverJoinEligible(st, p) && e.c.SupportsNewer(dbrpc.FeatJoin) {
+		reply := "rendered one row per frame"
+		if e.c.SupportsNewer(dbrpc.FeatJoinWire) {
+			reply = "wire-form rows, batched many per frame"
+		}
 		out = append(out, "  executed in the store: only the joined rows cross the wire, and one "+
-			"side is held rather than both")
+			"side is held rather than both; reply is "+reply)
 	} else {
 		out = append(out, "  executed client-side: "+whyNotServerSide(e, st, p))
 	}
@@ -1673,8 +1678,8 @@ func whyNotServerSide(e *Executor, st *Statement, p *joinPlan) string {
 		return "a read inside a transaction must see that transaction's own writes, and the " +
 			"store joins committed state"
 	case !e.serverJoin:
-		return "the server-side join is not enabled; measured, it moves more data than this " +
-			"does whenever the join expands rather than filters"
+		return "the server-side join is not enabled; measured it is faster at every expansion " +
+			"factor, but it still moves more data whenever the join expands rather than filters"
 	case !e.c.SupportsNewer(dbrpc.FeatJoin):
 		return "this server does not advertise a server-side join, so no join opcode is sent"
 	default:
@@ -1867,6 +1872,56 @@ func (e *Executor) joinServerSide(st *Statement, p *joinPlan) ([]*classad.ClassA
 		req.Spec.Limit = st.Limit
 	}
 
+	rows, ok, err := e.joinWireRows(req)
+	if ok || err != nil {
+		return rows, ok, err
+	}
+	return e.joinTextRows(req)
+}
+
+// joinWireRows asks for the joined rows as wire-form records rather than as rendered
+// old-ClassAd text. Same plan, same rows; what changes is that the store does not render
+// each row and this does not parse it, and many rows ride in one frame instead of one.
+//
+// ok is false with a nil error when the reply form is unavailable -- an older server, a
+// catalog that cannot produce wire rows, or an unprivileged connection asking for whole ads,
+// which has no projection to withhold the private attributes from. That refusal arrives
+// BEFORE any row, so the caller can take the text reply without having emitted anything.
+func (e *Executor) joinWireRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool, error) {
+	var rows []*classad.ClassAd
+	var decodeErr error
+	// Not redacted by request: an unprivileged connection is redacted by the server whatever
+	// it asks for, and a privileged one is entitled to what the text reply would have given
+	// it. Asking for redaction here would withhold private attributes from the one caller
+	// allowed to see them.
+	err := e.c.JoinWire(e.opCtx(), req, false, func(row []byte) bool {
+		// row ALIASES the frame buffer and dies when this returns. DecodeInline builds an
+		// AST that owns its strings, so what is kept here outlives the frame.
+		a, derr := wire.DecodeInline(row)
+		if derr != nil {
+			decodeErr = fmt.Errorf("joined row did not decode: %w", derr)
+			return false
+		}
+		rows = append(rows, classad.FromAST(a))
+		return true
+	})
+	if errors.Is(err, dbrpc.ErrJoinWireUnsupported) {
+		return nil, false, nil // take the text reply
+	}
+	if decodeErr != nil {
+		return nil, false, decodeErr
+	}
+	if err != nil {
+		// Including a limit the store met part way through, which arrives after the rows:
+		// a partial join must not be rendered as a complete one.
+		return nil, false, err
+	}
+	return rows, true, nil
+}
+
+// joinTextRows is the original reply form: one rendered old-ClassAd row per frame, parsed
+// here. Kept for every server that does not carry the wire-form stream.
+func (e *Executor) joinTextRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool, error) {
 	var rows []*classad.ClassAd
 	err := e.c.Join(e.opCtx(), req, func(row string) bool {
 		ad, perr := classad.Parse(row)
@@ -1880,8 +1935,6 @@ func (e *Executor) joinServerSide(st *Statement, p *joinPlan) ([]*classad.ClassA
 		return nil, false, nil // join it here, as before
 	}
 	if err != nil {
-		// Including a limit the store met part way through, which arrives after the rows:
-		// a partial join must not be rendered as a complete one.
 		return nil, false, err
 	}
 	return rows, true, nil

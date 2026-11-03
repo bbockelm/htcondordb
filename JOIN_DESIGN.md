@@ -678,6 +678,73 @@ that estimate the server-side join is off by default, behind `ExecConfig.ServerS
 with this measurement as the reason. A flag rather than deleted code, because the path has to
 be exercised and re-measured as the rest of Phase 3 lands.
 
+*Superseded by the re-measurement below: the 1.4x is gone and the store is faster at every
+expansion factor. The flag is still off, but what it is now waiting on is a link, not an
+estimate.*
+
+#### Re-measured once the store's join stopped rendering: the time objection is gone
+
+The tables above were taken against a store whose join decoded every candidate row, carried
+its output as decoded ads, and answered with one rendered old-ClassAd row per frame. Four
+changes removed all of that: the join reads only the attributes it uses, filters on the sides
+rather than on the projected row (which was also a correctness fix -- a residual filter over
+an attribute the projection dropped matched nothing), carries its rows as the bytes storage
+produced, and answers with wire-form rows batched many per frame.
+
+Re-measured with the expansion factor swept rather than fixed at two right rows per left row.
+`k` is right rows per left row, so `k < 1` is the selective direction. Both arms end as
+rendered result rows, both go through `ExecString`, and the arm order is flipped between
+rounds; the figures are the better round for each arm, because the round-to-round spread on
+this machine reaches 15% and once 2.9x.
+
+**Over mutable tables, where both arms read wire rows and the only difference is where the
+pairing happened:**
+
+| left rows | k | out | client-side | in the store | | store allocs |
+|---|---|---|---|---|---|---|
+| 400 | 0.25 | 100 | 3.50 ms | 2.98 ms | 1.17x faster | 0.54x |
+| 400 | 1 | 400 | 5.18 ms | 4.74 ms | 1.09x faster | 0.87x |
+| 400 | 2 | 800 | 7.39 ms | 6.89 ms | 1.07x faster | 1.01x |
+| 400 | 8 | 3200 | 20.36 ms | 20.27 ms | tie | 1.19x |
+| 2048 | 0.25 | 512 | 7.44 ms | 5.62 ms | **1.32x faster** | 0.56x |
+| 2048 | 1 | 2048 | 15.92 ms | 14.05 ms | 1.13x faster | 0.89x |
+| 2048 | 2 | 4096 | 17.07 ms | 12.91 ms | **1.32x faster** | 1.04x |
+| 2048 | 8 | 16384 | 51.41 ms | 42.50 ms | 1.21x faster | 1.19x |
+
+**Over archives, which is what a history-to-epoch join actually reads:**
+
+| left rows | k | out | client-side | in the store | |
+|---|---|---|---|---|---|
+| 400 | 2 | 800 | 13.61 ms | 6.88 ms | 1.98x faster |
+| 2048 | 0.25 | 512 | 28.74 ms | 5.61 ms | **5.12x faster** |
+| 2048 | 2 | 4096 | 67.44 ms | 13.36 ms | **5.05x faster** |
+| 2048 | 8 | 16384 | 207.99 ms | 41.54 ms | 5.01x faster |
+
+**The archive arms differ in two things, and the table says so.** A mutable table is read
+through the wire row stream; an archive is served by its own opcode and `wireEligible`
+excludes it, so the client-side join's side reads come back as rendered text while the
+store-side reply is wire rows either way. `TestJoinArmsReadArchivesAsTextAndTablesAsWire`
+pins exactly that, so the framing is revisited if archives ever gain a wire read. The archive
+row is still the right one to compare against the 1.4x-slower finding, because that finding
+was taken on the same archive fixture with the same asymmetry already present -- the store
+arm got 2.7x faster at `left=400, k=2` (19.0 ms to 6.9 ms) while the client arm did not move
+(13.7 ms to 13.6 ms).
+
+**Where the crossover sits now.** In ALLOCATIONS, which are the stable number here, the
+controlled comparison crosses 1.0 between `k=1` and `k=2` -- the bytes model's `k=1` plus the
+pairing the store saves the client. In TIME it does not cross at all over the range measured:
+the store is never slower. So the half that put the flag off has reversed, and what is left
+is the half that was settled separately: with per-side widths `l` and `r` the store ships
+`|L|*k*(l+r)` against the client's `|L|*(l + k*r)`, below 1 exactly when `k < 1`, measured at
+0.63x for `k=0.25` and 1.36x for `k=8`.
+
+**So the trade is now CPU against bandwidth, and nothing here prices bandwidth.** `net.Pipe`
+is an in-memory pipe; it charges for serialization and framing and nothing for the link. The
+measurement supports defaulting the flag on for a local or well-provisioned connection and
+says nothing about a constrained one, which is a deployment property rather than a property
+of the statement. That is the one thing still missing, and it is a smaller gap than the
+expansion estimate the flag was originally waiting for.
+
 #### Pricing it with the one number that was missing
 
 The count aggregate already reaches an O(1) length for a mutable table and a zone-pruned
