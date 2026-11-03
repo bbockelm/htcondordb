@@ -286,7 +286,7 @@ Three things building it settled that the specification did not anticipate:
   keeping what it used to throw away — so it is pinned by a test that searches a READ peer's
   whole batch for the value, with a DAEMON peer proving the fixture has one to withhold.
 
-### 5.7 The declaration, and how it invalidates
+### 5.7 Remembering a table's column types, and how a schema invalidates
 
 The intent was a per-table Arrow type map — `attr -> {arrow type, nullable, strict?}` — stored
 alongside the columnar schema and sharing its generation counter, seeded by introspection and
@@ -329,22 +329,50 @@ server-side, because an attribute's numeric bounds are a disclosure even where i
 so two levels derive different schemas from one table and a shared entry would hand private
 column names to whoever asked second.
 
-**Built: the declaration** (`flightsvc/declared.go`). The pin makes instability *visible*; this
-is what makes it rare. Every schema published is otherwise MEASURED — a sample of a table still
-being written to, re-taken whenever the cache expires — which is sound for one read and wrong
-for everything a consumer does with a catalog.
+**Built: the column-type memory** (`flightsvc/columntypes.go`). The pin makes instability
+*visible*; this is what makes it rare. Every schema published is otherwise MEASURED — a sample of
+a table still being written to, re-taken whenever the cache expires — which is sound for one read
+and wrong for everything a consumer does with a catalog.
 
-**The rule is monotone: a declaration is a floor, not a ceiling.** A declared column keeps its
-type and its position for as long as the declaration stands; the measurement cannot retype it
-and an admin can. An attribute nobody has declared is typed by measurement and **appended**,
-never inserted. A declared column whose attribute has vanished from the sample stays, as a
-column of nulls, because dropping it would renumber everything after it.
+**Nobody writes this down.** It is not a schema an operator authors and the endpoint obeys; ads
+are not typed and this does not pretend they are. It is the endpoint remembering what it
+*measured*, so that two derivations of an unchanged table agree even though each is a fresh
+sample. The one place a human states a type is `HTCONDORDB_FLIGHT_ATTR_KINDS`, which is older
+than this and answers a different question: the type is known and the sample does not show it.
 
-The consequence is the one that matters: **a schema a client cached is always a prefix of the
-current one.** A positional reader cannot be made to read the wrong column by anything that
-happens to the table; at worst it does not know about a new column at the end.
+**The schema is allowed to move. It just has to earn it.** This follows what the columnar
+accelerator does for its group schemas — re-derive every pass, adopt only when successive
+derivations agree, write down what changed and why. One stray string in a numeric column moves
+nothing; a column that has genuinely become a string moves once `retypeAgreement` derivations in
+a row have said so. The count is *successive*, not cumulative: a sample that agrees with the
+settled type clears the candidate, so a column that disagrees one sample in three never moves at
+all.
 
-Four things worth recording:
+Three rather than two because a wobble produces two of anything often enough; three rather than
+ten because each derivation costs a cache expiry, so a genuine change is adopted inside a couple
+of minutes at the default TTL — a reasonable time to be wrong about a column, and an unreasonable
+one to make a dashboard wait.
+
+**Order is append-only even when type is not**, and the asymmetry is deliberate. A type that
+changes costs a client values it must re-read; a *position* that changes costs it every column
+after the one that moved, silently, because nothing in the protocol says the fifth column is not
+what it was. So **a schema a client cached is always a prefix of the current one**, whatever the
+types have done.
+
+**Every adopted change bumps a generation and is logged.** The generation rides in the published
+Arrow schema's own metadata (`htcondordb.schema_generation`, beside `htcondordb.table` and
+`htcondordb.schema_version`), so a consumer sees it on every fetch without a side call, and it
+survives the IPC stream to whatever opens the file at the far end. The log records what moved and
+on what evidence, which is what answers "when did this column become a string, and why".
+
+The generation and the fingerprint answer different questions, and keeping both is the point. The
+fingerprint names a schema's *content*: it agrees across processes and restarts, says nothing
+about history, and is what the pin compares. The generation counts *adopted changes to a table* —
+and it exists only because the endpoint now remembers the table's columns and therefore knows one
+happened. `fingerprint.go` argued against a counter on the grounds that a measured schema has no
+owner to bump one; the memory is that owner, which is why the two landed together.
+
+Four more things worth recording:
 
 - **One column is exempt, deliberately.** The tail is not an attribute — it is this endpoint's
   own column — and it is always last, so appending an attribute moves it. A client reading the
@@ -356,7 +384,7 @@ Four things worth recording:
   leak the attribute's name to whoever can read the file and publish a column READ peers cannot
   fill. A privileged reader's extra columns are served and not recorded.
 - **Never a correctness dependency.** An unreadable file starts from the measurement; an
-  unwritable one declares for this process only. Both warn, because the symptom of a silent
+  unwritable one remembers for this process only. Both warn, because the symptom of a silent
   reset — clients re-fetching catalogs — points nowhere near here. A daemon with no on-disk
   directory gets the in-process half, which still stops a schema moving between two RPCs of one
   session.
@@ -365,9 +393,10 @@ Four things worth recording:
   is written down, never what a client is shown — and their positions simply stop surviving a
   restart.
 
-`HTCONDORDB_FLIGHT_SCHEMA_FILE` chooses the path; the default is beside the database, which is
-where it belongs, since it describes that database's tables and is meaningless without them.
-`none` turns persistence off for a host that would rather re-measure.
+The file goes beside the database and is not a knob to tune: it holds no policy, only what was
+measured, and losing it costs a re-measurement rather than an answer.
+`HTCONDORDB_FLIGHT_COLUMN_TYPES_FILE` overrides the path and `none` turns persistence off, for
+the host that has to rather than the operator who should not have to.
 
 **Still wanted from the original plan:** the epoch-to-timestamp mapping as a declaration rather
 than a guess — `knownTimeAttrs` in the Grafana plugin is the right instinct with the wrong
@@ -571,12 +600,12 @@ listener should be on by default when the TCP one is not.
 | Aggregates, GROUP BY, ORDER BY, DISTINCT (§7.4) | `flightsvc/analytic.go` | the `repl` executor, with result columns typed from the SELECT list |
 | Projected scan, archives included | `flightsvc/statement.go` | the refs-chasing projection op reaches an archive, pushes the projection down, keeps expressions evaluable |
 | Schema cache, privilege-scoped | `flightsvc/schemacache.go` | stops a derivation per RPC |
-| Declared columns (§5.7) | `flightsvc/declared.go`, `HTCONDORDB_FLIGHT_SCHEMA_FILE` | a column keeps its type and position across samples and restarts; new attributes append |
+| Remembered column types (§5.7) | `flightsvc/columntypes.go` | a column keeps its position across samples and restarts and its type until successive derivations disagree; every adopted change bumps a generation carried in the schema metadata |
 | Admin type overrides | `cmd/htcondordb/flight.go` | `HTCONDORDB_FLIGHT_EXCLUDE_ATTRS`, `_ATTR_KINDS`, `_STRICT_MIXED_KINDS`, `_TIME_ATTRS` |
 | SqlInfo conformance | `flightsvc/server.go` | the entries a real driver asks for at connect, one of which failed every ADBC client while Go was green |
 | ANSI → ClassAd lowering (§8) | `ansi/` | the comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, and `?` holes |
 | The same dialect in the REPL | `repl/dialect.go`, `-dialect` | one Arrow-column→SQL-kind mapping serves both front doors |
-| Result-column typing | `repl/arrowcols.go` | the SELECT list typed against a table's declarations; shared, so the two front doors cannot disagree about what a query returns |
+| Result-column typing | `repl/arrowcols.go` | the SELECT list typed against a table's settled column types; shared, so the two front doors cannot disagree about what a query returns |
 | Arrow output in the REPL | `repl/arrowout.go`, `.format arrow` | a SELECT's result as Arrow IPC; refuses a terminal |
 
 **Prepared statements with bound parameters** are served. Two decisions in that increment are
@@ -719,7 +748,7 @@ Ordered by value per unit of work.
    format here is text. Three sources, because the honest typed form of each result differs —
    `SELECT *` encodes the ads against the table's schema with the tail, a projection evaluates
    each item per ad through the same `RowStreamer` the other formats use, and an aggregate,
-   which has no ads, parses its cells back from display text against their declared types.
+   which has no ads, parses its cells back from display text against their settled types.
 
    **The branch order is load-bearing and nothing ordinary proves it.** Routing a projection
    through the aggregate branch passes every type and value assertion, because an ordinary
@@ -758,9 +787,9 @@ Ordered by value per unit of work.
      attributes anyone wants, and making a computed cell an ordinary column value is the single
      change that most increases what a column producer could hand out.
 
-   What it wanted from the declaration it now has: a producer emitting one Arrow schema across
+   What it wanted from the column-type memory it now has: a producer emitting one Arrow schema across
    blocks that vectorize and blocks that do not cannot derive that schema from whichever block
-   it is looking at, and it no longer has to — the schema is declared before the scan starts.
+   it is looking at, and it no longer has to — the schema is settled before the scan starts.
 
    One blocker that was on this list is **gone**: vectorization declining per block. Measured on
    the same fixture, `blocks: vector=53 declined=0 churn=0 pruned=0 empty=0 rowWindows=1` — not

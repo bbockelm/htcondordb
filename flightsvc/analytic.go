@@ -28,7 +28,7 @@ import (
 //
 // **The result schema is not the table's.** `COUNT(*)` is an int64 column that no attribute
 // produced; `AVG(x)` is a float64 whatever `x` is. So the columns are typed from the SELECT
-// LIST, against the table's declared types -- which is the one thing that makes answering
+// LIST, against the table's settled column types -- which is the one thing that makes answering
 // GetFlightInfo without executing possible at all, and that is a protocol requirement rather
 // than an optimization.
 //
@@ -36,7 +36,7 @@ import (
 // parsed on the way into Arrow. That is the text round trip the scan path just finished
 // deleting, and it is acceptable HERE and not there for a reason worth stating: an aggregate
 // result is group rows rather than table rows -- tens or thousands, not millions -- and the
-// parse is against a DECLARED type rather than an inferred one, so it cannot silently retype a
+// parse is against a SETTLED type rather than an inferred one, so it cannot silently retype a
 // column the way inference does. If an analytic result ever becomes large enough for the parse
 // to matter, the fix is a typed row API out of `repl`, not a heuristic here.
 //
@@ -73,10 +73,10 @@ func parseAnalytic(q string) (*analytic, error) {
 	if len(st.Joins) > 0 || len(st.SetBranches) > 0 {
 		// The same refusal the REPL's ANSI dialect gives, for the same reason: a bare
 		// column could belong to either side, and typing it from the first table's
-		// declarations would type it from the wrong one.
+		// settled column types would type it from the wrong one.
 		return nil, &unsupportedShape{reason: "a JOIN or a set operation is not served here: a " +
 			"bare column could belong to either side, and this endpoint types columns from " +
-			"one table's declarations; " + unsupportedHint}
+			"one table's column types; " + unsupportedHint}
 	}
 	if st.AsOf != "" {
 		return nil, &unsupportedShape{reason: "FOR SYSTEM_TIME AS OF is not served here; " + unsupportedHint}
