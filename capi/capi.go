@@ -75,13 +75,17 @@ type conn struct {
 	// cfg is the configuration the session was built from, kept so a caller that
 	// needs a second exchange with the same daemon (the queue client's sync-health
 	// probe) reuses the security policy instead of re-reading CONDOR_CONFIG.
-	cfg    *config.Config
-	cl     *cedarclient.HTCondorClient
-	dbc    *dbrpc.Client
-	ex     *repl.Executor
-	mu     sync.Mutex
-	ctx    context.Context
-	cancel context.CancelFunc
+	cfg *config.Config
+	cl  *cedarclient.HTCondorClient
+	dbc *dbrpc.Client
+	ex  *repl.Executor
+	// colTypes caches this connection's derived table columns, so reporting a result's
+	// types does not sample records per statement (coltypes.go). Per connection rather
+	// than shared: the derivation is scoped to what this session may see.
+	colTypes *colTypeCache
+	mu       sync.Mutex
+	ctx      context.Context
+	cancel   context.CancelFunc
 	// dead is set the moment the transport under dbc fails, by watchTransport.
 	// dbrpc cannot tell a caller apart from the inside: when the read loop dies it
 	// CLOSES each in-flight stream's channel, which is byte for byte what the end
@@ -222,6 +226,7 @@ func openConnAs(addr, subsys string) (*conn, error) {
 	}
 	c.attach(dbrpc.NewCedarConn(ctx, cl.GetStream()))
 	c.ex = repl.NewExecutor(c.dbc, repl.ExecConfig{})
+	c.colTypes = newColTypeCache()
 	return c, nil
 }
 

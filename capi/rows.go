@@ -97,6 +97,11 @@ type sqlHeader struct {
 	Note string `json:"note,omitempty"`
 	// Star reports that the statement was SELECT *.
 	Star bool `json:"star,omitempty"`
+	// ColumnTypes are the DECLARED kind of each column, aligned with Columns. Absent
+	// when nothing could be derived, so a caller can tell "no types reported" from
+	// "this column has no type" (coltypes.go). Available at OPEN, which is the point:
+	// a caller learns its result's shape without fetching a row.
+	ColumnTypes []string `json:"column_types,omitempty"`
 	// InTransaction reports whether an explicit transaction is open on the connection.
 	InTransaction bool `json:"in_transaction"`
 	// Streamed reports whether rows arrive as the server produces them (true) or were
@@ -256,6 +261,9 @@ func openBufferedCursor(c *conn, st *repl.Statement, objects bool, timeout time.
 		InTransaction: inTxn,
 		DurationNS:    elapsed.Nanoseconds(),
 	}
+	if res.IsSelect {
+		h.ColumnTypes = columnKinds(c.ex, c.colTypes, st, h.Columns)
+	}
 	return finishOpen(cur, h, cursor, header, out)
 }
 
@@ -309,6 +317,7 @@ func openStreamCursor(c *conn, st *repl.Statement, columns []string,
 	h := sqlHeader{
 		Select:        true,
 		Columns:       columns,
+		ColumnTypes:   columnKinds(c.ex, c.colTypes, st, columns),
 		InTransaction: inTxn,
 		Streamed:      true,
 	}

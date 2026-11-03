@@ -58,6 +58,12 @@ type sqlResult struct {
 	Select bool `json:"select"`
 	// Columns are the SELECT headers, in row-cell order.
 	Columns []string `json:"columns"`
+	// ColumnTypes are the DECLARED kind of each column, aligned with Columns:
+	// "int", "real", "bool", "string", "timestamp", or "" for a column the derivation
+	// declined to type. ABSENT ENTIRELY when nothing could be derived, so a caller can
+	// tell "this library does not report types" from "this column has no type" and fall
+	// back to reading the values (coltypes.go).
+	ColumnTypes []string `json:"column_types,omitempty"`
 	// Rows holds one array of typed cells per row, aligned to Columns. See cellValues for
 	// how a cell gets its type.
 	Rows [][]any `json:"rows"`
@@ -135,7 +141,14 @@ func hcdb_sqlImpl(h C.uintptr_t, sql *C.char, opts C.int, out **C.char) C.int {
 	}
 	res.Duration = elapsed
 
-	doc, err := json.Marshal(buildResult(res, int(opts), inTxn))
+	built := buildResult(res, int(opts), inTxn)
+	// Types after the statement has run, so a failure to derive them cannot fail a query
+	// that otherwise worked. It is a second round trip the first time a table is seen on
+	// this connection, and cached thereafter.
+	if res.IsSelect {
+		built.ColumnTypes = columnKinds(c.ex, c.colTypes, st, built.Columns)
+	}
+	doc, err := json.Marshal(built)
 	if err != nil {
 		*out = C.CString("encoding result: " + err.Error())
 		return hcdbErr

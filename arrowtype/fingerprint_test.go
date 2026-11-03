@@ -1,6 +1,7 @@
 package arrowtype
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -137,5 +138,34 @@ func TestFingerprintOfNothingIsStable(t *testing.T) {
 	}
 	if empty == Fingerprint([]Decision{fpCol("Owner", arrow.BinaryTypes.String, true)}) {
 		t.Error("the empty schema collided with a one-column one")
+	}
+}
+
+// TestDefaultTimeAttrsIsFreshAndLowercase pins the two things callers rely on without saying
+// so. A caller ADDS its configured attributes to this map, so handing out a shared one would
+// let one consumer's configuration leak into another's -- and the Grafana plugin does exactly
+// that, adding its own "time" alias. And every lookup folds the name first, so an entry with a
+// capital in it would be an entry nothing matches.
+func TestDefaultTimeAttrsIsFreshAndLowercase(t *testing.T) {
+	a := DefaultTimeAttrs()
+	b := DefaultTimeAttrs()
+	if len(a) == 0 {
+		t.Fatal("no epoch attributes at all")
+	}
+	a["mycustomtime"] = true
+	if b["mycustomtime"] {
+		t.Error("two callers share one map, so one's configuration reaches the other")
+	}
+	for name := range b {
+		if name != strings.ToLower(name) {
+			t.Errorf("%q is not lowercased, so a folded lookup will never find it", name)
+		}
+	}
+	// The well-known ones a job ad actually carries, since an empty-but-present map would
+	// pass everything above.
+	for _, want := range []string{"qdate", "completiondate", "jobstartdate"} {
+		if !b[want] {
+			t.Errorf("%s is missing", want)
+		}
 	}
 }

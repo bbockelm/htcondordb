@@ -92,6 +92,21 @@ func TestSpokeWithoutJobMetrics(t *testing.T) {
 		v, _ := sourceRowAttrBool(cat, "ap1", "JobMetricsSynced")
 		return v
 	})
+	// And wait for the ap2 attributes this is about to assert. Every wait above is on a
+	// DIFFERENT condition -- ap1's job_metrics, ap2's missing-table flag -- and none of
+	// them implies that ap2's own tables have finished syncing. It usually has by now,
+	// because ap1's sync takes longer, which is a coincidence of timing rather than
+	// anything the hub promises: observed failing on HistorySynced.
+	//
+	// A poll with a deadline is not a sleep. Waiting costs a passing run nothing and turns
+	// the assertion below into a statement about the hub rather than about how fast this
+	// machine happened to be.
+	for _, attr := range []string{"JobsSynced", "SyncStatusSynced", "HistorySynced", "JobsConnected", "HistoryConnected"} {
+		waitFor(t, "ap2's "+attr, func() bool {
+			v, _ := sourceRowAttrBool(cat, "ap2", attr)
+			return v
+		})
+	}
 
 	row, _ := sourceRow(cat, "ap2")
 	if st, _ := row.EvaluateAttrString("State"); st != StateFresh {

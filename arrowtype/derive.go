@@ -540,3 +540,62 @@ func Schema(ms []Measured, opts Options) (*arrow.Schema, []Decision) {
 	}
 	return arrow.NewSchema(fields, nil), decisions
 }
+
+// TypeOfKind is the Arrow type a kind name denotes, as HTCONDORDB_FLIGHT_ATTR_KINDS spells it.
+// Exported so a caller that PERSISTS a type -- a declared schema, say -- can store the kind
+// name rather than an Arrow type string, and read it back through the same mapping the
+// overrides use. Two spellings of int64 in one system is one too many.
+func TypeOfKind(kind string) (arrow.DataType, bool) { return kindType(kind) }
+
+// KindName is the inverse: the kind name for an Arrow type this package can produce, or false
+// for one it cannot name. False rather than a guess, because a kind nothing can read back is
+// worse than no kind at all -- it would persist as a column that silently disappears on reload.
+//
+// Not called KindOf, which is taken by the SQL-kind mapping in sqlkinds.go. The two answer
+// different questions -- "what may a predicate do with this column" against "how is this type
+// spelled in a config file or on disk" -- and collapsing them would make one of the two wrong
+// the first time the vocabularies diverge.
+func KindName(dt arrow.DataType) (string, bool) {
+	if dt == nil {
+		return "", false
+	}
+	switch dt.ID() {
+	case arrow.INT64:
+		return "int", true
+	case arrow.FLOAT64:
+		return "real", true
+	case arrow.BOOL:
+		return "bool", true
+	case arrow.STRING:
+		return "string", true
+	case arrow.TIMESTAMP:
+		// Only the unit this package produces. A timestamp in any other unit did not
+		// come from here and must not be renamed into one that did.
+		if ts, ok := dt.(*arrow.TimestampType); ok && ts.Unit == arrow.Second {
+			return "timestamp", true
+		}
+	}
+	return "", false
+}
+
+// DefaultTimeAttrs are the HTCondor attributes stored as unix-epoch SECONDS, lowercased.
+//
+// Nothing can infer this from the values -- an integer is an integer -- so it is declared, and
+// it is declared HERE because more than one consumer needs the same answer. The Flight endpoint
+// advertises these columns as `timestamp[s]` so date functions work downstream; the Grafana
+// plugin renders them on a time axis. Two copies of this list would let a column graph as a
+// time in one place and as a large integer in the other, which is the divergence this package
+// exists to remove.
+//
+// A fresh map each call, because a caller adds its own to it: the configured attributes are
+// ADDED to these rather than replacing them, so an operator naming one extra attribute does not
+// silently lose QDate.
+func DefaultTimeAttrs() map[string]bool {
+	return map[string]bool{
+		"qdate": true, "jobstartdate": true, "jobcurrentstartdate": true,
+		"enteredcurrentstatus": true, "completiondate": true, "lastheardfrom": true,
+		"daemonstarttime": true, "lastmatchtime": true, "joblaststartdate": true,
+		"shadowbday": true, "enteredcurrentactivity": true, "mycurrenttime": true,
+		"lastbenchmark": true,
+	}
+}

@@ -18,7 +18,7 @@ func TestResultToFrame_TypeInference(t *testing.T) {
 			{"bob", "1609462800", "16"},
 		},
 	}
-	frame := resultToFrame("A", res, "", "")
+	frame := resultToFrame("A", res, nil, "", "")
 	if len(frame.Fields) != 3 {
 		t.Fatalf("got %d fields, want 3", len(frame.Fields))
 	}
@@ -51,7 +51,7 @@ func TestResultToFrame_TimeFieldOverride(t *testing.T) {
 		Columns:  []string{"ts", "n"},
 		Rows:     [][]string{{"1609459200", "5"}},
 	}
-	frame := resultToFrame("A", res, "ts", "timeseries")
+	frame := resultToFrame("A", res, nil, "ts", "timeseries")
 	if frame.Fields[0].Type() != data.FieldTypeNullableTime {
 		t.Errorf("ts field type = %v, want nullable time (TimeField override)", frame.Fields[0].Type())
 	}
@@ -68,7 +68,7 @@ func TestResultToFrame_MislabeledTimeFallsBack(t *testing.T) {
 		Columns:  []string{"QDate"},
 		Rows:     [][]string{{"not-a-number"}},
 	}
-	frame := resultToFrame("A", res, "", "")
+	frame := resultToFrame("A", res, nil, "", "")
 	if frame.Fields[0].Type() != data.FieldTypeNullableString {
 		t.Errorf("mislabeled QDate type = %v, want nullable string fallback", frame.Fields[0].Type())
 	}
@@ -80,7 +80,7 @@ func TestResultToFrame_UndefinedIsNullNumber(t *testing.T) {
 		Columns:  []string{"Cpus"},
 		Rows:     [][]string{{"8"}, {"undefined"}},
 	}
-	frame := resultToFrame("A", res, "", "")
+	frame := resultToFrame("A", res, nil, "", "")
 	if frame.Fields[0].Type() != data.FieldTypeNullableFloat64 {
 		t.Fatalf("Cpus type = %v, want nullable float64", frame.Fields[0].Type())
 	}

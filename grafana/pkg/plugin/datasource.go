@@ -51,6 +51,9 @@ type Datasource struct {
 	cfg   connConfig
 	uid   string
 	conns *connManager
+	// decisions holds recently derived table columns, so a dashboard's panels do not each
+	// put a sampling scan through the daemon on every refresh (decisions.go).
+	decisions *decisionCache
 }
 
 // NewDatasource is the instance factory registered with the SDK. Grafana calls it
@@ -97,7 +100,8 @@ func NewDatasource(_ context.Context, s backend.DataSourceInstanceSettings) (ins
 	if js.ConnectTimeoutSeconds > 0 {
 		cfg.ConnectTimeout = time.Duration(js.ConnectTimeoutSeconds) * time.Second
 	}
-	return &Datasource{cfg: cfg, uid: s.UID, conns: newConnManager(cfg)}, nil
+	return &Datasource{cfg: cfg, uid: s.UID, conns: newConnManager(cfg),
+		decisions: newDecisionCache()}, nil
 }
 
 // Dispose is called when an instance is replaced or removed; close the pooled
@@ -167,7 +171,7 @@ func (d *Datasource) runSQL(exec *repl.Executor, q backend.DataQuery, qm queryMo
 		}
 		return backend.ErrDataResponse(status, msg), isConnError(err)
 	}
-	frame := resultToFrame(q.RefID, res, qm.TimeField, qm.Format)
+	frame := resultToFrame(q.RefID, res, d.decisionsFor(exec, sql), qm.TimeField, qm.Format)
 	if frame.Meta == nil {
 		frame.Meta = &data.FrameMeta{}
 	}

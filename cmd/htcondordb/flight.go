@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -98,6 +99,22 @@ func startFlightSQL(ctx context.Context, cfg *config.Config, log *logging.Logger
 		// because the schema follows the table: 30 seconds collapses a burst without
 		// holding yesterday's columns.
 		SchemaTTL: flightSchemaTTL(cfg, log),
+		// Where each table's declared columns live across restarts. The cache above
+		// stops the schema moving within its TTL; this stops it moving at all, which
+		// is what a consumer caching a catalog needs. Beside the database rather than
+		// in a directory of its own: it describes that database's tables and is
+		// meaningless without them, so the two should be backed up and moved together.
+		ColumnTypeFile: flightColumnTypeFile(cfg, log),
+		Warn: func(m string) {
+			log.Warn(logging.DestinationGeneral, m)
+		},
+		// A schema generation moving is not a problem, and logging it as one teaches an
+		// operator to ignore it. It is logged at all because a column changing type is the
+		// one schema event that can make a consumer's cached catalog wrong about a VALUE,
+		// and the daemon log is where an operator would look after noticing that.
+		Note: func(m string) {
+			log.Info(logging.DestinationGeneral, m)
+		},
 	})
 	if err != nil {
 		_ = ln.Close()
@@ -169,14 +186,13 @@ func flightSciToken(cfg *config.Config) (flightsvc.Authenticator, error) {
 // flightDeriveOptions carries the type declarations into the endpoint: which attributes are
 // epoch seconds, and the per-attribute overrides for the decisions type inference cannot make.
 //
-// Seeded from the same list the CLI and the Grafana plugin carry, which is the same knowledge
-// written down three times now -- it wants unifying behind the stored type map, and this is
-// the third site that will have to change when that lands.
+// The epoch attributes come from arrowtype, which is where the Grafana plugin reads them too.
+// They were written down twice, in two modules, and the second copy had drifted -- so a column
+// could graph as a time in one place and as a large integer in the other.
 func flightDeriveOptions(cfg *config.Config, log *logging.Logger) arrowtype.Options {
-	opts := arrowtype.Options{TimeAttrs: map[string]bool{}}
-	for name := range knownFlightTimeAttrs {
-		opts.TimeAttrs[name] = true
-	}
+	opts := arrowtype.Options{TimeAttrs: arrowtype.DefaultTimeAttrs()}
+	// Configured attributes are ADDED rather than replacing the built-ins: an operator
+	// naming one extra must not silently lose QDate.
 	for _, name := range getList(cfg, "HTCONDORDB_FLIGHT_TIME_ATTRS") {
 		opts.TimeAttrs[lower(name)] = true
 	}
@@ -258,14 +274,6 @@ var knownFlightPolicyExprs = map[string]bool{
 	"isowner": true, "withinresourcelimits": true,
 }
 
-var knownFlightTimeAttrs = map[string]bool{
-	"qdate": true, "jobstartdate": true, "jobcurrentstartdate": true,
-	"enteredcurrentstatus": true, "completiondate": true, "lastheardfrom": true,
-	"daemonstarttime": true, "lastmatchtime": true, "joblaststartdate": true,
-	"shadowbday": true, "enteredcurrentactivity": true, "mycurrenttime": true,
-	"lastbenchmark": true,
-}
-
 // getList reads a configuration parameter as a list, split on commas and whitespace, the way
 // HTCondor writes a list-valued parameter. Empty entries are dropped so a trailing comma does
 // not become an empty issuer -- which, with AcceptIssuers, would be an issuer nothing matches
@@ -303,6 +311,38 @@ func flightBytes(cfg *config.Config, log *logging.Logger, key string) int64 {
 			"unparseable Flight SQL size; serving with no limit", "knob", key, "value", raw)
 	}
 	return n
+}
+
+// flightColumnTypeFile resolves where the endpoint remembers each table's measured column types.
+//
+// NOT A KNOB TO TUNE. It goes beside the database, which is the only durable directory this
+// daemon is given, and an operator has no reason to move it or to think about it: it holds no
+// policy, only what the endpoint measured, and losing it costs a re-measurement rather than an
+// answer. An in-memory database has no such directory and gets no file -- the memory then lives
+// for the process, which still holds a schema steady within one session and is the most that can
+// be promised with nowhere to write.
+//
+// HTCONDORDB_FLIGHT_COLUMN_TYPES_FILE overrides the path and "none" turns persistence off, for a
+// host that would rather re-measure than keep state it has to reason about. Both exist for the
+// host that has to, not for the operator who should not have to.
+func flightColumnTypeFile(cfg *config.Config, log *logging.Logger) string {
+	if v, ok := cfg.Get("HTCONDORDB_FLIGHT_COLUMN_TYPES_FILE"); ok {
+		v = strings.TrimSpace(v)
+		if strings.EqualFold(v, "none") {
+			return ""
+		}
+		if v != "" {
+			return v
+		}
+	}
+	dir := resolveDBDir(cfg)
+	if dir == "" {
+		log.Info(logging.DestinationGeneral,
+			"no database directory, so Flight column types are declared in memory only; "+
+				"they will be re-measured after a restart")
+		return ""
+	}
+	return filepath.Join(dir, "flight-column-types.json")
 }
 
 // defaultFlightSchemaTTL is how long a derived table schema is reused when the knob is unset.

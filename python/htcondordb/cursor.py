@@ -49,6 +49,12 @@ class Cursor:
         self._ads: list[str] = []
         self._position = 0
         self._columns: list[str] | None = None
+        #: Declared kind per column, as the server reported it ("int", "real", "bool",
+        #: "string", "timestamp", or "" for a column it declined to type). ``None`` when
+        #: the library reported none, which is how an older one behaves -- and the
+        #: difference matters: no list means "fall back to reading values", while an
+        #: empty string in the list means "this column genuinely has no type".
+        self._column_kinds: list[str] | None = None
         self._rowcount = -1
         self._closed = False
         self._include_ads = False
@@ -69,21 +75,38 @@ class Cursor:
 
         Each entry is PEP 249's seven-tuple ``(name, type_code, display_size,
         internal_size, precision, scale, null_ok)``. Only ``name`` and ``type_code`` are
-        meaningful: ClassAd attributes are dynamically typed and columns have no declared
-        width or nullability. ``type_code`` is inferred from the first non-null value in
-        the column, and is ``None`` for a column that is null all the way down.
+        meaningful: columns have no declared width or nullability here.
 
-        Reading this fetches the first batch of a result nothing has been fetched from yet:
-        the column *names* come from the statement, but a type can only come from data, and
-        rows now arrive lazily. The rows are buffered, not consumed -- fetching still returns
-        them all.
+        ``type_code`` is the type the **server declared** for the column -- the same
+        derivation the Arrow and Flight SQL surfaces publish, so a column means the same
+        thing however it is read. That is a schema, not a description of what happened to
+        arrive, and it has three consequences worth knowing:
+
+        * A column that is null all the way down still reports its type. Under the old
+          inference it reported ``None``, which made an absent attribute and a typed column
+          with no values in this result indistinguishable.
+        * A column whose first row is an integer and whose second is a string no longer
+          reports INTEGER on the strength of row one.
+        * **Reading this fetches nothing.** PEP 249 expects the description to be available
+          once ``execute()`` returns, and it now is: the types arrive with the header.
+
+        Against a library too old to report them, it falls back to the old behaviour --
+        inferring from the first non-null value, which requires the first batch, so reading
+        this buffers one. The rows are buffered, not consumed; fetching still returns all
+        of them.
         """
         if self._columns is None:
             return None
-        if not self._rows and self._stream is not None:
-            self._buffer(1)
+        if self._column_kinds is None:
+            # No declared types: the old inference, and the fetch it needs.
+            if not self._rows and self._stream is not None:
+                self._buffer(1)
+            return tuple(
+                (name, _column_type(self._rows, index), None, None, None, None, None)
+                for index, name in enumerate(self._columns)
+            )
         return tuple(
-            (name, _column_type(self._rows, index), None, None, None, None, None)
+            (name, _declared_type(self._column_kinds, index), None, None, None, None, None)
             for index, name in enumerate(self._columns)
         )
 
@@ -355,6 +378,7 @@ class Cursor:
         self._ads = []
         self._position = 0
         self._columns = None
+        self._column_kinds = None
         self._rowcount = -1
         self._streamed = False
 
@@ -371,6 +395,7 @@ class Cursor:
             return
 
         self._columns = list(header.get("columns", []))
+        self._column_kinds = header.get("column_types") or None
         self._stream = stream
         if stream.streaming:
             # Registered only while it holds the lock, so the connection knows what to settle.
@@ -514,6 +539,7 @@ class Cursor:
         self._ads = list(document.get("ads") or [])
         self._rowcount = len(self._rows)
         self._columns = list(columns)
+        self._column_kinds = document.get("column_types") or None
 
 
 def _column_type(rows: Sequence[Sequence[Any]], index: int) -> Any:
@@ -537,3 +563,27 @@ def _column_type(rows: Sequence[Sequence[Any]], index: int) -> Any:
             return STRING
         return STRING
     return None
+
+
+#: PEP 249 type object for each kind the server declares. A kind this driver does not know
+#: maps to ``None`` rather than to a guess: a newer library naming a kind this one has never
+#: heard of should report "no type", not the wrong one.
+_DECLARED_TYPES = {
+    "int": NUMBER,
+    "real": NUMBER,
+    "bool": NUMBER,
+    "string": STRING,
+    "timestamp": DATETIME,
+}
+
+
+def _declared_type(kinds: Sequence[str], index: int) -> Any:
+    """The PEP 249 type object for a declared column kind, or ``None``.
+
+    ``None`` covers three distinct cases on purpose, because a caller can act on none of
+    them differently: a column past the end of the list, a column the derivation declined
+    to type (an empty string), and a kind this driver does not recognize.
+    """
+    if index >= len(kinds):
+        return None
+    return _DECLARED_TYPES.get(kinds[index])
