@@ -118,6 +118,7 @@ uintptr_t hcdb_query(uintptr_t h, char *table, char *constraint);
 int hcdb_query_next(uintptr_t qh, char **out);
 void hcdb_query_free(uintptr_t qh);
 int hcdb_sql(uintptr_t h, char *sql, int opts, char **out);
+int hcdb_sql_arrow(uintptr_t h, char *sql, void **out, size_t *length, char **err);
 uintptr_t hcdb_sql_ads(uintptr_t h, char *sql, char **err);
 int hcdb_sql_ads_next(uintptr_t ch, char **out);
 void hcdb_sql_ads_free(uintptr_t ch);
@@ -218,6 +219,26 @@ class _Library:
         for name, value in current.items():
             self.lib.hcdb_setenv(name.encode("utf-8"), value.encode("utf-8"))
         self._pushed_env = set(current)
+
+    def buffer(self, ptr, length: int) -> bytes:
+        """Copy a byte buffer the library allocated into ``bytes``, then free it.
+
+        The binary counterpart of :meth:`string`, and it exists for the same reason: the
+        buffer is the caller's to release, and doing the copy and the free in one place is
+        what keeps that from being forgotten at a call site.
+
+        It is a separate method rather than a flag on ``string`` because the two cannot
+        share an implementation safely. ``ffi.string`` stops at the first NUL, which is
+        correct for a C string and silently truncating for anything else -- and an Arrow
+        IPC stream contains NUL bytes by construction, at a different offset for every
+        query.
+        """
+        if ptr == self.ffi.NULL or length <= 0:
+            return b""
+        try:
+            return bytes(self.ffi.buffer(ptr, length))
+        finally:
+            self.lib.hcdb_free(self.ffi.cast("char *", ptr))
 
     def string(self, ptr) -> str:
         """Copy a C string the library allocated into a ``str``, then free it.

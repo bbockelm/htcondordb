@@ -9,11 +9,14 @@ from typing import TYPE_CHECKING, Any, Iterator
 
 from . import _errors, _library
 from ._errors import (
+    DatabaseError,
     InterfaceError,
+    InternalError,
     NotSupportedError,
     OperationalError,
     ProgrammingError,
 )
+from ._params import bind as _bind
 from .cursor import Cursor
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -352,6 +355,75 @@ class Connection:
             cursor.close()
             raise
         return cursor
+
+    def arrow_bytes(self, operation: str, parameters: Any = None) -> bytes:
+        """Run a SELECT and return its result as an Arrow IPC stream.
+
+        The raw bytes, with no pyarrow needed -- write them to a file for DuckDB's
+        ``read_arrow()``, hand them to another process, or open them yourself. See
+        :meth:`arrow` for the table.
+
+        The stream always carries a **schema**, even for a result with no rows, which is
+        why an empty result is still a stream rather than zero bytes: the column types are
+        the point, and a caller that read nothing could not tell an empty table from a
+        failure.
+        """
+        self._check_open()
+        statement = _bind(operation, parameters)
+        lib = self._lib
+        ffi, c = lib.ffi, lib.lib
+
+        out = ffi.new("void **")
+        length = ffi.new("size_t *")
+        err = ffi.new("char **")
+        try:
+            code = c.hcdb_sql_arrow(
+                self._handle, statement.encode("utf-8"), out, length, err
+            )
+        except AttributeError as exc:
+            # A library built before this entry point existed. Named as such rather than
+            # surfacing as a bare AttributeError from inside a query, because the fix is a
+            # rebuild and nothing in "no attribute 'hcdb_sql_arrow'" says so.
+            raise InterfaceError(
+                f"{lib.path} has no hcdb_sql_arrow; it predates Arrow output"
+                " (rebuild it with 'make lib')"
+            ) from exc
+
+        if code == _library.RESULT_OK:
+            return lib.buffer(out[0], int(length[0]))
+
+        message = lib.string(err[0]) or "the statement failed with no message"
+        if code in (_library.RESULT_BAD_SQL, _library.RESULT_DENIED):
+            raise ProgrammingError(message)
+        if code == _library.RESULT_PANIC:
+            raise InternalError(message)
+        if code == _library.RESULT_ERR:
+            raise OperationalError(message)
+        raise DatabaseError(f"unexpected result code {code}: {message}")
+
+    def arrow(self, operation: str, parameters: Any = None):
+        """Run a SELECT and return its result as a ``pyarrow.Table``.
+
+        The columns carry the types the **server declared** -- the same derivation the
+        Flight SQL endpoint publishes -- so a number is a number rather than whatever a
+        loader inferred from the text of the first cell::
+
+            table = conn.arrow("SELECT Owner, RequestMemory FROM jobs WHERE JobStatus == 2")
+            duckdb.sql("SELECT Owner, sum(RequestMemory) FROM table GROUP BY Owner")
+
+        pyarrow is an optional dependency: this is the only method that needs it, and
+        :meth:`arrow_bytes` does the same work without it.
+        """
+        data = self.arrow_bytes(operation, parameters)
+        try:
+            import pyarrow as pa
+        except ImportError as exc:
+            raise InterfaceError(
+                "arrow() needs pyarrow; install it, or use arrow_bytes() for the raw"
+                " Arrow IPC stream"
+            ) from exc
+        with pa.ipc.open_stream(data) as reader:
+            return reader.read_all()
 
     def ads(self, operation: str, parameters: Any = None) -> "AdStream":
         """Run a SELECT and iterate its rows as ``classad2.ClassAd`` objects.
