@@ -120,6 +120,13 @@ test: ## Run the test suite
 
 vet: ## Static checks
 	$(GOENV) $(GO) vet ./...
+	# grafana/ is a separate module that requires this one, so neither `go vet ./...`
+	# nor `go build ./...` here reaches it: a dependency this module gains is simply
+	# invisible until grafana's own CI job fails with "updates to go.mod needed",
+	# which points at go.mod rather than at the change that caused it. `make tidy`
+	# already pairs the two; vetting them together is what makes the omission show up
+	# before a push rather than after one.
+	cd grafana && $(GOENV) $(GO) vet ./...
 
 tidy: ## Reconcile go.mod / go.sum (both modules)
 	$(GOENV) $(GO) mod tidy

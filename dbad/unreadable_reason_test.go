@@ -34,6 +34,7 @@ func TestUnreadableReasonsReachTheAd(t *testing.T) {
 		"DeltaUnreadableChainDecompress":  0,
 		"DeltaUnreadableChainBaseDecode":  0,
 		"DeltaUnreadableChainPatchDecode": 0,
+		"DeltaUnreadableSealedNeedsKey":   0,
 	} {
 		got, ok := ad.EvaluateAttrInt(name)
 		if !ok {

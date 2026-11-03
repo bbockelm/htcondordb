@@ -109,7 +109,7 @@ func aggSpecsFor(st *Statement) []dbrpc.AggSpec {
 func (p *aggProjector) columns() []string {
 	cols := make([]string, len(p.items))
 	for i, it := range p.items {
-		cols[i] = it.header()
+		cols[i] = it.Header()
 	}
 	return cols
 }

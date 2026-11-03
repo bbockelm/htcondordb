@@ -145,7 +145,7 @@ func TestSQLSpellingTranslation(t *testing.T) {
 		t.Errorf("CASE translation:\n  got  %s\n  want %s", st.Items[0].Expr, want)
 	}
 	// The header keeps the SQL the user typed, not the translation.
-	if h := st.Items[0].header(); !strings.HasPrefix(h, "CASE WHEN") {
+	if h := st.Items[0].Header(); !strings.HasPrefix(h, "CASE WHEN") {
 		t.Errorf("header = %q, want the source CASE text", h)
 	}
 

@@ -21,6 +21,7 @@ import (
 
 	"github.com/bbockelm/htcondordb/ansi"
 	"github.com/bbockelm/htcondordb/arrowtype"
+	"github.com/bbockelm/htcondordb/repl"
 )
 
 // The statement surface: one shape, and a refusal for everything else.
@@ -74,9 +75,11 @@ type query struct {
 	limit int
 }
 
-const unsupportedHint = "this endpoint accepts `SELECT <columns|*> FROM <table> [WHERE <predicate>] " +
-	"[LIMIT n]`. An aggregate, an alias, a function or an ORDER BY is refused rather than " +
-	"approximated, because a partly-understood query returns rows that look right"
+const unsupportedHint = "this endpoint accepts a read-only SELECT over one table: columns, " +
+	"aggregates, GROUP BY, HAVING, ORDER BY, DISTINCT and LIMIT, as in " +
+	"`SELECT <columns|*> FROM <table> [WHERE <predicate>] [LIMIT n]`. A JOIN, a set " +
+	"operation, and anything that writes are refused rather than approximated, because a " +
+	"partly-understood query returns rows that look right"
 
 // parseQuery recognises a statement, or returns an error naming what is supported.
 func parseQuery(q string) (query, error) {
@@ -143,8 +146,8 @@ func project(decisions []arrowtype.Decision, cols []string) ([]arrowtype.Decisio
 			return nil, fmt.Errorf("no such column %q in this table", want)
 		}
 		if d.Verdict != arrowtype.Typed {
-			return nil, fmt.Errorf("column %q has no typed form (%s: %s); it is available as text in the untyped tail",
-				want, d.Reason, d.Detail)
+			return nil, fmt.Errorf("column %q has no typed form (%s: %s); it is available as text in %s",
+				want, d.Reason, d.Detail, arrowtype.TailColumnName)
 		}
 		out = append(out, d)
 	}
@@ -170,7 +173,19 @@ func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table st
 		return schema, decisions, nil
 	}
 	max := s.sampleMax()
-	rep, err := db.AttrTypeProfiles(ctx, table, max)
+	// The EVALUATED classes, because this endpoint's encoder evaluates: an attribute a pool
+	// stores as an expression is an integer in the column, and typing it from the stored
+	// classes rules it untypeable and gives it no column at all. MemoryUsage is that
+	// attribute on a real history table.
+	//
+	// A store too old to measure them answers the plain request, successfully, with the
+	// stored classes -- which is a different answer, not a lesser one, so it is taken only
+	// when the peer has said it cannot do better. The endpoint still works against such a
+	// store; it just publishes the schema it published before.
+	rep, err := db.AttrTypeProfilesEvaluated(ctx, table, max)
+	if errors.Is(err, dbrpc.ErrEvalTypesUnsupported) {
+		rep, err = db.AttrTypeProfiles(ctx, table, max)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -178,15 +193,21 @@ func (s *Server) tableSchemaWith(ctx context.Context, db *dbrpc.Client, table st
 	// sound basis for declaring a column non-nullable.
 	complete := rep.Sampled < max
 	ms := arrowtype.FromProfilesComplete(rep.Profiles, rep.Sampled, complete)
-	schema, decisions := arrowtype.Schema(ms, s.derive)
+	// The tail is this endpoint's contract rather than the host's choice. Without it an
+	// attribute the measurement declined to type is simply absent from the schema, and a
+	// client cannot tell that from an attribute the table does not have -- so a host could
+	// not turn it off without making the schema lie, and there is no reason to let it.
+	derive := s.derive
+	derive.Tail = true
+	schema, decisions := arrowtype.Schema(ms, derive)
 	s.schemas.put(key, schema, decisions)
 	return schema, decisions, nil
 }
 
-// defaultSampleMax is how many records a schema derivation looks at. Matches arrowstream's
-// default: the schema a client sees through the catalog and the schema it gets from a query
-// have to agree, and they will not if the two paths sample differently.
-const defaultSampleMax = 10000
+// defaultSampleMax is how many records a schema derivation looks at: the shared default, so the
+// schema a client sees through the catalog, the one it gets from a query, and the one the REPL
+// derives are all the same declaration about the same table.
+const defaultSampleMax = arrowtype.DefaultSampleMax
 
 // sampleMax is the server's effective cap. It is a field rather than a constant so a test can
 // make the CAPPED case reachable: with the default, any fixture small enough to run quickly is
@@ -201,50 +222,106 @@ func (s *Server) sampleMax() int {
 }
 
 func (s *Server) GetSchemaStatement(ctx context.Context, cmd flightsql.StatementQuery, _ *flight.FlightDescriptor) (*flight.SchemaResult, error) {
-	schema, _, err := s.planSchema(ctx, cmd.GetQuery())
+	p, err := s.planStatement(ctx, cmd.GetQuery())
 	if err != nil {
 		return nil, err
 	}
-	return &flight.SchemaResult{Schema: flight.SerializeSchema(schema, s.alloc)}, nil
+	return &flight.SchemaResult{Schema: flight.SerializeSchema(p.schema, s.alloc)}, nil
 }
 
-// planSchema recognises a query and returns the schema its rows will carry, projection applied.
-// It is what lets the schema be answered without running anything.
+// plan is everything a statement can be answered with before any rows are read: the shape of
+// its result, the shape of its parameters, the query it came from, and the NAME of that result
+// shape (see pin.go), which is what lets a later fetch prove it is delivering what was promised.
+type plan struct {
+	schema *arrow.Schema
+	params *arrow.Schema
+	parsed query
+	// fp names schema. Carried to the client in the ticket and checked back at the fetch.
+	fp string
+	// an is set when the simple recogniser refused the statement and the executor took
+	// it instead (analytic.go). Its decisions are typed from the SELECT list rather than
+	// from the table, so they travel with it.
+	an        *analytic
+	decisions []arrowtype.Decision
+}
+
+// planStatement recognises a query and returns the schema its rows will carry, projection
+// applied. It is what lets the schema be answered without running anything.
 //
 // A WHERE clause does NOT change the schema: it selects rows, and the columns a table offers
 // are a property of the table. Deriving the schema from a predicate's matches instead would
 // make it vary by query and a consumer's cached catalog worthless. It is still lowered here,
 // so a predicate this endpoint cannot serve is refused when the schema is asked for rather
 // than surfacing only once rows are fetched.
-func (s *Server) planSchema(ctx context.Context, q string) (*arrow.Schema, query, error) {
-	schema, _, parsed, err := s.planStatement(ctx, q)
-	return schema, parsed, err
-}
-
-// planStatement is planSchema plus the parameter schema, which only a prepare needs. One
-// implementation so a prepared statement cannot disagree with a direct one about what a query
-// means or which columns it returns.
 //
-// The parameter schema is built from the DECLARED column types, so a client binds what it would
-// read: a placeholder against a timestamp column takes a timestamp, not the integer underneath.
-func (s *Server) planStatement(ctx context.Context, q string) (*arrow.Schema, *arrow.Schema, query, error) {
+// One implementation, so a prepared statement cannot disagree with a direct one about what a
+// query means or which columns it returns. The parameter schema only a prepare needs, and it
+// is built from the DECLARED column types, so a client binds what it would read: a placeholder
+// against a timestamp column takes a timestamp, not the integer underneath.
+func (s *Server) planStatement(ctx context.Context, q string) (plan, error) {
 	parsed, err := parseQuery(q)
 	if err != nil {
-		return nil, nil, query{}, err
+		// The scan recogniser refused. That is not the same as "not SQL": an
+		// aggregate, a GROUP BY or an ORDER BY is a statement the executor serves,
+		// so it gets a second reading before the refusal stands (analytic.go).
+		an, aerr := parseAnalytic(q)
+		if aerr != nil {
+			if _, shape := aerr.(*unsupportedShape); shape {
+				// It IS SQL, and it is a shape this endpoint does not serve.
+				// More use to a reader than "a regexp did not match".
+				return plan{}, aerr
+			}
+			return plan{}, err
+		}
+		// From here the statement is the executor's, so ITS complaints are the ones
+		// worth reporting -- "no such column Frob" rather than the scan recogniser's
+		// list of shapes, which is an answer to a question the client did not ask.
+		return s.planAnalytic(ctx, an)
 	}
 	_, decisions, err := s.tableSchema(ctx, parsed.table)
 	if err != nil {
-		return nil, nil, query{}, err
+		return plan{}, err
 	}
 	tmpl, err := templateFor(parsed, decisions)
 	if err != nil {
-		return nil, nil, query{}, err
+		return plan{}, err
 	}
 	picked, err := project(decisions, parsed.cols)
 	if err != nil {
-		return nil, nil, query{}, err
+		return plan{}, err
 	}
-	return schemaOf(picked), paramSchema(tmpl, decisions), parsed, nil
+	// The fingerprint names the RESULT columns rather than the table's whole decision list.
+	// That is what the client was told and what it reads by position; a column appearing
+	// elsewhere in the table changes neither, and refusing over it would make a busy table
+	// unqueryable for the sake of a promise nobody made.
+	return plan{schema: schemaOf(picked), params: paramSchema(tmpl, decisions), parsed: parsed,
+		fp: arrowtype.Fingerprint(picked), decisions: picked}, nil
+}
+
+// planAnalytic plans a statement the scan recogniser refused, by typing the SELECT list
+// against the table's own declarations.
+//
+// It takes no parameters. A prepared statement with a `?` in an aggregate query would need
+// the bound value to reach `repl`'s parser, which parses once and holds a ClassAd predicate
+// thereafter -- so binding would mean re-planning per execution, and the schema is promised
+// before that. Refusing is honest and the client can inline the value.
+func (s *Server) planAnalytic(ctx context.Context, an *analytic) (plan, error) {
+	_, table, err := s.tableSchema(ctx, an.st.Table)
+	if err != nil {
+		return plan{}, err
+	}
+	decisions, err := repl.ArrowDecisions(an.st, table)
+	if err != nil {
+		return plan{}, err
+	}
+	return plan{
+		schema:    schemaOf(decisions),
+		params:    arrow.NewSchema(nil, nil),
+		parsed:    query{table: an.st.Table, limit: an.st.Limit},
+		fp:        arrowtype.Fingerprint(decisions),
+		an:        an,
+		decisions: decisions,
+	}, nil
 }
 
 // paramSchema describes the placeholders, in order.
@@ -352,6 +429,16 @@ func columnsOf(decisions []arrowtype.Decision) ansi.Columns {
 	return arrowtype.Columns(decisions)
 }
 
+// hasTail reports whether these decisions include the tail column.
+func hasTail(decisions []arrowtype.Decision) bool {
+	for _, d := range decisions {
+		if d.Tail {
+			return true
+		}
+	}
+	return false
+}
+
 // schemaOf builds the Arrow schema of the typed decisions, in their given order.
 func schemaOf(decisions []arrowtype.Decision) *arrow.Schema {
 	fields := make([]arrow.Field, 0, len(decisions))
@@ -371,18 +458,21 @@ func schemaOf(decisions []arrowtype.Decision) *arrow.Schema {
 // holding per-query state between two RPCs that may not even arrive on the same connection,
 // and the query is what the handle would look up anyway.
 func (s *Server) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	schema, _, err := s.planSchema(ctx, cmd.GetQuery())
+	p, err := s.planStatement(ctx, cmd.GetQuery())
 	if err != nil {
 		return nil, err
 	}
-	ticket, err := flightsql.CreateStatementQueryTicket([]byte(cmd.GetQuery()))
+	// The handle carries the query AND the name of the schema just promised, so the fetch
+	// can prove it is delivering that schema rather than a later measurement of a table
+	// that moved in between (pin.go).
+	ticket, err := flightsql.CreateStatementQueryTicket([]byte(pinnedHandle(p.fp, cmd.GetQuery())))
 	if err != nil {
 		return nil, err
 	}
 	return &flight.FlightInfo{
 		Endpoint:         []*flight.FlightEndpoint{{Ticket: &flight.Ticket{Ticket: ticket}}},
 		FlightDescriptor: desc,
-		Schema:           flight.SerializeSchema(schema, s.alloc),
+		Schema:           flight.SerializeSchema(p.schema, s.alloc),
 		TotalRecords:     -1,
 		TotalBytes:       -1,
 	}, nil
@@ -392,19 +482,32 @@ func (s *Server) GetFlightInfoStatement(ctx context.Context, cmd flightsql.State
 //
 // The schema is derived again here rather than carried in the ticket. That is a second profile
 // round trip, and it is the correct trade: a schema in the ticket would be a schema the client
-// could edit, and this one has to match what the encoder will actually produce.
+// could edit, and this one has to match what the encoder will actually produce. What the ticket
+// does carry is the NAME of the schema the client was promised, which it cannot usefully edit
+// -- an invented name refuses its own request and nothing else (pin.go).
 func (s *Server) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	return s.doGetQuery(ctx, string(ticket.GetStatementHandle()), nil)
+	fp, stmt := parsePinnedHandle(string(ticket.GetStatementHandle()))
+	return s.doGetQuery(ctx, stmt, nil, fp)
 }
 
 // doGetQuery is the one scan implementation, shared by a direct statement and a prepared one.
 // Two copies would drift, and the drift would be invisible: a prepared statement returning
 // subtly different rows from the same SQL run directly is the kind of bug nobody reports
 // because nobody compares.
-func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	parsed, err := parseQuery(stmt)
-	if err != nil {
-		return nil, nil, err
+func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args, pinned string) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	parsed, perr := parseQuery(stmt)
+	var an *analytic
+	if perr != nil {
+		// Same two-reading rule as the plan: a shape the scan cannot answer may still
+		// be one the executor can (analytic.go).
+		var aerr error
+		if an, aerr = parseAnalytic(stmt); aerr != nil {
+			if _, shape := aerr.(*unsupportedShape); shape {
+				return nil, nil, aerr
+			}
+			return nil, nil, perr
+		}
+		parsed = query{table: an.st.Table, limit: an.st.Limit}
 	}
 	table := parsed.table
 	// A stream slot first: refusing here costs nothing, while refusing after the schema
@@ -425,19 +528,54 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 		slot()
 		return nil, nil, err
 	}
-	constraint, err := constraintFor(parsed, allDecisions, bound)
+	var constraint string
+	var decisions []arrowtype.Decision
+	if an != nil {
+		// A bound value cannot reach the executor: it parses the statement once and
+		// holds a ClassAd predicate thereafter, so a placeholder would have to be
+		// substituted before parsing and the schema is promised before that. The
+		// prepare reports an EMPTY parameter schema, so a client that bound anything
+		// bound it to a statement that said it takes none -- which is a client bug
+		// worth naming rather than a value worth ignoring.
+		if bound != nil && len(bound.vals) > 0 {
+			release()
+			slot()
+			return nil, nil, status.Errorf(codes.InvalidArgument,
+				"%d value(s) were bound to an aggregate or ordered statement, which takes "+
+					"no parameters here; inline the value", len(bound.vals))
+		}
+		// The executor carries its own predicate, lowered by the ANSI dialect when it
+		// runs, so there is no constraint to build here and the columns come from the
+		// SELECT list rather than from the table.
+		decisions, err = repl.ArrowDecisions(an.st, allDecisions)
+	} else {
+		constraint, err = constraintFor(parsed, allDecisions, bound)
+		if err == nil {
+			decisions, err = project(allDecisions, parsed.cols)
+		}
+	}
 	if err != nil {
 		release()
 		slot()
 		return nil, nil, err
 	}
-	decisions, err := project(allDecisions, parsed.cols)
-	if err != nil {
+	// What was promised is what gets delivered, or nothing is. This is the last point at
+	// which the two can still be compared: past it the encoder is built and the client is
+	// reading buffers by position.
+	if err := checkPin(pinned, decisions); err != nil {
 		release()
 		slot()
 		return nil, nil, err
 	}
 	schema := schemaOf(decisions)
+	// The tail is built from what the typed columns did NOT take, so it can only be filled
+	// from a whole record: a pushed-down projection would deliver exactly the attributes
+	// that are already columns and leave the tail empty in every row, which is a wrong
+	// answer rather than a slow one. Asking for it therefore turns the projection off.
+	cols := parsed.cols
+	if hasTail(decisions) {
+		cols = nil
+	}
 
 	ch := make(chan flight.StreamChunk, 2)
 	go func() {
@@ -477,42 +615,15 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 				return false
 			}
 		}
-		// The REFS-CHASING projection op, for three reasons that happen to coincide.
-		//
-		// It reaches an ARCHIVE. The plain query op does not -- it refuses one by
-		// design and says so -- so reading `history`, the table most queries are about,
-		// used to fail after the endpoint had already listed it and derived its schema.
-		// The projection op serves a mutable table, a view's backing and an archive
-		// alike.
-		//
-		// It PUSHES THE PROJECTION DOWN, inside the decode walk: a non-projected
-		// attribute is never rendered, and a projection the hot header covers is served
-		// from the hot header alone. Before this, `SELECT Owner FROM jobs` pulled every
-		// attribute of every matching ad and this encoder dropped the rest on the floor.
-		//
-		// And it chases the projected expressions' REFERENCES, which this encoder needs
-		// because it EVALUATES. `MemoryUsage` projected without the siblings it is
-		// written over evaluates to undefined, so the plain projection op would turn a
-		// perfectly good integer column into nulls -- correct for a relay forwarding
-		// text, wrong for anything that evaluates. parsed.cols is nil for SELECT *,
-		// which the op reads as "no projection": every attribute, as before.
-		//
-		// No fallback to the non-refs op. Every Flight read goes through the in-process
-		// dbrpc loopback (see session.go), so the server is this same binary and cannot
-		// be a build that lacks the opcode. A fallback here would be untestable code
-		// guarding an impossible case.
-		scanErr := db.QueryRawProjectRefsStream(ctx, table, constraint, parsed.cols, parsed.limit, func(row string) bool {
-			// The projection ops stream OLD-ClassAd text, not the bracketed form.
-			ad, perr := classad.ParseOld(row)
-			if perr != nil {
-				return true
-			}
-			_ = enc.Append(ad) // non-strict: coercions and nulls are counted, not fatal
-			if enc.Rows() >= batchRows {
-				return flush()
-			}
-			return true
-		})
+		var scanErr error
+		if an != nil {
+			// One batch: an aggregate's whole result is materialized by the
+			// executor before any of it can be correct, so there is nothing to
+			// stream and a flush per batch would only split a small table.
+			scanErr = s.runAnalytic(ctx, db, an, enc, decisions)
+		} else {
+			scanErr = s.scanInto(ctx, db, enc, table, constraint, cols, parsed.limit, flush)
+		}
 		if scanErr != nil {
 			ch <- flight.StreamChunk{Err: scanErr}
 			return
@@ -520,6 +631,126 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args) (*arr
 		flush()
 	}()
 	return schema, ch, nil
+}
+
+// scanInto fills enc from the store, flushing a batch whenever one is full.
+//
+// TWO PRODUCERS, and which one runs is decided by whether the encoder has a tail column.
+//
+// The typed value stream is the one worth having: it evaluates in the store, where the record's
+// reference closure and its precomputed values already are, and ships results column-major. The
+// text projection renders every record to ClassAd source for this process to parse straight
+// back, which measured as the large majority of a read's CPU -- work that is not work, only the
+// cost of a relay between two halves of the same daemon.
+//
+// It cannot serve a TAIL, and that is a property of the op rather than a gap in the wiring: the
+// value stream returns one column per REQUESTED attribute, as values, and the tail is the
+// complement of a whole record in its stored form. Neither the set nor the form is available
+// there. So SELECT * keeps the text path for as long as its schema carries a tail, and an
+// explicit projection -- which is what a client aggregating or joining actually issues -- takes
+// the fast one.
+//
+// No fallback for a server that lacks the opcode. Every Flight read goes through the in-process
+// dbrpc loopback, so the server is this same binary; a fallback would be untestable code
+// guarding an impossible case, which is the mistake the refs-chasing projection already
+// documents here.
+//
+// redact is false because it asks for redaction BEYOND the session's: an unprivileged
+// connection is redacted whatever it passes, and a privileged one is entitled to what it reads.
+func (s *Server) scanInto(ctx context.Context, db *dbrpc.Client, enc *arrowtype.Encoder,
+	table, constraint string, cols []string, limit int, flush func() bool) error {
+	if !enc.HasTail() && len(enc.Attrs()) > 0 {
+		vals := make([]classad.Value, len(enc.Attrs()))
+		cells := make([][]classad.Value, len(enc.Attrs()))
+		return db.QueryValuesStream(ctx, table, constraint, enc.Attrs(), limit, false,
+			func(b *dbrpc.ValueBatch) bool {
+				// Column-major, one forward pass each, rather than ValueAt per cell.
+				// ValueAt recounts the validity bitmap from row 0 every call, so reading a
+				// whole batch through it is quadratic in the batch size -- measured at
+				// 6257 ns/row against 2254 for this, on a read whose store side is 2213.
+				// The entire difference was the accessor, not the work.
+				for col := range b.Cols {
+					cells[col] = unpackValueColumn(&b.Cols[col], b.Rows, cells[col][:0])
+				}
+				for row := range b.Rows {
+					for col := range b.Cols {
+						vals[col] = cells[col][row]
+					}
+					_ = enc.AppendValues(vals) // non-strict: counted, not fatal
+					if enc.Rows() >= batchRows && !flush() {
+						return false
+					}
+				}
+				return true
+			})
+	}
+	// The REFS-CHASING projection op, for three reasons that happen to coincide.
+	//
+	// It reaches an ARCHIVE. The plain query op does not -- it refuses one by design and says
+	// so -- so reading `history`, the table most queries are about, used to fail after the
+	// endpoint had already listed it and derived its schema.
+	//
+	// It PUSHES THE PROJECTION DOWN, inside the decode walk: a non-projected attribute is
+	// never rendered, and a projection the hot header covers is served from the hot header
+	// alone.
+	//
+	// And it chases the projected expressions' REFERENCES, which this encoder needs because
+	// it EVALUATES. MemoryUsage projected without the siblings it is written over evaluates
+	// to undefined, so the plain projection op would turn a perfectly good integer column
+	// into nulls -- correct for a relay forwarding text, wrong for anything that evaluates.
+	// cols is nil for SELECT *, which the op reads as "no projection": every attribute.
+	return db.QueryRawProjectRefsStream(ctx, table, constraint, cols, limit, func(row string) bool {
+		// The projection ops stream OLD-ClassAd text, not the bracketed form.
+		ad, perr := classad.ParseOld(row)
+		if perr != nil {
+			return true
+		}
+		_ = enc.Append(ad) // non-strict: coercions and nulls are counted, not fatal
+		if enc.Rows() >= batchRows {
+			return flush()
+		}
+		return true
+	})
+}
+
+// unpackValueColumn expands one packed column into per-row values in a single forward pass,
+// carrying a running dense index and a running exception index rather than searching for each.
+//
+// It belongs upstream beside the batch it unpacks, and should be deleted when dbrpc offers a
+// sequential reader; it lives here because the quadratic accessor is the only one that exists
+// and the cost of using it is most of a read.
+//
+// dst is appended to and returned so the caller can reuse one slice per column across batches.
+func unpackValueColumn(c *dbrpc.ValueColumn, rows int, dst []classad.Value) []classad.Value {
+	dense, exc := 0, 0
+	for row := range rows {
+		if row>>3 >= len(c.Valid) || c.Valid[row>>3]&(1<<(uint(row)&7)) == 0 {
+			// Exceptions are in ascending Row order, so the cursor only moves forward.
+			for exc < len(c.Exceptions) && c.Exceptions[exc].Row < row {
+				exc++
+			}
+			if exc < len(c.Exceptions) && c.Exceptions[exc].Row == row {
+				dst = append(dst, c.Exceptions[exc].Value)
+			} else {
+				dst = append(dst, classad.NewUndefinedValue())
+			}
+			continue
+		}
+		switch c.Kind {
+		case dbrpc.KindInt:
+			dst = append(dst, classad.NewIntValue(c.Ints[dense]))
+		case dbrpc.KindReal:
+			dst = append(dst, classad.NewRealValue(c.Reals[dense]))
+		case dbrpc.KindBool:
+			dst = append(dst, classad.NewBoolValue(c.Bools[dense]))
+		case dbrpc.KindString:
+			dst = append(dst, classad.NewStringValue(c.Strs[dense]))
+		default:
+			dst = append(dst, classad.NewErrorValue())
+		}
+		dense++
+	}
+	return dst
 }
 
 // batchRows matches arrowstream's default, for the same reason sampleMax does.

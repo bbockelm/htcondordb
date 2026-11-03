@@ -1,310 +1,235 @@
-# Design sketch: Arrow output, and how far up the Flight stack to climb
+# Arrow output over Flight SQL
 
-**Status:** ADBC over Arrow Flight SQL is implemented and read-only — type derivation in
-`arrowtype/`, the endpoint in `flightsvc/`, the SQL front end in `ansi/` — and verified in CI
-against the DuckDB CLI and a real ADBC driver. **§13 is the progress record: what is shipped,
-what is left, and why we cannot yet go straight from the vector engine to Arrow.** The transport
-and pushdown designs below (§6, §7) remain a sketch for a rung we did not climb. Measurements in
-§3 and §5.8 stand as taken.
-**Grounded in:** `repl/sql.go`, `repl/exec.go`, `repl/rowstream.go`, `grafana/pkg/plugin/frame.go`,
-and in classad's `collections/adschema.go`, `collections/vm/vecexec.go`, `dbrpc/proto.go`,
-`db/aggregate.go`. Binary sizes in §3 are measured, not estimated; §3.1 says how.
-**Audience:** whoever implements this, in htcondordb and in the classad storage/dbrpc layers.
+**Status:** implemented and read-only. Type derivation in `arrowtype/`, the endpoint in
+`flightsvc/`, the ANSI front end in `ansi/`, verified in CI against the DuckDB CLI and a real
+ADBC driver. A projected read ships typed, evaluated values straight from the store with no
+text in the path. §7 is the status record: what is shipped, what a read costs, and what is
+left.
+
+**Audience:** whoever works on this, in htcondordb and in the classad storage/dbrpc layers.
 Assumes familiarity with the columnar segment layout and the vectorized matcher, not with
 Arrow Flight.
 
-## 1. Goal, and two findings that set the shape
+**Grounded in** `repl/sql.go`, `repl/exec.go`, `repl/rowstream.go`, `grafana/pkg/plugin/frame.go`,
+and classad's `collections/adschema.go`, `collections/vm/vecexec.go`, `dbrpc/proto.go`,
+`db/aggregate.go`. Every number below is measured; the sections say how.
 
-Make htcondordb tables (the live job queue, history archives, collector ads) consumable by
-the Arrow ecosystem — DuckDB first, then pandas/polars and the ADBC/JDBC client family — so
-that joins, window functions, `PIVOT` and CSV/Parquet export work against pool data without
-an export step.
+---
 
-Two findings reorder the obvious plan.
+## 1. Goal, and the two findings that set the shape
 
-**Finding 1: DuckDB never sends SQL to a Flight server.** Via the Airport extension, DuckDB
+Make htcondordb tables — the live job queue, history archives, collector ads — consumable by
+the Arrow ecosystem, so that joins, window functions, `PIVOT` and CSV/Parquet export work
+against pool data without an export step.
+
+Two findings reordered the obvious plan.
+
+**Finding 1: DuckDB never sends SQL to a Flight server.** Through the Airport extension DuckDB
 parses, binds and plans the query itself; the server receives a catalog listing, a column-id
-list, and a *serialized DuckDB bound expression tree* as JSON. No SQL string is on the wire
-at any point. So an ANSI SQL dialect is **not** a prerequisite for DuckDB. It *is* a
-prerequisite for Arrow Flight **SQL**, a different and standard protocol, which reaches far
-more clients (§10).
+list, and a serialized DuckDB bound expression tree as JSON. No SQL string is on the wire. So
+an ANSI dialect is *not* a prerequisite for DuckDB. It *is* a prerequisite for Arrow Flight
+**SQL**, a different and standard protocol that reaches far more clients.
 
-**Finding 2: Arrow is cheap; gRPC and Flight are not.** Measured against this daemon
-(§3): the Arrow array and IPC packages add **+3.1 MB (+9.6%)**, while gRPC + the Flight
-protobufs + msgpack add a further **+11.2 MB (+35% of base)**. The expensive dependency is
-the *transport*, not Arrow.
+**Finding 2: Arrow is cheap; gRPC and Flight are not.** Arrow arrays and IPC add **+3.1 MB
+(+9.6%)** to this daemon; gRPC plus the Flight protobufs adds a further **+11.2 MB (+35% of
+base)** (§3). The expensive dependency is the transport, not Arrow.
 
-Together these say: get Arrow out of the daemon over the transport we already have, and put
-Flight — if we want it at all — somewhere else.
+## 2. Protocol: four rungs, and the one we took
 
-## 2. Protocol choice: why not just Arrow Flight, and why Airport at all
+The reason Airport comes up at all is narrow: **DuckDB has no built-in Arrow Flight client.**
+Plain Flight is not something DuckDB can `ATTACH`. So "serve Arrow Flight" and "serve DuckDB"
+are different goals.
 
-The reason Airport comes up is narrow: **DuckDB has no built-in Arrow Flight client.** Plain
-Flight is not a thing DuckDB can `ATTACH`. So "serve Arrow Flight directly" and "serve
-DuckDB" are different goals, and there are four rungs, not one.
+| Rung | What we serve | Extra deps | Who can read it | Who filters |
+|------|---------------|-----------|-----------------|-------------|
+| **0** | Arrow IPC over the existing dbrpc/CEDAR stream | arrow arrays+IPC (**+3.1 MB**) | our CLI/Python/Go clients; DuckDB via `nanoarrow`'s `read_arrow()`; pyarrow → DuckDB zero-copy | **us**, in our own language: ClassAd constraints, server-side aggregates, TopK, AS OF |
+| **1** | Standard Arrow Flight | + gRPC + Flight protos (**+11.2 MB**) | any Flight client | us — the ticket format is ours |
+| **2** | Arrow **Flight SQL** | same as rung 1, plus the dialect work | ADBC (Python/Go/Java/R), the Flight SQL JDBC driver, BI tools, DuckDB's own ADBC extension | **us**, from SQL text we receive |
+| **3** | Airport (Flight + custom `DoAction`s) | rung 1 + msgpack + DuckDB's expression JSON | DuckDB only | **DuckDB's planner**, pushed to us |
 
-| Rung | What we serve | Extra deps | Who can read it | Who does the filtering |
-|------|---------------|-----------|-----------------|------------------------|
-| **0** | Arrow IPC over the existing dbrpc/CEDAR stream | arrow arrays+IPC (**+3.1 MB**) | our CLI/Python/Go clients; DuckDB via the `nanoarrow` community extension's `read_arrow()` on a file or stream buffer; pyarrow → DuckDB zero-copy; pandas/polars | **us**, in our own language — full existing power: ClassAd constraints, server-side aggregates, TopK, AS OF |
-| **1** | Standard Arrow Flight (`ListFlights`/`GetFlightInfo`/`DoGet`) | + gRPC + Flight protos (**+11.2 MB**) | any Flight client, any language | us — the ticket format is ours to define |
-| **2** | Arrow **Flight SQL** (standard, Arrow project) | same as rung 1, plus the dialect work | ADBC (Python/Go/Java/R), the Flight SQL JDBC driver, BI tools; DuckDB via its own ADBC extension | **us**, from SQL text we receive |
-| **3** | Airport (Flight + custom `DoAction`s) | rung 1 + msgpack + DuckDB's expression JSON | DuckDB only | **DuckDB's planner**, pushed to us as serialized expressions |
-
-Reading that table changes the recommendation I would have made from the DuckDB goal alone:
-
-- **Rung 0 delivers most of the practical value for 9.6% of the binary and almost none of the
-  protocol risk.** No gRPC, no Flight protobufs, no msgpack, no community extension, no
-  unversioned expression format. And critically, the *client asks in our language*, so our
-  constraint engine, server-side `GROUP BY`, TopK and time travel all stay reachable.
-- **Rung 1 buys essentially nothing over rung 0 for the DuckDB goal.** It is network
-  convenience for non-DuckDB Flight clients. Skip it as a destination; it falls out of rung 2.
-- **Rung 2 is the right standard target.** It is a versioned Arrow-project protocol, it reaches
-  the widest client set, and it hands us **SQL text** — which plays to this store's strengths
-  (we have a dialect, a planner, pushdown and `EXPLAIN`) rather than against them.
-- **Rung 3 is the only way to get DuckDB `ATTACH` plus planner pushdown**, and it is also the
-  most coupled option on every axis: a custom msgpack protocol, a community extension, an
-  expression serialization that DuckDB's own documentation reserves the right to change in any
-  release, and a server role reduced to *dumb scan source* — our constraint engine and TopK
-  become unreachable (there is no LIMIT in Airport's endpoint parameters at all). The docs site
-  currently serves an expired TLS certificate, which is a fair signal about maintenance posture
-  even though the extension itself is MIT and active.
-
-**Recommendation: 0, then 2, with 3 as an optional adapter if it is ever wanted.** Rung 3 is
-not wrong — it is the only route to a genuinely seamless `SELECT ... FROM ospool.jobs.queue` —
-but it should be the thing we add once the Arrow encoder and schema contract (which every rung
-needs) are already proven, and it should never be the reason the daemon grows a gRPC stack.
-
-### 2.1 What rung 0 actually looks like to a user
-
-```sql
--- DuckDB, with the nanoarrow community extension
-INSTALL nanoarrow FROM community; LOAD nanoarrow;
-SELECT Owner, count(*) FROM read_arrow('jobs.arrows') GROUP BY Owner;
-```
-```python
-# or no extension at all: pyarrow -> DuckDB, zero copy
-import duckdb, htcondordb
-tbl = htcondordb.connect().arrow("SELECT Owner, Cpus FROM jobs WHERE JobStatus == 2")
-duckdb.sql("SELECT Owner, sum(Cpus) FROM tbl GROUP BY Owner")
-```
-
-The filtering, grouping and limiting happen in the daemon, in the language the daemon is good
-at. What crosses the boundary is a typed Arrow batch.
+**We built 0 and 2.** Rung 0's pieces — the type contract and the encoder — are prerequisites
+for rung 2 that happen to be independently useful, so they ship as `htcondordb-cli arrow` and
+`arrowstream/` rather than as a milestone. Rung 1 falls out of rung 2. Rung 3 is the only route
+to DuckDB `ATTACH` with planner pushdown, and it is the most coupled option on every axis: a
+custom msgpack protocol, a community extension, an expression serialization DuckDB reserves the
+right to change in any release, and a server role reduced to dumb scan source — our constraint
+engine and TopK become unreachable, since Airport's endpoint parameters have no LIMIT at all.
+Appendix A keeps what was learned about it.
 
 ## 3. Measured binary cost
 
 One pinned dependency set, three arms differing only by which source file is present, built
-from an exact copy of `cmd/htcondordb` (the no-Arrow arm reproduced the shipped daemon
-byte-for-byte, confirming the copy is faithful). darwin/arm64, `go1.26.0`, unstripped, no
-`-ldflags` beyond the version stamp — matching `make daemon`.
+from an exact copy of `cmd/htcondordb`. The no-Arrow arm reproduced the shipped daemon
+byte for byte, which is what says the copy is faithful. darwin/arm64, `go1.26.0`, unstripped.
 
 | Arm | Size | Delta |
 |-----|------|-------|
 | daemon as-is | 31,842,514 | — |
-| + Arrow arrays + IPC (rung 0) | 34,900,178 | **+3,057,664 (+9.6%)** |
-| + Flight + gRPC + msgpack (rungs 1–3) | 46,063,954 | **+11,163,776 more (+35.1% of base)** |
-| full stack | 46,063,954 | +14,221,440 (+44.7%) |
+| + Arrow arrays + IPC | 34,900,178 | **+3,057,664 (+9.6%)** |
+| + Flight + gRPC + msgpack | 46,063,954 | **+11,163,776 more (+35.1% of base)** |
 
-**Measured again once it was really wired in.** The table above comes from synthetic arms that
-link the dependencies without using them. With `flightsvc` actually serving from the daemon --
-flightsql, the catalog schemas, the per-identity session machinery -- the daemon goes from
-35,803,010 to 51,962,834 bytes: **+16.2 MB (+45.1%)**, against the +14.2 MB the synthetic arm
-predicted. The estimate was good to about two megabytes and low, which is the direction an
-estimate from a program that merely imports a library usually errs.
+**Re-measured once it was really wired in.** Those arms link the dependencies without using
+them. With `flightsvc` actually serving — flightsql, the catalog schemas, the per-identity
+session machinery — the daemon goes from 35,803,010 to 51,962,834 bytes: **+16.2 MB (+45.1%)**
+against the +14.2 MB the synthetic arm predicted. An estimate taken from a program that merely
+imports a library errs low, and did.
 
-**No cgo.** Verified, not assumed: `arrowtype`, the daemon, and the full stack (arrow + array
-+ ipc + flight + flightsql + grpc + msgpack linked into a copy of the daemon) all build with
-`CGO_ENABLED=0`, and every package we would use declares zero cgo files. The only cgo in
-arrow-go is `arrow/cdata`, the C Data Interface for handing arrays to C or Python Arrow
-in-process, which we do not import. So static builds, musl images and the RPM cross-build are
-unaffected.
+**No cgo**, verified rather than assumed: every package used declares zero cgo files and the
+full stack builds with `CGO_ENABLED=0`. arrow-go's only cgo is `arrow/cdata`, which we do not
+import. Static builds, musl images and the RPM cross-build are unaffected. The
+`modernc.org/sqlite` in arrow-go's go.mod is the pure-Go transpiled SQLite and is in the
+dependency tree of none of the packages we use.
 
-The `modernc.org/sqlite` version arrow-go drags in points the opposite way from how it looks:
-modernc's SQLite is the *pure-Go* one, C transpiled to Go precisely to avoid cgo. It is also
-go.mod-only -- sqlite appears in the dependency tree of none of the packages we use (flightsql,
-flight, ipc, array all report zero), because arrow-go needs it for its own Flight SQL example
-server. MVS raises the version; nothing links it.
+## 4. Where types are erased
 
-Notes that matter for interpreting these:
+Types exist at the bottom of the stack and at the top, and are erased in the middle. That
+erasure is the whole engineering problem.
 
-- The daemon **already links protobuf** (2,826 symbols, via `prometheus/client_golang` →
-  `client_model`), so the gRPC figure is already net of the protobuf runtime. A naive
-  measurement against a toy baseline over-counts by ~3.6 MB.
-- Arrow's cost is lower here than in isolation (~6.6 MB on a bare baseline) because the daemon
-  already links compression and hashing code Arrow shares.
-- Width-6 integer columns have no Arrow equivalent and widen to `int64`; that is a runtime
-  copy, not a size concern.
+**At the bottom — already Arrow-shaped.** `adField` (`collections/adschema.go`) carries
+per-column kind, width, signedness and offset, plus a per-record escape bitmap: an Arrow schema
+with different field names. `vm.Vec` (`collections/vm/vecexec.go`) is close to an Arrow array —
+`Raw`+`RawWidth` is a fixed-width buffer, `Dict` is a `DictionaryArray` (fold-sorted, which
+Arrow permits via its ordered flag), `Hi`/`Lo` bitplanes are a nullable boolean, `St` is nearly
+a validity bitmap. A real is stored as `math.Float64bits` in the same int64 slot, so loading a
+real column is a copy rather than a conversion.
 
-### 3.1 Reproducing this (and the trap in it)
-
-Copy the non-test files of `cmd/htcondordb` into a scratch module with
-`replace github.com/bbockelm/htcondordb => <repo>`, add the Arrow/Flight source files, and
-build with `GOWORK=off` (a worktree otherwise inherits `go.work`).
-
-**The trap:** running `go mod tidy` between arms silently bumped `modernc.org/sqlite`,
-`modernc.org/libc`, `protobuf` and `x/net`, which made the *larger* arm measure 686 KB
-**smaller** than the baseline. Tidy once, with every arm's imports present, then build each arm
-against that single frozen `go.mod`/`go.sum` and diff `go version -m` output across the
-binaries to confirm the only version differences are the modules under test.
-
-## 4. What the code already gives us
-
-Types exist at the bottom of the stack and at the top, and are **erased in the middle**. That
-erasure is the whole engineering problem, and it is the same problem at every rung.
-
-**At the bottom — already Arrow-shaped.**
-
-- `adField` (`collections/adschema.go:48`) carries per-column `kind` (`akBool`/`akInt`/
-  `akReal`/`akString`), `width` (int: 1/2/4/6/8; real/string: 8; bool: bit-packed), `unsigned`,
-  and offset — plus a per-record **escape bitmap** whose bit index is the field's position in
-  `s.fields`. This is an Arrow schema with different field names.
-- `vm.Vec` (`collections/vm/vecexec.go:60`) is close to an Arrow array already: `Raw []byte` +
-  `RawWidth` is a fixed-width Arrow buffer; `Dict` is an Arrow `DictionaryArray` (fold-sorted,
-  which Arrow permits via its ordered flag); `Hi/Lo` bitplanes are three-valued logic, i.e. a
-  nullable Arrow boolean; `St []uint8` (`VsInt`/`VsReal`/`VsBool`/`VsUndef`/`VsError`/
-  `VsString`/`VsDictCode`, `vecexec.go:48`) is nearly a validity bitmap.
-- A real is stored as `math.Float64bits` in the same int64 slot, so loading a real column is a
-  copy, not a conversion — the property that makes a columnar Arrow encoder cheap.
-
-**At the top — typed.** `RowStreamer` (`repl/rowstream.go:32`) hands back
+**At the top — typed.** `RowStreamer` (`repl/rowstream.go`) hands back
 `func(*classad.ClassAd) []classad.Value`, and `classad.ValueType` distinguishes undefined /
 error / bool / int / real / string / list / nested ad.
 
-**In the middle — strings.** `QueryRaw*` returns `[]string` of ad text;
-`AggRow{Group []string, Values []string}` (`db/aggregate.go:64`); `repl.Result.Rows` is
-`[][]string` (`repl/exec.go:340`). Visible consequences today: the Grafana plugin re-derives
-types by parsing every cell and bailing on the first non-numeric (`inferField`,
-`grafana/pkg/plugin/frame.go:48`) with a hardcoded epoch-attribute list (`knownTimeAttrs`,
-`frame.go:15`), and the Python driver documents `description` as "what arrived, not a schema."
+**In the middle — strings.** `QueryRaw*` returns ad text; `AggRow` holds `[]string`;
+`repl.Result.Rows` is `[][]string`. The visible consequences are that the Grafana plugin
+re-derives types by parsing every cell and bailing on the first non-numeric, with a hardcoded
+epoch-attribute list, and that the Python driver documents `description` as "what arrived, not
+a schema".
 
-So this is not "add types." It is **stop discarding them**.
+So this is not "add types". It is **stop discarding them**.
 
-**What does not exist.** `adKind` is private to package `collections` and never escapes.
-`GroupSchemaInfo` (`collections/colgroupschema.go:63`, via `db.DB.GroupSchemas`,
-`db/db.go:1205`) reports attribute *presence* fractions but **no types**. The declared Arrow
-schema needs a new introspection path out of `collections` → `db` → `dbrpc` (§5.7).
+## 5. The schema contract
 
-## 5. The schema contract (the hard part, and it is rung-independent)
-
-Arrow fixes a schema for a whole stream. A schema derived from whichever rows happened to show
-up is a bug factory, and this repository has already been bitten twice by the general shape:
-expression-valued columnar fields read as UNDEFINED by fast COUNT paths (inflating counts), and
-persisted field order re-derived from process-local intern ids. So: **declare the schema, do
-not infer it** — and keep the declaration with the columnar schema, which already carries most
-of what it needs.
+Arrow fixes a schema for a whole stream, and a schema derived from whichever rows happened to
+show up is a bug factory — this repository has been bitten twice by the general shape already
+(expression-valued columnar fields reading as UNDEFINED in fast COUNT paths; persisted field
+order re-derived from process-local intern ids). So **declare the schema, do not infer it**.
 
 Three decisions govern everything below:
 
 1. **Arrow carries evaluated values**, never unevaluated expressions (§5.1).
 2. **Coerce exceptional values where the coercion is exact**; null only what cannot be
    coerced (§5.3).
-3. **Pick the Arrow type that minimizes exceptions**, even where storage chose a narrower one
-   (§5.2).
+3. **Pick the Arrow type that minimizes exceptions**, even where storage chose a narrower
+   one (§5.2).
 
-The effect of all three is that the storage schema and the Arrow schema are deliberately *not*
-the same schema. Storage optimizes bytes on disk and accepts exceptions as the price; Arrow
-optimizes for a column that is wholly one type, because that is the only thing a consumer can
-use. Same source of truth, different objective function.
+The effect is that the storage schema and the Arrow schema are deliberately *not* the same
+schema. Storage optimizes bytes on disk and accepts exceptions as the price; Arrow optimizes
+for a column that is wholly one type, because that is the only thing a consumer can use. Same
+source of truth, different objective function.
 
 ### 5.1 Arrow columns carry evaluated values
 
-`nodeKind` (`collections/adschema.go:139`) classifies a computed expression as `akNone` — it is
-not a storable scalar, so an expression-valued attribute is an **escape**, held in the record
-rather than the fixed slot. For Arrow we evaluate it and encode the result.
+`nodeKind` classifies a computed expression as `akNone` — not a storable scalar — so an
+expression-valued attribute is an escape, held in the record rather than the fixed slot. For
+Arrow we evaluate it and encode the result.
 
-This has three consequences worth stating:
+**True of the schema as well as the encoder.** For a long time only the encoder obeyed this:
+the type report classified what the cells *stored*, so an expression-valued attribute was ruled
+untypeable and got no column for the encoder to fill. The evaluation also moved — it now
+happens in the store, where the record's reference closure and its precomputed values already
+are, rather than in this process after a render and a reparse (§7.2).
 
-- **Evaluation needs the ad, not just the column.** An expression's own references are expanded
-  transitively while decoding, and `vm.ReadPlan`'s seed set is not closed over them — the
-  reason `colproject` refuses to serve a narrowed ad to a match that reads attributes
-  (`collections/colproject.go`). So a record with an expression escape in a projected column
-  forces a row reassembly for *that record*. Escapes are rare by construction, so this is a
-  slope, not a cliff; but the encoder must be able to fall back per record, and the cost should
-  show up in the scan stats rather than being invisible.
+Four consequences:
+
+- **Evaluation needs the ad, not just the column.** An expression's references are expanded
+  transitively while decoding, and `vm.ReadPlan`'s seed set is not closed over them. So a record
+  with an expression escape in a projected column forces a row reassembly for *that* record.
+  Escapes are rare by construction, so this is a slope rather than a cliff — but the encoder
+  must fall back per record, and the cost must appear in the scan stats rather than being
+  invisible.
 - **An evaluated expression is usually not an exception at all.** `WallClockTime` stored as an
   expression that evaluates to an integer is an integer. This is most of why decision 1 matters:
   it converts a large class of apparent type exceptions into ordinary values.
-- **Evaluation is not necessarily stable.** An expression referencing `CurrentTime` yields a
-  different value on each read, so an Arrow batch is a snapshot of evaluation, not of stored
-  state. That matches how every other read of this store behaves, but it means two Arrow dumps
-  of an unchanged table can legitimately differ.
+- **Evaluation is not stable.** An expression referencing `CurrentTime` yields a different value
+  on each read, so an Arrow batch is a snapshot of evaluation, not of stored state. That matches
+  every other read of this store, but two Arrow dumps of an unchanged table can legitimately
+  differ.
 - **Evaluation MUST go through the redacted path for an unprivileged reader.** This is a
-  security requirement, not a detail. `db.PrivateConstraintRef`'s own comment records the hole
-  it cannot close: an ad may store a *public* attribute whose value is an expression over a
-  private one (`Leak = ClaimId`). A constraint on `Leak` references nothing private and passes
-  the gate, while evaluation resolves `ClaimId` -- and the stated fix is that the private value
-  must be ABSENT AT EVALUATION TIME for such a reader, which the redacted decode walk already
-  arranges for rendering. An encoder that evaluates with the private values present turns every
-  Arrow read into the oracle `refusePrivateConstraint` exists to prevent, and it is the same
-  hazard class as the wire scan that shipped plaintext of encrypted attributes once already.
-  So: evaluate with the reader's own view, never the privileged one, and make that the default
-  rather than a flag someone can forget to set.
+  security requirement, not a detail. An ad may store a *public* attribute whose value is an
+  expression over a private one (`Leak = ClaimId`): a constraint on `Leak` references nothing
+  private and passes the gate, while evaluation resolves `ClaimId`. The private value must be
+  **absent at evaluation time** for such a reader, which the redacted decode walk already
+  arranges. An encoder that evaluates with private values present turns every Arrow read into
+  the oracle `private_gate.go` exists to prevent — the same hazard class as the wire scan that
+  shipped plaintext of encrypted attributes once already.
 
 **Corollary — do not promote predominantly-expression attributes to typed columns.**
 `Requirements` evaluates to a boolean, and that boolean is almost never what anyone wants; the
-*text* is the point. Attributes whose stored form is `akNone` across the sample stay out of the
-typed schema and live in the tail column (§5.6), which preserves source text. So the division
-is: **typed columns hold evaluated values; the tail column preserves what was written.**
+*text* is the point. Such attributes stay out of the typed schema and live in the tail column
+(§5.6). The division is: **typed columns hold evaluated values; the tail column preserves what
+was written.**
+
+This corollary is mandatory rather than advisory, and §5.8 measures why. Typing from evaluated
+values types `Requirements` too — it evaluates to a boolean in 1685 of 2000 ads, so it is not
+rescued by evaluating badly; it gets a perfectly good column of 85% meaningless booleans and
+15% null. It is the same *shape* as `MemoryUsage`, and the difference is which of the value and
+the expression a reader is after, which no measurement reaches. So the daemon seeds the policy
+expressions as excluded (`knownFlightPolicyExprs`: `Requirements`, `Rank`, `START`, the
+`Periodic*` and `OnExit*` family, `IsOwner`, `WithinResourceLimits`) the way it seeds the epoch
+attributes, and the knob adds to that rather than replacing it. Excluding is not hiding — the
+tail carries the text, which is the only reason excluding is an acceptable answer at all, so
+the two had to land together.
 
 ### 5.2 Choosing the Arrow type: widen to minimize exceptions
 
-`chooseIntWidth` (`collections/adschema.go:113`) picks the smallest width covering **≥ `fit`**
-of the sampled values — 0.95 for a base-schema column, 0.999 for a hot one
-(`colscan.go:638`) — and deliberately accepts the rest as per-record exceptions, because two
-bytes per record per column is worth real disk.
+`chooseIntWidth` picks the smallest width covering ≥ `fit` of the sampled values (0.95 for a
+base-schema column, 0.999 for a hot one) and deliberately accepts the rest as per-record
+exceptions, because two bytes per record per column is worth real disk.
 
 For Arrow that trade does not exist: the width buys almost nothing (IPC compresses, and DuckDB
 widens to `BIGINT` for arithmetic anyway) while every exception costs an escape read and a
-coercion. So the Arrow width is chosen to cover **every** value, not a fit fraction:
+coercion. So the Arrow width covers **every** value, not a fit fraction.
 
 - **Integer columns default to `int64`.** A value that escaped a 2-byte storage column is still
-  an integer; widening makes it an ordinary value and the exception count goes to zero.
-- **Narrowing is an optimization that needs an exact bound, which we do not have yet.** Zone
-  maps hold per-segment `[min,max]` but only for configured `ZoneAttrs`, and they hold them as
-  **float64** (`zoneRange{Min, Max float64}`, `collections/zonemap.go`), which cannot bound an
-  int64 column exactly above 2^53. If narrowing is wanted later, the describe-table op should
-  track an exact integer min/max per column at seal time — sealing already walks every value, so
-  it is close to free there and cannot be reconstructed cheaply afterwards.
+  an integer; widening makes it ordinary and the exception count goes to zero.
+- **Narrowing would need an exact bound we do not have.** Zone maps hold per-segment `[min,max]`
+  but only for configured `ZoneAttrs`, and they hold them as float64, which cannot bound an
+  int64 column exactly above 2^53. If narrowing is ever wanted, capture an exact integer min/max
+  at seal time — sealing already walks every value, so it is nearly free there and cannot be
+  reconstructed cheaply afterwards.
 - **Signedness follows the data, not the storage flag.** `adField.unsigned` is per-segment; if
-  any segment holds a negative value, the Arrow type is signed.
-- **Width 6 has no Arrow equivalent** and becomes `int64` regardless.
+  any segment holds a negative value the Arrow type is signed.
+- **Width 6 has no Arrow equivalent** and becomes `int64`.
 
-The same principle applies one level up, to the *kind*: if declaring an `akInt` column as
-`double` would eliminate more exceptions than it creates, do that — **but only when every
-integer value in the column round-trips through float64 exactly.** `vm.Vec` keeps the int64
-payload specifically to preserve integers above 2^53, and silently trading that away at the
-Arrow boundary would discard the property the storage layer went to trouble to keep. Without
-an exact bound (above), "every value round-trips" is not provable, so a genuinely mixed int/real
-column stays Tier C (§5.4) until the bound exists.
+The same principle applies to the *kind*: if declaring an `akInt` column as `double` eliminates
+more exceptions than it creates, do that — **but only when every integer in the column
+round-trips through float64 exactly.** `vm.Vec` keeps the int64 payload specifically to preserve
+integers above 2^53, and trading that away silently at the Arrow boundary would discard a
+property the storage layer went to trouble to keep.
 
 ### 5.3 The coercion lattice
 
-Applied per escaped value, after evaluation. "Exact" means the coercion is information-
-preserving and reversible; anything else is counted, and refused under strict mode (§5.5).
+Applied per escaped value, after evaluation. "Exact" means information-preserving and
+reversible; anything else is counted, and refused under strict mode (§5.5).
 
 | Declared column | Escaped value | Action | Exact? |
 |---|---|---|---|
 | `double` | integer | widen to float64 | exact for \|v\| < 2^53; **counted as lossy** above |
-| `int64` | boolean | 1 / 0 | exact (matches `colagg`'s existing `akBool` handling) |
+| `int64` | boolean | 1 / 0 | exact |
 | `double` | boolean | 1.0 / 0.0 | exact |
-| `int64` | real with integral value | truncate to integer | exact |
-| `int64` | real with fractional value | **no coercion** — see §5.2 on widening the column, else null | — |
-| `utf8` | any scalar | ClassAd unparse | exact (text is what `utf8` means here) |
-| any | undefined / attribute absent | **null** | not a coercion; this is the validity bitmap |
+| `int64` | real with integral value | truncate | exact |
+| `int64` | real with fractional value | **no coercion** — widen the column, else null | — |
+| `utf8` | any scalar | ClassAd unparse | exact |
+| any | undefined / absent | **null** | not a coercion; this is the validity bitmap |
 | any | ERROR | **null**, counted *separately* from undefined | — |
 | any numeric | list / nested ad | null (or unparse if the column is `utf8`) | — |
 
-**What we deliberately refuse to coerce: strings into numbers.** Parsing `"42"` into an
-`int64` column is the bug class this codebase has already hit, where a stringified number was
-written into an attribute and read back as the wrong type. A string in a numeric column means
-the data is heterogeneous, which is information — it belongs in the exception count and, if it
-is common, in a Tier C declaration. Silently parsing it would make a type error look like clean
-data, which is precisely what decision 2 is trying to avoid. (Numeric → `utf8` is fine and goes
-the other way: `utf8` is a faithful representation of any ClassAd value.)
+**What we deliberately refuse to coerce: strings into numbers.** Parsing `"42"` into an `int64`
+column is a bug class this codebase has already hit, where a stringified number was written into
+an attribute and read back as the wrong type. A string in a numeric column means the data is
+heterogeneous, which is information — it belongs in the exception count and, if common, in a
+Tier C declaration. Silently parsing it would make a type error look like clean data. Numeric →
+`utf8` is fine and goes the other way.
 
 ### 5.4 The residual tiers
-
-With §5.1–5.3 absorbing most of what used to be exceptional, only three outcomes remain:
 
 | Tier | Condition | Arrow type |
 |---|---|---|
@@ -312,74 +237,116 @@ With §5.1–5.3 absorbing most of what used to be exceptional, only three outco
 | B | as A, but some values are absent, undefined, ERROR, or lossily coerced | same type, **nullable** |
 | C | kinds genuinely disagree and no exact widening unifies them | `utf8` holding the unparse of the evaluated value |
 
-Tier C is now a statement about the *data* ("this attribute really does hold both strings and
-numbers"), not an artifact of how storage fitted a width. That is the point of the three
-decisions: the tier should describe the pool, not our encoder.
+Tier C is a statement about the *data*, not an artifact of how storage fitted a width. That is
+the point of the three decisions: the tier should describe the pool, not our encoder.
 
-**Measured, Tier C is empty** (§5.8): after evaluation, every mixed attribute on a real AP is
-int/real, and those are `double`. Keep the tier -- it is the honest answer for data that really
-is mixed, and an empty tier costs nothing -- but do not build the machinery around it as though
-it were the common case, and do not let §5.3's "no exact bound, so Tier C" rule stand in for the
-bound. Without the bound, `BytesRecvd`, `CumulativeSlotTime` and `CpusUsage` all land in Tier C
-wrongly.
+**Measured, Tier C is empty** (§5.8). Keep it — it is the honest answer for data that really is
+mixed, and an empty tier costs nothing — but do not build machinery around it as though it were
+the common case.
 
 ### 5.5 Exceptions must be measurable, and strictness must be available
 
 A column that silently nulls 3% of its values is the failure mode where a server-side clamp hid
-a unit bug: plausible output, no error. So the encoder counts, **per column per stream**, and
-reports in stream metadata, `EXPLAIN` and the query log:
+a unit bug: plausible output, no error. So the encoder counts, per column per stream: values
+coerced exactly, values coerced **lossily**, values nulled split into absent / undefined / ERROR
+/ uncoercible-type, and records that fell back to row reassembly.
 
-- values coerced exactly (free, informational),
-- values coerced **lossily** (an int64 above 2^53 into a `double`),
-- values nulled, split into absent / undefined / ERROR / uncoercible-type,
-- records that fell back to row reassembly to evaluate an expression (§5.1).
+A **strict mode**, per table or per session, fails the read on any lossy coercion or uncoercible
+value instead of nulling. Default lenient; strict is what a correctness investigation uses, and
+what a scheduled export should set.
 
-A **strict mode**, per table or per session, fails the read on any lossy coercion or
-uncoercible value instead of nulling. Default lenient; strict is what a correctness
-investigation uses, and what a scheduled export should set.
-
-### 5.6 `SELECT *` is "schema columns plus a tail column"
+### 5.6 `SELECT *` is "schema columns plus a tail column" — built
 
 A jobs table has thousands of distinct attributes across its rows; the union is useless as an
-Arrow schema and expensive to serialize. Mirror the storage layout instead: the
-declared/columnar fields become typed Arrow columns, and everything else — including the
-predominantly-expression attributes of §5.1 — becomes **one** column, `_ad` as `utf8` ClassAd
-text (simplest) or `map<utf8, utf8>` (queryable from DuckDB, larger). This falls out of the
-base-schema-plus-cold-tail layout we already have, preserves source text for everything not
-promoted, and gives users a correct escape hatch rather than a schema that lies by omission.
+Arrow schema and expensive to serialize. So the typed columns are joined by **one** `_ad` column
+of `utf8` holding a bracketed ClassAd — bracketed rather than the newline-separated old form
+because this is one cell of one row, and a self-delimiting value survives a CSV or Parquet
+export that a multi-line one does not. Null when there is nothing left over.
 
-### 5.7 Where the declaration lives, and how it invalidates
+`arrowtype.TailDecision()` is a `Decision` like any other, so schema building, projection by
+name and the encoder's field list handle it with no special case, and `Options.Tail` appends it
+last so a client reading by position is unaffected by turning it on. The Flight endpoint sets it
+unconditionally: a host that could switch it off could only switch the schema back to lying.
 
-Per the decision to keep this with the columnar info: a **per-table Arrow type map**,
-`attr -> {arrow type, nullable, strict?}`, stored alongside the columnar schema and sharing its
-**generation counter**. Seeded from the introspection below; overridable by an admin.
+Three things building it settled that the specification did not anticipate:
 
-- The **epoch-to-timestamp mapping becomes a declaration**, not a guess. `knownTimeAttrs`
-  (`frame.go:15`) is the right instinct with the wrong mechanism: seed from it, let an admin add
-  `MyCustomDate`, advertise those columns as `timestamp[s]` so date functions work downstream.
-  Map the key attribute to the rowid role.
-- The generation counter is what a rung-3 catalog hashes (§6), so DuckDB's `airport_cache`
-  invalidates exactly when the advertised schema changes and never otherwise.
+- **It had to be the complement of the COLUMNS, not of the table's schema**, and that interacts
+  with projection pushdown. `SELECT Owner, _ad` with the projection pushed down delivers exactly
+  the attributes that are already columns, so every tail would be empty — a wrong answer that
+  looks like a table with nothing left over rather than like a failure. Asking for the tail
+  therefore turns the projection off, which is a real cost and is the cost the query asked for.
+- **It keeps the STORED form.** Evaluating on the way in would discard the only thing the column
+  is for: an attribute lands here precisely because its evaluated form was not worth a column.
+- **It changed what an untyped attribute means for privacy.** Before, the encoder dropped
+  anything with no column, so a private attribute that reached this process was discarded on the
+  way out whatever the session was — by accident, not by policy. The tail keeps everything, so
+  the stripping now has to be real. It is, and it is the loopback's: an unprivileged dbrpc
+  session never puts the attribute in the row. That is the property routing Flight through dbrpc
+  exists to buy, and exactly the kind that stops holding the moment something downstream starts
+  keeping what it used to throw away — so it is pinned by a test that searches a READ peer's
+  whole batch for the value, with a DAEMON peer proving the fixture has one to withhold.
 
-**A schema change must not silently retype a column mid-flight.** The columnar schema evolves
-(demand-driven promotion, hot-column refit, group-schema derivation), and a stream already in
-progress must keep the type it announced — pin the generation for the life of a stream and let
-the next one pick up the new map.
+### 5.7 The declaration, and how it invalidates
 
-**New dbrpc op** (next free opcode is 66; highest in use is `opArchiveAggregateStats = 65`,
-`dbrpc/proto.go:244`): *describe table*, returning per attribute
-`{kind-after-evaluation, exact integer min/max, unsigned, presence fraction, escape fraction
-by cause, cardinality estimate}`. Requires exporting kind information out of `collections`
-(`adKind` is package-private today and never escapes). Cardinality and range estimates come
-from the value-index histograms already maintained for the planner — which also, nearly for
-free, answers Airport's optional column-statistics action later.
+The intent was a per-table Arrow type map — `attr -> {arrow type, nullable, strict?}` — stored
+alongside the columnar schema and sharing its generation counter, seeded by introspection and
+overridable by an admin. **Half of that is built and half is not**, and the half that is built
+came out differently from the plan.
+
+**Built: the pin** (`arrowtype.Fingerprint`, `flightsvc/pin.go`). Flight answers a query in two
+RPCs: one promises a shape, the other delivers rows. Both derived the schema independently from
+a sample of a table still being written to, so a column appearing between them did not shift one
+value for a client reading by position — it shifted every value after it, and nothing in the
+protocol said so. `GetFlightInfo` now puts the fingerprint of the schema it promised into the
+ticket; `DoGet` re-derives, compares, and refuses with `FAILED_PRECONDITION` and an instruction
+to re-plan rather than serving rows under a superseded shape. A prepared statement carries the
+same pin server-side, re-set by every call that reports a schema.
+
+Three things that differ from the paragraph above, each found by building it:
+
+- **The exposure is the statement, not the stream.** *Within* a stream the schema was never at
+  risk: it is derived once, before the scan. The FlightInfo/DoGet pair is where the gap was, so
+  the pin is for the life of a statement.
+- **A content hash, not a generation counter.** A counter needs an owner to bump it, and a
+  schema derived from a sample has none — the table's writers do not know they changed it. A
+  hash needs no state, agrees across processes and restarts, and has the property a counter does
+  not: a re-derivation that produces the same schema produces the same name, so an unchanged
+  table never invalidates anything.
+- **The name travels, not the schema.** The ticket is in the client's hands, so anything in it is
+  something the client can edit. A fingerprint it invents cannot make the server produce a shape
+  of its choosing — the only reachable outcome is refusing its own request.
+
+A prepared statement re-pins rather than holding the pin from prepare. Handles live half an hour
+against a thirty-second schema cache, so a pin fixed at prepare would start refusing a working
+statement as soon as the pool set a new attribute — a worse failure than the one being
+prevented. The guarantee is the one that was wanted: what the client was last told is what it
+gets, or it is told why not.
+
+**A cache, privilege-scoped** (`flightsvc/schemacache.go`, default 30s) stops a derivation per
+RPC and makes the promised and delivered schema one object in the common case. Keyed by
+privilege, which is not a detail: an unprivileged type report has private attributes filtered out
+server-side, because an attribute's numeric bounds are a disclosure even where its value is not,
+so two levels derive different schemas from one table and a shared entry would hand private
+column names to whoever asked second.
+
+**Not built: the declaration itself.** The pin makes instability *visible*; it does not make the
+schema stable. A table that keeps gaining attributes keeps refusing fetches planned a moment
+earlier, correctly and uselessly. What is still wanted is a stored, admin-overridable type map,
+with the epoch-to-timestamp mapping as a declaration rather than a guess — `knownTimeAttrs` in
+the Grafana plugin is the right instinct with the wrong mechanism. Seeding it is already
+half-written: `knownFlightPolicyExprs` and the `HTCONDORDB_FLIGHT_*` overrides are a declaration
+in config rather than in storage. The describe-table op it would ride on wants, per attribute,
+`{kind-after-evaluation, exact integer min/max, unsigned, presence fraction, escape fraction by
+cause, cardinality estimate}`, and requires exporting kind information out of `collections`
+(`adKind` is package-private today). Cardinality and range come from the value-index histograms
+the planner already maintains.
 
 ### 5.8 Measured: what ap2001 actually holds
 
-The tiers above were written before anyone had looked. `AttrTypeProfiles` (classad #439) was
-pointed at 2000 ads sampled from each of ap2001's `jobs` and `history` tables -- pulled with an
-ordinary `SELECT ... LIMIT` and profiled in a LOCAL store, because a novel read shape does not
-go at a production daemon.
+The tiers above were written before anyone had looked. `AttrTypeProfiles` was pointed at 2000 ads
+sampled from each of ap2001's `jobs` and `history` tables — pulled with an ordinary
+`SELECT ... LIMIT` and profiled in a **local** store, because a novel read shape does not go at a
+production daemon.
 
 | | `jobs` | `history` |
 |---|---|---|
@@ -390,39 +357,26 @@ go at a production daemon.
 | NaN reals | **0** | **0** |
 | predominantly expression-valued | 8 | 6 |
 
-The first two rows are the §5.4 point made empirically: counting stored `undefined` as a
-competing class invents 7 mixed attributes in `jobs` and 2 in `history` that are not mixed.
+The first two rows make §5.4's point empirically: counting stored `undefined` as a competing
+class invents 7 mixed attributes in `jobs` and 2 in `history` that are not mixed.
 
-**Every heterogeneous attribute fell into one of three patterns, and all three resolve without
-a fallback type.**
+Every heterogeneous attribute fell into one of three patterns, and all three resolve without a
+fallback type.
 
-1. **int/real mixing -- the large majority.** `BytesRecvd` 67 int to 1933 real, `BytesSent`
-   1948 to 52, `CpusUsage` 2 to 1998, `Rank` 1 to 1999, plus `CommittedSlotTime`,
-   `CumulativeSlotTime`, `GPUsAverageUsage`, `NetworkInputMb`, `NetworkOutputMb`. This is
-   mostly not heterogeneous data at all: ClassAd writes an integral float without a decimal
-   point, so a genuinely float-valued attribute arrives as a mix of int and real NODES. It is
-   safely `double` -- and it is safe *because* no integer is past 2^53, which is exactly what
-   §5.2's exact-bounds measurement is for.
+1. **int/real mixing — the large majority.** `BytesRecvd` 67 int to 1933 real, `BytesSent` 1948
+   to 52, `CpusUsage` 2 to 1998, `Rank` 1 to 1999, plus `CommittedSlotTime`, `CumulativeSlotTime`,
+   `GPUsAverageUsage`, `NetworkInputMb`, `NetworkOutputMb`. Mostly not heterogeneous data at all:
+   ClassAd writes an integral float without a decimal point, so a genuinely float-valued
+   attribute arrives as a mix of int and real *nodes*. Safely `double` — and safe *because* no
+   integer is past 2^53.
 2. **scalar + `undefined`.** `MachineAttrGLIDEIN_ResourceName0` and `..._Site0` are 25 strings
-   against 1975 `undefined` in history. These are uniformly string attributes that usually have
-   no value, not mixed ones -- see §5.4 on why undefined is a null and not a type.
-3. **scalar + expression.** `Requirements` is 1995 expressions to 5 booleans; `RequestMemory`
-   and `RequestDisk` are 1994 integers to 1 expression; `MemoryUsage` is 1996 expressions to 4
+   against 1975 undefined in history: uniformly string attributes that usually have no value.
+3. **scalar + expression.** `Requirements` is 1995 expressions to 5 booleans; `RequestMemory` and
+   `RequestDisk` are 1994 integers to 1 expression; `MemoryUsage` is 1996 expressions to 4
    integers. Under §5.1 these evaluate, and the evaluated type is uniform.
 
-Of the 10 residual in each table, `jobs` splits 3 int/real to 7 scalar+expression and
-`history` splits 8 to 2. Apply §5.1's evaluation and the expression ones collapse, leaving
-**int/real as the only real heterogeneity: 3 attributes in `jobs`, 8 in `history`** -- all of
-them `double`.
-
-**So Tier C may be empty in practice.** §5.3's conservative rule -- a mixed int/real column
-goes to `utf8` because the round-trip cannot be proven -- would have sent `BytesRecvd`,
-`CumulativeSlotTime` and `CpusUsage` to string columns. The exact bound is what rescues them,
-which upgrades it from an optimization to the thing that makes the common case work. Build it.
-
-**Then measured again, after evaluation.** The paragraph above used to end by saying pattern 3's
-resolution was a claim about the encoder rather than something the sample proved. So the same
-ads were re-profiled by *evaluating* each attribute and classifying the result:
+**Then measured again, after evaluation**, because pattern 3's resolution was a claim about the
+encoder rather than something the sample proved:
 
 | | `jobs` | `history` |
 |---|---|---|
@@ -432,953 +386,636 @@ ads were re-profiled by *evaluating* each attribute and classifying the result:
 | evaluated to undefined/error in every ad | 3 | 3 |
 
 **Every mixed-after-evaluation attribute is int/real.** Not one string/number mix, not one
-list/scalar mix, in either table. `Rank`, `CommittedSlotTime`, `CumulativeSlotTime`,
-`RequestDisk` in `jobs`; `CpusUsage`, `BytesRecvd`, `BytesSent`, `CumulativeSlotTime`,
-`CommittedSlotTime`, `GPUsAverageUsage`, `NetworkInputMb`, `NetworkOutputMb` in `history`. So
-**Tier C is empty on this data**, and §5.1's evaluation is what empties it: the
-expression-valued attributes collapse exactly as predicted -- `MemoryUsage` evaluates to an
-integer in all 2000 history ads (it is an expression in 1996 of them), `RequestMemory` likewise,
-`OnExitHold` to a boolean.
+list/scalar mix, in either table. So **Tier C is empty on this data**, and §5.1's evaluation is
+what empties it: `MemoryUsage` evaluates to an integer in all 2000 history ads though it is an
+expression in 1996 of them, `RequestMemory` likewise, `OnExitHold` to a boolean.
 
-**And the §5.1 corollary is confirmed quantitatively.** `Requirements` evaluates to a boolean in
-1685 of 2000 `jobs` ads -- plus **141 errors** and 174 undefined, because evaluating a match
-expression with no machine to match against is not a meaningful question. A typed column for it
-would be 85% meaningless booleans and 15% null. Its *text* is what anyone wants, which is why
-predominantly-expression attributes stay out of the typed schema and live in the tail column.
+**What this does not establish.** One AP, one moment, 2000 ads per table. `BytesSent` exceeding
+2^53 is 9 PB in a single job — implausible now, not impossible, and the guard costs a comparison,
+so it stays. The evaluation ran with the ad as its own scope and no target, which is what an
+Arrow encoder does; an attribute whose value depends on a target would evaluate differently in a
+matchmaking context, and none of this says what should happen there. And it ran with full
+privileges, so it says nothing about the redacted path §5.1 requires.
 
-**What this still does not establish.** One AP, one moment, 2000 ads per table. `BytesSent`
-exceeding 2^53 is 9 PB in a single job -- implausible now, not impossible, and the guard costs a
-comparison, so it stays. The evaluation here ran with the ad as its own scope and no target,
-which is what an Arrow encoder would do; an attribute whose value depends on a target would
-evaluate differently in a matchmaking context, and none of this says what SHOULD happen there.
-And it was evaluated with full privileges, so it says nothing about the redacted path §5.1
-requires.
-
-## 6. The rung-3 wire contract, for when we get there
-
-Recorded here so it does not have to be rediscovered; **not** needed for rungs 0–2. Everything
-is msgpack-serialized C++ structs; `FlightInfo` and schemas are Arrow IPC. Pin these against a
-real DuckDB build rather than trusting this summary.
-
-- **`DoAction("list_schemas")`** (required). In: `{catalog_name}`. Out: msgpack
-  `{length, data}`, `data` = zstd-compressed msgpack of `{contents, schemas[]}`; each schema's
-  `contents` is `{sha256, url?, serialized?}` wrapping a zstd msgpack array of serialized
-  `FlightInfo`s, one per table. Each `FlightInfo.app_metadata` holds msgpack
-  `SerializedFlightAppMetadata{type: "table"|"table_function"|"scalar_function", schema,
-  catalog, name, comment, input_schema?, action_name?, description?}`. **Caching is keyed on the
-  SHA256** — if present, DuckDB caches on disk indefinitely and will not re-fetch, so the hash
-  must change exactly when the schema does (§5.7).
-- **`DoAction("endpoints")`** (required). In: `{descriptor, parameters{json_filters,
-  column_ids, table_function_parameters, table_function_input_schema, at_unit, at_value}}`.
-  Out: msgpack `vector<string>` of serialized `FlightEndpoint`s, fetched **in parallel** by
-  DuckDB's thread pool; their union is the whole flight. **All endpoints must therefore read the
-  same snapshot** — embed a snapshot/AS OF token in every ticket. `at_unit`/`at_value` map onto
-  our AS OF reads (`Statement.AsOf`, `repl/sql.go:209`); very few Flight servers can honor it.
-  There is **no LIMIT** here, so our server-side TopK (`dbrpc/topk.go:26`, via `tryTopK`,
-  `repl/exec.go:1411`) is unreachable from DuckDB.
-- **Identifier case.** DuckDB does not fold identifiers before sending: `SELECT * FROM FooBar`
-  asks for `FooBar`. The server must match DuckDB's case-insensitive behavior itself. ClassAd
-  attribute names are already case-insensitive (`classad/evaluator.go:490`); table names in our
-  catalog are not, so fold there.
-
-## 7. Pushdown (rung 3 only)
-
-`column_ids` maps onto existing projection pushdown (`projectionAttrs`, `repl/exec.go:863`).
-`json_filters` is `{filters: [...], column_binding_names_by_index: [...]}` over DuckDB bound
-expressions: `BOUND_COMPARISON` (`COMPARE_EQUAL`, `COMPARE_GREATERTHAN`, ...),
-`BOUND_CONJUNCTION` (`CONJUNCTION_AND`/`OR`), `BOUND_OPERATOR` (`COMPARE_IN`),
-`BOUND_COLUMN_REF`, `BOUND_CONSTANT`, `BOUND_FUNCTION` (`name: "prefix"`, `"length"`, ...).
-
-**Airport re-filters on the client**, so a translator that handles what it understands and
-**drops** what it does not is correct, merely slower. That is what makes rung 3 tractable at
-all. But the rule has one sharp edge:
-
-- unknown `expression_class`, function or type → **drop that filter**; never fail a read;
-- a dropped conjunct inside an `AND` is fine (we return a superset); a dropped conjunct inside
-  an `OR` means **the whole disjunction must be dropped**, not one arm. This is the easiest
-  place in the design to introduce silent wrong answers.
-
-DuckDB's documentation states outright that this serialization may change in any release, so
-pin a DuckDB version in CI and expect to chase it.
-
-### 7.1 String comparison is the sharp edge (and it also hits rung 2)
-
-ClassAd's `==`, `!=`, `<`, `<=`, `>`, `>=` compare strings **case-insensitively**
-(`compareStringsFold`, `classad/evaluator.go:1142`; `valuesEqual`, `:1258`), matching the C++
-reference engine; only `=?=`/`=!=` are case-sensitive. The segment dictionaries are fold-sorted
-too, so this is not skin-deep. SQL's `=` is case-sensitive. Therefore:
-
-- **Equality:** translating `=` to ClassAd `==` yields a **superset**, which a client-side
-  re-filter corrects — safe at rung 3. The exact form is `=?=`, which is case-sensitive AND
-  carries an exact-case index run (§9.5); a `strcmp` idiom would be invisible to the planner.
-  **Verify with EXPLAIN** that match reordering puts the indexed term first; if not, that is a
-  planner fix, not a reason to skip the exact term.
-- **Ordering (`<`, `>`):** fold-order and byte-order results are neither a subset nor a superset
-  of one another — compare `"apple"` against `"R"` under each. **Do not push these down.**
-
-ClassAd also has **ERROR** as well as UNDEFINED, which SQL lacks; a cross-type non-numeric
-comparison yields ERROR. Harmless for pushdown (the row fails the constraint), but a decision
-to make and document for the dialect (§10).
-
-## 8. Topology and authorization (W5) — gRPC in process
+## 6. Topology and authorization: gRPC in process
 
 **Decided: the gRPC server runs inside the daemon.** No gateway process, no byte relay. This
-costs the measured **+11.2 MB** on every daemon that enables it (§3) and gives up the crash and
-memory isolation a separate process would have provided. What it buys is worth more than both,
-and it resolves two open questions rather than deferring them.
-
-### 8.1 Why this is the better call, not just the simpler one
+costs the measured +11.2 MB on every daemon that enables it and gives up the crash and memory
+isolation a separate process would have provided. What it buys is worth more than both.
 
 **The delegated-auth problem disappears instead of being mitigated.** A gateway holds *one*
 CEDAR identity, so either every Flight user collapses to the gateway's access level — a
 non-starter on a shared AP, where READ-level private-attribute stripping is exactly what a
 mis-scoped relay would leak — or the gateway forwards caller identity and the daemon trusts a
-token that is not the caller's unless it validates it as such. In process, each gRPC connection
-carries its own credentials and is authorized directly. There is nothing to delegate.
+token that is not the caller's. In process, each gRPC connection carries its own credentials and
+is authorized directly. There is nothing to delegate.
 
 **The authorization layer is already transport-independent.** `server.Authorizer` is
-`func(perm, peerAddr, user string) bool`, documented as having the same shape as
-`cedarserver.Server.Authorizer` and `authz.Policy.Authorize` (`server/server.go:40`). Nothing
-about `effectiveLevel` or `levelOptions` (`server/server.go:379-405`) knows it is sitting on a
-CEDAR connection — they take an address and a mapped user. So an in-process gRPC path reuses
-the level escalation and the `dbrpc.ServeOptions` (read-only, private stripping, privileged)
-**verbatim**, and a peer gets the same access over Flight as over CEDAR by construction rather
-than by a second policy that has to be kept in agreement.
+`func(perm, peerAddr, user string) bool`; nothing about `effectiveLevel` or `levelOptions` knows
+it is sitting on a CEDAR connection. So the in-process path reuses the level escalation and the
+`dbrpc.ServeOptions` verbatim, and a peer gets the same access over Flight as over CEDAR by
+construction rather than by a second policy that has to be kept in agreement.
 
-**It settles §9.5's fork.** An internal ANSI opcode has no text form, so a gateway front end
-would have forced `dbrpc` to carry a serialized AST. In process there is no wire between the
-binder and the evaluator: the front end parses, binds against the type map and lowers to a
-`vm` program in the same address space that runs it. The internal opcode stays genuinely
-internal, and `dbrpc` needs no new capability at all. **The two decisions fit together** —
-in-process is what makes the internal opcode free.
+**It also removes the relay from the hot path**, which is what makes the typed value stream
+(§7.2) possible at all.
 
-**It removes the relay from the hot path.** Phase 2's point is an Arrow batch built straight
-from columnar segments; a gateway would have re-encoded or relayed every byte of it.
+### 6.1 The listener
 
-### 8.2 The listener
+Not through HTCondor's shared port: `Daemon.Listener` resolves the command socket through CEDAR
+routing a gRPC client cannot speak. So a **dedicated TCP port, opt-in by config**
+(`HTCONDORDB_FLIGHT_ADDRESS`, default empty), following the precedent of the metrics/pprof
+listener — a daemon that does not set it is unchanged and pays only the binary size. A
+**Unix-domain-socket listener** as well, for local clients: peer credentials over a UDS are the
+only thing that reproduces CEDAR's FS authentication. Caveat from experience: `sun_path` is ~100
+bytes and a glidein's sandbox path blows it, so bind a bare short name in the socket directory
+and publish the short path, never a long absolute one.
 
-Not through HTCondor's shared port. `Daemon.Listener` resolves the command socket through the
-inherited shared-port endpoint, an inherited listener, or a self-registered named socket
-(`golang-htcondor/daemon/daemon.go:259`) — all CEDAR routing a gRPC client cannot speak. So:
+**One difference from the metrics listener matters.** Its comment says it "carries no secrets —
+storage sizes and timings — but bind it to a trusted interface". A Flight listener carries **ad
+contents**. "Trusted interface" is not an adequate control for it; authentication is mandatory,
+and that distinction belongs in the config documentation so nobody reasons from the metrics
+precedent to an open port.
 
-- **A dedicated TCP port, opt-in by config**, following the precedent already in the daemon:
-  the metrics/pprof HTTP server is a second in-process listener gated on
-  `HTCONDORDB_METRICS_ADDRESS` (`cmd/htcondordb/main.go:479`). Name this one the same way
-  (`HTCONDORDB_FLIGHT_ADDRESS`), default empty, so a daemon that does not set it is unchanged
-  and pays nothing but the binary size.
-- **A Unix-domain-socket listener as well**, for local clients: peer credentials over a UDS are
-  the only thing that reproduces CEDAR's FS authentication, which is how local tools
-  authenticate today without a token. Caveat from experience: `sun_path` is ~100 bytes, and a
-  glidein's sandbox path blows it — bind a bare short name in the socket directory and publish
-  the short path, never a long absolute one.
+### 6.2 Authentication
 
-**One difference from the metrics listener that matters.** Its comment says it "carries no
-secrets -- storage sizes and timings -- but bind it to a trusted interface". A Flight listener
-carries **ad contents**. "Trusted interface" is not an adequate control for it; authentication
-is mandatory (§8.3), and that distinction should be in the config documentation so nobody
-reasons from the metrics precedent to an open port.
-
-### 8.3 Authentication: produce a `user`, then reuse everything
-
-The only CEDAR-specific thing in the path is *authentication* — turning a connection into a
-mapped fully-qualified user. Three mechanisms, in the order they are worth building:
-
-1. **Bearer token in gRPC metadata, validated as an HTCondor IDTOKEN / SciToken** by the same
-   code CEDAR uses. This reuses the existing trust root (signing keys under `passwords.d`, read
-   as root) and yields the same identity string the CEDAR path produces, so no new trust
-   infrastructure and no second notion of who a caller is. It is also what every ADBC client
-   can already send.
-2. **Peer credentials on the UDS**, mapping uid to a user in `UID_DOMAIN` — the FS equivalent,
-   for local tooling.
-3. **mTLS**, mapping the client certificate subject, mirroring CEDAR's SSL method. Reuse
-   HTCondor's existing `AUTH_SSL_*` parameters for the server's own key and chain rather than
-   inventing a parallel set.
+The only CEDAR-specific thing in the path is authentication — turning a connection into a mapped
+fully-qualified user. Three mechanisms: a **bearer token** in gRPC metadata validated as an
+HTCondor IDTOKEN / SciToken by the same code CEDAR uses (reusing the existing trust root, and
+what every ADBC client can already send); **peer credentials on the UDS**, mapping uid to a user
+in `UID_DOMAIN`; and **mTLS** mapping the certificate subject, reusing HTCondor's `AUTH_SSL_*`
+parameters rather than inventing a parallel set.
 
 **Authentication is OPTIONAL by default, following CEDAR rather than being stricter.** An
-earlier draft of this section argued the opposite -- fail closed, no anonymous access, on the
-grounds that a new endpoint has not inherited HTCondor's `OPTIONAL` compatibility concession.
-That was overruled, and the counter-argument is the better one.
+earlier draft argued the opposite — fail closed, no anonymous access. The counter-argument is
+better: CEDAR already serves an anonymous peer, `peerUser` returns `""` for a connection that
+negotiated nothing, the `ALLOW_`/`DENY_` policy is asked about that empty identity, and whatever
+it answers is the answer. An endpoint that refused the same caller would not be safer, it would
+be *inconsistent* — two doors onto one store with two postures, where an operator who tightened
+`ALLOW_READ` would have tightened only one and could not easily tell which. Matching CEDAR means
+the Flight endpoint adds no exposure of its own.
 
-CEDAR already serves an anonymous peer: `peerUser` returns `""` for a connection that
-negotiated no authentication (`server/server.go:518`), the `ALLOW_`/`DENY_` policy is asked
-about that empty identity, and whatever it answers is the answer. An endpoint that refused the
-same caller would not be safer, it would be *inconsistent* -- two doors onto one store with two
-different postures, where an operator who tightened `ALLOW_READ` would have tightened only one
-of them and could not easily tell which. Matching CEDAR means the Flight endpoint adds no
-exposure of its own: what an anonymous caller may read here is exactly what it may already read
-there, decided by the same policy.
-
-Permissive is not open. An anonymous caller still has to satisfy `ALLOW_READ`, still gets READ
-level only, and still has private attributes stripped. What changed is *who decides* -- the
-pool's policy rather than this code. `REQUIRED` remains available for a pool that wants this
-door stricter than its CEDAR one.
+Permissive is not open. An anonymous caller still satisfies `ALLOW_READ`, still gets READ level
+only, and still has private attributes stripped. What changed is *who decides*. `REQUIRED`
+remains available for a pool that wants this door stricter.
 
 **The distinction that does hold is between presenting nothing and presenting something bad.**
-No credential is anonymous. A credential that is present and fails to verify is an error that
-refuses the connection, because downgrading it would leave a caller who meant to authenticate
-puzzled by what is missing -- and would turn a revoked or expired token into a silent loss of
-privilege rather than a reported one.
+No credential is anonymous. A credential that is present and fails to verify refuses the
+connection, because downgrading it would leave a caller who meant to authenticate puzzled, and
+would turn a revoked or expired token into a silent loss of privilege rather than a reported one.
 
-### 8.4 Authorization, and one thing that must not leak
+### 6.3 Authorization, and one thing that must not leak
 
-Reuse `effectiveLevel` and `levelOptions` unchanged. Two additional gates:
+`effectiveLevel` and `levelOptions` are reused unchanged, with two additional gates:
 
-- **Flight is READ-only in v1 regardless of the peer's level.** Writes are a non-goal (§11), so
-  the Flight path asks for read-only `ServeOptions` even for a peer authorized at WRITE or
-  DAEMON. Enabling an endpoint should never be the thing that widens what a principal can do.
-- **The describe-table op must filter private attributes at this boundary.** The type profile
-  reports no values, but it does report numeric **bounds**, and a bound on a private attribute
-  is a disclosure even though the value is not — `AttrTypeProfiles`' doc comment says so and
-  deliberately does not filter, because the filter belongs where the serving level is known.
-  This is that place. A profile served at READ carries the same private-attribute stripping as
-  an ad does.
+- **Flight is READ-only regardless of the peer's level.** Writes are a non-goal, so the Flight
+  path asks for read-only `ServeOptions` even for a peer authorized at WRITE or DAEMON. Enabling
+  an endpoint should never widen what a principal can do.
+- **The type report filters private attributes at this boundary.** The profile reports no values,
+  but it does report numeric **bounds**, and a bound on a private attribute is a disclosure even
+  though the value is not. `AttrTypeProfiles` deliberately does not filter, because the filter
+  belongs where the serving level is known. This is that place.
 
-### 8.5 What in-process costs, and the mitigations that are part of the work
+That second gate grew teeth when the type report started **evaluating** (§5.1). The op used to
+classify wire nodes, and a sealed node classifies as sealed, so privilege never mattered to it.
+Evaluating resolves references, so `Derived = Salary * 2` would carry `Salary`'s exact numeric
+bounds into a profile named `Derived`, past the name filter. Two rules, both at the source: a
+private reference resolves to undefined *inside the resolver*, where it is exact (a static walk
+of the expression misses references reached by selection or subscript), and the connection's
+entitlement reaches the op, so an unprivileged peer evaluates with no key.
+
+### 6.4 What in-process costs, and the containment that replaces isolation
 
 A pathological read now runs in the daemon's address space. This is not hypothetical: a novel
 `COUNT` shape panicked htcondordb in production for a 15-second outage. A gateway would have
-contained that. In process, containment has to be built:
+contained that; in process, containment has to be built.
 
-- **A panic barrier per RPC.** DONE. A deferred `recover()` *in the handler goroutine itself* —
-  a helper that wraps `recover()` in another function catches nothing, which is a mistake
-  already made once in this codebase. One query must not take the store down. **Still
-  untested**: removing it passes the suite, because nothing in the fixtures panics and inducing
-  one would mean an injection point in production code. Correct by inspection is not the same
-  as covered.
-- **A bounded Arrow allocator per stream.** DONE (`arrowtype.Budget`). One wrinkle worth
-  recording: `memory.Allocator` is `Allocate(size int) []byte` with no error return, and a nil
-  slice makes a builder write into nothing. **Panicking is the only refusal the interface
-  permits**, so the budget panics with a typed error and the handler's barrier turns it into a
-  failed request. A budget refusal reports `ResourceExhausted` with the numbers in it, kept
-  distinct from an internal fault, because the client's recourse is a narrower query rather
-  than a bug report.
-- **A concurrency cap on streams.** DONE. It **refuses rather than queues**: a queue of scans
-  inside the daemon is the thing the cap exists to prevent, and a refused client can retry
-  while one left hanging cannot tell whether to.
-- **Cancellation that actually reaches the scan.** The handler's context is the one the scan
-  takes, so a client hanging up stops the work. **Not independently tested** -- the flush select
-  honours `ctx.Done()`, but nothing proves a disconnect mid-stream actually stops the scan
-  rather than running it to completion for nobody.
+- **A panic barrier per RPC.** A deferred `recover()` *in the handler goroutine itself* — a
+  helper that wraps `recover()` in another function catches nothing, a mistake already made once
+  in this codebase. **Still untested**: removing it passes the suite, because nothing in the
+  fixtures panics and inducing one would mean an injection point in production code. Correct by
+  inspection is not the same as covered.
+- **A bounded Arrow allocator per stream** (`arrowtype.Budget`). `memory.Allocator` is
+  `Allocate(size int) []byte` with no error return, and a nil slice makes a builder write into
+  nothing, so **panicking is the only refusal the interface permits**. The budget panics with a
+  typed error and the handler's barrier turns it into a failed request, reported as
+  `ResourceExhausted` with the numbers in it and kept distinct from an internal fault, because
+  the client's recourse is a narrower query rather than a bug report.
+- **A concurrency cap on streams** that **refuses rather than queues**: a queue of scans inside
+  the daemon is what the cap exists to prevent, and a refused client can retry while one left
+  hanging cannot tell whether to.
+- **Cancellation that reaches the scan.** The handler's context is the one the scan takes.
+  **Not independently tested** — the flush select honours `ctx.Done()`, but nothing proves a
+  disconnect mid-stream stops the scan rather than running it to completion for nobody.
 - **Watch retained allocators.** Arrow batches are large allocations in the same heap as the
   block cache and the mmap'd segments; a retained encoder pool here is the shape that already
   produced a 3 GB heap once.
 
-### 8.6 Open
+**Open:** port advertisement — address file, collector ad, both, or neither? Whether the UDS
+listener should be on by default when the TCP one is not.
 
-Port advertisement — address file, collector ad, both, or neither? Whether the UDS listener
-should be on by default when the TCP one is not. And whether `HTCONDORDB_FLIGHT_ADDRESS` alone
-should enable the endpoint or whether it needs a separate boolean, as pprof has.
+## 7. Status
 
-## 9. Plan: ADBC (rung 2) is the target
-
-**Decision: ADBC.** That means an Arrow Flight **SQL** server. Rung 3 (Airport) is not being
-built; §6 and §7 stay as reference should that change. Rung 0 is not a deliverable (§9.4) —
-its pieces are prerequisites that happen to be independently useful.
-
-### 9.1 What arrow-go already provides
-
-`arrow/flight/flightsql` carries most of the protocol:
-
-- **`flightsql.Server`** is a wide interface (~45 methods), but **`BaseServer`** supplies
-  not-implemented defaults for all of them, so we implement only what we serve.
-- **`BaseServer` implements `SqlInfo` for real** — `RegisterSqlInfo(id, value)` plus
-  `GetFlightInfoSqlInfo`/`DoGetSqlInfo`. This is what an ADBC client reads at connect.
-- **`flightsql/schema_ref`** holds the spec-fixed Arrow schemas for every metadata command
-  (`Catalogs`, `DBSchemas`, `Tables`, `TablesWithIncludedSchema`, `TableTypes`, `PrimaryKeys`,
-  `SqlInfo`, `XdbcTypeInfo`, ...). Metadata is **conformance work, not design work**.
-- **A complete SQLite reference server** ships in the package (`example/`,
-  `sqlite_server_test.go`). Read it before writing anything.
-
-### 9.2 Minimum viable ADBC server
-
-Everything else stays on `BaseServer`'s defaults.
-
-| Method | Why |
-|---|---|
-| `GetFlightInfoStatement` | SQL text in → `FlightInfo` with the result schema and one endpoint. Needs §5 to answer the schema **without executing**. |
-| `GetSchemaStatement` | lets a client ask for the schema alone |
-| `DoGetStatement` | ticket → `(*arrow.Schema, <-chan flight.StreamChunk)`; this is where the encoder lands |
-| `RegisterSqlInfo` | the handful of entries ADBC reads at connect |
-| `DoGetCatalogs` / `DoGetDBSchemas` / `DoGetTables` / `DoGetTableTypes` | catalog browsing; schemas come from `schema_ref` |
-
-**Deliberately deferred:** Substrait (both plan variants), transactions
-and savepoints, primary/imported/exported keys and cross-reference, `DoPutCommandStatementUpdate`
-(writes), `StatementIngest`, `XdbcTypeInfo`, `CancelFlightInfo`.
-
-**Prepared statements with bound parameters are DONE**, which was listed here as the first thing
-to add after v1 because it is how ADBC binds parameters. `CreatePreparedStatement` +
-`DoPutPreparedStatementQuery` + `DoGetPreparedStatement` + `ClosePreparedStatement` are served,
-and `ansi.LowerTemplate` lowers a predicate with its `?` holes left open.
-
-Two decisions in that increment are worth recording, because both were arrived at by trying the
-obvious thing first:
-
-- **The lowered predicate is a FRAGMENT LIST, not a string with substitution markers.** A marker
-  scheme has to prove no other part of the expression can contain the marker, and the one
-  caller-controlled part is a string literal, whose rendered form can hold any byte that is not
-  a quote or a backslash. Binding is therefore a concatenation of pieces that were never
-  adjacent, and there is nothing to search. `TestBoundStringCannotEscapeItsLiteral` is the
-  check.
-- **A parameter slot covers the WHOLE comparison, not the value.** A NULL bound value does not
-  compare the column against null; it makes the comparison yield NULL, which drops the row --
-  `false` in a ClassAd WHERE clause, and `Cpus == false` is not it. So the slot renders either
-  `Cpus == 4` or `false`, decided where the operator is still in scope.
-
-A placeholder is validated for lowerability at PREPARE time, with no value, so every refusal the
-inline path gives is given to the parameterised path from the same code: `NOT Owner = ?` and
-`Owner > ?` are refused at the prepare, not at the bind. `executemany` over a SELECT is refused
-rather than served from the first parameter set, because N parameter sets are N result sets and a
-DoGet returns one.
-
-**A real ADBC driver is in CI, and it is not redundant with the Go tests.** Every Go test here
-drives arrow-go's own `flightsql.Client` against arrow-go's own `flightsql` server, which checks
-that two halves of one library agree — not that the endpoint is conformant. Connecting
-`adbc_driver_flightsql` for the first time failed immediately:
-
-```
-NOT_FOUND: [FlightSQL] no information for sql info number 1 (GetInfo(DoGet))
-```
-
-`FLIGHT_SQL_SERVER_VERSION` was never registered, and **one missing SqlInfo entry fails a
-client's whole `adbc_get_info()` call** — so the endpoint looked broken to every ADBC client
-while the Go suite was green, because arrow-go's client never asks for it. Registered now, along
-with the facts a client asks next (`SERVER_SQL`, `SERVER_SUBSTRAIT`, transaction and cancel
-support), and the daemon passes its build stamp so deployments are distinguishable from the
-client side.
-
-The tests live in `python/tests/test_flightsql_adbc.py` against the session daemon's Flight
-listener — the same process that serves CEDAR, because that is how the endpoint deploys and a
-separate daemon would test a configuration nobody runs. `HTCONDORDB_REQUIRE_ADBC=1` turns a
-skipped driver into a failure, and the CI step additionally greps for named passes, because
-neither pytest's exit status nor a REQUIRE flag can speak for a test that was never collected.
-
-This is the same lesson as the DuckDB job (§12): a reader that is the writer's own library agrees
-with it by construction.
-
-### 9.3 Workstreams and what actually blocks what
-
-```
-W1  ANSI SQL dialect        (repl only)            ─┐
-W2  Type/schema contract §5 (collections→db→dbrpc) ─┼─ all three can start now
-W5  In-process gRPC §8      (listener + authn)      ─┘
-                                   │
-W3  Arrow encoder  ────────────────┘ (needs W2)
-                                   │
-W4  Flight SQL server ─────────────┘ (needs W3)
-```
-
-- **W1 — ANSI dialect.** A compiler from ANSI SQL to a ClassAd expression: no Arrow, no gRPC,
-  no wire change, no storage change (§9.5). Ships on its own as `.dialect ansi` (§10) and
-  improves the REPL and Python driver independently of everything here. It binds against W2's
-  type map, so it wants W2 first; and because ADBC always speaks ANSI, W4 needs *some* W1 —
-  though not a complete one, since unsupported constructs are refused rather than lowered.
-- **W2 — type/schema contract (§5).** Export `adKind` out of `collections`; the describe-table
-  op (opcode 66); the type map beside the columnar schema with its generation; exact integer
-  min/max captured at seal; the coercion lattice and its counters. Ships on its own: it is
-  what lets `GetFlightInfoStatement` answer a schema without executing, **and** it fixes the
-  inference divergence between the DB-API driver and the Grafana plugin today.
-- **W3 — Arrow encoder.** Rows → Arrow against W2's declared schema; later columns → Arrow
-  (the old Phase 2, below). Carries one hard security requirement: because it evaluates
-  expressions (§5.1), it must evaluate through the **redacted** path for an unprivileged
-  reader, or it becomes the private-attribute oracle `private_gate.go` exists to prevent.
-- **W4 — Flight SQL server.** The §9.2 method set over the existing `repl` executor, in the
-  daemon (§8), behind an opt-in listener. Needs enough of W1 to lower whatever SQL it accepts,
-  and refuses the rest (§9.5).
-- **W5 — in-process gRPC topology and authorization (§8).** Settled: the gRPC server runs in
-  the daemon, so there is no gateway identity to delegate and the existing `Authorizer` is
-  reused verbatim. What remains is implementation, not design: the opt-in listener (TCP and
-  UDS), token/peer-cred/mTLS authentication producing a mapped user, and the containment that
-  in-process requires -- per-RPC panic barrier, bounded Arrow allocator, stream concurrency cap,
-  cancellation that reaches the scan.
-
-**Then, separately: the columnar encoder.** Emit Arrow batches built directly from columnar
-segments rather than from reassembled ads. This is where the vectorized engine pays off, and it
-is real work in classad/collections, not plumbing: there is **no "column batch out" API** today.
-`colproject` and `colvec` feed the **matcher**, not an external consumer, and vectorization
-**declines per block** (string columns, expression escapes, heavily-superseded blocks), so the
-producer must handle a stream where some blocks arrive columnar and others reassemble row-wise
-— while emitting one stable Arrow schema throughout (§5.7). Measure against
-`QueryRawWireStream` (`dbrpc/queryraw.go:467`), not against the string path, or the comparison
-will flatter the result: mutable reads are decompression-bound and per-record, so part of the
-win is available without Arrow at all.
-
-### 9.4 Rung 0 is a prerequisite, not a deliverable
-
-Rung 0 adds **no capability that is impossible today**. pandas already works through the
-DB-API (`python/README.md`), DuckDB is already reachable via a pandas hop, and the capi cursor
-already bounds memory by batching at `rowChunkBytes`. What it changes is that types stop being
-guessed (§5) and that five representations — ad text, ClassAd parse, JSON, Python objects,
-pandas inference — collapse to one. The first is a correctness fix; the second is a large
-constant factor. Neither is a feature.
-
-Its value is that W2 and W3 are unavoidable for ADBC, and this is where they can be built and
-verified against real pool data with no gRPC and no protocol conformance in the way. Expose
-them (`.arrow`/`.arrows` in the CLI beside `.format`, `arrow()` on the Python client) because
-it is nearly free once the encoder exists — not because it is the ADBC milestone.
-
-### 9.5 The dialect is a property of the front door, not of a connection
-
-**The wire form stays ClassAd. ADBC is always ANSI.** The ANSI front-end is a *compiler*: it
-parses SQL, binds it against the §5 type map, and lowers the expression to a ClassAd
-expression (or straight to a `vm` program) before anything crosses dbrpc. The store keeps
-evaluating exactly one language.
-
-This is better than making the dialect a connection option, which an earlier draft of this
-section proposed:
-
-- **There is no default to get wrong and no flip to stage.** Flight SQL is ANSI from its first
-  release, so no query ever changes meaning underneath a client. The undiscoverability problem
-  disappears with it — a client never has to ask which dialect it got, because the endpoint
-  only ever speaks one.
-- **The wire protocol does not change**, so there is one constraint language to version, test
-  and fuzz, and the existing `dbrpc` surface is untouched.
-- **`.dialect ansi` in the REPL becomes the same code path**, which is how the lowering gets
-  tested without a gRPC stack anywhere in the picture.
-
-Four consequences, all of them real:
-
-**(1) W1 becomes a prerequisite for W4 — but a gradual one.** The ADBC endpoint cannot ship
-without *some* ANSI front-end. It can ship without a *complete* one, because an unsupported
-construct is **refused at bind time**, not approximated. Note the asymmetry with rung 3 (§7):
-there, dropping a filter we could not translate was safe because Airport re-filters on the
-client. Here **nothing downstream corrects us**, so the rule inverts — *refuse, never
-approximate*. A construct we cannot lower faithfully is an error, and that is the whole reason
-partial ANSI is safe to ship.
-
-**(2) Case-sensitive equality needs no new operator: `=?=` is it, and it is already indexed.**
-ClassAd's identity operator is case-sensitive (`evaluateIs`, `classad/evaluator.go:1317`), and
-the storage layer optimizes it directly — there is a dedicated **exact-case key run** for
-`=?=`/`=!=` in the in-memory index (`collections/index.go:315`, with a case-uniform-bucket
-optimization so it does not double memory) and in the archive sidecar
-(`collections/archive_mmapindex.go:185`, binary-searched by `catFindExact`). The planner
-already routes it (`collections/vm/probe.go:267`). So ANSI `Owner = 'x'` lowers to
-`Owner =?= "x"`: exact, case-sensitive, and an index probe. No grammar extension, and no
-fold-term hint — an earlier draft of this section proposed
-`Owner == "x" && strcmp(Owner, "x") == 0`, which was solving a problem the index already solves.
-
-For the record on why a `strcmp` idiom would be merely *worse* and not catastrophic: with
-`OpCallFunc`, a strict built-in compiles natively and the program stays `Native()`, so it keeps
-the column prefilter and the vector executor. What it does not get is an **index probe**,
-because `probe.go` matches operator shapes, not function calls. That is also the reason not to
-reach for it elsewhere: a function call is a comparison the planner cannot see.
-
-**The remaining gap is three-valued logic, and an opcode closes it better than a lowering
-trick.** `=?=` returns **false** on a type mismatch, so `Owner =?= "x"` with `Owner` undefined
-is false where SQL yields NULL. Under `AND` and `OR` that is unobservable for a WHERE clause
-(`NULL AND TRUE` and `false && true` both drop; `NULL OR TRUE` and `false || true` both keep).
-It diverges in exactly two positions: under `NOT`, where SQL drops a NULL row and ClassAd keeps
-it since `!false` is true; and wherever the value is *surfaced* rather than filtered on
-(`CASE WHEN`, `IS NOT TRUE`, a projected boolean).
-
-An earlier draft proposed a **polarity-aware lowering** -- bare `=?=` in positive position,
-a guarded `isUndefined(x) ? undefined : (x =?= lit)` under negation. That works and is the
-wrong trade: it produces two forms of every predicate, one of which loses the index, and
-polarity is exactly the kind of analysis that is correct in review and wrong inside a `CASE`
-inside a `NOT` inside an `OR`.
-
-**So equality gets an internal opcode too, and the family is uniform:** ANSI `=`, `<>`, `<`,
-`<=`, `>`, `>=` as opcodes in the AST/`vm` space, case-sensitive and NULL-propagating, with no
-surface syntax. One lowering per operator, no polarity analysis, and the semantics stated once
-in the opcode rather than encoded in an idiom. Equality maps onto the same exact-case index run
-`=?=` already uses, so it keeps the probe while carrying SQL's three-valued logic; ordering
-scans, because no fold-sorted structure can prune a byte-ordered range.
-
-**String *ordering* needs an operator, not a function.** There is no case-sensitive relational
-operator to lower to: `=?=` answers equality only, and the dictionary is fold-sorted so its
-ordering cannot serve a byte-ordered range anyway. Lowering `Owner > 'R'` to
-`strcmp(Owner, "R") > 0` would work and is the wrong shape -- `probe.go` matches operator
-SHAPES, not function calls, so an idiom pretending to be a comparison is invisible to the
-planner, and every future reader has to recognise the idiom to know what it means.
-
-So this is the second place an **internal opcode** is the answer (§9.5): a case-sensitive
-relational comparison in the AST/`vm` space, with no surface syntax. It will still scan -- no
-fold-sorted structure can prune a byte-ordered range -- but it is a comparison the planner and
-the vector executor can SEE, rather than a call they must pattern-match, and the semantics are
-stated once in the opcode instead of encoded in an idiom. Being a scan should be visible in
-`EXPLAIN` rather than discovered.
-
-**An INTERNAL opcode is the recommended direction — better than the polarity analysis above.**
-Not a grammar extension: nothing reachable from the external syntax, which would be a public
-API that cannot be withdrawn and would leak through the query log, `EXPLAIN` output and
-copy-paste. An opcode in the AST/`vm` space only, corresponding *directly* to ANSI `=` —
-case-sensitive, type-strict, **undefined-propagating**. Then there is **one** lowering rather
-than two, so no polarity analysis and nowhere to get it wrong inside a `CASE` inside a `NOT`
-inside an `OR`; and it is always indexable, because the opcode carries the 3VL semantics
-instead of trading them away.
-
-**The cost is the hazard class this tree already knows: an operator must be implemented in
-every evaluation path or it silently misbehaves on one** — the scalar interpreter, the
-vectorized executor, the compiler, the probe/index planner, and the archive sidecar, which are
-the same mutable/archive and in-memory/persistent splits that have produced divergence bugs
-here before. The in-flight `OpCallFunc` work is the scale model: one opcode touches
-`opcode.go`, `compile.go`, `interp.go`, `program.go`, `vecexec.go` and `classad/vm_support.go`,
-plus a strictness taxonomy to justify what may and may not be lowered. A conformance suite
-running every operator through every path, the vectorized one included, is part of the work.
-
-**W1 must be based on that in-flight work, not run parallel to it** — it occupies exactly these
-files.
-
-**Where W1 runs is settled by §8, and that is what makes the opcode free.** An internal opcode
-has no text form, so a gateway front end would have forced `dbrpc` to carry a serialized AST.
-With gRPC in process there is no wire between the binder and the evaluator: the front end
-parses, binds against the type map (§5.7) and lowers to a `vm` program in the same address space
-that runs it. The opcode stays genuinely internal, `dbrpc` needs no new capability, and
-`EXPLAIN` reports the real plan. W1's output is an expression tree, not a string.
-
-**(3) The §5 type map makes a real binder possible, which is strictly better than lowering.**
-ClassAd yields ERROR for a cross-type comparison (`valuesEqual`, `classad/evaluator.go:1258`);
-SQL rejects it when the statement is bound. With declared column types in hand, the ANSI
-front-end can refuse `WHERE Owner > 5` at bind time with a type error, the way a SQL engine
-does, instead of lowering it and quietly filtering every row out. This is a genuine W2 → W1
-dependency and an argument for doing W2 first.
-
-**(4) Three-valued logic lines up; the gaps are types.** `!undefined` is undefined
-(`classad/evaluator.go:725`), `undefined == x` is undefined, and a row whose constraint is
-undefined fails it — which matches SQL dropping a NULL predicate, including through `NOT`.
-The lowering vocabulary is good: `substr`, `size`, `regexp`, `replace`,
-`strcat`, `int`/`real`/`string`, `toupper`/`tolower`, `split`/`join`, `member`, `formattime`,
-`interval`, and the Elvis operator for `COALESCE`. What has **no** faithful ClassAd form, and
-must therefore be refused rather than approximated: `DECIMAL` arithmetic (no exact decimal
-type), true `DATE`/`TIME`/`TIMESTAMP` types as distinct from epoch integers, and any explicit
-`COLLATE`.
-
-**Record both forms.** Every logged statement and every `EXPLAIN` carries the ANSI source *and*
-the lowered ClassAd expression. Without that, debugging a wrong result means guessing at the
-lowering — and the index hint in (2) is only verifiable if the lowered form is visible.
-
-## 10. The ANSI SQL dialect (W1)
-
-Today a WHERE clause is a **ClassAd** expression captured verbatim, with a short list of SQL
-spellings translated at the token level (`repl/sqlexpr.go`): `CASE`, `'text'`, `=`, `<>`,
-`AND`/`OR`/`NOT`, `IS [NOT] NULL`. Everything else passes through byte for byte.
-
-W1 replaces that with a real front end: parse to an AST, **bind against the §5 type map**, and
-lower to a ClassAd expression (or straight to `vm`) — `LIKE`, `BETWEEN`, `IN`, `CAST`,
-`COALESCE`, `||`, string and date functions, SQL's NULL propagation — refusing at bind time
-anything it cannot lower faithfully. §9.5 is the contract it implements and the lowering
-vocabulary it has to work with.
-
-**ADBC does not choose a dialect**; the Flight SQL endpoint is ANSI-only (§9.5). The REPL keeps
-a choice, because it is the one place both dialects are useful — ClassAd stays the default for
-everyone who already types it, and `.dialect` beside `.format` is how the lowering gets
-exercised without a gRPC stack:
-
-```
-.dialect classad     # today's behavior (default)
-.dialect ansi        # the same lowering ADBC gets
-```
-
-**`.dialect` is SHIPPED** (`repl/dialect.go`). Three things about it are worth recording:
-
-- **It translates at the PARSE boundary, not after it.** `Statement.Where` is documented as "the
-  translated ClassAd constraint" — by the time the executor runs, `Owner = 'alice'` is already
-  `Owner == "alice"`, and handing that to a SQL parser produces nonsense rather than an error
-  anyone can act on. The first implementation did exactly that. The parser now also keeps the
-  clause's raw text (`WhereRaw`), which is what the ANSI lowering reads. The translation happens
-  once in `Exec`, before anything else, so the scan, a DELETE's selector and **EXPLAIN** all
-  work from one constraint — an EXPLAIN that reported the untranslated plan would describe a
-  query that never ran.
-- **It recurses into wrapped statements.** EXPLAIN wraps the statement it reports on and
-  `CREATE MATERIALIZED VIEW` embeds the SELECT that defines it; both carry the predicate.
-- **A JOIN or a set operation is refused under ANSI.** A bare column could belong to either
-  table, and lowering it against the first table's types would type it from the wrong one.
-
-The column types come from `arrowtype.Columns`, the **same mapping** the Flight SQL endpoint
-uses, deliberately in one place: two surfaces lower SQL against these types, and a second copy
-would let them disagree about a column's type and so about what a query means — exactly the
-divergence the `ansi` package exists to remove. The types are derived per statement rather than
-cached, so a column added during a session is visible immediately instead of being refused as
-unknown until the REPL restarts.
-
-ANSI is **strictly less capable** in the REPL, on purpose: `WHERE Owner > 'R'` works today and
-is refused under ANSI. The dialect is a compatibility and debugging tool — the only way to see
-what an ADBC client will get without an ADBC client in hand — not an upgrade path.
-
-**Shipped so far (the `ansi` package), and the one place it departs from this section.** The
-predicate subset is lowered: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`/`OR`/`NOT`, parentheses,
-`IS [NOT] NULL`, `IN`, `BETWEEN`, and the literals. String equality lowers to `=?=` per §9.5.
-
-The departure is polarity. §9.5 proposes a **guarded form** under negation; the implementation
-**refuses** there instead. Two forms of every predicate means one of them loses the index, and
-polarity is the analysis that is right in review and wrong three levels into a nested
-expression. Refusing is still a polarity analysis, but its failure mode is "you cannot write
-that yet" rather than silently wrong rows — and it is positional, so a string equality outside a
-`NOT` is unaffected and double negation returns to positive. The internal opcodes remain the way
-to lift the restriction, and nothing here blocks them.
-
-Also refused, each for a reason rather than for want of effort: string **ordering** (fold-order
-and byte-order are neither subset nor superset, and the dictionaries are fold-sorted so no index
-could serve a byte range), string **inequality** (its 3VL guard is correct but unverified
-against the index, and an unindexed inequality over a large table is better introduced
-deliberately than discovered), a **type-invalid** comparison (refused at bind time as a SQL
-engine does, rather than lowered into ClassAd's ERROR where it would quietly filter out every
-row), and an **unknown or untypeable** column.
-
-A caveat the in-process decision did NOT remove: the lowered constraint crosses `dbrpc` as
-**text**, because the Flight endpoint reads through an in-process loopback to reuse the
-authorization layer (§8.1). So an internal opcode with no surface syntax could not travel it as
-things stand — a second reason the refusal above is the right first move rather than a stopgap.
-
-**One caution, for the REPL only.** `.format` changes how results *print*; `.dialect` changes
-what a query *means* — `WHERE Owner = 'bbockelm'` folds case under ClassAd and does not under
-ANSI. So the mode has to be visible (prompt, `EXPLAIN`, and recorded on every logged statement
-alongside the lowered form) and set explicitly by scripts rather than inherited. ERROR needs no
-separate decision: §9.5(3) rejects the comparisons that would produce it at bind time.
-
-The existing dialect is otherwise in good shape for Flight SQL: GROUP BY, HAVING, DISTINCT,
-`COUNT(DISTINCT)`, `FILTER (WHERE ...)`, ranking window functions, `QUALIFY`, `time_bucket`,
-`EXPLAIN [ANALYZE]`, and server-side aggregate pushdown (`execSelect`, `repl/exec.go:1250`).
-Flight SQL additionally wants the catalog metadata commands (`CommandGetTables`,
-`CommandGetDbSchemas`, `CommandGetSqlInfo`) and prepared statements, mechanical once §5 exists.
-
-## 11. Non-goals, risks, open questions
-
-**Non-goals:** writes (Airport's `DoExchange`) — a second write path with its own transaction
-semantics for much less value than reads; scalar/table UDFs; `ALTER TABLE`; rung 1 as a
-destination.
-
-**Implemented so far.** The measurement (`collections.AttrTypeProfiles`, dbrpc op 68), the type
-decision and encoder (`arrowtype`), an Arrow IPC export (`arrowstream`, `htcondordb-cli
-arrow`), the ANSI predicate lowering (`ansi`), and a Flight SQL endpoint served in process
-(`flightsvc`) accepting `SELECT <cols|*> FROM <table> [WHERE <predicate>] [LIMIT n]` and
-refusing the rest. Verified against a non-Go consumer: 2000 real
-ap2001 history ads read back by pyarrow as 226 typed columns, with arithmetic over the columns
-the stray-expression bug would have made text.
-
-**Risks.** DuckDB's filter JSON is unversioned by policy (§7) — only if rung 3 is ever built.
-Catalog serialization cost for wide tables — measure a real jobs table early; §5.6 and SHA256
-caching are the answer. **An encoder that evaluates expressions must evaluate through the redacted
-path** (§5.1) or it becomes the private-attribute oracle `private_gate.go` exists to prevent.
-**In-process gRPC means a pathological read runs in the daemon's
-address space** (§8.5): the panic barrier, bounded allocator, concurrency cap and real
-cancellation are not polish, they are what replaces the isolation a separate process would have
-given. Phase 2 must not let an Arrow schema vary as blocks alternate between columnar and
-row-wise. And a novel query shape against production has crashed this daemon before, so every
-new read path is exercised against a local store first.
-
-**Open questions.** `_ad` as `utf8` or `map<utf8,utf8>`? Does the type map belong in the table
-catalog or a sidecar? At rung 0, is the unit of delivery a stream op or a file the client points
-`read_arrow()` at — and if a file, who cleans it up?
-
-## 12. Testing
-
-The hazard is **vacuous green**: a test passes identically whether pushdown worked or every
-filter was dropped, and whether a column came back `int64` or `utf8`. Row counts cannot tell the
-difference. So assert on:
-
-- the **Arrow type** of every column, against the declared type map;
-- coercion/null counters at zero for Tier A columns, non-zero where a fixture plants an escape;
-- a differential oracle — the same logical query through the REPL and through Arrow must agree,
-  including on case sensitivity;
-- in Phase 2, that blocks actually vectorized (the existing `vecSplit` counters) rather than
-  every block declining to the row path.
-
-Keep the integration suite inside the usual runtime budget; DuckDB-in-the-loop tests run on
-demand, not on every push.
-
-## 13. Progress: what is shipped, and what is left
-
-ADBC works end to end. A client connects, browses the catalog, is given a typed schema without
-executing anything, and reads `SELECT <cols|*> FROM <table> [WHERE <predicate>] [LIMIT n]` as
-Arrow batches, with `?` parameters bound through a prepared statement. Two *external* clients
-check it in CI rather than arrow-go checking itself (§12): the DuckDB CLI through `nanoarrow`,
-and `adbc_driver_flightsql` through gRPC.
-
-What is left is not transport. It is **breadth of SQL**, a **declared** schema rather than a
-sampled one, and getting the store's records here without a text round trip — which §13.2
-measures at **87% of a read's CPU**, against 3% for the Arrow encoding everyone assumed was the
-cost and under 10% for the storage read a columnar producer would accelerate. The columnar
-producer comes after those, and §13.2 says why in numbers.
-
-### 13.1 Shipped
+### 7.1 Shipped
 
 | | Where | Note |
 |---|---|---|
 | Type derivation (§5.1–§5.5) | `arrowtype/derive.go` | evaluate, coerce, widen int/real on exact bounds, text fallback |
-| Row encoder (§5.1) | `arrowtype/encode.go` | per-column coercion counters; the caller owes it redacted ads |
+| Row encoder | `arrowtype/encode.go` | per-column coercion counters; the caller owes it redacted ads |
+| Value encoder | `arrowtype/encode.go` | `AppendValues` runs the same coercion, counting and null rules as `Append`, so a row encoded from values and the same row from its ad land identically |
+| Schema fingerprint and pin (§5.7) | `arrowtype/fingerprint.go`, `flightsvc/pin.go` | the promised schema is the delivered one, or the fetch refuses |
+| Tail column (§5.6) | `arrowtype/derive.go` | `_ad`, the row's residue as bracketed ClassAd text |
 | Memory budget | `arrowtype/budget.go` | an allocator that panics, turned into one failed request |
 | Serverless export (rung 0) | `arrowstream/`, `htcondordb-cli arrow` | an `.arrows` file, read by DuckDB's `read_arrow()` |
-| In-process gRPC (§8) | `cmd/htcondordb/flight.go`, `flightsvc/session.go` | opt-in listener; a dbrpc loopback per connection |
-| Authentication and authorization (§8.3–§8.4) | `flightsvc/authn.go`, `session.go` | token or anonymous → CEDAR's own `Authorizer`; READ-only whatever the peer holds |
-| Containment (§8.5) | `flightsvc/statement.go`, `server.go` | panic barrier per stream, byte budget, stream cap that refuses rather than queues |
-| Flight SQL method set (§9.2) | `flightsvc/server.go`, `statement.go`, `prepared.go` | catalogs, schemas, tables, table types, statement, prepared + bind |
-| Projected scan, archives included | `flightsvc/statement.go` | the refs-chasing projection op: reaches an archive, pushes the projection down, keeps expressions evaluable |
-| Schema cache, privilege-scoped | `flightsvc/schemacache.go` | stops a derivation per RPC; makes the promised and delivered schema one object within the TTL |
+| In-process gRPC (§6) | `cmd/htcondordb/flight.go`, `flightsvc/session.go` | opt-in listener; a dbrpc loopback per connection |
+| Authn and authz (§6.2–§6.3) | `flightsvc/authn.go`, `session.go` | token or anonymous → CEDAR's own `Authorizer`; READ-only whatever the peer holds |
+| Containment (§6.4) | `flightsvc/statement.go`, `server.go` | panic barrier per stream, byte budget, stream cap that refuses rather than queues |
+| Flight SQL method set | `flightsvc/server.go`, `statement.go`, `prepared.go` | catalogs, schemas, tables, table types, statement, prepared + bind |
+| Typed value scan | `flightsvc/statement.go` | `opQueryValues`: evaluate in the store, ship columns, append to Arrow — no text |
+| Aggregates, GROUP BY, ORDER BY, DISTINCT (§7.4) | `flightsvc/analytic.go` | the `repl` executor, with result columns typed from the SELECT list |
+| Projected scan, archives included | `flightsvc/statement.go` | the refs-chasing projection op reaches an archive, pushes the projection down, keeps expressions evaluable |
+| Schema cache, privilege-scoped | `flightsvc/schemacache.go` | stops a derivation per RPC |
+| Admin type overrides | `cmd/htcondordb/flight.go` | `HTCONDORDB_FLIGHT_EXCLUDE_ATTRS`, `_ATTR_KINDS`, `_STRICT_MIXED_KINDS`, `_TIME_ATTRS` |
 | SqlInfo conformance | `flightsvc/server.go` | the entries a real driver asks for at connect, one of which failed every ADBC client while Go was green |
-| ANSI → ClassAd lowering (W1, §10) | `ansi/` | the comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, and `?` holes |
-| The same dialect in the REPL | `repl/dialect.go`, `-dialect` | one Arrow-column→SQL-kind mapping serves both front doors (`arrowtype/sqlkinds.go`) |
+| ANSI → ClassAd lowering (§8) | `ansi/` | the comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, and `?` holes |
+| The same dialect in the REPL | `repl/dialect.go`, `-dialect` | one Arrow-column→SQL-kind mapping serves both front doors |
+| Result-column typing | `repl/arrowcols.go` | the SELECT list typed against a table's declarations; shared, so the two front doors cannot disagree about what a query returns |
+| Arrow output in the REPL | `repl/arrowout.go`, `.format arrow` | a SELECT's result as Arrow IPC; refuses a terminal |
 
-### 13.2 Are we at the point of going straight from the vector engine to Arrow?
+**Prepared statements with bound parameters** are served. Two decisions in that increment are
+worth keeping, both arrived at by trying the obvious thing first:
 
-**No, and the gap is wider than plumbing.** What one row costs today:
+- **The lowered predicate is a FRAGMENT LIST, not a string with substitution markers.** A marker
+  scheme has to prove no other part of the expression can contain the marker, and the one
+  caller-controlled part is a string literal, whose rendered form can hold any byte that is not a
+  quote or a backslash. Binding is a concatenation of pieces that were never adjacent, so there
+  is nothing to search.
+- **A parameter slot covers the WHOLE comparison, not the value.** A NULL bound value does not
+  compare the column against null; it makes the comparison yield NULL, which drops the row —
+  `false` in a ClassAd WHERE clause, and `Cpus == false` is not it. So the slot renders either
+  `Cpus == 4` or `false`, decided where the operator is still in scope.
 
-```
-columnar segment → render ad text (classad) → dbrpc frame → classad.Parse (flightsvc)
-    → evaluate attribute by attribute → array.Builder.Append → Arrow buffer
-```
+**A real ADBC driver is in CI, and it is not redundant with the Go tests.** Every Go test drives
+arrow-go's own client against arrow-go's own server, which checks that two halves of one library
+agree — not that the endpoint is conformant. Connecting `adbc_driver_flightsql` for the first
+time failed immediately with `NOT_FOUND: no information for sql info number 1`:
+`FLIGHT_SQL_SERVER_VERSION` was never registered, and **one missing SqlInfo entry fails a
+client's whole `adbc_get_info()` call** — so the endpoint looked broken to every ADBC client
+while the Go suite was green, because arrow-go's client never asks for it.
 
-`doGetQuery` reads through `db.QueryTableStream` and parses each row with `classad.Parse`
-(`flightsvc/statement.go:474`). Columns are rebuilt a cell at a time out of text that was
-columnar two hops earlier.
+### 7.2 What a read costs
 
-Four things stand between that and a column handed straight out of the vector engine, and three
-of them are in classad rather than here.
+This is the measurement that decides the order of everything left.
 
-1. **There is no column-out API, and no selection.** `blockVecSource.LoadColumn`
-   (classad `collections/colvec.go:104`) is private, and the only exported vectorized entries
-   are `VectorEvalCount` and its grouped sibling — a count, and group accumulators. Nothing
-   hands back a `vm.Vec`, and nothing applies the match mask to produce the *surviving* rows'
-   values. The grouped path is the precedent to copy rather than a thing to extend: it reads the
-   group and aggregate columns through the block's columns **in every tier**, including tiers
-   where the predicate fell back to per-record evaluation, exactly so that group identity cannot
-   depend on which tier answered (`collections/colvecgroup.go`). A column producer needs the same
-   property for values.
-2. **A column handed out aliases the block.** `loadStr` deliberately does not copy — one
-   allocation per record made a string predicate slower than the row path — and the dictionary is
-   **per block** and fold-sorted. So a producer either copies, or pins the block for the life of
-   the batch; and an Arrow `DictionaryArray` cannot span blocks without remapping codes. Sealed
-   is not alive, which is the same lifetime question that has already bitten a read taken off a
-   segment here.
-3. **Vectorization declines per block, by design.** `vecSplit` (`collections/colvec.go:42`)
-   counts blocks served as vectors, blocks the executor declined (a string column, an expression
-   in the cold tail, Elvis), mostly-superseded blocks where evaluating every record is wasted
-   work, zone-pruned blocks, and windows with no columnar block at all. A producer therefore has
-   to emit **one stable Arrow schema** across a stream in which some blocks arrive columnar and
-   others reassemble row-wise (§5.7). That is a feature of the storage layer — a schema change
-   costs a slope rather than a cliff — and it is the constraint that makes this more than an
-   encoder.
-4. **dbrpc has no columnar frame, and the loopback is what buys redaction.** A columnar producer
-   inside `collections` would still render to text at the dbrpc boundary, so the win would stop
-   there. And the encoder *requires* ads already reduced to the reader's view and cannot check it
-   (`arrowtype/encode.go`); that holds today **by construction**, because every Flight read goes
-   through the dbrpc server's own private-attribute stripping and private-constraint gate
-   (`flightsvc/session.go`). Any path that bypasses dbrpc has to carry both with it, or Arrow
-   becomes the private-attribute oracle `private_gate.go` exists to prevent.
+`BenchmarkReadStages` and `BenchmarkReadShapes` read a 20 000-record columnarized archive with a
+six-column projection, medians of three to five runs, Apple M2 Pro. Ad width is a dimension of
+the benchmark rather than a detail: a six-column projection out of a nine-attribute record asks a
+different question from the same projection out of a job ad, and the narrow case flatters
+whichever path reads the whole record. The 45-attribute figures are the realistic ones.
 
-**And what would it be worth? Measured, and it is not what the plan assumed.**
-
-`BenchmarkReadStages` (`flightsvc/readcost_test.go`) reads a 20 000-ad archive projected to six
-columns, with the per-segment columnar accelerator off and on. Medians of five runs, ns per row,
-Apple M2 Pro:
-
-| | record tier | columnar tier | allocs/row |
-|---|---|---|---|
-| store scan + projection + **render** + loopback | 10 719 | **9 437** | 40 |
-| ClassAd text parse | 6 518 | **6 434** | 86 |
-| evaluate + Arrow append | 500 | **484** | 0.1 |
-| end-to-end over gRPC *(overlapped, not a sum)* | 15 618 | **13 773** | — |
-
-The stages are measured **in isolation**, not cumulatively, and the parse arm is the control that
-says so: it is the same text in both tiers and it measured the same, 6 518 against 6 515. An
-earlier cumulative version of this benchmark was non-monotone — the full gRPC read came out faster
-than a strict subset of its own work — because the dbrpc loopback serves from its own goroutine,
-so a "scan, then parse in the yield" arm runs the two concurrently and subtracting them attributes
-nothing. The end-to-end arm still overlaps by design; it is the number a user feels, and the
-others are the CPU it costs.
-
-**That first table hides its own answer, and a first reading of it got this wrong.** The top row
-is labelled "scan + projection + render + loopback" and was then reasoned about as if it were all
-*scan* — irreducible storage work — which produced a ceiling of 1.74x for ever removing the parse
-and the encode. Splitting the row apart kills that conclusion.
-
-**What "render" means here**, since the word is doing real work: a stored record is binary —
-inline attribute names and typed value nodes, each a tag byte plus a varint or a length-prefixed
-string. The text projection op walks each matched record and builds ClassAd SOURCE TEXT from it,
-literally the bytes `Owner = "user43"\nClusterId = 1029\n…`, which then crosses dbrpc as a string
-for the consumer to parse back. The wire op produces no text at all: it assembles a
-self-contained row by copying the stored nodes.
-
-`BenchmarkWireNativeRead` runs the same query both ways — same constraint, same matching, same
-projection, same reference closure, same loopback, a yield that only counts — and the wire scan
-costs **1 610 ns/row against the text projection's 9 437**, 5.9x less, over tight spreads (1.1%
-and 3.0% across five runs). The render was 83% of what the scan appeared to cost.
-
-**And that 83% is CPU, not payload.** The obvious alternative explanation is that the text form
-is simply bigger, so more bytes cross the pipe. Measured on the same records and projection, it
-is **156.3 bytes/row against 139.8 — a ratio of 1.12x**. Sixteen extra bytes a row through an
-in-process pipe is worth nanoseconds, so it accounts for well under 1% of the gap. What the text
-path is spending is the per-attribute work of FORMATTING: decode the node, turn an integer into
-decimal digits or a string into a quoted and escaped literal, write `Name = value\n`. The wire
-path copies the node's bytes instead.
-
-So the real attribution of a read, on the columnar tier, is:
+**Where the text path's CPU went**, on the columnar tier:
 
 | | ns/row | share |
 |---|---|---|
-| **render each record to text** | 7 827 | **47.9%** |
-| **ClassAd parse it back** | 6 434 | **39.3%** |
+| render each record to text | 7 827 | **47.9%** |
+| ClassAd parse it back | 6 434 | **39.3%** |
 | storage read + projection + loopback | 1 610 | 9.8% |
 | evaluate + Arrow append | 484 | 3.0% |
 
-**Render and parse are 87% of a read's CPU, and neither is work.** Both exist only because the
-relay renders text that the consumer immediately parses back.
+**Render and parse were 87% of a read, and neither is work** — only the cost of a relay that
+rendered text its consumer immediately parsed back. "Render" is literal: the text projection op
+walked each matched record and built ClassAd source bytes, `Owner = "user43"\nClusterId = 1029\n…`,
+which crossed dbrpc as a string. And that 87% is CPU, not payload: the text form is 156.3
+bytes/row against 139.8, a ratio of 1.12x, so sixteen extra bytes a row through an in-process
+pipe accounts for well under 1% of the gap. What the text path spent was the per-attribute work
+of *formatting*.
 
-Four things follow.
+**The typed value frame deleted it.** `opQueryValues` ships a column as a kind, a validity
+bitmap, a dense slice of that kind's values, and an exceptions list keyed by row — which is the
+shape an Arrow buffer wants. UNDEFINED and ERROR stay distinct rather than collapsing to null,
+and a list or nested ad crosses as the unparser's text with a `NonScalar` flag, because text is
+the only useful form of such a value but it must not arrive indistinguishable from a string.
 
-1. **The Arrow encoder is not the cost** — 3% of CPU and a tenth of an allocation per row, with
-   an expression-valued column among the six deliberately, since that is the case that must
-   evaluate rather than read. "Go straight from the vector engine to Arrow" is barely about
-   Arrow.
-2. **Reading values straight off the wire row is 7x.** A wire row is an inline-names ad:
-   `wire.Ad.LookupByName` finds one attribute's node bytes and `wire.LiteralValue` decodes a
-   scalar from them, so a value reaches an Arrow builder with no render and no ClassAd between.
-   Measured: **2 326 ns/row against 16 355 today, and 8 allocations a row against 88.** For a
-   projection of literal-valued attributes only, 2 043 — **8x**.
-3. **But that figure is a ceiling, not a promise.** The benchmark appends a null where a node is
-   not a literal and counts those (`fellthrough/row`); a real encoder must EVALUATE there, and on
-   this fixture `MemoryUsage` is an expression in every ad. A projection that includes an
-   expression-valued attribute pays for an evaluator on every row of it, and §5.8 says that on a
-   real AP such attributes are common in the stored form even though their evaluated kind is
-   uniform. The hybrid — literals read from the node, expressions evaluated — is the design, and
-   its real-world speedup sits between the 8x of the literals-only arm and whatever the evaluator
-   costs.
-4. **The columnar accelerator is worth 1.12x on a materializing read**, against the multiples it
-   earns on `COUNT` and `GROUP BY`. Not a disappointment: the vectorized engine's demonstrated
-   wins are on **match-only** work, where the answer is a count or a few group rows and nothing is
-   materialized. A readout that materializes every projected attribute of every matching record is
-   a different workload.
+| tier | projection | text ns/row | values ns/row | |
+|---|---|---|---|---|
+| record | literals | 12 592 | **6 220** | 2.0x |
+| record | with an expression | 17 715 | **10 357** | 1.7x |
+| columnar | literals | 5 561 | **2 113** | 2.6x |
+| columnar | with an expression | 23 424 | **2 246** | **10.4x** |
 
-So the columnar producer is still not the next thing to build, but for a better reason than the
-first reading gave: **87% of a read is a text round trip that no columnar work is needed to
-delete**, and the storage read it would actually accelerate is under 10%. Build the wire-native
-read first; whatever is left over is what the vectorized engine has to argue against.
+End to end over gRPC, which is the number a user feels rather than the CPU it costs — same
+fixture, same process, the only difference being which op the scan uses:
+
+| | ns/row | allocations | bytes |
+|---|---|---|---|
+| text projection, parsed back | 13 882 | 2 522 920 | 251 MB |
+| typed value stream | **2 234** | **365 927** | **41 MB** |
+| | **6.2x** | **6.9x** | **6.1x** |
+
+**The first version of that table said 2.06x, and it was measuring the consumer rather than the
+change.** `ValueBatch.ValueAt` recounts the validity bitmap from row 0 on every call, so reading
+a whole batch through it is quadratic in the batch size — and it is the obvious way to read one.
+Walking each column once with a running dense index took the same read from 6 257 to 2 254
+ns/row. Nothing about the op or the data changed; the accessor was three quarters of the cost. It
+is worth recording how it was caught, because the green tests could not: splitting the read put
+the store's own scan at 2 213 ns/row and the whole read at 6 257, which made "turning values into
+Arrow" cost seven times what turning *ads* into Arrow had cost. A component getting dramatically
+slower while doing strictly less work is not a result, it is a bug report.
+
+**So the remaining attribution is:** store side (scan, projection, evaluation, column packing,
+loopback) **2 213 ns/row**; everything this process adds to reach Arrow buffers, **41 ns/row**.
+**~98% of a projected read is now the storage scan.**
+
+Two things follow and are worth stating plainly. **The Arrow encoder is not the cost** — 3% of
+CPU and a tenth of an allocation per row, with an expression-valued column among the six
+deliberately, since that is the case that must evaluate rather than read. And **a columnar
+producer's entire upside is inside `collections`**; there is nothing left to win on the consumer
+side.
+
+**One attribute was costing a projection its fast path, and fixing that was the largest single
+win.** Projecting `MemoryUsage` reassembled 20 000 of 20 000 records against 349 for the same
+projection with a literal in its place. An expression cell is escaped out of its column, so it
+came back in the narrowed ad, the closure check correctly rejected it — it reads
+`ResidentSetSize`, which the projection did not name — and after eight consecutive misses the
+scan abandoned the columnar path for the rest of the segment. Columnarizing already computes a
+qualifying expression cell once and keeps the literal beside the block, which is how the
+aggregates read these attributes from columns; the projection resolved through the ad's wire
+bytes and never saw it. Substituting that literal took the read from 19 092 to 2 246 ns/row and
+246 to 18 allocations.
+
+**The gate on that substitution is the whole safety argument, and the obvious choice was wrong.**
+The storage layer's rule is that a computed value never appears in an ad as if it were the
+attribute's stored literal — a consumer that *relays* what it is given would ship an ad different
+from the record. `projPlan.closure` looks like the right licence and is not: it means the
+consumer follows references, and `QueryRawWireRefs` does that and then ships the entries. Gating
+on it put `Mem = 1` into relayed rows where the record holds `Mem = (Rss+1023)/1024`. The licence
+is a separate, strictly stronger flag — the consumer sees only the evaluated result.
+
+**`SELECT *` does not take the typed path, and the reason is structural.** The value stream
+returns one column per *requested* attribute, as values; the tail column (§5.6) is the complement
+of a whole record in its *stored* form, and the stream has neither the set nor the form. So the
+two are mutually exclusive, and the endpoint picks by whether the schema carries a tail: an
+explicit projection — what a client aggregating or joining actually issues — takes the fast path,
+and `SELECT *` keeps the text one. Pinned by a test that asserts which op each query shape
+reaches, because the rows are identical either way and the costs differ by 2x. Closing the gap
+means a frame that can carry a record's residue alongside the typed columns, which is an upstream
+change rather than a wiring one.
 
 **What this does not establish.** One machine, one dataset, one read shape: six columns out of a
 34-field schema. A wider projection moves work toward the scan and away from the per-record
 overheads; `SELECT *` more so. The archive here was columnarized on demand in one pass with every
 sealed segment covered, where a production table carries a backlog and an uncovered segment reads
-the old way. And the wire-native figure does not evaluate expressions, as item 3 says — it is the
-literal path's cost, measured, plus a fall-through count.
+the old way.
 
-**The first step was not columnar at all, and it is taken.** The scan no longer pulls whole ads
-as bracketed text: `QueryRawProjectRefsStream` applies the projection *inside* the decode walk,
-so a non-projected attribute is never rendered and a projection the hot header covers is served
-from the hot header alone. Refs-chasing rather than the plain projection op because this encoder
-evaluates — `MemoryUsage` projected without the siblings it is written over evaluates to
-undefined, which turns a good integer column into nulls. The same change made archive tables
-readable (§13.3).
+### 7.3 What is left
 
-`QueryRawWireStream` goes further and skips the text form altogether; a wire-form read measured
-12.8x end to end elsewhere in this tree, which is the same reason §9.3 insists the columnar
-encoder be measured against it and not against the string path. But it is **blocked upstream**,
-not merely next: `opQueryRawWire` is not served from an archive — probed directly, it answers
-*"QueryRawWire is not served from an archive; use QueryRawProject, which does read one"* — so
-adopting it today would re-break `history`. It needs the archive case added in classad first.
+Ordered by value per unit of work.
 
-### 13.3 What is left
+1. **The declared type map** (§5.7). The pin makes schema drift visible; the declaration is what
+   makes it rare, and it is what a columnar producer needs, since a producer emitting one Arrow
+   schema across blocks that vectorize and blocks that do not cannot derive that schema from
+   whichever block it is looking at.
 
-Ordered by value per unit of work, not by position in the stack.
+2. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
+   parses cells and keeps its own `knownTimeAttrs`; the DB-API cursor still documents
+   `description` as "what arrived, not a schema". Both need typed columns to reach them over
+   their own transports, so neither is the "nearly free" job this item used to claim — the
+   plugin runs in Grafana's process and would have to derive the schema itself through
+   `AttrTypeProfiles`, which is real work rather than wiring. `arrow()` on the Python client is
+   the same shape. **`.format arrow` in the REPL is done** (`repl/arrowout.go`): a SELECT's
+   result as an Arrow IPC stream, refusing a terminal because it is binary and every other
+   format here is text. Three sources, because the honest typed form of each result differs —
+   `SELECT *` encodes the ads against the table's schema with the tail, a projection evaluates
+   each item per ad through the same `RowStreamer` the other formats use, and an aggregate,
+   which has no ads, parses its cells back from display text against their declared types.
 
-**One item came off this list while the section was being written**, because writing it down is
-what found it: `SELECT * FROM history` returned an error. The endpoint listed the archive table,
-derived its schema (776 bytes of it), and then failed the read, because `opQuery` refuses an
-archive by design and says so. Nothing caught it: every Flight test ran against a single mutable
-table, and the one test that mentioned an archive name only checked that the *recogniser* accepts
-a `/`. Moving the scan onto the refs-chasing projection op fixed it and pushed the projection down
-in the same change (§13.2), and the harness now holds an archive. The lesson is the fixture, not
-the API: a new read surface needs an archive in its tests from the first one, or it cannot see
-this class of bug at all.
+   **The branch order is load-bearing and nothing ordinary proves it.** Routing a projection
+   through the aggregate branch passes every type and value assertion, because an ordinary
+   fixture round-trips through text unchanged. What separates them is an attribute whose VALUE
+   is the word `undefined`, which the display form also uses to spell "no value": read from the
+   ad it is that string, parsed back from text it is a null. That is also a standing limitation
+   of the aggregate branch, stated here rather than discovered.
 
-1. **The text round trip, which is 87% of a read.** Rendering each record to text is 48% of a
-   read's CPU and parsing it back is a further 39%, at 86 allocations per row (§13.2) — and
-   neither is work, only the cost of a relay that renders what its consumer immediately parses.
-   Reading values straight off the wire row measured **7x** end to end, 8x for a projection of
-   literal-valued attributes.
+3. **Then the columnar producer.** Last, and for a measured reason rather than an argued one:
+   what is left of a read is the storage read itself, and it should be measured against the
+   wire-native read rather than against the text path it replaced. The remaining blockers are all
+   inside `collections`:
 
-   Two pieces, in order. **Upstream:** `opQueryRawWire` skips the text form and did not serve an
-   archive, so adopting it would have re-broken `history` -- classad PR #477 adds the archive
-   case, and this wants the tag. **Here:** an encoder that reads a wire node directly
-   (`wire.Ad.LookupByName` + `wire.LiteralValue`) and falls back to an evaluator for a node that
-   is not a literal. The fallback is the part with a real design question in it, because on a
-   real AP an attribute's STORED form is an expression far more often than its evaluated kind
-   suggests (§5.8) -- so how often the fallback fires decides how much of the 7x survives.
-   `BenchmarkWireNativeRead` is in the tree and skips, naming the missing op, until the
-   dependency carries it.
-2. **The schema is sampled, not declared.** §5.7's describe-table op — a per-table type map
-   stored beside the columnar schema, sharing its generation counter, seeded by introspection and
-   overridable by an admin — was not built. What shipped is `opAttrTypes`, returning profiles of a
-   sample: the measurement, not the declaration.
+   - **There is no column-out API, and no selection.** `blockVecSource.LoadColumn` is private, and
+     the only exported vectorized entries are `VectorEvalCount`, `ColumnarEvalCount` and the
+     grouped aggregates — counts and group accumulators. Nothing hands back a `vm.Vec`, and
+     nothing applies the match mask to produce the surviving rows' values. The compaction is
+     genuinely new code, a gather per kind. The grouped path is the precedent to copy rather than
+     a thing to extend: it reads the group and aggregate columns through the block's columns in
+     **every** tier, including tiers where the predicate fell back to per-record evaluation,
+     exactly so that group identity cannot depend on which tier answered. A column producer needs
+     the same property for values.
+   - **A column handed out aliases the block.** `loadStr` deliberately does not copy — one
+     allocation per record made a string predicate slower than the row path — and the dictionary
+     is per block and fold-sorted. So a producer either copies or pins the block for the life of
+     the batch, and an Arrow `DictionaryArray` cannot span blocks without remapping codes. Sealed
+     is not alive, which is the same lifetime question that has bitten a read taken off a segment
+     here before.
+   - **The computed region is a precomputed location, not a column.** Measured per block on a
+     20 000-record fixture: `ResidentSetSize` and `JobStatus` are escape-free in 53 of 53 blocks,
+     so a raw contiguous width-native vector is available for them today. `MemoryUsage` is
+     escape-free in **0 of 53**, with **19 717 of 19 717 cells escaped**. It vectorizes —
+     `fixEscapes` reads the computed region, which is why the aggregates can see it — but
+     `escapeFree` is false, so it can never take the `rawColumn` path and instead repairs every
+     record one at a time. That is the difference between a loop and a memcpy, on exactly the
+     attributes anyone wants, and making a computed cell an ordinary column value is the single
+     change that most increases what a column producer could hand out.
 
-   Two of the three consequences are now closed by a cache (`flightsvc/schemacache.go`, default
-   30s). The repeat scans are gone — a derivation is no longer paid per RPC — and the schema a
-   client is promised and the one it is delivered are the same object within the TTL, where before
-   they were two independent measurements of a moving table and a client trusting the first read
-   the second by position.
+   One blocker that was on this list is **gone**: vectorization declining per block. Measured on
+   the same fixture, `blocks: vector=53 declined=0 churn=0 pruned=0 empty=0 rowWindows=1` — not
+   one block fell back. It remains a correctness constraint on the producer (one stable schema
+   across tiers) rather than a performance one.
 
-   What a cache cannot do is make that a **guarantee**, and this is where the missing generation
-   bites: the entry can expire between the two calls, and there is nothing to pin, because the
-   type report carries profiles and a sample size and no generation counter. Within one stream the
-   schema is fixed by construction — it is derived once, before the scan — so a mid-stream retype
-   is not the exposure; the FlightInfo/DoGet pair is. §5.7's "pin the generation for the life of a
-   stream" wants restating as "pin it for the life of a statement", and it needs classad to
-   publish one.
+   A second is gone too: **the dbrpc text boundary, and redaction with it.** `opQueryValues` is a
+   columnar, typed frame, and because it lives inside the dbrpc server the private-attribute
+   stripping and the private-constraint gate hold by construction. What remains is that its
+   producer is per record: the server packs those columns one row at a time and then ships them
+   column-major. So this is no longer "design a columnar protocol and re-solve redaction"; it is
+   "put a vector producer behind a wire format that already exists". A vector producer must sit
+   **inside** that boundary too, or Arrow becomes the private-attribute oracle.
 
-   The cache is keyed by privilege, which is not a detail: an unprivileged type report has the
-   private attributes filtered out server-side, because an attribute's numeric bounds are a
-   disclosure even where its value is not, so two levels derive different schemas from one table
-   and a shared entry would hand private column names to whoever asked second.
-3. **The type decision is made on the stored form, while the encoder evaluates.**
-   `AttrTypeProfiles` classifies wire nodes and states that it evaluates nothing, so `expr`
-   competes as a value class and an expression-dominant attribute is ruled `Untyped`
-   (`arrowtype/derive.go:315`). On ap2001's `history` that drops `MemoryUsage` from the schema
-   although it **evaluates to an integer in all 2000 sampled ads** (§5.8). The measurement that
-   established §5.1 was a one-off script; the server op that would act on it reports stored
-   classes. Profiling *evaluated* values is work in `collections`, and it is what makes §5.1
-   true of the schema and not only of the encoder.
-4. **There is no tail column.** §5.6 specifies `SELECT *` as the typed columns plus one `_ad`
-   column carrying everything not promoted. `Schema` simply omits every `Untyped` attribute
-   (`arrowtype/derive.go:463`), which is the "schema that lies by omission" §5.6 names:
-   `Requirements`, whose *text* is the only useful form of it, is invisible over ADBC rather
-   than preserved. Until item 3 lands, so is `MemoryUsage` — and those two failures look
-   identical from a client, which is the argument for building the tail column first.
-5. **Overrides and strictness are implemented and unreachable.** `arrowtype.Options.Overrides`
-   and `StrictMixedKinds` are tested, and the daemon wires only `TimeAttrs`
-   (`cmd/htcondordb/flight.go:167`). An admin can declare an epoch attribute, but cannot force a
-   column's type or ask to be refused rather than handed a text fallback. Configuration, not
-   design.
-6. **The SQL surface is a recogniser, not the executor.** `parseQuery`
-   (`flightsvc/statement.go:81`) is one regexp; an aggregate, `GROUP BY`, `ORDER BY`, a `JOIN`, a
-   set operation or a function is refused rather than approximated. The `repl` executor does all
-   of them, and the server-side TopK and the archive `GROUP BY` already exist underneath — so a
-   DuckDB user aggregating pool data currently pulls every row to do it locally, over an endpoint
-   whose store could have answered. This is the largest remaining piece of W1 and the one that
-   most changes what the endpoint is *for*; §9.2's note that the method set sits "over the
-   existing `repl` executor" describes the intent, not the code.
-7. **Two of the three type guesses §4 set out to replace are still there.** The Grafana plugin
-   parses cells and keeps its own `knownTimeAttrs` (`grafana/pkg/plugin/frame.go:15`), and the
-   DB-API cursor still documents `description` as "what arrived, not a schema"
-   (`python/htcondordb/cursor.py:523`). There is no `arrow()` on the Python client and no
-   `.arrow` in the REPL, both of which §9.4 asked for as nearly free once the encoder existed.
-   The encoder exists.
-8. **The two front doors sample different amounts.** The REPL's ANSI dialect profiles 2000
-   records (`repl/dialect.go:91`), the endpoint 10 000, so the set of columns each believes the
-   table has can differ on the same table at the same moment. One kind mapping already serves
-   both (`arrowtype/sqlkinds.go`); the sample size should too.
-9. **Then the columnar producer** (§13.2, and §9.3's closing paragraph). Last, and for a
-   measured reason rather than an argued one: once item 1 has deleted the text round trip, what
-   is left of a read is the storage read itself at **under 10% of today's CPU**, and the columnar
-   accelerator is worth 1.12x on a read that materializes rows. So the producer has to argue
-   against a small remainder, and it should be measured against the wire-native read rather than
-   against the text path it replaced. What it still wants from item 2 is the *declared* schema: a
-   producer emitting one stable Arrow schema across blocks that vectorize and blocks that do not
-   cannot derive that schema from whichever block it is looking at.
+**Still deliberately not built:** writes, Substrait, transactions and savepoints, key metadata,
+`XdbcTypeInfo`, `CancelFlightInfo`, scalar/table UDFs, `ALTER TABLE`.
 
-Still deliberately not built: writes, Substrait, transactions and savepoints, key metadata,
-`XdbcTypeInfo`, `CancelFlightInfo` (§9.2), and everything in §11.
+### 7.4 The analytic path
 
-## 14. Parked: the one Airport-only opportunity worth remembering
+`SELECT <cols> FROM t [WHERE] [LIMIT]` is a scan with a filter, so the endpoint serves it by
+scanning. An aggregate, a `GROUP BY`, an `ORDER BY` or a `DISTINCT` is not: the value of a row
+depends on the other rows, so somebody has to hold the result set. `repl`'s executor already
+does all of it, with the server-side TopK and the archive's own `GROUP BY` underneath, and the
+endpoint used to refuse the lot — so a client wanting `COUNT(*) GROUP BY Owner` pulled every row
+and counted them locally, over an endpoint whose store could have answered.
 
-Not being built (§9), recorded so it is not rediscovered.
+Two things make this more than routing, and both are about the schema.
 
-**`data://` endpoints (rung 3).** An Airport endpoint's location may be
-`data:application/x-msgpack-duckdb-function-call;base64,...`, embedding a DuckDB function call
-(`read_parquet`, `read_csv`, Iceberg/Delta) instead of a `grpc://` address. So: add a **Parquet
-exporter for sealed archive segments** (the exporter framework already exists), and `endpoints`
-can return a mix — `data://` endpoints pointing DuckDB at Parquet files it reads at full native
-speed, plus one `grpc://` endpoint for the hot, mutable tail.
+**The result schema is not the table's.** `COUNT(*)` is an int64 column no attribute produced;
+`AVG(x)` is a float64 whatever `x` is; `MIN`/`MAX`/`SUM` and `time_bucket` take their column's
+own declared type; a window function is a count. So the columns are typed from the **SELECT
+list**, against the table's declarations — which is what makes answering GetFlightInfo without
+executing possible at all, and that is a protocol requirement rather than an optimization.
+Everything is nullable except a count, which is defined for every group, zero included.
 
-Bulk history analytics then runs with the daemon **out of the data path entirely**, and DuckDB
-does its own file-level predicate and projection pushdown. For "scan five years of history" this
-beats any amount of encoder work, and it reuses retention and sealing machinery we already have.
-Worth noting the exporter is independently useful at rung 0 too: a Parquet dump that DuckDB
-reads directly needs no Flight stack at all.
+**The executor returns display text.** `repl.Result.Rows` is `[][]string`, so a cell is parsed
+on the way into Arrow — the text round trip the scan path just finished deleting. It is
+acceptable here and not there for a reason worth stating: an aggregate result is group rows
+rather than table rows, and the parse is against a **declared** type rather than an inferred
+one, so it cannot silently retype a column the way inference does. A cell that does not parse as
+its declared type is a null, not a string. If an analytic result ever grows large enough for the
+parse to matter, the fix is a typed row API out of `repl`, not a heuristic here.
+
+**Read-only, structurally.** Only `StmtSelect` reaches the executor, checked before anything
+else. The executor also runs INSERT, UPDATE, DELETE and DDL, and the endpoint's read-only
+promise must not depend on the ANSI front end happening to refuse those spellings.
+
+Three limits, each deliberate:
+
+- **A JOIN or a set operation is refused**, the same refusal the REPL's ANSI dialect gives and
+  for the same reason: a bare column could belong to either side, and typing it from the first
+  table's declarations would type it from the wrong one.
+- **No bound parameters.** The executor parses once and holds a ClassAd predicate thereafter, so
+  a placeholder would have to be substituted before parsing, and the schema is promised before
+  that. Such a statement still *prepares* — preparing is how a client learns its SQL will work,
+  and this SQL will — and reports an empty parameter schema; binding to it is refused at the
+  bind, saying so, rather than at the fetch saying "unsupported SQL" about a statement the same
+  endpoint just prepared.
+- **A computed expression becomes `utf8`.** Its value cannot be typed from a measurement — nothing
+  measured `CurrentTime - QDate` — so it takes the answer the tail column takes: text, which is
+  faithful for any ClassAd value. Refusing instead would make this endpoint strictly less capable
+  than the REPL for a shape the REPL answers correctly. The cost is that arithmetic downstream
+  sees a string, and the declared type map is what would fix it.
+
+The executor materializes the whole result before the first cell reaches Arrow, because that is
+what an aggregate *is*. The stream cap and byte budget apply around it, but the executor's own
+working set is not bounded by them, so a `GROUP BY` over a high-cardinality attribute is the
+shape to watch — the same way it is in the REPL.
+
+**An aggregate is a disclosure channel of its own shape**, and building this found a hole that
+the scan path does not have. Nobody has to see a value to learn it: `SELECT ClaimId, COUNT(*)
+GROUP BY ClaimId` names every distinct value as a group key, `MIN`/`MAX` report two of them
+exactly, and `COUNT(DISTINCT x)` reports the cardinality. The closure is the same one the scan
+relies on — an unprivileged peer's type report does not carry a private attribute, so there is
+no column to type against — but it only holds if every column the statement NAMES is resolved,
+not only the ones it projects. The first implementation resolved the projected ones, which let
+a READ peer through on `COUNT(DISTINCT ClaimId)` (a count's result type does not depend on its
+argument, so the argument was never looked at), on `GROUP BY` and `ORDER BY` over a column that
+is never printed, and on `HAVING MAX(ClaimId) > 'a'`. Caught by a test with a DAEMON arm proving
+the fixture has something to withhold. The refusal says the column is not there, which is what
+it also says about a column that genuinely is not there — naming it as private would answer the
+question the refusal exists to refuse.
+
+**The mutant that mattered** was the executor keeping its default dialect. ClassAd's `==` folds
+case and ANSI's `=` does not, so an analytic query whose predicate took the default would answer
+a different question — same columns, same types, more rows — and no type assertion anywhere
+would catch it. Six were checked to fail named tests: that one, AVG typed from its column, a
+non-SELECT admitted to the executor, an unparseable cell retyped to a string instead of nulled,
+a nullable COUNT, and bound values silently ignored.
+
+## 8. The ANSI dialect
+
+**The wire form stays ClassAd; ADBC is always ANSI.** The ANSI front end is a *compiler*: it
+parses SQL, binds it against the type map, and lowers to a ClassAd expression before anything
+crosses dbrpc. The store keeps evaluating exactly one language.
+
+That is better than making the dialect a connection option, which an earlier draft proposed.
+There is no default to get wrong and no flip to stage — Flight SQL is ANSI from its first
+release, so no query ever changes meaning underneath a client, and a client never has to ask
+which dialect it got. The wire protocol does not change, so there is one constraint language to
+version, test and fuzz. And `.dialect ansi` in the REPL is the same code path, which is how the
+lowering gets tested without a gRPC stack anywhere in the picture.
+
+**REFUSE, NEVER APPROXIMATE.** Note the asymmetry with Airport: there, dropping a filter we
+could not translate was safe because the client re-filters. Here nothing downstream corrects us,
+so the rule inverts. A construct we cannot lower faithfully is an error — and that is the whole
+reason partial ANSI is safe to ship.
+
+### 8.1 Case sensitivity, and why `=?=` is the answer
+
+ClassAd's `==`, `!=`, `<`, `<=`, `>`, `>=` compare strings **case-insensitively**, matching the
+C++ reference engine; only `=?=`/`=!=` are case-sensitive. The segment dictionaries are
+fold-sorted too, so this is not skin-deep. SQL's `=` is case-sensitive.
+
+ClassAd's identity operator is case-sensitive *and* the storage layer optimizes it directly:
+there is a dedicated exact-case key run for `=?=`/`=!=` in the in-memory index, with a
+case-uniform-bucket optimization so it does not double memory, and in the archive sidecar,
+binary-searched. The planner already routes it. So ANSI `Owner = 'x'` lowers to `Owner =?= "x"`:
+exact, case-sensitive, and an index probe. No grammar extension.
+
+An earlier draft proposed `Owner == "x" && strcmp(Owner, "x") == 0`, which was solving a problem
+the index already solves. For the record on why that would be merely *worse* and not
+catastrophic: a strict built-in compiles natively and the program stays `Native()`, so it keeps
+the column prefilter and the vector executor. What it does not get is an index probe, because the
+planner matches operator *shapes*, not function calls. That is the reason not to reach for an
+idiom elsewhere either: a function call is a comparison the planner cannot see.
+
+**String *ordering* is refused** rather than lowered. Fold-order and byte-order results are
+neither a subset nor a superset of one another — compare `"apple"` against `"R"` under each — and
+the dictionaries are fold-sorted, so no index could serve a byte-ordered range anyway.
+
+### 8.2 Three-valued logic, and the internal opcode that would close it
+
+`=?=` returns **false** on a type mismatch, so `Owner =?= "x"` with `Owner` undefined is false
+where SQL yields NULL. Under `AND` and `OR` that is unobservable for a WHERE clause (`NULL AND
+TRUE` and `false && true` both drop; `NULL OR TRUE` and `false || true` both keep). It diverges
+in exactly two positions: under `NOT`, where SQL drops a NULL row and ClassAd keeps it since
+`!false` is true; and wherever the value is *surfaced* rather than filtered on (`CASE WHEN`,
+`IS NOT TRUE`, a projected boolean).
+
+An earlier draft proposed a **polarity-aware lowering** — bare `=?=` in positive position, a
+guarded `isUndefined(x) ? undefined : (x =?= lit)` under negation. That works and is the wrong
+trade: it produces two forms of every predicate, one of which loses the index, and polarity is
+exactly the analysis that is correct in review and wrong inside a `CASE` inside a `NOT` inside an
+`OR`. **The implementation refuses there instead.** Refusing is still a polarity analysis, but
+its failure mode is "you cannot write that yet" rather than silently wrong rows, and it is
+positional, so a string equality outside a `NOT` is unaffected and double negation returns to
+positive.
+
+**The way to lift the restriction is an internal opcode**, not a lowering trick: ANSI `=`, `<>`,
+`<`, `<=`, `>`, `>=` as opcodes in the AST/`vm` space, case-sensitive and NULL-propagating, with
+**no surface syntax**. Not a grammar extension — anything reachable from the external syntax is a
+public API that cannot be withdrawn and would leak through the query log, `EXPLAIN` and
+copy-paste. One lowering per operator, no polarity analysis, and the semantics stated once in the
+opcode rather than encoded in an idiom. Equality maps onto the same exact-case index run `=?=`
+uses, so it keeps the probe while carrying SQL's three-valued logic; ordering scans, because no
+fold-sorted structure can prune a byte-ordered range, and being a scan should be visible in
+`EXPLAIN` rather than discovered.
+
+**Two costs, both real.** An operator must be implemented in **every** evaluation path or it
+silently misbehaves on one — the scalar interpreter, the vectorized executor, the compiler, the
+probe/index planner, and the archive sidecar, which are the same mutable/archive and
+in-memory/persistent splits that have produced divergence bugs here before. A conformance suite
+running every operator through every path is part of the work. And the lowered constraint crosses
+`dbrpc` as **text**, because the Flight endpoint reads through an in-process loopback to reuse
+the authorization layer (§6), so an internal opcode with no surface syntax cannot travel it as
+things stand.
+
+### 8.3 What is lowered, and what is refused
+
+Lowered today (`ansi/`): `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`/`OR`/`NOT`, parentheses,
+`IS [NOT] NULL`, `IN`, `BETWEEN`, the literals, and `?` placeholders. String equality lowers to
+`=?=`.
+
+Refused, each for a reason rather than for want of effort: string **ordering** (§8.1), string
+**inequality** (its 3VL guard is correct but unverified against the index, and an unindexed
+inequality over a large table is better introduced deliberately than discovered), a
+**type-invalid** comparison (refused at bind time as a SQL engine does, rather than lowered into
+ClassAd's ERROR where it would quietly filter out every row), an **unknown or untypeable**
+column, and string equality **under a negation** (§8.2).
+
+The lowering vocabulary available for the rest: `substr`, `size`, `regexp`, `replace`, `strcat`,
+`int`/`real`/`string`, `toupper`/`tolower`, `split`/`join`, `member`, `formattime`, `interval`,
+and the Elvis operator for `COALESCE`. What has **no** faithful ClassAd form and must be refused:
+`DECIMAL` arithmetic, true `DATE`/`TIME`/`TIMESTAMP` types as distinct from epoch integers, and
+any explicit `COLLATE`.
+
+**The column types come from `arrowtype.Columns`**, the same mapping the Flight endpoint uses,
+deliberately in one place: two surfaces lower SQL against these types, and a second copy would
+let them disagree about a column's type and so about what a query means. Types are derived per
+statement rather than cached, so a column added during a session is visible immediately.
+
+### 8.4 The REPL's `.dialect`
+
+ANSI is **strictly less capable** in the REPL, on purpose: `WHERE Owner > 'R'` works today and is
+refused under ANSI. The dialect is a compatibility and debugging tool — the only way to see what
+an ADBC client will get without an ADBC client in hand — not an upgrade path.
+
+Three things about it are worth recording:
+
+- **It translates at the PARSE boundary, not after it.** `Statement.Where` is "the translated
+  ClassAd constraint", so by the time the executor runs, `Owner = 'alice'` is already
+  `Owner == "alice"`, and handing that to a SQL parser produces nonsense rather than an error
+  anyone can act on. The first implementation did exactly that. The parser now keeps the clause's
+  raw text, which is what the ANSI lowering reads, and the translation happens once in `Exec` so
+  the scan, a DELETE's selector and `EXPLAIN` all work from one constraint.
+- **It recurses into wrapped statements** — `EXPLAIN` wraps the statement it reports on and
+  `CREATE MATERIALIZED VIEW` embeds the SELECT that defines it.
+- **A JOIN or a set operation is refused under ANSI**, because a bare column could belong to
+  either table and lowering it against the first table's types would type it from the wrong one.
+
+**One caution.** `.format` changes how results *print*; `.dialect` changes what a query *means* —
+`WHERE Owner = 'bbockelm'` folds case under ClassAd and does not under ANSI. So the mode has to
+be visible (prompt, `EXPLAIN`, and recorded on every logged statement alongside the lowered form)
+and set explicitly by scripts rather than inherited.
+
+## 9. Testing
+
+The hazard is **vacuous green**: a test passes identically whether pushdown worked or every
+filter was dropped, and whether a column came back `int64` or `utf8`. Row counts cannot tell the
+difference. So assert on the **Arrow type** of every column against the declared map; on
+coercion and null counters, at zero for Tier A columns and non-zero where a fixture plants an
+escape; on a differential oracle, where the same logical query through the REPL and through
+Arrow must agree including on case sensitivity; and, for a columnar producer, that blocks
+actually vectorized rather than every block declining to the row path.
+
+Two lessons the suite has already paid for:
+
+- **A reader that is the writer's own library agrees with it by construction.** Two *external*
+  clients check the endpoint in CI: the DuckDB CLI through `nanoarrow`, and
+  `adbc_driver_flightsql` through gRPC, against the session daemon's own Flight listener — the
+  same process that serves CEDAR, because that is how the endpoint deploys and a separate daemon
+  would test a configuration nobody runs. `HTCONDORDB_REQUIRE_ADBC=1` turns a skipped driver into
+  a failure, and the CI step greps for named passes, because neither pytest's exit status nor a
+  REQUIRE flag can speak for a test that was never collected.
+- **A new read surface needs an archive in its fixtures from the first test.** `SELECT * FROM
+  history` returned an error for a while: the endpoint listed the archive table, derived its
+  schema, and then failed the read, because `opQuery` refuses an archive by design. Nothing
+  caught it — every Flight test ran against a single mutable table, and the one test that
+  mentioned an archive name only checked that the recogniser accepts a `/`.
+
+Keep the integration suite inside the usual runtime budget; DuckDB-in-the-loop tests run on
+demand, not on every push.
+
+## 10. Risks
+
+**An encoder that evaluates expressions must evaluate through the redacted path** (§5.1) or it
+becomes the private-attribute oracle `private_gate.go` exists to prevent.
+
+**In-process gRPC means a pathological read runs in the daemon's address space** (§6.4): the
+panic barrier, bounded allocator, concurrency cap and real cancellation are not polish, they are
+what replaces the isolation a separate process would have given. A novel query shape against
+production has crashed this daemon before, so every new read path is exercised against a local
+store first.
+
+**A columnar producer must not let an Arrow schema vary** as blocks alternate between columnar
+and row-wise.
+
+**Catalog serialization cost for wide tables** — measure against a real jobs table early.
+
+---
+
+## Appendix A. The road not taken: Airport (rung 3)
+
+Recorded so it does not have to be rediscovered. Everything is msgpack-serialized C++ structs;
+`FlightInfo` and schemas are Arrow IPC. Pin these against a real DuckDB build rather than
+trusting this summary.
+
+- **`DoAction("list_schemas")`.** In: `{catalog_name}`. Out: msgpack `{length, data}`, `data` =
+  zstd-compressed msgpack of `{contents, schemas[]}`; each schema's `contents` is
+  `{sha256, url?, serialized?}` wrapping a zstd msgpack array of serialized `FlightInfo`s, one per
+  table, each with msgpack `SerializedFlightAppMetadata` in `app_metadata`. **Caching is keyed on
+  the SHA256** — if present, DuckDB caches on disk indefinitely and will not re-fetch, so the hash
+  must change exactly when the schema does.
+- **`DoAction("endpoints")`.** In: `{descriptor, parameters{json_filters, column_ids,
+  table_function_parameters, table_function_input_schema, at_unit, at_value}}`. Out: msgpack
+  vector of serialized `FlightEndpoint`s, fetched **in parallel** by DuckDB's thread pool; their
+  union is the whole flight, so **all endpoints must read the same snapshot** — embed an AS OF
+  token in every ticket. `at_unit`/`at_value` map onto our AS OF reads, which very few Flight
+  servers can honor. There is **no LIMIT**, so our server-side TopK is unreachable from DuckDB.
+- **Identifier case.** DuckDB does not fold before sending: `SELECT * FROM FooBar` asks for
+  `FooBar`. ClassAd attribute names are already case-insensitive; table names in our catalog are
+  not, so fold there.
+
+**Pushdown.** `column_ids` maps onto existing projection pushdown. `json_filters` is a tree of
+DuckDB bound expressions: `BOUND_COMPARISON`, `BOUND_CONJUNCTION`, `BOUND_OPERATOR`,
+`BOUND_COLUMN_REF`, `BOUND_CONSTANT`, `BOUND_FUNCTION`. **Airport re-filters on the client**, so a
+translator that handles what it understands and drops what it does not is correct, merely slower —
+which is what would make rung 3 tractable at all. One sharp edge: an unknown expression class,
+function or type means **drop that filter**, never fail a read; a dropped conjunct inside an `AND`
+is fine because we return a superset, but a dropped conjunct inside an `OR` means **the whole
+disjunction must be dropped**, not one arm. That is the easiest place in the design to introduce
+silent wrong answers.
+
+DuckDB's documentation states outright that this serialization may change in any release.

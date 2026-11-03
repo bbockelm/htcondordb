@@ -65,6 +65,10 @@ type preparedStmt struct {
 	// bound is the values a DoPut supplied, or nil if the client has not bound any.
 	// Nil is meaningfully different from empty: see the args type.
 	bound *args
+	// fp names the schema this handle most recently told its client to expect (pin.go).
+	// It is re-pinned by every call that reports a schema and checked by the fetch, so a
+	// client gets the shape it was last told or an error, never a different one.
+	fp string
 }
 
 // prepared is the live statement table.
@@ -81,7 +85,7 @@ func newPrepared() *prepared {
 
 // add stores a statement and returns its handle. It expires stale entries first, so a cap is
 // reached only by statements that are genuinely live rather than by accumulated debris.
-func (p *prepared) add(query, owner string) ([]byte, error) {
+func (p *prepared) add(query, owner, fp string) ([]byte, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.expireLocked()
@@ -94,7 +98,7 @@ func (p *prepared) add(query, owner string) ([]byte, error) {
 		return nil, status.Errorf(codes.Internal, "generating a statement handle: %v", err)
 	}
 	key := hex.EncodeToString(raw)
-	p.byKey[key] = preparedStmt{query: query, owner: owner, created: time.Now()}
+	p.byKey[key] = preparedStmt{query: query, owner: owner, created: time.Now(), fp: fp}
 	return []byte(key), nil
 }
 
@@ -127,6 +131,29 @@ func (p *prepared) bind(handle []byte, caller string, vals []any) error {
 	st.bound = &args{vals: vals}
 	p.byKey[key] = st
 	return nil
+}
+
+// repin records the schema a handle has just told its client to expect.
+//
+// Every call that REPORTS a schema re-pins, rather than the pin being fixed at prepare. A
+// prepared statement outlives a schema cache entry by a wide margin -- half an hour against
+// thirty seconds -- so a pin fixed at prepare would start refusing a perfectly good statement
+// as soon as the table grew an attribute, which is a worse failure than the one it prevents.
+// Re-pinning keeps the property that matters: whatever the client was LAST told is what the
+// next fetch delivers, or it is told why not.
+//
+// A handle that has gone away is not an error here. The caller is reporting a schema it has
+// already derived, and the fetch that would check the pin cannot find the handle either.
+func (p *prepared) repin(handle []byte, caller, fp string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := string(handle)
+	st, ok := p.byKey[key]
+	if !ok || st.owner != caller {
+		return
+	}
+	st.fp = fp
+	p.byKey[key] = st
 }
 
 func (p *prepared) remove(handle []byte, caller string) error {
@@ -183,19 +210,19 @@ func (s *Server) CreatePreparedStatement(ctx context.Context, req flightsql.Acti
 	if err != nil {
 		return res, err
 	}
-	schema, params, _, err := s.planStatement(ctx, req.GetQuery())
+	pl, err := s.planStatement(ctx, req.GetQuery())
 	if err != nil {
 		return res, err
 	}
-	handle, err := s.prep.add(req.GetQuery(), owner)
+	handle, err := s.prep.add(req.GetQuery(), owner, pl.fp)
 	if err != nil {
 		return res, err
 	}
 	isUpdate := false
 	return flightsql.ActionCreatePreparedStatementResult{
 		Handle:          handle,
-		DatasetSchema:   schema,
-		ParameterSchema: params,
+		DatasetSchema:   pl.schema,
+		ParameterSchema: pl.params,
 		IsUpdate:        &isUpdate,
 	}, nil
 }
@@ -213,11 +240,12 @@ func (s *Server) GetSchemaPreparedStatement(ctx context.Context, cmd flightsql.P
 	if err != nil {
 		return nil, err
 	}
-	schema, _, err := s.planSchema(ctx, st.query)
+	pl, err := s.planStatement(ctx, st.query)
 	if err != nil {
 		return nil, err
 	}
-	return &flight.SchemaResult{Schema: flight.SerializeSchema(schema, s.alloc)}, nil
+	s.prep.repin(cmd.GetPreparedStatementHandle(), st.owner, pl.fp)
+	return &flight.SchemaResult{Schema: flight.SerializeSchema(pl.schema, s.alloc)}, nil
 }
 
 func (s *Server) GetFlightInfoPreparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
@@ -225,14 +253,15 @@ func (s *Server) GetFlightInfoPreparedStatement(ctx context.Context, cmd flights
 	if err != nil {
 		return nil, err
 	}
-	schema, _, err := s.planSchema(ctx, st.query)
+	pl, err := s.planStatement(ctx, st.query)
 	if err != nil {
 		return nil, err
 	}
+	s.prep.repin(cmd.GetPreparedStatementHandle(), st.owner, pl.fp)
 	return &flight.FlightInfo{
 		Endpoint:         []*flight.FlightEndpoint{{Ticket: &flight.Ticket{Ticket: desc.Cmd}}},
 		FlightDescriptor: desc,
-		Schema:           flight.SerializeSchema(schema, s.alloc),
+		Schema:           flight.SerializeSchema(pl.schema, s.alloc),
 		TotalRecords:     -1,
 		TotalBytes:       -1,
 	}, nil
@@ -255,7 +284,7 @@ func (s *Server) DoGetPreparedStatement(ctx context.Context, cmd flightsql.Prepa
 		// a prepared statement it is already using.
 		bound = &args{}
 	}
-	return s.doGetQuery(ctx, st.query, bound)
+	return s.doGetQuery(ctx, st.query, bound, st.fp)
 }
 
 func (s *Server) preparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery) (preparedStmt, error) {
@@ -303,6 +332,14 @@ func (s *Server) DoPutPreparedStatementQuery(ctx context.Context, cmd flightsql.
 func (s *Server) bindCheck(ctx context.Context, stmt string, vals []any) (string, query, error) {
 	parsed, err := parseQuery(stmt)
 	if err != nil {
+		if _, aerr := parseAnalytic(stmt); aerr == nil {
+			// It prepared, because the executor serves it; it just has nowhere to
+			// put a value. Reporting the scan recogniser's grammar here would tell
+			// a client its statement is unsupported, which it is not.
+			return "", query{}, status.Errorf(codes.InvalidArgument,
+				"this statement takes no parameters (its parameter schema is empty); "+
+					"inline the value instead of binding it")
+		}
 		return "", query{}, err
 	}
 	_, decisions, err := s.tableSchema(ctx, parsed.table)

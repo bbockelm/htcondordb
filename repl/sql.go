@@ -330,7 +330,7 @@ type OrderTerm struct {
 }
 
 // header returns the display header for a select item.
-func (it SelectItem) header() string {
+func (it SelectItem) Header() string {
 	if it.Alias != "" {
 		return it.Alias
 	}

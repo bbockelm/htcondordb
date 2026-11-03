@@ -38,11 +38,9 @@ import (
 // override it when it knows better.
 const defaultBatchRows = 2048
 
-// defaultSampleMax is how many records the type profile looks at. The schema is a declaration
-// about a whole table, so the sample wants to be large enough to see an attribute's minority
-// kinds -- on a real AP the attributes that matter most had their second kind in well under 1%
-// of records.
-const defaultSampleMax = 10000
+// defaultSampleMax is how many records the type profile looks at: the shared default, so an
+// exported file and a Flight stream of the same table carry the same columns.
+const defaultSampleMax = arrowtype.DefaultSampleMax
 
 // Options configures an export.
 type Options struct {

@@ -135,8 +135,8 @@ func TestAggregateExprParse(t *testing.T) {
 		it.Aggs[1].Func != "SUM" || it.Aggs[1].Arg != "Cpus" {
 		t.Errorf("lifted aggregates = %+v, want COUNT(*) then SUM(Cpus)", it.Aggs)
 	}
-	if it.header() != "2 * COUNT(*) + SUM(Cpus)" {
-		t.Errorf("header = %q, want the source text", it.header())
+	if it.Header() != "2 * COUNT(*) + SUM(Cpus)" {
+		t.Errorf("header = %q, want the source text", it.Header())
 	}
 	if !it.GroupLevel() || it.IsAggregate() {
 		t.Errorf("an expression over aggregates is group-level but not a bare aggregate")

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bbockelm/golang-htcondor/logging"
+	"github.com/bbockelm/htcondordb/arrowtype"
 )
 
 // TestFlightLimitsParsing: the limits are the endpoint's only protection against a query that
@@ -70,7 +71,7 @@ func TestFlightLimitsParsing(t *testing.T) {
 // lose QDate.
 func TestFlightTimeAttrs(t *testing.T) {
 	cfg := mkSyncCfg(t, "HTCONDORDB_FLIGHT_TIME_ATTRS = MyCustomTime, Another_Time\n")
-	opts := flightDeriveOptions(cfg)
+	opts := flightDeriveOptions(cfg, testLogger(t))
 
 	for _, name := range []string{"QDate", "qdate", "CompletionDate", "JobStartDate"} {
 		if !opts.TimeAttrs[strings.ToLower(name)] {
@@ -87,7 +88,7 @@ func TestFlightTimeAttrs(t *testing.T) {
 	}
 
 	// With the knob unset the built-in set must still be there.
-	if bare := flightDeriveOptions(mkSyncCfg(t, "")); !bare.TimeAttrs["qdate"] {
+	if bare := flightDeriveOptions(mkSyncCfg(t, ""), testLogger(t)); !bare.TimeAttrs["qdate"] {
 		t.Error("QDate is lost when the knob is unset")
 	}
 }
@@ -125,5 +126,110 @@ func TestFlightSchemaTTL(t *testing.T) {
 		if got := flightSchemaTTL(cfg, logger); got != c.want {
 			t.Errorf("schema TTL %q -> %v, want %v", c.raw, got, c.want)
 		}
+	}
+}
+
+// testLogger is a logger a config reader can warn through, since a malformed declaration is
+// reported rather than failing startup.
+func testLogger(t *testing.T) *logging.Logger {
+	t.Helper()
+	l, err := logging.New(&logging.Config{OutputPath: "stderr", SkipGlobalInstall: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+// TestFlightOverridesAreReachable covers an "implemented and unreachable" gap: arrowtype has had
+// Overrides and StrictMixedKinds since it was written, and the daemon wired only TimeAttrs, so
+// an admin could declare an epoch attribute and nothing else.
+//
+// The exclusion is the one worth having first. Requirements and MemoryUsage are the same SHAPE
+// -- both expressions in almost every ad, both evaluating to one clean kind -- and differ only
+// in whether the value or the text is the content, which no measurement separates. Excluding
+// one is not hiding it: the tail carries its text.
+func TestFlightOverridesAreReachable(t *testing.T) {
+	cfg := mkSyncCfg(t, "HTCONDORDB_FLIGHT_EXCLUDE_ATTRS = Requirements, Env\n"+
+		"HTCONDORDB_FLIGHT_ATTR_KINDS = ImageSize:int, Score:real\n"+
+		"HTCONDORDB_FLIGHT_STRICT_MIXED_KINDS = true\n")
+	opts := flightDeriveOptions(cfg, testLogger(t))
+
+	for _, name := range []string{"requirements", "env"} {
+		if !opts.Overrides[name].Exclude {
+			t.Errorf("%s was not excluded", name)
+		}
+	}
+	if got := opts.Overrides["imagesize"].Kind; got != "int" {
+		t.Errorf("ImageSize kind is %q, want int", got)
+	}
+	if got := opts.Overrides["score"].Kind; got != "real" {
+		t.Errorf("Score kind is %q, want real", got)
+	}
+	if !opts.StrictMixedKinds {
+		t.Error("strict mixed kinds was not enabled")
+	}
+
+	// A malformed or unknown declaration is dropped with a warning, not silently honoured
+	// as something else and not fatal to startup. Honouring "ImageSize:intt" as a string
+	// column would be a declaration the operator never made.
+	bad := flightDeriveOptions(mkSyncCfg(t,
+		"HTCONDORDB_FLIGHT_ATTR_KINDS = NoColon, ImageSize:intt, :real\n"), testLogger(t))
+	if _, ok := bad.Overrides["imagesize"]; ok {
+		t.Errorf("a malformed kind declaration produced an override: %v", bad.Overrides["imagesize"])
+	}
+
+	// With none of the knobs set, the seeded policy expressions are the only overrides and
+	// strictness is off, so the rest of the schema is the measurement's.
+	bare := flightDeriveOptions(mkSyncCfg(t, ""), testLogger(t))
+	if !bare.Overrides["requirements"].Exclude {
+		t.Error("Requirements is not excluded by default; a pool's schema would carry a column of meaningless booleans")
+	}
+	if bare.StrictMixedKinds {
+		t.Error("strictness is on by default")
+	}
+	for name := range bare.Overrides {
+		if !knownFlightPolicyExprs[name] {
+			t.Errorf("unset knobs produced an override for %q, which is not a seeded policy expression", name)
+		}
+	}
+}
+
+// TestFlightOverridePrecedence: a contradictory configuration has to resolve the same way every
+// time, not by which loop ran last.
+//
+// Naming a kind is an explicit "this should be a column", so it beats a seeded DEFAULT
+// exclusion -- otherwise the default silently outranks the declaration, which is the no-op this
+// knob exists to avoid. Naming an exclusion is an explicit "do not", so it beats everything,
+// because between two explicit declarations the conservative one should win.
+func TestFlightOverridePrecedence(t *testing.T) {
+	// A kind for a seeded policy expression: typed, as asked.
+	opts := flightDeriveOptions(mkSyncCfg(t, "HTCONDORDB_FLIGHT_ATTR_KINDS = Requirements:string\n"), testLogger(t))
+	if ov := opts.Overrides["requirements"]; ov.Exclude || ov.Kind != "string" {
+		t.Errorf("Requirements is %+v; a named kind must clear the default exclusion", ov)
+	}
+
+	// Both, for the same attribute: excluded.
+	opts = flightDeriveOptions(mkSyncCfg(t, "HTCONDORDB_FLIGHT_ATTR_KINDS = ImageSize:int\n"+
+		"HTCONDORDB_FLIGHT_EXCLUDE_ATTRS = ImageSize\n"), testLogger(t))
+	if ov := opts.Overrides["imagesize"]; !ov.Exclude {
+		t.Errorf("ImageSize is %+v; a named exclusion must win over a named kind", ov)
+	}
+}
+
+// TestKnownKindsMatchTheDerivation keeps the validator and the thing it validates in step. A
+// kind this list accepts and kindType does not would be accepted at startup and then ignored,
+// which is the silent-no-op the validation exists to prevent.
+func TestKnownKindsMatchTheDerivation(t *testing.T) {
+	for _, kind := range arrowtype.KnownKinds() {
+		opts := arrowtype.Options{Overrides: map[string]arrowtype.Override{"x": {Kind: kind}}}
+		_, decisions := arrowtype.Schema([]arrowtype.Measured{{
+			Name: "X", Sampled: 10, Present: 10, ValueClasses: map[string]int{"int": 10},
+		}}, opts)
+		if len(decisions) == 0 || decisions[0].Verdict != arrowtype.Typed {
+			t.Errorf("kind %q is accepted by KnownKinds but produced %+v", kind, decisions)
+		}
+	}
+	if arrowtype.KnownKind("intt") {
+		t.Error("KnownKind accepts a kind the derivation does not know")
 	}
 }

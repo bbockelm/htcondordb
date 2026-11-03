@@ -219,8 +219,8 @@ func TestWindowParse(t *testing.T) {
 		t.Errorf("WinOrder = %+v, want QDate DESC", it.WinOrder)
 	}
 	const wantHeader = "ROW_NUMBER() OVER (PARTITION BY Owner, JobStatus ORDER BY QDate DESC)"
-	if it.header() != wantHeader {
-		t.Errorf("header = %q, want %q", it.header(), wantHeader)
+	if it.Header() != wantHeader {
+		t.Errorf("header = %q, want %q", it.Header(), wantHeader)
 	}
 	// A statement with no window carries no QUALIFY and takes the ordinary path.
 	st, err = Parse(`SELECT Owner FROM jobs`)

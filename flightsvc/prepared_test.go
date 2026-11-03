@@ -80,8 +80,9 @@ func TestPreparedStatementValidatesAtPrepareTime(t *testing.T) {
 	ctx := context.Background()
 
 	for _, q := range []string{
-		`SELECT COUNT(*) FROM ` + dbrpc.DefaultTable,
+		`DELETE FROM ` + dbrpc.DefaultTable,
 		`SELECT * FROM ` + dbrpc.DefaultTable + ` WHERE Owner > 'R'`,
+		`SELECT MAX(NoSuchColumn) FROM ` + dbrpc.DefaultTable,
 		`SELECT NoSuchColumn FROM ` + dbrpc.DefaultTable,
 		`SELECT * FROM nosuchtable`,
 	} {
@@ -187,11 +188,11 @@ func TestPreparedTableIsBounded(t *testing.T) {
 	p := newPrepared()
 	p.max = 3
 	for i := 0; i < 3; i++ {
-		if _, err := p.add("SELECT * FROM t", "alice"); err != nil {
+		if _, err := p.add("SELECT * FROM t", "alice", ""); err != nil {
 			t.Fatalf("statement %d refused below the cap: %v", i, err)
 		}
 	}
-	_, err := p.add("SELECT * FROM t", "alice")
+	_, err := p.add("SELECT * FROM t", "alice", "")
 	if err == nil {
 		t.Fatal("a statement past the cap was accepted")
 	}
@@ -206,7 +207,7 @@ func TestPreparedTableIsBounded(t *testing.T) {
 		}
 		break
 	}
-	if _, err := p.add("SELECT * FROM t", "alice"); err != nil {
+	if _, err := p.add("SELECT * FROM t", "alice", ""); err != nil {
 		t.Errorf("no room after closing one: %v", err)
 	}
 }
@@ -216,7 +217,7 @@ func TestPreparedTableIsBounded(t *testing.T) {
 func TestPreparedEntriesExpire(t *testing.T) {
 	p := newPrepared()
 	p.ttl = time.Millisecond
-	h, err := p.add("SELECT * FROM t", "alice")
+	h, err := p.add("SELECT * FROM t", "alice", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +287,7 @@ func TestPreparedHandlesAreUnguessable(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < n; i++ {
 		// The SAME query each time: a handle derived from its content would collide.
-		h, err := p.add("SELECT * FROM t", "alice")
+		h, err := p.add("SELECT * FROM t", "alice", "")
 		if err != nil {
 			t.Fatal(err)
 		}

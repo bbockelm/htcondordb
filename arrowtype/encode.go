@@ -3,6 +3,7 @@ package arrowtype
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -124,6 +125,13 @@ type Encoder struct {
 	opts     EncodeOptions
 	rows     int
 	released bool
+
+	// tail is the index of the tail column, or -1. typed is the folded names the tail must
+	// NOT repeat -- the columns of this encoder, not of the table, because the tail's
+	// promise is "what you did not get as a column" and that is what the reader can check.
+	tail  int
+	typed map[string]bool
+	tbuf  []byte // reused across rows; the tail's text is copied by the builder
 }
 
 // NewEncoder prepares an encoder for the typed columns of decisions. Untyped decisions are
@@ -138,9 +146,16 @@ func NewEncoder(decisions []Decision, opts EncodeOptions) *Encoder {
 	var fields []arrow.Field
 	var attrs []string
 	var stats []ColumnStats
+	tail := -1
+	typed := map[string]bool{}
 	for _, d := range decisions {
 		if d.Verdict != Typed {
 			continue
+		}
+		if d.Tail {
+			tail = len(fields)
+		} else {
+			typed[strings.ToLower(d.Name)] = true
 		}
 		fields = append(fields, d.Field)
 		attrs = append(attrs, d.Name)
@@ -153,6 +168,8 @@ func NewEncoder(decisions []Decision, opts EncodeOptions) *Encoder {
 		builder: array.NewRecordBuilder(alloc, schema),
 		stats:   stats,
 		opts:    opts,
+		tail:    tail,
+		typed:   typed,
 	}
 }
 
@@ -180,7 +197,101 @@ func (e *Encoder) Stats() []ColumnStats { return e.stats }
 func (e *Encoder) Append(ad *classad.ClassAd) error {
 	var firstErr error
 	for i, attr := range e.attrs {
+		if i == e.tail {
+			e.appendTail(i, ad)
+			continue
+		}
 		if err := e.appendCell(i, attr, ad); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	e.rows++
+	return firstErr
+}
+
+// appendTail writes the row's attributes that no typed column took, as a bracketed ClassAd.
+//
+// It renders the STORED form of each one, not an evaluated value, which is the whole reason the
+// column is text: the attributes that land here are the ones whose evaluated form was not worth
+// a column, and for Requirements -- the archetype -- the expression IS the content.
+//
+// A row with nothing left over gets a null rather than an empty ad. "There was nothing else" is
+// a fact about the row, and an empty ad reads as a value that happens to be empty; null is the
+// one a reader can filter on without parsing.
+func (e *Encoder) appendTail(i int, ad *classad.ClassAd) {
+	b := e.builder.Field(i).(*array.StringBuilder)
+	st := &e.stats[i]
+	e.tbuf = e.tbuf[:0]
+	n := 0
+	for _, a := range ad.AST().Attributes {
+		if a == nil || e.typed[strings.ToLower(a.Name)] {
+			continue
+		}
+		if n == 0 {
+			e.tbuf = append(e.tbuf, '[', ' ')
+		} else {
+			e.tbuf = append(e.tbuf, ';', ' ')
+		}
+		e.tbuf = append(e.tbuf, a.String()...)
+		n++
+	}
+	if n == 0 {
+		b.AppendNull()
+		st.Nulls[CauseAbsent]++
+		return
+	}
+	e.tbuf = append(e.tbuf, ' ', ']')
+	b.BinaryBuilder.Append(e.tbuf)
+	st.Direct++
+}
+
+// Attrs are the attribute names this encoder's columns read, in field order. A producer that
+// fetches values rather than ads asks for exactly these, in exactly this order.
+func (e *Encoder) Attrs() []string { return e.attrs }
+
+// HasTail reports whether one of the columns is the tail. It matters to a producer because the
+// tail is built from a whole record -- see AppendValues, which cannot fill it.
+func (e *Encoder) HasTail() bool { return e.tail >= 0 }
+
+// AppendValues encodes one row from values that are ALREADY EVALUATED, aligned with Attrs.
+//
+// It is Append for a producer that fetched typed values instead of ads: the coercion, the
+// counting and the nulls are the same code, so a row encoded this way and the same row encoded
+// from its ad land in the same column with the same type. What it skips is the render and the
+// reparse between them.
+//
+// Two differences from Append, both consequences of there being no ad.
+//
+// It cannot fill the tail column, which is the complement of a whole record and not a function
+// of the projected values; an encoder that has one is refused rather than left with a ragged
+// batch, which NewRecord would panic on.
+//
+// And an ABSENT attribute is indistinguishable from one that evaluated to undefined, because a
+// projection yields undefined for both. Each is still a null, so the column is identical; what
+// is lost is the split between CauseAbsent and CauseUndefined in the stats, and every such cell
+// is counted as undefined. The two are worth distinguishing when the question is about the
+// data, which is why Append distinguishes them and this says so rather than quietly merging.
+func (e *Encoder) AppendValues(vals []classad.Value) error {
+	if e.tail >= 0 {
+		return fmt.Errorf("arrowtype: this encoder has a tail column, which values alone cannot fill")
+	}
+	if len(vals) != len(e.attrs) {
+		return fmt.Errorf("arrowtype: %d values for %d columns", len(vals), len(e.attrs))
+	}
+	var firstErr error
+	for i, v := range vals {
+		b := e.builder.Field(i)
+		st := &e.stats[i]
+		var err error
+		switch v.Type() {
+		case classad.UndefinedValue:
+			err = e.appendNull(b, st, i, e.attrs[i], CauseUndefined)
+		case classad.ErrorValue:
+			err = e.appendNull(b, st, i, e.attrs[i], CauseError)
+		default:
+			err = e.coerce(b, st, e.attrs[i], v)
+		}
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

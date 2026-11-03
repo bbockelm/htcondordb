@@ -16,14 +16,20 @@ import (
 // session holds the mutable REPL state the meta-commands change: the current
 // output target and serialization format.
 type session struct {
-	exec     *Executor
-	base     io.Writer // the original output (restored by `.output stdout`)
-	out      io.Writer // current output target
-	outFile  *os.File  // non-nil when output is redirected to a file
-	outPath  string
-	format   Format
-	table    string   // current table for meta-commands (.use changes it)
-	readLine ReadLine // input source, for interactive prompts (e.g. .suggest -i)
+	exec    *Executor
+	base    io.Writer // the original output (restored by `.output stdout`)
+	out     io.Writer // current output target
+	outFile *os.File  // non-nil when output is redirected to a file
+	outPath string
+	// arrowWrote records that an Arrow stream has already gone to the current output.
+	// `.output` holds one file handle across queries, so a second stream would be
+	// CONCATENATED onto the first -- a file most readers will read only the head of,
+	// silently. Worth a warning rather than a refusal: concatenated streams are a real
+	// thing to want, and the one who wants them should be the one who said so.
+	arrowWrote bool
+	format     Format
+	table      string   // current table for meta-commands (.use changes it)
+	readLine   ReadLine // input source, for interactive prompts (e.g. .suggest -i)
 }
 
 // ReadLine reads one input line (without the trailing newline), returning io.EOF
@@ -96,8 +102,65 @@ func Run(ctx context.Context, e *Executor, readLine ReadLine, console io.Writer)
 			s.explainOwner(console, execErr)
 			continue
 		}
+		if s.format == FormatArrow {
+			s.writeArrow(console, e, line, res)
+			continue
+		}
 		FormatResult(s.out, res, s.format)
 	}
+}
+
+// writeArrow encodes a result as Arrow IPC, or says why it cannot.
+//
+// It REFUSES A TERMINAL. An Arrow stream is binary, and every other format here is text, so
+// the mistake -- `.format arrow` with no `.output` -- is an easy one to make and its result is
+// a screenful of control characters and a wedged terminal. Refusing names the missing step.
+//
+// The statement is parsed again rather than threaded out of the executor: the typing needs the
+// SELECT list, and the executor returns display headers. Re-parsing is the same work the WATCH
+// check above already does, and the clause this needs -- the projection -- is not one the
+// dialect translation rewrites.
+func (s *session) writeArrow(console io.Writer, e *Executor, line string, res *Result) {
+	if !res.IsSelect {
+		// A write or a DDL has no rows to encode. Its note still belongs on screen
+		// rather than being silently swallowed by a format that cannot hold it.
+		FormatResult(console, res, FormatTable)
+		return
+	}
+	if isCharDevice(s.out) {
+		fmt.Fprintf(console, "error: arrow output is binary; redirect it first "+
+			"(`.output results.arrows`) or use `.format table`\n")
+		return
+	}
+	st, err := Parse(line)
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	if s.arrowWrote {
+		fmt.Fprintf(console, "note: appending a second Arrow stream to %s; most readers "+
+			"will see only the first. `.output <file>` again to start a new one\n", s.outPath)
+	}
+	if err := e.WriteArrow(s.out, st, res); err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	s.arrowWrote = true
+	fmt.Fprintf(console, "arrow: %d row(s)\n", len(res.Rows))
+}
+
+// isCharDevice reports whether w is a terminal. A pipe or a file is fine for binary; a tty is
+// not, and this is the only thing that tells them apart from inside the session.
+func isCharDevice(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func isMeta(line string) bool {
@@ -243,6 +306,7 @@ func (s *session) setOutput(console io.Writer, arg string) {
 	s.outFile = f
 	s.outPath = path
 	s.out = f
+	s.arrowWrote = false
 	fmt.Fprintf(console, "output: %s\n", path)
 }
 
@@ -361,7 +425,8 @@ Meta-commands:
   .help                 show this help
   .tables               list tables (* marks the current one)
   .use <table>          set the current table for the commands below
-  .format <mode>        table (default) | json | classad | classad-new
+  .format <mode>        table (default) | json | classad | classad-new | arrow
+                        (arrow is binary Arrow IPC; redirect it with .output)
   .dialect <d>          classad (default) | ansi -- how WHERE expressions are read.
                         ansi matches the Flight SQL endpoint: string = is case-
                         SENSITIVE, and anything it cannot lower faithfully is refused

@@ -34,6 +34,7 @@
 package arrowtype
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -124,6 +125,56 @@ type Decision struct {
 	Reason string
 	// Detail is a human sentence explaining this attribute's case.
 	Detail string
+	// Tail marks the one column that carries what the others do not. It is not an
+	// attribute: its cell is built from whatever the row holds that no typed column took,
+	// so an encoder fills it from the complement rather than by looking its Name up.
+	Tail bool
+}
+
+// DefaultSampleMax is how many records a type derivation reads.
+//
+// It lives here rather than beside each caller because the number is part of the ANSWER, not a
+// per-caller tuning knob: the schema is a declaration about a whole table, and two front doors
+// that sample differently believe the table has different columns. They did. The endpoint read
+// 10000 and the REPL dialect read 2000 while its comment said the two matched, so the same
+// table could present one set of columns over ADBC and another in the REPL at the same moment.
+//
+// The size itself is set by what the minority kinds look like on a real AP: the attributes
+// whose typing matters most had their second kind in well under 1% of records, so a sample has
+// to be large to see one at all.
+const DefaultSampleMax = 10000
+
+// TailColumnName is the column that carries the attributes no typed column covers.
+//
+// The leading underscore is deliberate: a ClassAd attribute name cannot begin with one, so this
+// column cannot collide with a real attribute however a table evolves.
+const TailColumnName = "_ad"
+
+// TailDecision is the tail column, as a Decision so that every path which already handles
+// columns handles it -- schema building, projection by name, the encoder's field list.
+//
+// WHY THE SCHEMA NEEDS IT. Without a tail, an attribute with no typed column is simply absent
+// from the schema, and a client cannot tell "this table has no such attribute" from "this
+// attribute exists and we declined to type it". Those are different facts with different
+// remedies, and the second one is common: Requirements is an expression in almost every ad and
+// its TEXT is the only useful form of it, so the column it deserves is this one.
+//
+// It is utf8 holding a bracketed ClassAd. Bracketed rather than the newline-separated old form
+// because this is one cell of one row: a self-delimiting value survives a CSV or Parquet export
+// that a multi-line one does not.
+func TailDecision() Decision {
+	return Decision{
+		Name:    TailColumnName,
+		Verdict: Typed,
+		Tail:    true,
+		Field: arrow.Field{
+			Name:     TailColumnName,
+			Type:     arrow.BinaryTypes.String,
+			Nullable: true,
+		},
+		Reason: "tail",
+		Detail: "every attribute of the row that no typed column covers, as ClassAd text",
+	}
 }
 
 // Override is a declared decision about one attribute, for the cases inference cannot reach.
@@ -172,6 +223,10 @@ type Options struct {
 	// falling back to a text column. Off by default: a text column is a faithful
 	// representation and a correctness investigation is what wants the refusal.
 	StrictMixedKinds bool
+	// Tail appends the TailDecision column, so the schema covers what it does not type.
+	// Off by default so that a caller which only wants the typed columns -- a measurement,
+	// a catalog listing that costs per column -- does not have to strip one.
+	Tail bool
 }
 
 // override returns the declared decision for an attribute, if any.
@@ -181,6 +236,18 @@ func (o Options) override(name string) (Override, bool) {
 	}
 	ov, ok := o.Overrides[strings.ToLower(name)]
 	return ov, ok
+}
+
+// KnownKinds lists the kind names an Override may force, for a caller validating configuration
+// before it reaches the derivation. An unknown kind is otherwise ignored silently, which from an
+// operator's side looks exactly like a declaration that was honoured and had no effect.
+func KnownKinds() []string { return []string{"int", "real", "bool", "string", "timestamp"} }
+
+// KnownKind reports whether kind is one KnownKinds lists. It compares exactly: a kind is a
+// fixed token, not an attribute name, so case is not folded here and a caller that accepts
+// mixed case folds it before asking.
+func KnownKind(kind string) bool {
+	return slices.Contains(KnownKinds(), kind)
 }
 
 // kindType maps an override's kind name to its Arrow type.
@@ -463,6 +530,13 @@ func Schema(ms []Measured, opts Options) (*arrow.Schema, []Decision) {
 		if d.Verdict == Typed {
 			fields = append(fields, d.Field)
 		}
+	}
+	// Last, so the typed columns keep the order the measurement gave them and a client
+	// reading by position is unaffected by whether the tail is there.
+	if opts.Tail {
+		d := TailDecision()
+		decisions = append(decisions, d)
+		fields = append(fields, d.Field)
 	}
 	return arrow.NewSchema(fields, nil), decisions
 }

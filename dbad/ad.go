@@ -199,6 +199,8 @@ var unreadableReasons = []struct{ reason, suffix string }{
 	// A write from a session not entitled to the data key (an unprivileged dbrpc client) that
 	// needed the whole record, refused because the record holds a sealed value that only the key
 	// can carry forward. Not storage damage: the writer lacks the privilege to rewrite that row.
+	// Published beside the others because a reason classad emits with nowhere to land is counted
+	// into nothing, and an operator watching a rising unreadable count has to tell the two apart.
 	{"sealed-needs-key", "SealedNeedsKey"},
 }
 
