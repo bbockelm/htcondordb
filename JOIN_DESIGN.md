@@ -793,6 +793,72 @@ computable.** The count the previous section added -- the right side's size, for
 is exactly `k = right rows / left rows`. The estimate the flag was originally waiting for is the
 same estimate the batching decision already fetches.
 
+#### Where the store-side join's time actually goes, and why columnar does not help it yet
+
+The link measurement above prices the ship. This prices the WORK, at a size the earlier numbers
+never reached: every join measurement before this ran at 400-2048 left rows, which fits in cache
+whole and is far too small to say anything about either the read path or the pairing.
+
+**The store-side win holds at scale, and widens.** Archive tables, `k=2`:
+
+| left | out rows | client-side | in the store | |
+|---|---|---|---|---|
+| 2,048 | 4,096 | 78.0 ms | 18.3 ms | 4.3x |
+| 20,000 | 40,000 | 701.6 ms | 122.7 ms | 5.7x |
+| 100,000 | 200,000 | 3,772 ms | 784 ms | 4.8x |
+
+**But the store arm is read-bound, not pairing-bound.** CPU profile at `left=100000`, with the
+fixture build excluded and parked threads (`pthread_cond_wait`, `usleep`) not counted as work:
+
+| | row-oriented | columnar |
+|---|---|---|
+| decompression | 4.09 s | 3.99 s |
+| allocator + GC | 3.81 s | 4.72 s |
+| wire decode | 1.64 s | 1.46 s |
+| **join pairing** | **0.60 s** | **0.61 s** |
+
+The pairing is about 5% of the join, and one seventh of decompression alone. Any work on the pair
+loop -- cache tiling included -- is bounded by that 5% before it starts.
+
+**Columnarizing the store changes nothing for this query.** The columnar arm really is columnar:
+the fixture asserts `ColumnarizedSegments` moved, and it rewrote 128 segments saving 5.98 MB. Yet
+decompression is unchanged and allocations go UP, and the profile says why -- the entry into zstd
+is the same on both arms:
+
+```
+collections.(*Collection).runParallelWireScan.func3
+  -> forEachVisibleWindowKeyed
+     -> (*zstdCodec).DecompressPrefix     3.96 s
+```
+
+`runParallelWireScan` walks records and prefix-decompresses each one. Each record is its own zstd
+frame, so it pays frame setup per record, and within literals decoding the table reconstruction
+(2.25 s) now costs MORE than the decode itself (1.16 s) -- a consequence of the hot-prefix
+optimization succeeding, since it cut the payload to a couple of KB while the fixed per-frame cost
+does not scale with `want`.
+
+A columnar block compresses its regions ONCE per block (`colblock.go`: `strComp`, `coldComp`,
+`coldNumComp`). None of that is reached, because this path does not go through `refVisitorState`
+and so skips the columnar prefilter and the columnar reassembly rules. `forEachVisibleWindowKeyed`
+says so in its own comment: *"The query workers do not use it: they go through refVisitorState."*
+
+**This is a defect the neighbouring path already had and already fixed.** `runParallelQuery`
+carries the post-mortem:
+
+> They used to walk the records, decompress, matchWire and decode, which skipped the columnar
+> prefilter that only the refVisitor path has -- so over a columnarized store every record the
+> WHERE rejects was rebuilt from the arena first.
+
+The wire scan still does exactly that. So the join's read is the lever, and the fix has a
+precedent to follow rather than a design to invent.
+
+**One hypothesis tested and rejected, recorded so it is not retried.** A trained ZSTD dictionary
+does NOT remove the per-frame table cost: 122.6 ms without against 126.6 ms with, best round each,
+and 29% more allocations. It trained (about 114,800 records per table), so this is a real result
+and not a silent no-op. A first run suggested 1.32x in the dictionary's favour; flipping the arm
+order showed that whichever arm ran second won, and the effect vanished. The benchmarks here run
+both orders for that reason.
+
 #### Pricing it with the one number that was missing
 
 The count aggregate already reaches an O(1) length for a mutable table and a zone-pruned
