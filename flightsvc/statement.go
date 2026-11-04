@@ -698,8 +698,39 @@ func (s *Server) scanInto(ctx context.Context, db *dbrpc.Client, enc *arrowtype.
 	if !enc.HasTail() && len(enc.Attrs()) > 0 {
 		vals := make([]classad.Value, len(enc.Attrs()))
 		cells := make([][]classad.Value, len(enc.Attrs()))
-		return db.QueryValuesStream(ctx, table, constraint, enc.Attrs(), limit, false,
+		colv := make([]arrowtype.ColumnValues, len(enc.Attrs()))
+		// ASK FOR DICTIONARY STRING COLUMNS. A pool's Owner, a site name, a status text:
+		// storage holds these as a per-block dictionary and the plain wire form expanded
+		// them to one string per row, on both sides. The decoder expands the dictionary
+		// into the same slice, so nothing below this had to change except knowing the kind.
+		//
+		// It is a request, not a demand: against a server too old to advertise it the flag
+		// is not set and the plain form arrives, which this reads just as well.
+		return db.QueryValuesStreamOpts(ctx, table, constraint, enc.Attrs(), limit, false,
+			dbrpc.ValueStreamOptions{Dictionary: true},
 			func(b *dbrpc.ValueBatch) bool {
+				// COLUMN-WISE where the values can go into the builders as they are: the
+				// relay already carries dense typed arrays, and boxing each cell into a
+				// classad.Value so the encoder can unbox it again is a round trip through
+				// a representation neither end wanted.
+				//
+				// It refuses a batch that needs any conversion or any per-row decision,
+				// and the per-cell path below takes it -- so the coercion rules stay in
+				// one place and this is a shortcut rather than a second semantics.
+				if len(b.Cols) == len(colv) {
+					ok := true
+					for col := range b.Cols {
+						if !columnValuesOf(&b.Cols[col], b.Rows, &colv[col]) {
+							ok = false
+							break
+						}
+					}
+					if ok {
+						if took, _ := enc.AppendColumns(b.Rows, colv); took {
+							return enc.Rows() < batchRows || flush()
+						}
+					}
+				}
 				// Column-major, one forward pass each, rather than ValueAt per cell.
 				// ValueAt recounts the validity bitmap from row 0 every call, so reading a
 				// whole batch through it is quadratic in the batch size -- measured at
@@ -787,6 +818,49 @@ func unpackValueColumn(c *dbrpc.ValueColumn, rows int, dst []classad.Value) []cl
 		dense++
 	}
 	return dst
+}
+
+// columnValuesOf renders one relay column as the encoder's dense form. ok=false when the column
+// carries anything the fast path does not describe -- an exception that is a value rather than a
+// null, or a kind with no dense array at all -- and the caller then takes the per-cell path.
+//
+// An exception that IS a null becomes one here: the relay sends undefined and error cells in the
+// exception list, they are much the commonest thing in it, and refusing the batch over an absent
+// attribute would give the fast path back on exactly the columns a projection asks for.
+func columnValuesOf(c *dbrpc.ValueColumn, rows int, out *arrowtype.ColumnValues) bool {
+	*out = arrowtype.ColumnValues{Valid: c.Valid, Nulls: out.Nulls[:0]}
+	switch c.Kind {
+	case dbrpc.KindInt:
+		out.Ints = c.Ints
+	case dbrpc.KindReal:
+		out.Reals = c.Reals
+	case dbrpc.KindBool:
+		out.Bools = c.Bools
+	case dbrpc.KindString, dbrpc.KindStringDict:
+		// Both forms land in the same Strs slice: the dictionary is expanded at decode by
+		// copying string HEADERS into it, so the only difference upstream is how many
+		// distinct strings were ever allocated.
+		out.Strs = c.Strs
+	default:
+		return false
+	}
+	for i := range c.Exceptions {
+		x := &c.Exceptions[i]
+		if x.NonScalar {
+			return false
+		}
+		switch x.Value.Type() {
+		case classad.UndefinedValue:
+			out.Nulls = append(out.Nulls, arrowtype.NullCell{Row: x.Row, Cause: arrowtype.CauseUndefined})
+		case classad.ErrorValue:
+			out.Nulls = append(out.Nulls, arrowtype.NullCell{Row: x.Row, Cause: arrowtype.CauseError})
+		default:
+			// A scalar of another kind: it may coerce, it may not, and deciding that is
+			// coerce's job rather than this function's.
+			return false
+		}
+	}
+	return true
 }
 
 // batchRows matches arrowstream's default, for the same reason sampleMax does.
