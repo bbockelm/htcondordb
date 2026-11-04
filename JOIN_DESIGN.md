@@ -745,6 +745,54 @@ says nothing about a constrained one, which is a deployment property rather than
 of the statement. That is the one thing still missing, and it is a smaller gap than the
 expansion estimate the flag was originally waiting for.
 
+#### The link, priced
+
+`BenchmarkJoinOverLink` runs both arms over real TCP wrapped in a writer that charges each byte
+against a fixed capacity, and sweeps that capacity against the expansion factor. Capacity is
+charged; propagation delay is not, because charging an RTT per `Write` would penalize a pipelined
+stream for writes a real link overlaps. Leaving latency out biases the result **towards the client
+arm**, which issues two whole side reads where the store arm issues one join, so each crossover
+below is a conservative bound.
+
+`left=2048`, better round per arm, store against client:
+
+| link | k=0.25 | k=1 | k=2 | k=8 |
+|---|---|---|---|---|
+| 10 Gbps | 1.32x faster | 1.13x faster | 1.29x faster | 1.13x faster |
+| 1 Gbps | 1.32x faster | 1.19x faster | 1.24x faster | 1.23x faster |
+| 100 Mbps | **2.24x faster** | 1.35x faster | 1.04x faster | **1.41x SLOWER** |
+| 10 Mbps | **2.21x faster** | 1.09x faster | **1.16x SLOWER** | **1.40x SLOWER** |
+
+Bytes the server sent per query, which is the direction the arms differ in:
+
+| k | store | client | ratio |
+|---|---|---|---|
+| 0.25 | 43,526 | 107,022 | 0.41x |
+| 1 | 174,030 | 188,402 | 0.92x |
+| 2 | 348,044 | 296,923 | 1.17x |
+| 8 | 1,392,088 | 948,009 | 1.47x |
+
+**The bytes model predicts the crossovers quantitatively, which is the part worth trusting.** The
+store wins while its CPU advantage covers the time to ship its extra bytes, so the crossover sits
+at `extra bytes / CPU advantage`. Taking the CPU advantage from this sweep's own 10 Gbps row:
+k=2 gives 51,121 B / 4.49 ms = 91 Mbps, and k=8 gives 444,079 B / 9.12 ms = 390 Mbps. Both
+predictions fall inside the intervals the sweep actually brackets -- k=2 between 10 and 100 Mbps,
+k=8 between 100 Mbps and 1 Gbps. The model was written down before the sweep ran.
+
+**What this settles.** The flag was waiting on a deployment property, and the deployment property
+turns out to be a single threshold that the expansion factor sets:
+
+- **k <= 1 -- the store ships no more than the client, and wins at every capacity measured.** It
+  wins by MORE as capacity falls (1.32x at 10 Gbps, 2.24x at 100 Mbps for k=0.25), because the
+  bytes it saves start to matter. There is no link on which this direction is wrong.
+- **k > 1 -- the store ships more, and the win survives only above the crossover.** At gigabit and
+  above it is still faster at every k measured; below that it inverts, reaching 1.4x slower.
+
+So the honest default is not one flag but a conditional, and **the condition is already
+computable.** The count the previous section added -- the right side's size, for one round trip --
+is exactly `k = right rows / left rows`. The estimate the flag was originally waiting for is the
+same estimate the batching decision already fetches.
+
 #### Pricing it with the one number that was missing
 
 The count aggregate already reaches an O(1) length for a mutable table and a zone-pruned
