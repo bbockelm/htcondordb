@@ -85,6 +85,13 @@ func benchAd(i int) string {
 	return b.String()
 }
 
+// benchValueOpts is what the Flight service asks for, so the value arms measure the form that
+// actually ships. Without it they take the plain string column, which allocates a Go string per
+// cell on the client where the dictionary allocates one per distinct value -- so the arms would
+// charge the client for work the service does not do, and the comparison they exist to make would
+// be against a path nobody takes.
+var benchValueOpts = dbrpc.ValueStreamOptions{Dictionary: true}
+
 // benchProjection is the common read: a handful of columns, not the whole ad.
 var benchProjection = []string{"Owner", "ClusterId", "JobStatus", "QDate", "MemoryUsage", "CpusUsage"}
 
@@ -428,7 +435,8 @@ func benchReadStages(b *testing.B, rows int, columnar bool) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			n := 0
-			if err := st.client.QueryValuesStream(ctx, "history", "true", benchProjection, 0, false,
+			if err := st.client.QueryValuesStreamOpts(ctx, "history", "true", benchProjection, 0, false,
+				benchValueOpts,
 				func(vb *dbrpc.ValueBatch) bool { n += vb.Rows; return true }); err != nil {
 				b.Fatal(err)
 			}
@@ -449,7 +457,8 @@ func benchReadStages(b *testing.B, rows int, columnar bool) {
 		for i := 0; i < b.N; i++ {
 			enc := arrowtype.NewEncoder(projected, arrowtype.EncodeOptions{})
 			n := 0
-			if err := st.client.QueryValuesStream(ctx, "history", "true", benchProjection, 0, false,
+			if err := st.client.QueryValuesStreamOpts(ctx, "history", "true", benchProjection, 0, false,
+				benchValueOpts,
 				func(vb *dbrpc.ValueBatch) bool {
 					for row := range vb.Rows {
 						vals := make([]classad.Value, len(vb.Cols))
@@ -495,7 +504,8 @@ func benchReadStages(b *testing.B, rows int, columnar bool) {
 			n := 0
 			vals := make([]classad.Value, len(benchProjection))
 			cells := make([][]classad.Value, len(benchProjection))
-			if err := st.client.QueryValuesStream(ctx, "history", "true", benchProjection, 0, false,
+			if err := st.client.QueryValuesStreamOpts(ctx, "history", "true", benchProjection, 0, false,
+				benchValueOpts,
 				func(vb *dbrpc.ValueBatch) bool {
 					for col := range vb.Cols {
 						cells[col] = unpackColumn(&vb.Cols[col], vb.Rows, cells[col][:0])
