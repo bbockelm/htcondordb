@@ -3,6 +3,81 @@
 htcondordb is configured through the HTCondor config it inherits from
 `condor_master` (plus a couple of environment overrides for clients).
 
+## Common setups
+
+Each block goes in `/etc/condor/config.d/50-htcondordb.conf` and takes effect on
+`condor_restart -master` (or `condor_reconfig` for anything but
+`DAEMON_LIST`/`DC_DAEMON_LIST`).
+
+### Mirror the local schedd
+
+The usual deployment, and the whole minimum — the file paths default to the
+schedd's own:
+
+```conf
+DAEMON_LIST    = $(DAEMON_LIST), HTCONDORDB
+DC_DAEMON_LIST = $(DC_DAEMON_LIST) +HTCONDORDB
+
+HTCONDORDB_SYNC_SCHEDD = true
+```
+
+### Keep a bounded amount of history
+
+Archives grow without limit until you cap them:
+
+```conf
+HTCONDORDB_SYNC_SCHEDD = true
+
+# applies to history and epoch_history
+HTCONDORDB_ARCHIVE_MAX_BYTES = 20 GB
+# narrower cap for one of them
+HTCONDORDB_EPOCH_HISTORY_MAX_BYTES = 5 GB
+```
+
+### Record what jobs actually used
+
+Adds a resource-usage time series off the same file the mirror already reads:
+
+```conf
+HTCONDORDB_SYNC_SCHEDD = true
+HTCONDORDB_JOB_METRICS = true
+
+HTCONDORDB_JOB_METRICS_MAX_AGE = 30d
+# extra dimensions to GROUP BY
+HTCONDORDB_JOB_METRICS_ATTRS             = ProjectName
+HTCONDORDB_JOB_METRICS_CATEGORICAL_ATTRS = ProjectName
+```
+
+### Group history by a dimension of your own
+
+An unindexed `GROUP BY` is a full scan, so index what you group by:
+
+```conf
+HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS = AccountingGroup, ProjectName
+```
+
+### Serve Arrow-native clients
+
+For notebooks, pandas, Polars and DuckDB. Read-only, and off until you set an
+address:
+
+```conf
+HTCONDORDB_FLIGHT_ADDRESS = 127.0.0.1:9095
+```
+
+See [Arrow Flight SQL](arrow-flight-sql.md) for the client side.
+
+### Point a client somewhere else
+
+`HTCONDORDB_ADDRESS_FILE` and `HTCONDORDB_HOST` are read from the environment
+too, which is how a client with no command line (the Python driver's
+`connect()`) reaches a daemon other than the local one:
+
+```sh
+export HTCONDORDB_HOST='<db.example.org:9618?sock=htcondordb>'
+python -c "import htcondordb; print(htcondordb.connect().execute('SELECT COUNT(*) FROM jobs').fetchone())"
+```
+
 ## Address resolution
 
 `HTCONDORDB_ADDRESS_FILE` and `HTCONDORDB_HOST` are also read from the
@@ -38,8 +113,8 @@ there.
 | `HTCONDORDB_DIR` | `$(SPOOL)/htcondordb` | On-disk database directory. |
 | `HTCONDORDB_ADDRESS_FILE` | `$(LOG)/.htcondordb_address` | Where the command address is published, and where clients look for it. Also read from the environment. |
 | `HTCONDORDB_HOST` | — | Client fallback when no address file is readable. Also read from the environment. |
-| `HTCONDORDB_QUEUE_POOL_SIZE` | `4` | **Client side** — read from the configuration of the daemon that embeds the C queue client (the schedd answering `condor_q` from a mirror), not from this daemon's. How many dbrpc sessions concurrent queries may spread over. One session is one socket and one decode loop, so simultaneous full dumps queue behind each other; sessions are dialled only when queries actually contend, and closed again after two minutes idle. Raise it on a submit host that serves many simultaneous queries against a well-provisioned mirror; `1` restores a single shared session. The gain is in the first few connections — the database's own scan is already parallel internally — so a large value mostly buys descriptors. |
-| `HTCONDORDB_CLIENT_PPROF` | unset | **Client side**, and a DIAGNOSTIC — read from the environment of the process that embeds the C client, so for the schedd it is set through `SCHEDD_ENVIRONMENT`. An address (`127.0.0.1:9096`) serves Go pprof for the client half, which is otherwise invisible: the schedd's own profiler sees C++ and the database's sees only what reaches the database, so work that accumulates in between — goroutines held across queries, a decode loop that slows as it is reused — appears in neither. Unset, nothing listens. Keep it on loopback: the endpoint serves heap contents, goroutine stacks and CPU profiles, and the host is often a root daemon; a non-loopback address is accepted but logged as a warning. |
+| `HTCONDORDB_QUEUE_POOL_SIZE` | `4` | **Client side** — set in the configuration of the daemon that embeds the C queue client (the schedd answering `condor_q` from a mirror), not this daemon's. How many dbrpc sessions concurrent queries may spread over, so that simultaneous full dumps do not queue behind each other. Raise it on a submit host serving many simultaneous queries; `1` restores a single shared session. Most of the gain is in the first few sessions. |
+| `HTCONDORDB_CLIENT_PPROF` | unset | **Client side**, and a diagnostic — read from the environment of the process that embeds the C client, so for the schedd it is set through `SCHEDD_ENVIRONMENT`. An address (`127.0.0.1:9096`) serves Go pprof for the client half, which neither the schedd's own profiler nor the database's can see. Unset, nothing listens. Keep it on loopback — it serves heap contents, goroutine stacks and CPU profiles; a non-loopback address is accepted but warned about. |
 | `HTCONDORDB_HA_MODE` | `standalone` | `standalone` / `leader-follower` / `consistent`. See [HA](ha.md). |
 | `HTCONDORDB_ROLE` | `leader` | Leader-follower role. |
 | `HTCONDORDB_LEADER` | — | Leader address (follower). |
@@ -64,11 +139,11 @@ there.
 | `HTCONDORDB_FEDERATE_DISCOVER_INTERVAL` | `60` | Seconds between a hub's collector discovery passes. |
 | `HTCONDORDB_FEDERATE_STATE_INTERVAL` | `5` | Seconds between a hub's source-state refreshes (`federation_sources`, ad summary, metrics). |
 | `HTCONDORDB_ARCHIVE_ROTATE_INTERVAL` | `3600` | Archive-table retention sweep interval (seconds; `0` disables). |
-| `HTCONDORDB_ARCHIVE_INDEX_MIN_DEMAND` | `100` | Query count at which the maintenance pass adds an index to an archive (history) table on its own. A negative value turns archive index auto-tune off. Higher than the mutable tables' threshold of 10 on purpose: a mutable index is built from live data, while an archive index is backfilled by decompressing history (bounded by the archive's 1 GiB backfill horizon), and an auto-added archive index is never auto-dropped, because dropping is nearly free and re-adding costs another backfill. Against the 7-day demand half-life, 100 asks for a sustained read pattern rather than one afternoon of ad-hoc queries. |
+| `HTCONDORDB_ARCHIVE_INDEX_MIN_DEMAND` | `100` | Query count at which the maintenance pass adds an index to an archive table on its own. Demand decays with a 7-day half-life, so the default asks for a sustained read pattern rather than one afternoon of ad-hoc queries. An auto-added archive index is never auto-dropped. A negative value turns archive index auto-tune off. |
 | `HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS` | — | Categorical (string-equality) indexes on the `history` and `epoch_history` archives **in addition to** each table's built-in set (see [Schedd sync](schedd-sync.md#built-in-indexes)). Name grouping dimensions such as `AccountingGroup` or `ProjectName`: an unindexed `GROUP BY` is a full scan. Naming an attribute here that the built-in set indexes as a value index makes it categorical. Applied to an existing archive on the next start or `condor_reconfig`, backfilled in the background. Add-only. |
 | `HTCONDORDB_ARCHIVE_INDEX_BACKFILL_BYTES` | `256 MiB` | Per-pass budget, in stored segment bytes, for carrying the index set to archive segments sealed before an index was added. Adding an index (by hand or by auto-tune) rebuilds only the newest 1 GiB of the archive at once; the maintenance pass rebuilds the older segments that lack it, newest first, this much per pass, so a large history is covered over several passes without one long stall. Accepts a unit suffix (`512 MiB`) or plain bytes; `0` turns the backfill off. `.indexes <table>` shows what is still pending; `.reindex <table>` covers the whole archive at once. |
 | `HTCONDORDB_ARCHIVE_VALUE_ATTRS` | — | Numeric (equality and range) indexes on the `history` and `epoch_history` archives in addition to the built-in set. Same rules as `HTCONDORDB_ARCHIVE_CATEGORICAL_ATTRS`. |
-| `HTCONDORDB_SCHEMA_REQUIRE_ATTRS` | `ResidentSetSize, ProportionalSetSize, CurrentResidentSetSize, MemoryUsage, ImageSize, DiskUsage, RemoteWallClockTime, CommittedTime, RemoteUserCpu, RemoteSysCpu, BytesSent, BytesRecvd` | Attributes the columnar schema must carry on `jobs`, `history` and `epoch_history` whatever their presence rate. When unset, `history` also requires `CompletionDate`, which it is bounded and aggregated by and which otherwise has to be read out of every record, and `epoch_history` also requires `VacateReasonCode`, which only stopped runs carry and which searches for them filter on; a configured list replaces the defaults (it is not added to the defaults), since every required field costs bytes in every record. A field is otherwise admitted only when it appears in ~90% of sampled ads, which on a job table measures how far the jobs got rather than what anyone reads: everything in this list is written once a job has RUN, and the same table holds every job removed before it ever ran. `MemoryUsage` is usually the starter's expression `((ResidentSetSize + 1023) / 1024)` rather than a number; its value is computed when a segment is columnarized, so `COUNT`/`MIN`/`MAX`/`SUM` and bucketed `GROUP BY` over it read the column instead of every record. `none` requires nothing. A change rewrites nothing at once: the next maintenance pass adopts the re-derived schema, and each pass after it rewrites a budgeted number of sealed segments (64) onto it, so a history of millions of jobs converges over a few days, with exact answers throughout. `.schema rebuild <table>` adopts it immediately; `.schema require` shows any attribute the derivation refused. |
+| `HTCONDORDB_SCHEMA_REQUIRE_ATTRS` | `ResidentSetSize, ProportionalSetSize, CurrentResidentSetSize, MemoryUsage, ImageSize, DiskUsage, RemoteWallClockTime, CommittedTime, RemoteUserCpu, RemoteSysCpu, BytesSent, BytesRecvd` | Attributes the columnar schema must carry on `jobs`, `history` and `epoch_history` whatever their presence rate — otherwise an attribute needs to appear on ~90% of sampled ads, which on a job table measures how far the jobs got rather than what anyone queries. When unset, `history` additionally requires `CompletionDate` and `epoch_history` additionally requires `VacateReasonCode`; **a configured list replaces the defaults** rather than adding to them, since every required field costs bytes in every record. `none` requires nothing. A change takes effect gradually: the next maintenance pass adopts the new schema and each pass after it rewrites 64 sealed segments onto it, with exact answers throughout. `.schema rebuild <table>` adopts it immediately; `.schema require` shows any attribute the derivation refused. |
 | `HTCONDORDB_ARCHIVE_MAX_BYTES` | — | Default on-disk size cap applied to **both** schedd-sync archives (`history`, `epoch_history`). Oldest whole segments are dropped past the cap on the retention sweep. Accepts a unit suffix (`10 GB`, `500MiB`) or plain bytes; unset/`0` = no limit. |
 | `HTCONDORDB_HISTORY_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for the `history` archive; overrides the shared default (set to `0` to uncap this table while the default caps the other). |
 | `HTCONDORDB_EPOCH_HISTORY_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for the `epoch_history` archive; overrides the shared default. |
@@ -81,17 +156,17 @@ there.
 | `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE` | library default (8 MiB) | Sealed-segment size for `job_metrics` (create-time only). Accepts a unit suffix (`8 MiB`); `0` means the library default. Values below 64 KiB or at/above 4 GiB are refused (logged, default used). Leave it alone unless you have measured: bytes per record is **not** monotone in segment size, and 8 MiB measured best of 2/8/32/64 MiB (2 MiB cost 1.5x the storage for a 4% faster recent-range query). |
 | `HTCONDORDB_JOB_METRICS_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for `job_metrics`; overrides the shared default (`0` uncaps this table). |
 | `HTCONDORDB_JOB_METRICS_MAX_AGE` | — | Age cap measured against `SampleTime`. A bare number is seconds; a duration suffix (`30d`, `720h`) is accepted. Both caps apply; whichever binds first drops the oldest whole segments. |
-| `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | **Create-time only** — the storage layer has no runtime setter for it, so on an existing archive this is ignored; set it before first enabling or drop the table. Allows secondary (group) columnar schemas for attributes only *some* jobs carry — GPU metrics, a container universe's `NetworkIn`/`NetworkOut`. They sit below the 90% presence a field needs in the base schema, so without grouping they are stored as rows. Not free: measured at +60% bytes/record on a heterogeneous pool, in exchange for the columnar fast path on those attributes. A pool with no GPUs and no containers pays nothing either way. |
+| `HTCONDORDB_JOB_METRICS_GROUP_SCHEMAS` | `true` | **Create-time only** — on an existing archive this is ignored; set it before first enabling sampling, or drop the table. Gives a columnar fast path to attributes only *some* jobs carry (GPU metrics, a container universe's `NetworkIn`/`NetworkOut`), which otherwise fall below the 90% presence the base schema needs and are stored as rows. Measured at +60% bytes/record on a mixed pool; a pool with no GPUs and no containers pays nothing either way. |
 | `HTCONDORDB_FLIGHT_ADDRESS` | — | Serve **Arrow Flight SQL** on this address (`127.0.0.1:9095`, `:9095`). Unset, nothing listens and no gRPC port is opened. Lets Arrow-native clients — anything speaking ADBC, and so pandas, Polars or DuckDB — read tables as Arrow record batches. Read-only: there is no write surface at all. See [Arrow Flight SQL](arrow-flight-sql.md). |
 | `HTCONDORDB_FLIGHT_AUTHENTICATION` | `OPTIONAL` | `OPTIONAL` / `SCITOKEN` / `NONE`. `OPTIONAL` follows CEDAR rather than being stricter: a credential is verified when one is offered, otherwise the connection gets the anonymous identity and `ALLOW_READ` decides — so this door exposes exactly what the same caller could already read over CEDAR, under the same policy. `SCITOKEN` requires a bearer token from a trusted issuer. `NONE` serves every caller as anonymous. |
 | `HTCONDORDB_FLIGHT_SCITOKEN_ISSUERS` | — | Trusted token issuers, required by `SCITOKEN` and refused without it. |
 | `HTCONDORDB_FLIGHT_STREAM_MEMORY` | `0` (unlimited) | Bytes of Arrow memory one result stream may hold. A stream past it is refused with `ResourceExhausted` naming the limit, rather than growing the daemon's heap until something else fails. Accepts a unit suffix. |
 | `HTCONDORDB_FLIGHT_MAX_STREAMS` | `0` (unlimited) | Concurrent result streams. Past it a client is refused immediately and told to retry, which costs nothing, instead of queueing behind work the daemon has not got the memory for. |
-| `HTCONDORDB_FLIGHT_SCHEMA_TTL` | `30s` | How long a table's derived Arrow schema is reused. Deriving one samples records, and every statement needs it twice — once to answer the result shape and once to encode the rows — so a client looping over a prepared statement otherwise pays a sampling scan per call. The trade is staleness: a column that appears in the table shows up in the schema only once the entry ages out. `0` disables the cache and derives one per request. A bare number is seconds; a suffix (`90s`, `5m`) works too. Entries are scoped to the caller's authorization, so a reader that may not see private attributes never gets a schema derived for one that may. |
+| `HTCONDORDB_FLIGHT_SCHEMA_TTL` | `30s` | How long a table's derived Arrow schema is reused, so a client looping over a prepared statement does not pay a sampling scan per call. The trade is staleness: a column that appears in the table shows up in the schema only once the entry ages out — set `0` if you are watching one arrive. A bare number is seconds; a suffix (`90s`, `5m`) works too. Entries are scoped to the caller's authorization. |
 | `HTCONDORDB_FLIGHT_TIME_ATTRS` | — | Extra attributes holding unix-epoch **seconds**, to be served as Arrow timestamps rather than integers. Nothing can infer this from the values, so it is declared. `QDate`, `CompletionDate`, `JobStartDate` and similar well-known job attributes are already recognized. |
-| `HTCONDORDB_FLIGHT_EXCLUDE_ATTRS` | — | Attributes to give no typed column, whatever the measurement says. The case for it is an attribute whose **text** is the content: `Requirements` is an expression in nearly every ad and evaluates to a boolean that means nothing without a machine to match against, and it is the same shape as `MemoryUsage`, whose evaluated value *is* the content — no measurement separates the two. Excluding an attribute does not hide it; its text still arrives in the `_ad` tail column. |
+| `HTCONDORDB_FLIGHT_EXCLUDE_ATTRS` | — | Attributes to give no typed column, whatever the measurement says. Use it for an attribute whose **text** is the content — `Requirements` evaluates to a boolean that means nothing without a machine to match against. Excluding an attribute does not hide it; its text still arrives in the `_ad` tail column. |
 | `HTCONDORDB_FLIGHT_ATTR_KINDS` | — | Forced column types, as `Attribute:kind` entries. Kinds: `int`, `real`, `bool`, `string`, `timestamp`. For the attribute whose type is known and whose sample happens not to show it. A forced kind the data does not hold is allowed and is not silent: the encoder counts every value it then cannot store. A malformed or unknown entry is logged and ignored rather than failing startup. |
-| `HTCONDORDB_FLIGHT_COLUMN_TYPES_FILE` | beside the database | Where the endpoint remembers each table's measured column types, so a column keeps its position and its settled type across a restart and a consumer's cached catalog stays valid. Not a schema anyone authors: it holds what was measured, not policy, and losing it costs a re-measurement rather than an answer. Types do move when the measurement keeps disagreeing — the schema generation in the published Arrow metadata says when — while a column's POSITION never moves, so a cached schema is always a prefix of the current one. `none` turns persistence off; with no database directory the memory lives for the process only. It records nothing an unprivileged reader could not already list. |
+| `HTCONDORDB_FLIGHT_COLUMN_TYPES_FILE` | beside the database | Where the endpoint remembers each table's measured column types, so a column keeps its position and its settled type across a restart and a client's cached catalog stays valid. Not a schema you author — losing it costs a re-measurement, not an answer. A column's position never moves, so a cached schema is always a prefix of the current one. `none` turns persistence off. |
 | `HTCONDORDB_FLIGHT_STRICT_MIXED_KINDS` | `false` | Refuse an attribute whose kinds genuinely disagree instead of serving it as a text column. Off by default because a text column is a faithful representation of mixed data; turn it on to hear about the disagreement rather than read around it. |
 | `HTCONDORDB_CHANGEFEED_ADDRESS` | — | Serve the HTTP/SSE change feed on this address (`:9620`), from which a non-CEDAR sink pulls this database's tables and archives. Unset, nothing listens. |
 | `HTCONDORDB_CHANGEFEED_ADDRESS_FILE` | — | Where the feed's bound address is written (useful with a `:0` port). |
@@ -106,12 +181,9 @@ Standard `SEC_*` and `ALLOW_`/`DENY_` knobs configure security and authorization
 
 ### Unparseable values
 
-Every `HTCONDORDB_JOB_METRICS_*` knob above that takes a size or a duration reports a value it
-cannot parse, at `ERROR`, naming the knob — and falls back to the **safe** direction: no cap, no
-throttle, the library default. Nothing is guessed at.
+Every knob above that takes a size or a duration logs a value it cannot parse at `ERROR`, naming
+the knob, and falls back to the safe direction: no cap, no throttle, the library default.
 
-This is worth stating because the older integer parser did guess, and silently.
-`HTCONDORDB_JOB_METRICS_MAX_AGE = 30d` resolved to **30 seconds**, so the hourly retention sweep
-erased the table on every pass; `HTCONDORDB_JOB_METRICS_SEGMENT_SIZE = 8 MiB` resolved to **8
-bytes**. If you are reading logs from a deployment older than this change, check for
-`max_age_seconds` and `SegmentSize` values far smaller than what the configuration says.
+Versions before this parser existed read `30d` as **30 seconds** and `8 MiB` as **8 bytes**,
+silently. If you are reading logs from an older deployment, check for `max_age_seconds` and
+`SegmentSize` values far smaller than the configuration asks for.
