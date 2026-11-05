@@ -116,6 +116,10 @@ jobs:
           fi
 
       - name: Run the suite, and confirm the ADBC tests ran
+        # The suite finishes in about ninety seconds. A cap in minutes is generous for
+        # that and still bounds a wedged client call, which otherwise runs to GitHub's
+        # six-hour job limit: one did, and was cancelled having reported nothing.
+        timeout-minutes: 15
         env:
           # Turns every skip in the ADBC tests into a failure, so the Flight SQL endpoint
           # cannot go unchecked just because a driver failed to import.
@@ -129,12 +133,16 @@ jobs:
         # into a failure, but it cannot speak for a test that was never collected: a renamed
         # file or a broken import at collection time would leave pytest reporting success
         # over a suite missing the tests this step exists to run.
+        #
+        # Through tee rather than a captured variable: the grep below needs the whole
+        # output, but capturing it means nothing reaches the log until the command
+        # returns -- so a run that never returns reports neither how far the suite got
+        # nor the thread dump faulthandler writes when a test overruns.
         run: |
           set -euo pipefail
-          out=$(make python-test 2>&1) || { echo "$out"; exit 1; }
-          echo "$out"
+          make python-test 2>&1 | tee suite.log
           for name in test_adbc_get_info test_adbc_bound_parameters test_adbc_select_and_types; do
-            if ! grep -q "${name} PASSED" <<<"$out"; then
+            if ! grep -q "${name} PASSED" suite.log; then
               echo "::error::${name} did not run; the Flight SQL endpoint went unchecked"
               exit 1
             fi

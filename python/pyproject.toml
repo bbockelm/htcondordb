@@ -56,3 +56,9 @@ htcondordb = ["_lib/*.so", "_lib/*.dylib", "_lib/*.dll"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Dump every thread's stack when one test overruns this, so a client call that never
+# returns names itself in the log instead of stopping the run with nothing to read.
+# The whole suite takes about ninety seconds; the longest single test shells out to a
+# subprocess it gives 120s, so this sits above that and fires only on a real wedge.
+# It reports and lets the test continue -- the job's own timeout is what ends the run.
+faulthandler_timeout = 180
