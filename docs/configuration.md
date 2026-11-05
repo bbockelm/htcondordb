@@ -101,6 +101,17 @@ there.
 | `HTCONDORDB_CHANGEFEED_MIN_AGE_SECONDS` | — | With `HTCONDORDB_CHANGEFEED_AGE_ATTR`, the minimum age before acknowledged records may be dropped. The archive's size and age caps still win. |
 | `HTCONDORDB_CHANGEFEED_LEASE_SECONDS` | `3600` | How long a subscriber that stops acknowledging holds back the GC floor before it is evicted. |
 
+| `HTCONDORDB_WASM_FUNCTIONS` | — | Names of WebAssembly modules to load as ClassAd **functions**, so a query or a constraint can call one. Each needs `HTCONDORDB_WASM_<NAME>_PATH` and `_MIN_ARGS`. See [User functions](user-functions.md). |
+| `HTCONDORDB_WASM_AGGREGATES` | — | Names of WebAssembly modules to load as **aggregates**, reduced the way `SUM` is. Each needs `HTCONDORDB_WASM_<NAME>_PATH`. |
+| `HTCONDORDB_WASM_<NAME>_PATH` | — | The module file. Required. |
+| `HTCONDORDB_WASM_<NAME>_MIN_ARGS` | — | How many arguments the function takes. Required for a function; it is checked before the module runs, so there is no safe default. |
+| `HTCONDORDB_WASM_<NAME>_MAX_ARGS` | `_MIN_ARGS` | The most it takes; `-1` is variadic. |
+| `HTCONDORDB_WASM_<NAME>_TRUSTED` | `false` | Drop the wall-clock deadline and run the module uninterruptibly, which is most of the per-call cost. The step budget, the memory cap and every validation still apply. A trusted module that loops forever hangs a goroutine with nothing able to stop it, so set this only for a module you built. |
+| `HTCONDORDB_WASM_MEMORY_PAGES` | `128` | Linear memory per module, in 64 KiB pages. |
+| `HTCONDORDB_WASM_STEPS` | `10000000` | The deterministic step budget a module charges itself against. |
+| `HTCONDORDB_WASM_TIMEOUT` | `1` | Seconds of wall clock before a call is abandoned. This is the backstop that stops a module which charges itself nothing. |
+| `HTCONDORDB_WASM_MAX_INSTANCES` | `GOMAXPROCS` | Concurrent instances of one module. |
+
 Standard `SEC_*` and `ALLOW_`/`DENY_` knobs configure security and authorization
 — see [Authorization](authorization.md).
 

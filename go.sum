@@ -8,6 +8,8 @@ github.com/PelicanPlatform/classad/db v0.37.0 h1:Y9vWh6kEFqnB0BrS0Pg62WclDFb91Ps
 github.com/PelicanPlatform/classad/db v0.37.0/go.mod h1:jQDTCoDRKQdXlq8fhe37rTDIG22vwIpbdbqWCnOLvaM=
 github.com/PelicanPlatform/classad/dbrpc v0.37.0 h1:Sd6P8u/NR/qeTnkOg5ZinkzJI4OcNBYeS9YPeX7+uz8=
 github.com/PelicanPlatform/classad/dbrpc v0.37.0/go.mod h1:CykQBZZBwxXNWAyiawuBMX0oqj7N08BZpcYRhm3f2BI=
+github.com/PelicanPlatform/classad/wasmudf v0.37.1-0.20261105142505-837330b2540f h1:nIYk3XTjZaH7GNjRFuYhRUZk2GG+0RvNnzX/7rct4YY=
+github.com/PelicanPlatform/classad/wasmudf v0.37.1-0.20261105142505-837330b2540f/go.mod h1:RVpFzTOjY/ahMDS3NA4paW/clbMdXYlVraT2onL2CfY=
 github.com/RoaringBitmap/roaring/v2 v2.29.0 h1:jSjxqZEqiF9W5dHUFsemupb9bnLaQJwZVe5yMetbsZg=
 github.com/RoaringBitmap/roaring/v2 v2.29.0/go.mod h1:BZufmFbox589n3j5eOmyTaLSGXbRLc2LmQvjKjzSEGU=
 github.com/andybalholm/brotli v1.2.3 h1:8H1qwOkl2LPfjf3YezB90JnCliZb6SInJ/OJkEbA5NQ=
@@ -161,6 +163,8 @@ github.com/stretchr/testify v1.8.0/go.mod h1:yNjHg4UonilssWZ8iaSj1OCr/vHnekPRkoO
 github.com/stretchr/testify v1.8.1/go.mod h1:w2LPCIKwWwSfY2zedu0+kehJoqGctiVI29o6fzry7u4=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
+github.com/tetratelabs/wazero v1.12.0 h1:DuWcpNu/FzgEXgGBDp8J1Spc+CWOvvtvVyjKlaZopYU=
+github.com/tetratelabs/wazero v1.12.0/go.mod h1:LvKtzl2RqO4gyF27BiXU+nKAjcV8f38U+kP/q2vgxh0=
 github.com/tidwall/btree v1.8.1 h1:27ehoXvm5AG/g+1VxLS1SD3vRhp/H7LuEfwNvddEdmA=
 github.com/tidwall/btree v1.8.1/go.mod h1:jBbTdUWhSZClZWoDg54VnvV7/54modSOzDN7VXftj1A=
 github.com/yuin/goldmark v1.4.13/go.mod h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY=
