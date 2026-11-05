@@ -86,6 +86,17 @@ type Catalog interface {
 	ServeConnOpts(conn dbrpc.MsgConn, opts dbrpc.ServeOptions) error
 }
 
+// localReader is the OPTIONAL half of Catalog: a catalog that can also be read in process, without
+// encoding the rows into a frame and decoding them back on the other side of the pipe.
+//
+// Optional rather than part of Catalog so that a catalog which cannot do it keeps working, and
+// reads exactly as it did -- the same reason a table that cannot serve a column scan falls through
+// to the framed path rather than failing. The loopback is still opened either way: it serves
+// everything that is not a column scan, and it is what a scan falls back to.
+type localReader interface {
+	LocalSession(opts dbrpc.ServeOptions) *dbrpc.LocalSession
+}
+
 // Sessions builds a per-connection Flight service over an in-process dbrpc loopback.
 type Sessions struct {
 	cat    Catalog
@@ -99,6 +110,8 @@ type Sessions struct {
 
 type session struct {
 	client *dbrpc.Client
+	// local is nil when the catalog cannot be read in process; callers fall back to client.
+	local *dbrpc.LocalSession
 }
 
 // NewSessions requires an authenticator. A nil one is a programming error rather than a
@@ -153,7 +166,7 @@ func (s *Sessions) For(ctx context.Context) (*dbrpc.Client, func(), error) {
 // side of the loopback was given, which the client never learns. It is reported here because
 // it is the one thing that makes two identities derive different schemas from the same table,
 // so anything caching a derivation has to key on it.
-func (s *Sessions) ForScoped(ctx context.Context) (*dbrpc.Client, bool, func(), error) {
+func (s *Sessions) ForScoped(ctx context.Context) (*dbrpc.Client, *dbrpc.LocalSession, bool, func(), error) {
 	return s.forScoped(ctx)
 }
 
@@ -170,23 +183,23 @@ func (s *Sessions) Identity(ctx context.Context) (string, error) {
 
 // forWithIdentity is openSession without the privilege bit, for callers that only need the identity.
 func (s *Sessions) forWithIdentity(ctx context.Context) (*dbrpc.Client, string, func(), error) {
-	client, user, _, release, err := s.openSession(ctx)
+	client, _, user, _, release, err := s.openSession(ctx)
 	return client, user, release, err
 }
 
 // forScoped is openSession without the identity.
-func (s *Sessions) forScoped(ctx context.Context) (*dbrpc.Client, bool, func(), error) {
-	client, _, private, release, err := s.openSession(ctx)
-	return client, private, release, err
+func (s *Sessions) forScoped(ctx context.Context) (*dbrpc.Client, *dbrpc.LocalSession, bool, func(), error) {
+	client, local, _, private, release, err := s.openSession(ctx)
+	return client, local, private, release, err
 }
 
 // openSession authenticates, authorizes, and opens one loopback session, reporting the identity it
 // authenticated as and whether the session was served with private attributes included.
-func (s *Sessions) openSession(ctx context.Context) (*dbrpc.Client, string, bool, func(), error) {
+func (s *Sessions) openSession(ctx context.Context) (*dbrpc.Client, *dbrpc.LocalSession, string, bool, func(), error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	user, limits, err := authenticateScoped(ctx, s.authn, md)
 	if err != nil {
-		return nil, "", false, nil, status.Errorf(codes.Unauthenticated, "%s: %v", s.authn.Name(), err)
+		return nil, nil, "", false, nil, status.Errorf(codes.Unauthenticated, "%s: %v", s.authn.Name(), err)
 	}
 	// An empty user is the anonymous peer, not a failure: the policy below decides whether
 	// it may read, exactly as it does for an anonymous CEDAR peer.
@@ -195,11 +208,11 @@ func (s *Sessions) openSession(ctx context.Context) (*dbrpc.Client, string, bool
 	// level is outside the session's bounding set before it consults ALLOW_READ. A SciToken is
 	// always bounded, so one that names no condor level is refused here as it is over CEDAR.
 	if !cedarsec.AuthorizationLimitsPermit(limits, []string{"READ"}) {
-		return nil, "", false, nil, status.Errorf(codes.PermissionDenied,
+		return nil, nil, "", false, nil, status.Errorf(codes.PermissionDenied,
 			"the credential's authorization limits %v do not include READ", limits)
 	}
 	if !s.authz("READ", addr, user) {
-		return nil, "", false, nil, status.Errorf(codes.PermissionDenied, "%s is not authorized to read",
+		return nil, nil, "", false, nil, status.Errorf(codes.PermissionDenied, "%s is not authorized to read",
 			describeUser(user))
 	}
 
@@ -223,18 +236,25 @@ func (s *Sessions) openSession(ctx context.Context) (*dbrpc.Client, string, bool
 		// leaves that one reading as unknown, which is the safe reading and is what a
 		// networked client would also get. Worth saying out loud, because silence here
 		// is indistinguishable from everything being wired.
-		return nil, "", false, nil, fmt.Errorf(
+		return nil, nil, "", false, nil, fmt.Errorf(
 			"dbrpc advertises no %v, which a client asks for; the loopback would read them as unknown",
 			missing)
 	}
 	client := dbrpc.NewClient(dbrpc.NewStreamConn(cc), dbrpc.WithPeerSessionAttrs(attrs))
 
-	sess := &session{client: client}
+	// The in-process reader, under the SAME ServeOptions the loopback server was given: one
+	// authorization decision, taken once above, carried to both. Deriving it separately would be
+	// the second policy this whole arrangement exists to avoid.
+	var local *dbrpc.LocalSession
+	if lr, ok := s.cat.(localReader); ok {
+		local = lr.LocalSession(opts)
+	}
+	sess := &session{client: client, local: local}
 	s.mu.Lock()
 	s.open[sess] = struct{}{}
 	s.mu.Unlock()
 
-	return client, user, opts.IncludePrivate, func() {
+	return client, local, user, opts.IncludePrivate, func() {
 		s.mu.Lock()
 		delete(s.open, sess)
 		s.mu.Unlock()
