@@ -36,6 +36,8 @@ import (
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 
+	"github.com/bbockelm/htcondordb/userfunc"
+
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
@@ -183,6 +185,20 @@ func run() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Load the same user functions the daemon loads, into THIS process.
+	//
+	// It is the same configuration and the same modules, because a query is evaluated in two
+	// places: a WHERE clause goes to the server as an expression, but a SELECT item is computed
+	// here, over the records that came back. A function loaded only on the server would work in
+	// one half of a query and be unknown in the other -- `WHERE f(x) > 1` fine, `SELECT f(x)`
+	// an error -- which is not a distinction anyone writing SQL should have to know about.
+	//
+	// A failure is reported and does not stop the tool: a function that will not load breaks the
+	// queries that call it, and refusing to start would break the ones that do not.
+	if werr := userfunc.New(ctx, slog.Default()).Apply(cfg); werr != nil {
+		slog.Warn("user functions not loaded; queries calling one will fail", "err", werr.Error())
+	}
 
 	addr, err := resolveAddress(ctx, cfg, fs)
 	if err != nil {

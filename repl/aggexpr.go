@@ -7,6 +7,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 )
 
@@ -101,7 +102,14 @@ func aggSpecsFor(st *Statement) []dbrpc.AggSpec {
 	}
 	out := make([]dbrpc.AggSpec, len(calls))
 	for i, a := range calls {
-		out[i] = dbrpc.AggSpec{Func: aggFunc(a.Func), Arg: a.Arg, Filter: a.Filter}
+		spec := dbrpc.AggSpec{Func: aggFunc(a.Func), Arg: a.Arg, Filter: a.Filter}
+		if spec.Func == db.AggUser {
+			// The selector says "user-defined"; the NAME is what says which one, and it is
+			// the only part of the request that identifies it. The server resolves it
+			// against its own registry.
+			spec.UserFunc = a.Func
+		}
+		out[i] = spec
 	}
 	return out
 }

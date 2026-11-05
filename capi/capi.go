@@ -185,6 +185,10 @@ func openConnAs(addr, subsys string) (*conn, error) {
 		// reads like the driver's own problem rather than a misdirected CONDOR_CONFIG.
 		return nil, fmt.Errorf("reading the HTCondor configuration: %w", err)
 	}
+	// Same modules the daemon and htcondordb-cli load; see userfunc.go for why the client
+	// needs them too.
+	loadUserFuncs(cfg)
+
 	sec, err := htcondor.GetSecurityConfig(cfg, command.DBSession, "CLIENT")
 	if err != nil {
 		return nil, err

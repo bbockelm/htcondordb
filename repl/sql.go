@@ -98,6 +98,8 @@
 package repl
 
 import (
+	"github.com/PelicanPlatform/classad/db"
+
 	"fmt"
 	"strconv"
 	"strings"
@@ -1762,7 +1764,23 @@ func isAggName(up string) bool {
 	case "COUNT", "SUM", "AVG", "MIN", "MAX":
 		return true
 	}
-	return false
+	return isUserAggName(up)
+}
+
+// isUserAggName reports whether the site has installed an aggregate by this name.
+//
+// IT ASKS THIS PROCESS'S REGISTRY, which is the client's, while the aggregate that will actually
+// run is the SERVER's. They are the same set when both read the same configuration, which is how
+// the modules are meant to be deployed -- but a name registered only on the server does not parse
+// here, and the error says the function is unknown rather than anything about the server. That is
+// the honest failure: the parser has to decide whether `p95(Cpus)` is an aggregate call or a scalar
+// one before any request exists, and nothing it could ask the server would come back in time.
+//
+// The lookup folds case, as every ClassAd function name does, so the upper-cased token matches a
+// name registered in any spelling.
+func isUserAggName(name string) bool {
+	_, ok := db.LookupAggregate(name)
+	return ok
 }
 
 // parseGroupCols parses the comma-separated GROUP BY term list. Each term is a

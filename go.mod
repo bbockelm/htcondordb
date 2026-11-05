@@ -16,11 +16,12 @@ go 1.26.0
 toolchain go1.27.0
 
 require (
-	github.com/PelicanPlatform/classad v0.37.0
+	github.com/PelicanPlatform/classad v0.37.1-0.20261105152414-1a8e7c99e9ed
 	github.com/PelicanPlatform/classad/changefeed v0.37.0
 	github.com/PelicanPlatform/classad/collections v0.37.0
-	github.com/PelicanPlatform/classad/db v0.37.0
-	github.com/PelicanPlatform/classad/dbrpc v0.37.0
+	github.com/PelicanPlatform/classad/db v0.37.1-0.20261105152414-1a8e7c99e9ed
+	github.com/PelicanPlatform/classad/dbrpc v0.37.1-0.20261105152414-1a8e7c99e9ed
+	github.com/PelicanPlatform/classad/wasmudf v0.37.1-0.20261105152414-1a8e7c99e9ed
 	github.com/apache/arrow-go/v18 v18.8.0
 	github.com/bbockelm/cedar v0.7.12
 	github.com/bbockelm/golang-htcondor v0.16.4-0.20260926032345-41c11247a087
@@ -74,6 +75,7 @@ require (
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/sethvargo/go-retry v0.4.0 // indirect
+	github.com/tetratelabs/wazero v1.12.0 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.etcd.io/bbolt v1.4.1 // indirect

@@ -93,6 +93,7 @@ The full language — tables, indexes, aggregates, `MATCH`, output formats, and 
 - [Schedd sync mode](docs/schedd-sync.md) — mirror a local schedd (primary use case).
 - [REPL reference](docs/repl.md) — the full query language and shell.
 - [Configuration](docs/configuration.md) — every `HTCONDORDB_*` knob.
+- [User functions](docs/user-functions.md) — add your own functions and aggregates, sandboxed.
 - [Authorization & security](docs/authorization.md) — access levels and getting WRITE.
 - [Federation hub](docs/federation.md) — many access points' mirrors in one catalog.
 - [High availability](docs/ha.md) — leader-follower and raft-consistent modes.

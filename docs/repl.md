@@ -302,6 +302,14 @@ htcondordb-cli -format json    -e "SELECT * FROM machines WHERE Cpus >= 8"
 htcondordb-cli -format classad -e 'SELECT * FROM jobs WHERE Owner == "alice"'
 ```
 
+### Site-specific functions
+
+Beyond the built-in ClassAd functions, a site can install its own as sandboxed
+WebAssembly modules, and they are then callable in a `WHERE` clause or a `SELECT` item
+like any other function. See [User functions](user-functions.md); what you need to know
+at the query prompt is that the modules have to be configured for **this** process too,
+not only for the daemon, because a `SELECT` item is computed here.
+
 ### `.dialect` — which language a WHERE clause is in
 
 A `WHERE` clause is a **ClassAd** expression by default, which is why the full ClassAd
