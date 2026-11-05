@@ -157,7 +157,7 @@ func project(decisions []arrowtype.Decision, cols []string) ([]arrowtype.Decisio
 // tableSchema derives a table's Arrow schema from a measurement of what its attributes hold.
 // It returns the decisions too, so a caller can report which attributes got no column.
 func (s *Server) tableSchema(ctx context.Context, table string) (*arrow.Schema, []arrowtype.Decision, error) {
-	db, private, release, err := s.dbFor(ctx)
+	db, _, private, release, err := s.dbFor(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -553,7 +553,7 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args, pinne
 		return nil, nil, status.Errorf(codes.ResourceExhausted,
 			"too many concurrent Flight streams (limit %d); retry shortly", cap(s.streams))
 	}
-	db, private, release, err := s.dbFor(ctx)
+	db, local, private, release, err := s.dbFor(ctx)
 	if err != nil {
 		slot()
 		return nil, nil, err
@@ -658,7 +658,7 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args, pinne
 			// stream and a flush per batch would only split a small table.
 			scanErr = s.runAnalytic(ctx, db, an, enc, decisions)
 		} else {
-			scanErr = s.scanInto(ctx, db, enc, table, constraint, cols, parsed.limit, flush)
+			scanErr = s.scanInto(ctx, db, local, enc, table, constraint, cols, parsed.limit, flush)
 		}
 		if scanErr != nil {
 			ch <- flight.StreamChunk{Err: scanErr}
@@ -693,9 +693,29 @@ func (s *Server) doGetQuery(ctx context.Context, stmt string, bound *args, pinne
 //
 // redact is false because it asks for redaction BEYOND the session's: an unprivileged
 // connection is redacted whatever it passes, and a privileged one is entitled to what it reads.
-func (s *Server) scanInto(ctx context.Context, db *dbrpc.Client, enc *arrowtype.Encoder,
-	table, constraint string, cols []string, limit int, flush func() bool) error {
+func (s *Server) scanInto(ctx context.Context, db *dbrpc.Client, local *dbrpc.LocalSession,
+	enc *arrowtype.Encoder, table, constraint string, cols []string, limit int, flush func() bool) error {
 	if !enc.HasTail() && len(enc.Attrs()) > 0 {
+		// IN PROCESS WHERE WE CAN. The framed path encodes these columns into a frame, copies
+		// them through the loopback pipe and decodes them back into the columns they started
+		// as; read directly and none of that happens. Same catalog, same session, same
+		// authorization -- the LocalSession carries the ServeOptions the loopback server was
+		// given, and applies the same two gates.
+		//
+		// Only for an unlimited read, because the column source itself is: under a LIMIT the
+		// order decides WHICH rows come back, and the column scan walks blocks rather than
+		// storage order. The framed op declines the same way, so this is not a second rule.
+		if local != nil && limit <= 0 {
+			err := s.scanLocal(ctx, local, enc, table, constraint, flush)
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, dbrpc.ErrLocalUnsupported) {
+				return err
+			}
+			// This table cannot serve a column scan. Fall through to the framed path, which
+			// reads it from records and returns the same rows.
+		}
 		vals := make([]classad.Value, len(enc.Attrs()))
 		cells := make([][]classad.Value, len(enc.Attrs()))
 		colv := make([]arrowtype.ColumnValues, len(enc.Attrs()))

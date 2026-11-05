@@ -72,7 +72,7 @@ type Server struct {
 	// of authorizing it, and because it is the only identity-dependent input to a schema
 	// derivation: an unprivileged type report has the private attributes filtered out, so
 	// a derived schema may not be shared across that line (see schemaCache).
-	dbFor func(context.Context) (*dbrpc.Client, bool, func(), error)
+	dbFor func(context.Context) (*dbrpc.Client, *dbrpc.LocalSession, bool, func(), error)
 	alloc memory.Allocator
 	// derive carries the type declarations -- epoch attributes, and the overrides for
 	// attributes whose type inference cannot decide (see arrowtype.Override).
@@ -188,7 +188,10 @@ func NewServer(db *dbrpc.Client, derive arrowtype.Options, alloc memory.Allocato
 		// the caller chose it when it built the client -- so the scope is reported as
 		// unprivileged, which is the conservative key: it never shares an entry with a
 		// privileged derivation, and with a single client there is nobody to share with.
-		dbFor: func(context.Context) (*dbrpc.Client, bool, func(), error) { return db, false, func() {}, nil },
+		dbFor: func(context.Context) (*dbrpc.Client, *dbrpc.LocalSession, bool, func(), error) {
+			// A fixed client has no session of its own to read in process through.
+			return db, nil, false, func() {}, nil
+		},
 		alloc: alloc, derive: derive, prep: newPrepared(),
 	}
 	if err := s.registerSqlInfo(); err != nil {
@@ -330,7 +333,7 @@ func (s *Server) GetFlightInfoTables(_ context.Context, cmd flightsql.GetTables,
 // honouring rather than refusing: a catalog browser that cannot see column types is not much
 // of a catalog browser.
 func (s *Server) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	db, private, release, err := s.dbFor(ctx)
+	db, _, private, release, err := s.dbFor(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
