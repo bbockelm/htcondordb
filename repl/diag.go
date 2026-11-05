@@ -354,6 +354,25 @@ func (s *session) showStats(w io.Writer, d *dbrpc.Diagnostics) {
 	if ss := d.SchemaScan; ss.Enabled {
 		fmt.Fprintf(w, "columnar:   on — %d/%d sealed segments covered, %d schema fields\n",
 			ss.CoveredSegments, ss.SealedSegments, ss.SchemaFields)
+		// COVERED IS NOT CONVERTED, and the difference is what a slow read is made of. A
+		// covered segment has a columnar block beside its records; a CONVERTED one stores the
+		// schema's values in the segment itself, which is also where an expression-valued
+		// attribute's computed result lives. Until a segment is converted, every row of such
+		// an attribute is read from the record -- measured at about 6us a row against 0.3 --
+		// and the conversion runs to a per-pass budget, so a large backlog is hours of reads
+		// at twenty times the cost with "covered" already reading as complete.
+		// A server that predates the count reports zero, which is indistinguishable from a
+		// store where nothing has been converted -- and that is the case most worth saying
+		// out loud -- so zero is reported as the ambiguity it is rather than as either one.
+		switch back := ss.SealedSegments - ss.ColumnarSegments; {
+		case ss.ColumnarSegments == 0 && ss.SealedSegments > 0:
+			fmt.Fprintf(w, "  backlog:  none of %d sealed segments converted, or this server "+
+				"does not report it\n", ss.SealedSegments)
+		case back > 0:
+			fmt.Fprintf(w, "  backlog:  %d of %d sealed segments still row-native; "+
+				"expression-valued attributes read from records until converted\n",
+				back, ss.SealedSegments)
+		}
 		if len(ss.HotFields) > 0 {
 			fmt.Fprintf(w, "  hot cols: %s (COUNT(*) WHERE on these takes the columnar fast path)\n",
 				strings.Join(ss.HotFields, ", "))
