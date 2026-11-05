@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
@@ -84,6 +85,13 @@ func benchAd(i int) string {
 	return b.String()
 }
 
+// benchValueOpts is what the Flight service asks for, so the value arms measure the form that
+// actually ships. Without it they take the plain string column, which allocates a Go string per
+// cell on the client where the dictionary allocates one per distinct value -- so the arms would
+// charge the client for work the service does not do, and the comparison they exist to make would
+// be against a path nobody takes.
+var benchValueOpts = dbrpc.ValueStreamOptions{Dictionary: true}
+
 // benchProjection is the common read: a handful of columns, not the whole ad.
 var benchProjection = []string{"Owner", "ClusterId", "JobStatus", "QDate", "MemoryUsage", "CpusUsage"}
 
@@ -107,13 +115,40 @@ type benchStack struct {
 	close  func()
 }
 
+// probeColumnScan reads the whole fixture through the column path and reports what the scan
+// actually touched. RecordReads -- rows whose bytes had to be materialized even so -- is the
+// measurement that matters here, and the one counter that distinguishes a converged archive from
+// one whose segments merely carry blocks.
+//
+// Outside every timer, and deliberately a direct store read rather than one through the service:
+// it is asking what the storage layer has, not what the Flight path costs.
+func probeColumnScan(b *testing.B, arch *db.ArchiveTable) collections.ColumnScanStats {
+	b.Helper()
+	var scan collections.ColumnScanStats
+	seq, err := arch.QueryColumnsStats("true", benchProjection, false, &scan)
+	if err != nil {
+		b.Fatalf("column probe: %v", err)
+	}
+	for range seq {
+	}
+	return scan
+}
+
 // benchArchive builds an archive of rows ads and, when columnar is set, turns the per-segment
-// columnar accelerator on and covers every sealed segment with it.
+// columnar accelerator on and runs maintenance until reads stop falling back to whole records.
 //
 // Production reaches that state by demand -- maintenance builds the schema from accumulated
-// read demand and covers a budget of segments per pass -- which a fixture gets none of, so it
-// is asked for directly. tier records what was actually achieved, because "enabled" and
-// "covering the segments you are about to read" are different claims.
+// read demand and rewrites a budget of segments per pass -- which a fixture gets none of, so it
+// is asked for directly. tier records what was actually achieved, because "enabled", "covering
+// the segments you are about to read" and "reading them from columns" are three different
+// claims, and this benchmark previously checked the weakest one.
+//
+// Coverage is the weak check: a sidecar columnar block is built for every sealed segment on one
+// schema scan, so CoveredSegments reaches SealedSegments immediately and says nothing about how
+// the records are stored. The rewrite that moves attributes out of the records is bounded per
+// pass, so after the single pass this used to do, most segments were still row-native and the
+// "columnar" arm was measuring the record path. The convergence loop below settles that from
+// the read side, where ColumnScanStats counts what the scan actually touched.
 func benchArchive(b *testing.B, rows int, columnar bool) *benchStack {
 	b.Helper()
 	cat, err := db.OpenCatalog(b.TempDir())
@@ -152,8 +187,43 @@ func benchArchive(b *testing.B, rows int, columnar bool) *benchStack {
 				"this arm would measure the record path and report it as columnar",
 				info.Enabled, info.SealedSegments, info.CoveredSegments)
 		}
-		tier = fmt.Sprintf("columnar (%d fields, %d/%d sealed segments covered)",
-			info.SchemaFields, info.CoveredSegments, info.SealedSegments)
+		// Converge on the read itself, because every other counter is blind to this. One
+		// maintenance pass rewrites a bounded number of segments into columnar-native form, so
+		// a fixture bigger than that budget keeps serving most rows from whole records for
+		// several passes -- while CoveredSegments, StaleSegments and RowWindows all sit at
+		// "fully columnar" from the first pass, since the blocks exist and every one of them
+		// vectorizes. Measured at 320k rows: 766 sealed, 766 covered, 0 stale, 1 row window,
+		// and 293,107 of 320,000 rows still reading a record. Only RecordReads moves, by one
+		// segment budget per pass.
+		//
+		// RecordReads never reaches zero: the segment still being appended to has no block, so
+		// its rows always cost a record. The loop therefore ends on a pass that wins nothing.
+		passes, scan := 1, probeColumnScan(b, arch)
+		for scan.RecordReads > 0 {
+			arch.BuildAndEnableSchemaScan(2000, 8)
+			passes++
+			next := probeColumnScan(b, arch)
+			if next.RecordReads >= scan.RecordReads {
+				scan = next
+				break
+			}
+			scan = next
+		}
+		if scan.Rows == 0 {
+			b.Fatal("the column probe read no rows; it is not measuring this fixture")
+		}
+		// Well above the unsealed-segment floor (1.2% of rows here) and far below what an
+		// unconverged fixture reads (92%), so this separates the two without being tuned to
+		// either.
+		if scan.RecordReads*10 > scan.Rows {
+			b.Fatalf("after %d maintenance pass(es) %d of %d rows still read a whole record: "+
+				"this arm would measure the record path and report it as columnar",
+				passes, scan.RecordReads, scan.Rows)
+		}
+		tier = fmt.Sprintf("columnar (%d fields, %d/%d sealed segments covered, %d maintenance "+
+			"pass(es), %d of %d rows still read a whole record)",
+			info.SchemaFields, info.CoveredSegments, info.SealedSegments,
+			passes, scan.RecordReads, scan.Rows)
 	} else if info := arch.SchemaScanInfo(); info.Enabled {
 		b.Fatalf("the columnar accelerator is on in the control arm (covered=%d)", info.CoveredSegments)
 	}
@@ -365,7 +435,8 @@ func benchReadStages(b *testing.B, rows int, columnar bool) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			n := 0
-			if err := st.client.QueryValuesStream(ctx, "history", "true", benchProjection, 0, false,
+			if err := st.client.QueryValuesStreamOpts(ctx, "history", "true", benchProjection, 0, false,
+				benchValueOpts,
 				func(vb *dbrpc.ValueBatch) bool { n += vb.Rows; return true }); err != nil {
 				b.Fatal(err)
 			}
@@ -386,7 +457,8 @@ func benchReadStages(b *testing.B, rows int, columnar bool) {
 		for i := 0; i < b.N; i++ {
 			enc := arrowtype.NewEncoder(projected, arrowtype.EncodeOptions{})
 			n := 0
-			if err := st.client.QueryValuesStream(ctx, "history", "true", benchProjection, 0, false,
+			if err := st.client.QueryValuesStreamOpts(ctx, "history", "true", benchProjection, 0, false,
+				benchValueOpts,
 				func(vb *dbrpc.ValueBatch) bool {
 					for row := range vb.Rows {
 						vals := make([]classad.Value, len(vb.Cols))
@@ -432,7 +504,8 @@ func benchReadStages(b *testing.B, rows int, columnar bool) {
 			n := 0
 			vals := make([]classad.Value, len(benchProjection))
 			cells := make([][]classad.Value, len(benchProjection))
-			if err := st.client.QueryValuesStream(ctx, "history", "true", benchProjection, 0, false,
+			if err := st.client.QueryValuesStreamOpts(ctx, "history", "true", benchProjection, 0, false,
+				benchValueOpts,
 				func(vb *dbrpc.ValueBatch) bool {
 					for col := range vb.Cols {
 						cells[col] = unpackColumn(&vb.Cols[col], vb.Rows, cells[col][:0])
