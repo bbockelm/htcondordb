@@ -745,6 +745,120 @@ says nothing about a constrained one, which is a deployment property rather than
 of the statement. That is the one thing still missing, and it is a smaller gap than the
 expansion estimate the flag was originally waiting for.
 
+#### The link, priced
+
+`BenchmarkJoinOverLink` runs both arms over real TCP wrapped in a writer that charges each byte
+against a fixed capacity, and sweeps that capacity against the expansion factor. Capacity is
+charged; propagation delay is not, because charging an RTT per `Write` would penalize a pipelined
+stream for writes a real link overlaps. Leaving latency out biases the result **towards the client
+arm**, which issues two whole side reads where the store arm issues one join, so each crossover
+below is a conservative bound.
+
+`left=2048`, better round per arm, store against client:
+
+| link | k=0.25 | k=1 | k=2 | k=8 |
+|---|---|---|---|---|
+| 10 Gbps | 1.32x faster | 1.13x faster | 1.29x faster | 1.13x faster |
+| 1 Gbps | 1.32x faster | 1.19x faster | 1.24x faster | 1.23x faster |
+| 100 Mbps | **2.24x faster** | 1.35x faster | 1.04x faster | **1.41x SLOWER** |
+| 10 Mbps | **2.21x faster** | 1.09x faster | **1.16x SLOWER** | **1.40x SLOWER** |
+
+Bytes the server sent per query, which is the direction the arms differ in:
+
+| k | store | client | ratio |
+|---|---|---|---|
+| 0.25 | 43,526 | 107,022 | 0.41x |
+| 1 | 174,030 | 188,402 | 0.92x |
+| 2 | 348,044 | 296,923 | 1.17x |
+| 8 | 1,392,088 | 948,009 | 1.47x |
+
+**The bytes model predicts the crossovers quantitatively, which is the part worth trusting.** The
+store wins while its CPU advantage covers the time to ship its extra bytes, so the crossover sits
+at `extra bytes / CPU advantage`. Taking the CPU advantage from this sweep's own 10 Gbps row:
+k=2 gives 51,121 B / 4.49 ms = 91 Mbps, and k=8 gives 444,079 B / 9.12 ms = 390 Mbps. Both
+predictions fall inside the intervals the sweep actually brackets -- k=2 between 10 and 100 Mbps,
+k=8 between 100 Mbps and 1 Gbps. The model was written down before the sweep ran.
+
+**What this settles.** The flag was waiting on a deployment property, and the deployment property
+turns out to be a single threshold that the expansion factor sets:
+
+- **k <= 1 -- the store ships no more than the client, and wins at every capacity measured.** It
+  wins by MORE as capacity falls (1.32x at 10 Gbps, 2.24x at 100 Mbps for k=0.25), because the
+  bytes it saves start to matter. There is no link on which this direction is wrong.
+- **k > 1 -- the store ships more, and the win survives only above the crossover.** At gigabit and
+  above it is still faster at every k measured; below that it inverts, reaching 1.4x slower.
+
+So the honest default is not one flag but a conditional, and **the condition is already
+computable.** The count the previous section added -- the right side's size, for one round trip --
+is exactly `k = right rows / left rows`. The estimate the flag was originally waiting for is the
+same estimate the batching decision already fetches.
+
+#### Where the store-side join's time actually goes, and why columnar does not help it yet
+
+The link measurement above prices the ship. This prices the WORK, at a size the earlier numbers
+never reached: every join measurement before this ran at 400-2048 left rows, which fits in cache
+whole and is far too small to say anything about either the read path or the pairing.
+
+**The store-side win holds at scale, and widens.** Archive tables, `k=2`:
+
+| left | out rows | client-side | in the store | |
+|---|---|---|---|---|
+| 2,048 | 4,096 | 78.0 ms | 18.3 ms | 4.3x |
+| 20,000 | 40,000 | 701.6 ms | 122.7 ms | 5.7x |
+| 100,000 | 200,000 | 3,772 ms | 784 ms | 4.8x |
+
+**But the store arm is read-bound, not pairing-bound.** CPU profile at `left=100000`, with the
+fixture build excluded and parked threads (`pthread_cond_wait`, `usleep`) not counted as work:
+
+| | row-oriented | columnar |
+|---|---|---|
+| decompression | 4.09 s | 3.99 s |
+| allocator + GC | 3.81 s | 4.72 s |
+| wire decode | 1.64 s | 1.46 s |
+| **join pairing** | **0.60 s** | **0.61 s** |
+
+The pairing is about 5% of the join, and one seventh of decompression alone. Any work on the pair
+loop -- cache tiling included -- is bounded by that 5% before it starts.
+
+**Columnarizing the store changes nothing for this query.** The columnar arm really is columnar:
+the fixture asserts `ColumnarizedSegments` moved, and it rewrote 128 segments saving 5.98 MB. Yet
+decompression is unchanged and allocations go UP, and the profile says why -- the entry into zstd
+is the same on both arms:
+
+```
+collections.(*Collection).runParallelWireScan.func3
+  -> forEachVisibleWindowKeyed
+     -> (*zstdCodec).DecompressPrefix     3.96 s
+```
+
+`runParallelWireScan` walks records and prefix-decompresses each one. Each record is its own zstd
+frame, so it pays frame setup per record, and within literals decoding the table reconstruction
+(2.25 s) now costs MORE than the decode itself (1.16 s) -- a consequence of the hot-prefix
+optimization succeeding, since it cut the payload to a couple of KB while the fixed per-frame cost
+does not scale with `want`.
+
+A columnar block compresses its regions ONCE per block (`colblock.go`: `strComp`, `coldComp`,
+`coldNumComp`). None of that is reached, because this path does not go through `refVisitorState`
+and so skips the columnar prefilter and the columnar reassembly rules. `forEachVisibleWindowKeyed`
+says so in its own comment: *"The query workers do not use it: they go through refVisitorState."*
+
+**This is a defect the neighbouring path already had and already fixed.** `runParallelQuery`
+carries the post-mortem:
+
+> They used to walk the records, decompress, matchWire and decode, which skipped the columnar
+> prefilter that only the refVisitor path has -- so over a columnarized store every record the
+> WHERE rejects was rebuilt from the arena first.
+
+The wire scan still does exactly that. So the join's read is the lever, and the fix has a
+precedent to follow rather than a design to invent.
+
+**One hypothesis tested and rejected, recorded so it is not retried.** A trained ZSTD dictionary
+does NOT remove the per-frame table cost: 122.6 ms without against 126.6 ms with, best round each,
+and 29% more allocations. It trained (about 114,800 records per table), so this is a real result
+and not a silent no-op. A first run suggested 1.32x in the dictionary's favour; flipping the arm
+order showed that whichever arm ran second won, and the effect vanished. The benchmarks here run
+both orders for that reason.
+
 #### Pricing it with the one number that was missing
 
 The count aggregate already reaches an O(1) length for a mutable table and a zone-pruned
