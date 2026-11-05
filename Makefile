@@ -44,6 +44,20 @@ GO    ?= go
 LIB_EXT ?= $(if $(filter Darwin,$(shell uname -s)),dylib,so)
 LIB     := $(BIN_DIR)/libhtcondordb_client.$(LIB_EXT)
 
+# Modules that live in this tree but are NOT part of this module: each has its own
+# go.mod and pins classad/cedar/golang-htcondor for itself. Bumping a dependency here
+# leaves them behind, and nothing says so at the time: their CI jobs are filtered to
+# their own directories, so a root-only bump does not even run them, and when one does
+# run it fails with "updates to go.mod needed, disabled by -mod=readonly", which points
+# at go.mod rather than at the change that caused it.
+#
+# That is not hypothetical. Before classad v0.37.0 the three exporters sat on v0.35.0
+# while this module had moved to v0.36.1; the list exists so a bump reaches all of them
+# in one step.
+#
+# A new sibling module with its own go.mod belongs in this list.
+SATELLITE_MODULES := grafana kafkasync archivedropbox opensearchsync
+
 .PHONY: all build daemon cli pgo-profile lib lib-check-linux archive python-test wheel wheel-macos wheel-linux wheel-validate wheel-clean test vet tidy clean version rpm rpm-build exporters
 
 all: build
@@ -118,26 +132,19 @@ version: ## Print the version that would be stamped
 test: ## Run the test suite
 	$(GOENV) $(GO) test ./...
 
-vet: ## Static checks
+vet: ## Static checks (this module and every satellite)
 	$(GOENV) $(GO) vet ./...
-	# grafana/ is a separate module that requires this one, so neither `go vet ./...`
-	# nor `go build ./...` here reaches it: a dependency this module gains is simply
-	# invisible until grafana's own CI job fails with "updates to go.mod needed",
-	# which points at go.mod rather than at the change that caused it. `make tidy`
-	# already pairs the two; vetting them together is what makes the omission show up
-	# before a push rather than after one.
-	cd grafana && $(GOENV) $(GO) vet ./...
+	@for m in $(SATELLITE_MODULES); do \
+		echo "  vet $$m"; \
+		( cd $$m && $(GOENV) $(GO) vet ./... ) || exit 1; \
+	done
 
-tidy: ## Reconcile go.mod / go.sum (both modules)
+tidy: ## Reconcile go.mod / go.sum (this module and every satellite)
 	$(GOENV) $(GO) mod tidy
-	# grafana/ is a separate module that requires this one (via a
-	# ../ replace) plus the same classad/cedar/golang-htcondor
-	# versions. Bumping a dependency here leaves it behind, and its
-	# CI job runs with -mod=readonly, so the drift surfaces there as
-	# "updates to go.mod needed, disabled by -mod=readonly" rather
-	# than anywhere near the change that caused it. Tidying both
-	# together is what keeps them in step.
-	cd grafana && $(GOENV) $(GO) mod tidy
+	@for m in $(SATELLITE_MODULES); do \
+		echo "  tidy $$m"; \
+		( cd $$m && $(GOENV) $(GO) mod tidy ) || exit 1; \
+	done
 
 clean: ## Remove built binaries
 	rm -rf $(BIN_DIR)
