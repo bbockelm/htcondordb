@@ -179,6 +179,18 @@ func (s *session) showSchema(w io.Writer, d *dbrpc.Diagnostics) {
 	}
 	fmt.Fprintf(w, "columnar accelerator: on — %d/%d sealed segments covered, %d schema field(s)\n",
 		ss.CoveredSegments, ss.SealedSegments, ss.SchemaFields)
+	// See the note in diag.go: covered is not converted, and only a converted segment serves an
+	// expression-valued attribute from its columns rather than from each record.
+	switch back := ss.SealedSegments - ss.ColumnarSegments; {
+	case ss.ColumnarSegments == 0 && ss.SealedSegments > 0:
+		fmt.Fprintf(w, "  none of %d sealed segments are converted, or this server does not\n",
+			ss.SealedSegments)
+		fmt.Fprintln(w, "  report the count; an expression-valued attribute is read from each record")
+	case back > 0:
+		fmt.Fprintf(w, "  %d of %d sealed segments are still row-native; an expression-valued\n",
+			back, ss.SealedSegments)
+		fmt.Fprintln(w, "  attribute is read from the records in those until maintenance converts them")
+	}
 	if len(ss.Schema) == 0 {
 		// An older server reports the counts but not the schema itself.
 		fmt.Fprintln(w, "  (this server does not report the schema's fields; hot columns: "+
