@@ -40,6 +40,18 @@ HTCONDORDB_WASM_AGGREGATES    = p95
 HTCONDORDB_WASM_P95_PATH      = /etc/condor/wasm/p95.wasm
 ```
 
+It is then usable wherever `SUM` is:
+
+```sql
+SELECT Owner, p95(RemoteWallClockTime) FROM history GROUP BY Owner
+```
+
+The aggregate runs on the **server**, which is where the rows are, so the module
+has to be configured there. The client needs the same configuration too, because
+it is the client's parser that has to decide whether `p95(x)` is an aggregate
+call or an ordinary function call before any request exists — a name it does not
+know is read as an ordinary function and fails.
+
 `MIN_ARGS` is required for a function, with no default, because the argument
 count is checked before the module runs. A default wider than the module really
 accepts would send it calls it refuses, and you would see `error` in a column

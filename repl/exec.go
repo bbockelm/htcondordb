@@ -2245,9 +2245,18 @@ func aggFunc(name string) dbrpc.AggFunc {
 		return dbrpc.AggMax
 	case aggCountDistinct:
 		return dbrpc.AggCountDistinct
-	default:
+	case "COUNT":
 		return dbrpc.AggCount
 	}
+	// A name the site installed. It has to be checked AFTER the built-ins, which may not be
+	// shadowed, and before the fallback below -- an aggregate mapped to the wrong selector is
+	// answered successfully and wrongly, which is the one outcome worth any amount of care.
+	if isUserAggName(name) {
+		return db.AggUser
+	}
+	// Nothing else reaches here: isAggName gates what the parser will accept as an aggregate
+	// call, and every name it accepts is handled above.
+	return dbrpc.AggCount
 }
 
 // applyLimit returns the first limit ads (0 = all).
