@@ -35,6 +35,14 @@ type benchmarkConfig struct {
 	Flight   string
 	SelfTest bool
 	Seed     int64
+	// Clients is how many readers run at once in self-test mode. One measures latency; more
+	// measures the store under contention, which is the question a server is usually being
+	// asked.
+	Clients int
+	// Iterations is how many times each reader repeats its read. The default is above one
+	// deliberately: measured on a 20000-row table a single-iteration cell swung 2.6x between
+	// runs, which is wider than any scaling effect it would be used to show.
+	Iterations int
 }
 
 type benchmarkFlags struct {
@@ -55,12 +63,22 @@ func registerBenchmarkFlags() *benchmarkFlags {
 	flag.BoolVar(&f.cfg.SelfTest, "benchmark-self-test", false,
 		"in benchmark mode, measure the store in process and exit instead of serving")
 	flag.Int64Var(&f.cfg.Seed, "benchmark-seed", 1, "dataset seed; the same seed gives the same data")
+	flag.IntVar(&f.cfg.Clients, "benchmark-clients", 1,
+		"concurrent readers for -benchmark-self-test")
+	flag.IntVar(&f.cfg.Iterations, "benchmark-iterations", 5,
+		"reads per reader; one iteration does not resolve on a small table")
 	return f
 }
 
 // runBenchmark builds the scratch dataset and either self-tests it or serves it until the
 // context is cancelled.
 func runBenchmark(ctx context.Context, cfg benchmarkConfig, out io.Writer) error {
+	if cfg.Iterations < 1 {
+		cfg.Iterations = 1
+	}
+	if cfg.Clients < 1 {
+		cfg.Clients = 1
+	}
 	if cfg.Dir == "" {
 		return fmt.Errorf("benchmark mode needs -benchmark-dir; it will not use the configured SPOOL or database directory")
 	}
@@ -97,8 +115,9 @@ func runBenchmark(ctx context.Context, cfg benchmarkConfig, out io.Writer) error
 			}
 			rep := bench.SelfTestArchive(t, bench.SelfTestSpec{
 				Table: string(shape), Constraint: "true",
-				Projection: []string{"ClusterId", "Owner", "JobStatus", "MemoryUsage"},
-				Iterations: 1,
+				Projection:  []string{"ClusterId", "Owner", "JobStatus", "MemoryUsage"},
+				Iterations:  cfg.Iterations,
+				Concurrency: cfg.Clients,
 			})
 			_, _ = fmt.Fprintf(out, "\n%s", rep)
 		}

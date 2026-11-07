@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -334,4 +335,38 @@ func TestReportSeparatesTheTwoForms(t *testing.T) {
 		t.Errorf("the store state is printed below the rates:\n%s", out)
 	}
 	t.Logf("\n%s", out)
+}
+
+// Concurrency must actually run K readers at once, each on its own connection. A harness that
+// dialled K and used one would report a contended rate as an uncontended one -- and the whole
+// reason for separate connections is that several reads multiplexed onto one measure that
+// connection rather than the server.
+func TestConcurrencyRunsSeparateConnections(t *testing.T) {
+	dial := serve(t, loaded(t, t.TempDir(), 2000))
+	var dialed atomic.Int32
+	counting := func(ctx context.Context) (*Conn, error) {
+		dialed.Add(1)
+		return dial(ctx)
+	}
+	const k = 4
+	rep, err := Run(context.Background(), counting, Spec{
+		Table: dbrpc.DefaultTable, Constraint: "true",
+		Projection:  []string{"ClusterId", "Owner"},
+		Transports:  []Transport{TextProjected},
+		Concurrency: k,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dialed.Load(); got != k {
+		t.Fatalf("dialed %d connections, want %d", got, k)
+	}
+	s := rep.Samples[0]
+	if s.Concurrency != k {
+		t.Errorf("sample reports concurrency %d, want %d", s.Concurrency, k)
+	}
+	// K readers each drain the whole table, so the cell totals K times the rows.
+	if s.Rows != int64(k*2000) {
+		t.Errorf("%d rows across %d readers, want %d", s.Rows, k, k*2000)
+	}
 }

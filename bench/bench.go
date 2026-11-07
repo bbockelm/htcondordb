@@ -31,6 +31,8 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/dbrpc"
+
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 )
 
 // Transport is one way of asking for results. They are different products, not settings of one:
@@ -65,11 +67,14 @@ const (
 // So a sweep must say which form it measured, and a reader must not carry a conclusion from one
 // to the other -- which is exactly the mistake that reads a raw-form reassembly rate as if it
 // described a typed consumer.
-func (t Transport) Evaluated() bool { return t == Values }
+func (t Transport) Evaluated() bool { return t == Values || t == Arrow }
 
 // Conn is one measured client connection.
 type Conn struct {
 	Client *dbrpc.Client
+	// Flight is the Arrow Flight SQL client, when the dialer opened one. A connection may
+	// carry either or both; a transport the connection cannot speak declines with a note.
+	Flight *flightsql.Client
 	Close  func()
 	// Bytes reports the bytes READ from the socket so far, or nil when the dialer does not
 	// count them. Counting at the socket rather than summing row lengths is what makes the
@@ -115,6 +120,10 @@ type Spec struct {
 	Limits []int
 	// Concurrency is how many clients read at once, each on its own connection.
 	Concurrency int
+	// SQLWhere is the Arrow arm's filter, which the caller asserts is equivalent to
+	// Constraint. The two languages differ, so the tool will not translate between them; see
+	// arrow.go.
+	SQLWhere string
 	// Iterations is how many times each client repeats its read, after one warm pass that is not
 	// timed. The warm pass matters: the segments are mmap'd and the first read of them pays
 	// page-in no later read pays.
@@ -285,7 +294,7 @@ func Run(ctx context.Context, dial Dialer, spec Spec) (Report, error) {
 func runCell(ctx context.Context, conns []*Conn, spec Spec, tr Transport, limit int) Sample {
 	s := Sample{Transport: tr, Limit: limit, Concurrency: len(conns)}
 	// Warm on one client: the point is to fault the segments in, which every client then sees.
-	if _, _, err := readOnce(ctx, conns[0].Client, spec, tr, limit); err != nil {
+	if _, _, err := readOnce(ctx, conns[0], spec, tr, limit); err != nil {
 		s.Err = err
 		s.Note = noteForError(err)
 		return s
@@ -304,7 +313,7 @@ func runCell(ctx context.Context, conns []*Conn, spec Spec, tr Transport, limit 
 			}
 			var ferr error
 			for i := 0; i < spec.Iterations; i++ {
-				r, b, err := readOnce(ctx, cn.Client, spec, tr, limit)
+				r, b, err := readOnce(ctx, cn, spec, tr, limit)
 				if err != nil {
 					ferr = err
 					break
@@ -349,7 +358,11 @@ func noteForError(err error) string {
 }
 
 // readOnce drains one result and reports what the client received.
-func readOnce(ctx context.Context, c *dbrpc.Client, spec Spec, tr Transport, limit int) (rows, bytes int64, err error) {
+func readOnce(ctx context.Context, cn *Conn, spec Spec, tr Transport, limit int) (rows, bytes int64, err error) {
+	c := cn.Client
+	if c == nil && tr != Arrow {
+		return 0, 0, fmt.Errorf("no dbrpc client for this connection")
+	}
 	switch tr {
 	case TextWhole:
 		// The projection op with NO attributes, which is defined to behave like the whole-ad
@@ -376,6 +389,10 @@ func readOnce(ctx context.Context, c *dbrpc.Client, spec Spec, tr Transport, lim
 				bytes += int64(len(row))
 				return true
 			})
+	case Arrow:
+		// Rows only: a column-major batch has no per-row length, so the bytes come from the
+		// socket (see runCell).
+		rows, err = readArrow(ctx, cn, spec, limit)
 	case Values:
 		// Column-major batches: rows are counted from the batch, and the BYTES come from the
 		// socket (see runCell), because a typed batch has no per-row length to add up.

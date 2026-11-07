@@ -3,6 +3,7 @@ package bench
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -44,18 +45,28 @@ type SelfTestSpec struct {
 	Projection []string
 	Limits     []int
 	Iterations int
+	// Concurrency is how many readers run at once, each on its own goroutine with its own
+	// iterator. One (the default) measures latency; more measures what the store does under
+	// contention, which is a different question and often the one that matters -- a read path
+	// that scales sublinearly looks fine at K=1.
+	//
+	// There is no client here to compete for cores, which is exactly why in-process
+	// concurrency is meaningful: every core the readers take is a core the store is using.
+	// The same is NOT true of a client sweep run on the same box; see the package comment.
+	Concurrency int
 }
 
 // SelfTestSample is one in-process cell. Bytes are what the read PRODUCED, which for the
 // evaluated form is not a byte count at all -- a value batch has no serialized size until
 // something serializes it -- so it is left zero there and the rate is reported in rows.
 type SelfTestSample struct {
-	Transport Transport
-	Limit     int
-	Rows      int64
-	Bytes     int64
-	Elapsed   time.Duration
-	Err       error
+	Transport   Transport
+	Limit       int
+	Concurrency int
+	Rows        int64
+	Bytes       int64
+	Elapsed     time.Duration
+	Err         error
 	// ConsumeElapsed is the same read with the consumer's work done on every row: the time a
 	// caller pays to turn the stream into usable objects, production included. ConsumeErr is
 	// non-nil when that work failed, which is itself a finding -- a row form whose consumer
@@ -116,6 +127,9 @@ func SelfTestArchive(t *db.ArchiveTable, spec SelfTestSpec) SelfTestReport {
 	if len(spec.Limits) == 0 {
 		spec.Limits = []int{0}
 	}
+	if spec.Concurrency < 1 {
+		spec.Concurrency = 1
+	}
 	rep := SelfTestReport{Spec: spec}
 
 	var st collections.ScanStats
@@ -148,41 +162,64 @@ func SelfTestArchive(t *db.ArchiveTable, spec SelfTestSpec) SelfTestReport {
 }
 
 func selfTestCell(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int) SelfTestSample {
-	s := SelfTestSample{Transport: tr, Limit: limit}
+	s := SelfTestSample{Transport: tr, Limit: limit, Concurrency: spec.Concurrency}
 	// One warm pass, untimed: the segments are mmap'd and the first read of them pays page-in
-	// that no later read pays.
+	// that no later read pays. Warmed once rather than per reader -- the page-in is shared.
 	if _, _, err := selfTestOnce(t, spec, tr, limit, false); err != nil {
 		s.Err = err
 		return s
 	}
-	start := time.Now()
-	for i := 0; i < spec.Iterations; i++ {
-		rows, bytes, err := selfTestOnce(t, spec, tr, limit, false)
-		if err != nil {
-			s.Err = err
-			break
-		}
-		s.Rows += rows
-		s.Bytes += bytes
+	rows, bytes, elapsed, err := selfTestPass(t, spec, tr, limit, false)
+	s.Rows, s.Bytes, s.Elapsed, s.Err = rows, bytes, elapsed, err
+	if err != nil {
+		return s
 	}
-	s.Elapsed = time.Since(start)
 
 	// The consuming pass, warmed the same way, over the same rows.
 	if _, _, err := selfTestOnce(t, spec, tr, limit, true); err != nil {
 		s.ConsumeErr = err
 		return s
 	}
-	cstart := time.Now()
-	for i := 0; i < spec.Iterations; i++ {
-		rows, _, err := selfTestOnce(t, spec, tr, limit, true)
-		if err != nil {
-			s.ConsumeErr = err
-			break
-		}
-		s.ConsumedRows += rows
-	}
-	s.ConsumeElapsed = time.Since(cstart)
+	crows, _, celapsed, cerr := selfTestPass(t, spec, tr, limit, true)
+	s.ConsumedRows, s.ConsumeElapsed, s.ConsumeErr = crows, celapsed, cerr
 	return s
+}
+
+// selfTestPass runs Concurrency readers, each doing Iterations reads, and reports the totals
+// against WALL CLOCK -- not the sum of the readers' own elapsed times, which would report a
+// contended run as fast as an uncontended one.
+func selfTestPass(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int, consume bool) (int64, int64, time.Duration, error) {
+	var mu sync.Mutex
+	var totalRows, totalBytes int64
+	var firstErr error
+	var wg sync.WaitGroup
+	start := time.Now()
+	for k := 0; k < spec.Concurrency; k++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var rows, bytes int64
+			var err error
+			for i := 0; i < spec.Iterations; i++ {
+				r, b, e := selfTestOnce(t, spec, tr, limit, consume)
+				if e != nil {
+					err = e
+					break
+				}
+				rows += r
+				bytes += b
+			}
+			mu.Lock()
+			totalRows += rows
+			totalBytes += bytes
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return totalRows, totalBytes, time.Since(start), firstErr
 }
 
 // selfTestOnce reads one result. With consume set it also does the CONSUMER's work on every row
@@ -275,8 +312,8 @@ func selfTestOnce(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int
 // String renders the in-process report, saying plainly what it is not.
 func (r SelfTestReport) String() string {
 	var b []byte
-	b = append(b, fmt.Sprintf("SELF-TEST (in process, no client and no network): table %s, constraint %q\n",
-		r.Spec.Table, r.Spec.Constraint)...)
+	b = append(b, fmt.Sprintf("SELF-TEST (in process, no client and no network): table %s, constraint %q, %d reader(s)\n",
+		r.Spec.Table, r.Spec.Constraint, r.Spec.Concurrency)...)
 	b = append(b, "This is how fast the store PRODUCES rows, not how fast a consumer receives them.\n"...)
 	b = append(b, "Run a client sweep beside it; the gap between the two is serialization and transport.\n"...)
 	if r.Escape.Measured {
