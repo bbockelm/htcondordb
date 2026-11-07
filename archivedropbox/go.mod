@@ -13,13 +13,13 @@ require (
 	github.com/PelicanPlatform/classad/db v0.37.0
 	github.com/PelicanPlatform/classad/dbrpc v0.37.0
 	github.com/bbockelm/cedar v0.7.12
-	github.com/bbockelm/golang-htcondor v0.13.0
+	github.com/bbockelm/golang-htcondor v0.20.2
 )
 
 require (
 	github.com/PelicanPlatform/classad/collections v0.37.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.29.0 // indirect
-	github.com/bbockelm/gosssd v0.0.1 // indirect
+	github.com/bbockelm/gosssd v0.0.4 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.4.2 // indirect
