@@ -1,7 +1,7 @@
 # Design sketch: user functions stored in the collection
 
-**Status:** PROPOSED. Nothing below is built. This document exists to settle the questions that
-decide the shape, because two of them are not implementation choices.
+**Status:** DECIDED, not built. The questions that decide the shape are answered in §6; §7 is what
+remains open.
 **Problem owner:** "an admin client should be able to register a function, and the modules should
 live in the collection rather than only in a config file".
 **Siblings:** [user-functions.md](../user-functions.md) (what configuration does today).
@@ -32,8 +32,14 @@ scoring function has to route it through whoever owns `/etc/condor`.
 
 A table, `user_functions`, one record per module, keyed by the function name as a query would
 spell it. A record carries: the name; the kind (`script` or `wasm`); the source — ClassAd Script
-text, or wasm bytes base64-encoded, since an attribute holds a string; the arity; and provenance
-(who registered it, when).
+text, or wasm bytes base64-encoded, since an attribute holds a string; the arity; provenance (who
+registered it, when); and an **instance identity**, a checksum over the source.
+
+The identity is what makes a result explicable. A name is not enough, because the thing behind a
+name changes; two queries seconds apart can run different code under one word. The checksum names
+the code that actually ran, so a diagnostic, a log line or an `EXPLAIN` can say *which* `pctUsed`
+answered. A checksum rather than a generated id, because it also makes "the same function" mean the
+same thing on two nodes that were loaded separately.
 
 Nothing here is a new storage mechanism. It is an ordinary table with an in-process writer, which
 is the existing answer to "who may write this".
@@ -113,16 +119,51 @@ Two things follow. A client should be able to **refuse** to load stored modules,
 and get the current behaviour. And a client that loads them should say so somewhere a user can see,
 rather than silently executing whatever arrived.
 
-## 6. What this does not settle
+## 6. Decided
+
+**Registration is administrative.** Writing the record is an ordinary table write; registering a
+name is not, for the reasons in §5.
+
+**A function instance is identified by a checksum over its source** (§2), so a result can be traced
+to the code that produced it rather than to a name that has since moved.
+
+**Registration survives a restart.** The table is the source of truth, so a daemon registers what it
+holds when it starts. Nothing else would be coherent: a function that vanished on restart would make
+a pool's behaviour depend on uptime.
+
+**A module that does not load marks the function BAD. It does not stop the daemon.** This is the
+one place where the stored path deliberately differs from the configured one, where a module that
+fails to load fails start-up. Three things justify the difference:
+
+- A configured module is a file on the host, editable by whoever is about to restart the daemon. A
+  stored module is not, and a daemon that will not start cannot be used to fix the record that stops
+  it starting. The repair path would run through the thing that is broken.
+- **A module can stop loading without anyone touching it** — a wasm guest valid under one runtime
+  version and rejected by the next is the obvious case. Tying start-up to that makes an upgrade a
+  coin toss.
+- Otherwise anyone who may register could stop the daemon starting, which turns an administrative
+  privilege into an availability one.
+
+**A bad function is an error when called**, which is what a name that does not exist already gives.
+It is registered, under its arity, pointing at an implementation that errors — not left
+unregistered. Leaving it out would change how the *call site* compiles, which is exactly the
+decision §3 says cannot be taken back; registering it keeps the name's shape fixed and puts the
+failure in the value, where a query can see it.
+
+Bad is a **state, not a silence**: it is in the daemon's log at start-up, in the function's record,
+and visible to an admin listing what is registered. An operator should be able to find out that
+`pctUsed` is bad without first noticing that a column has gone to `error`.
+
+## 7. What this does not settle
 
 - **When a client notices a change.** Modules fetched per session, per query, or cached with
-  invalidation are three different designs, and the trampoline only fixes the server half.
-- **Whether a replaced function's old results are explicable.** Two queries seconds apart can run
-  different code under one name. Provenance in the record helps a reader after the fact; nothing
-  makes a result self-describing.
-- **Whether registration should survive a restart automatically.** If the table is the source of
-  truth, a daemon should register everything in it at start-up — which makes a bad stored module a
-  start-up failure, exactly as a bad configured one is today. That is probably right and it is worth
-  saying out loud, because it means a client with DAEMON can stop the daemon from starting.
+  invalidation are three different designs, and the trampoline only fixes the server half. The
+  checksum gives the cache a key.
+- **Whether a bad function can be repaired without a restart.** Replacing the source is a write the
+  trampoline can absorb, so it should be possible — but a function that is bad because the *runtime*
+  rejects it will stay bad however often it is re-registered, and the error has to say which of the
+  two it is.
+- **Whether a client refuses stored modules.** §5 argues it should be able to; nothing here says
+  what the default is.
 - **Script aggregates do not exist yet.** `scriptudf` registers scalar functions only, so the
   aggregate half of this applies to wasm until that changes.
