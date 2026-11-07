@@ -117,9 +117,9 @@ repeated.
 ## Writing a module
 
 Any language that compiles to WebAssembly. The contract a module has to meet —
-the exports, how values cross, the batch entry point that makes it fast — is in
-the `classad` repository as `docs/wasm-udf-abi.md`, with worked examples beside
-it in `wasmudf/testdata/`.
+the exports, how values cross, the batch entry point that makes it fast — is
+[the WebAssembly UDF ABI][abi] in the `classad` repository, with worked examples
+beside it in [`wasmudf/testdata/`][testdata], one per point of the contract.
 
 The short version: export a `memory`, a version, and `classad_udf_call`; values
 cross as 16-byte tagged slots. An aggregate exports a different set of five
@@ -128,3 +128,19 @@ functions instead.
 A module that exports the optional **batch** entry point is called once per batch
 rather than once per record, which is worth roughly 28x. For a function that runs
 over every row of a large table, that is the difference that matters.
+
+## Beyond this page
+
+[User-defined functions and aggregates][udf] is the library-side companion. It is
+written for a Go program that embeds `classad` rather than for a daemon you
+configure, so its mechanism is a function call where this page's is a knob — but
+it is where the detail lives. Go there for the loader options this page does not
+expose, including the call-frame and result-size bounds, how many instances of one
+module may run at once, and the per-failure callback a host can install for logs
+and metrics; for the five exports an aggregate module provides, which the ABI
+specifies and this page only counts; and for the measured cost of each path, which
+is what makes the case for batching and for trust.
+
+[abi]: https://github.com/PelicanPlatform/classad/blob/main/docs/wasm-udf-abi.md
+[testdata]: https://github.com/PelicanPlatform/classad/tree/main/wasmudf/testdata
+[udf]: https://github.com/PelicanPlatform/classad/blob/main/docs/user-defined-functions.md
