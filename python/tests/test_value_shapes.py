@@ -271,3 +271,87 @@ class TestAliasedAndComputedColumnTypes:
         cursor = connection.cursor()
         cursor.execute(f"SELECT Owner, COUNT(*) AS n FROM {rows} GROUP BY Owner")
         assert cursor.fetchall() == [("123", 1)]
+
+
+class TestDistinctColumns:
+    """DISTINCT answers the same question the SELECT asks, column for column.
+
+    De-duplication IS grouping -- ``SELECT DISTINCT a, b`` is ``GROUP BY a, b`` -- and a
+    computed item has no attribute to group by, so one used to come back as a single row of
+    None for a SELECT that prints real numbers without the keyword in front of it. No error
+    was raised, which is what makes it worth a test at this level: a report reading None has
+    no way to tell a missing value from a question that was never asked.
+    """
+
+    @pytest.fixture
+    def rows(self, connection, table):
+        for key, machine, used, txt in (
+            ("1", "h1", 5, "4"),
+            ("2", "h1", 5, 4),
+            ("3", "h2", 7, "x"),
+        ):
+            connection.execute(
+                f"INSERT INTO {table} (Key, Machine, Used, Txt) VALUES (?, ?, ?, ?)",
+                (key, machine, used, txt),
+            ).close()
+        return table
+
+    @pytest.mark.parametrize(
+        "columns,expected",
+        [
+            ("Used * 2 AS d", [(10,), (14,)]),
+            ("Machine", [("h1",), ("h2",)]),
+            ("Machine AS host", [("h1",), ("h2",)]),
+            ("Machine, Used * 2 AS d", [("h1", 10), ("h2", 14)]),
+            ("Used, Used * 2 AS d", [(5, 10), (7, 14)]),
+        ],
+    )
+    def test_distinct_column_values(self, connection, rows, columns, expected):
+        for run in ("execute", "execute_with_ads"):
+            cursor = connection.cursor()
+            getattr(cursor, run)(f"SELECT DISTINCT {columns} FROM {rows}")
+            assert sorted(cursor.fetchall()) == expected, f"{run}: {columns}"
+
+    def test_distinct_keeps_a_string_apart_from_the_number_it_prints_as(
+        self, connection, rows
+    ):
+        """Txt holds the string "4", the number 4 and the string "x": three rows.
+
+        They are distinct VALUES even though two of them print identically, so merging
+        them would report one row whose label names only one of the two.
+        """
+        cursor = connection.cursor()
+        cursor.execute(f"SELECT DISTINCT Txt FROM {rows}")
+        values = [row[0] for row in cursor.fetchall()]
+        assert sorted(map(repr, values)) == ["'4'", "'x'", "4"], values
+
+        # The same, beside a computed column, which groups the rows in the client rather
+        # than in the store. The answer must not depend on that.
+        cursor = connection.cursor()
+        cursor.execute(f"SELECT DISTINCT Txt, Used * 2 AS d FROM {rows}")
+        pairs = cursor.fetchall()
+        assert sorted(map(repr, pairs)) == ["('4', 10)", "('x', 14)", "(4, 10)"], pairs
+
+    def test_distinct_orders_and_limits_the_deduplicated_rows(self, connection, rows):
+        """ORDER BY and LIMIT reach the answer, not the scan behind it.
+
+        Three ads match and only two distinct doubles come out of them, so LIMIT 1 is half
+        the answer rather than one third of the scan.
+        """
+        cursor = connection.cursor()
+        cursor.execute(f"SELECT DISTINCT Used * 2 AS d FROM {rows} ORDER BY d DESC LIMIT 1")
+        assert cursor.fetchall() == [(14,)]
+
+        cursor = connection.cursor()
+        cursor.execute(f"SELECT DISTINCT Used * 2 AS d FROM {rows} ORDER BY d")
+        assert cursor.fetchall() == [(10,), (14,)]
+
+    def test_distinct_over_a_missing_attribute_is_one_row(self, connection, rows):
+        """Every row is undefined, and they are one distinct row rather than three.
+
+        That is SQL's reading of DISTINCT over NULL: the rows are alike for the purpose of
+        de-duplication, even though comparing two undefined values with == is not true.
+        """
+        cursor = connection.cursor()
+        cursor.execute(f"SELECT DISTINCT NoSuchAttribute * 2 AS d FROM {rows}")
+        assert cursor.fetchall() == [(None,)]

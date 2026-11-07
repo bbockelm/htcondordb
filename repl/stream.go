@@ -116,24 +116,69 @@ func streamResult(res *Result, yield func(*classad.ClassAd) bool) error {
 		}
 		return nil
 	}
+	// No ads: the rows belong to groups rather than to any one ad, so an ad per row is
+	// synthesized from the cells. A result that was projected carries those cells as the
+	// VALUES they evaluated to, under the SELECT's own headers, so they are taken from there
+	// -- reading them back out of display text would retype a group key that is the string
+	// "4" into the number 4, which is precisely the distinction the grouping itself keeps.
+	// The ATTRIBUTE names stay the derived ones either way: a header is whatever the caller
+	// wrote and need not be a legal attribute name, and a streamed ad's shape is not
+	// something to change under a reader.
 	names := aggregateAttrNames(res.Columns)
-	for _, row := range res.Rows {
-		if !yield(aggregateAd(names, row)) {
+	projected := res.Projected
+	// All or nothing, and only when no header repeats. A projected ad is addressed BY the
+	// column's header, so two items sharing one (`SELECT a AS x, b AS x`) would read the
+	// same attribute twice and give both cells the later item's value -- where the display
+	// strings stay per cell and are right for both. The derived attribute names are already
+	// made unique, so the collision would show as two different names holding one value.
+	if len(projected) != len(res.Rows) || hasRepeatedHeader(res.Columns) {
+		projected = nil
+	}
+	for i, row := range res.Rows {
+		var proj *classad.ClassAd
+		if projected != nil {
+			proj = projected[i]
+		}
+		if !yield(aggregateAd(names, res.Columns, row, proj)) {
 			return nil
 		}
 	}
 	return nil
 }
 
-// aggregateAd builds one ClassAd from an aggregate result row, using names derived from
-// the column headers. Cells are typed the way the display strings read -- an aggregate's
-// values reach the client already reduced to text, so this is the same recovery the
-// tabular and JSON renderings do.
-func aggregateAd(names []string, row []string) *classad.ClassAd {
+// hasRepeatedHeader reports whether two SELECT items share a column header. Attribute names
+// are case-insensitive, so headers differing only in case name the same attribute.
+func hasRepeatedHeader(cols []string) bool {
+	seen := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		k := strings.ToLower(c)
+		if seen[k] {
+			return true
+		}
+		seen[k] = true
+	}
+	return false
+}
+
+// aggregateAd builds one ClassAd from an aggregate result row, using names derived from the
+// column headers.
+//
+// A cell takes its value from proj -- the row's projected ad, holding each selected item
+// under its header -- wherever one is there, so a group key reaches the stream as the value
+// it is. Without it the cell is typed the way its display string reads, which is the same
+// recovery the tabular and JSON renderings do and all that is possible for an aggregate's
+// own output, since that crosses the wire already reduced to text.
+func aggregateAd(names, columns []string, row []string, proj *classad.ClassAd) *classad.ClassAd {
 	ad := classad.New()
 	for i, name := range names {
 		if i >= len(row) {
 			break
+		}
+		if proj != nil && i < len(columns) {
+			if v := proj.EvaluateAttr(columns[i]); !v.IsUndefined() {
+				insertValue(ad, name, v)
+				continue
+			}
 		}
 		setAggregateAttr(ad, name, row[i])
 	}

@@ -214,8 +214,9 @@ func TestAggregateAttrNames(t *testing.T) {
 // Aggregate cells arrive as text; the synthesized ad types them rather than leaving
 // everything a string.
 func TestAggregateAdTypes(t *testing.T) {
-	ad := aggregateAd([]string{"N", "Avg", "Flag", "Name", "Missing"},
-		[]string{"3", "2.5", "true", "alice", "undefined"})
+	names := []string{"N", "Avg", "Flag", "Name", "Missing"}
+	ad := aggregateAd(names, names,
+		[]string{"3", "2.5", "true", "alice", "undefined"}, nil)
 
 	if v := ad.EvaluateAttr("N"); !v.IsInteger() {
 		t.Errorf("N is %v, want an integer", v)
