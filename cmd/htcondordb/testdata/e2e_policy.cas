@@ -1,0 +1,39 @@
+# Fixture for the end-to-end script user-function tests.
+#
+# ONE FILE, TWO DEFINITIONS, configured under two names pointing at the same
+# path. That is how a site keeps its policy functions together, and it is also
+# what makes the daemon read and parse the file once however many names point
+# at it.
+#
+# The names are unique to these tests because classad's registry is
+# process-wide and has no unregister: a name used once in a process is taken
+# for the rest of it.
+
+# What fraction of a resource is in use, as a percentage.
+def e2eScriptPct(used, total):
+    # Undefined in, undefined out: an attribute the record does not carry is
+    # not a mistake, and a constraint that treated it as one would reject the
+    # record rather than ignore the term.
+    if used is undefined:
+        return undefined
+    if total is undefined:
+        return undefined
+    # A division with no answer. Report it by RETURNING error.
+    if total <= 0:
+        return error
+    return used * 100.0 / total
+
+# A label, and the reason the tests ask for one: no arithmetic the query
+# language can do on its own produces the string "hot", so a column carrying
+# it is evidence that this function RAN, not merely that the query parsed.
+#
+# The body calls the file's other def, which is expanded where it is written.
+def e2eScriptBand(used, total):
+    pct = e2eScriptPct(used, total)
+    if pct is undefined:
+        return "unknown"
+    if pct is error:
+        return "unknown"
+    if pct > 75.0:
+        return "hot"
+    return "cold"
