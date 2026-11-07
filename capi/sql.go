@@ -22,7 +22,6 @@ import "C"
 import (
 	"encoding/json"
 	"math"
-	"strconv"
 	"strings"
 	"time"
 
@@ -194,9 +193,13 @@ func buildResult(r *repl.Result, opts int, inTxn bool) *sqlResult {
 // that item evaluated to -- which types an alias and a computed column as exactly as a
 // plain one: `Owner AS who` over the string "123" is the string "123", not the number 123.
 // `SELECT *` has no projection and its columns are attribute names, so the matched ad
-// answers instead. Only an aggregate has neither: the server reduced its values to strings
-// before they reached the client, so its cells are parsed back out of the display string,
-// which cannot tell a numeric-looking string from a number.
+// answers instead. An aggregate carries a projection too: its group keys arrive as values
+// beside their labels, and its computed items are evaluated here, so `GROUP BY IntStr`
+// groups the string "123" and reports the string "123".
+//
+// The display string is the last resort, for the cells no value reaches: a column the
+// projection could not name, and an aggregate's own output, which crosses as rendered text
+// (see the aggregate projection in repl).
 func cellValues(r *repl.Result, i int) []any {
 	row := r.Rows[i]
 	var proj, ad *classad.ClassAd
@@ -292,71 +295,9 @@ func valueJSON(v classad.Value) any {
 }
 
 // parseCell recovers a type from a display string, for cells with no typed value behind
-// them. The order matches how repl renders values (valueDisplay), so a round trip is exact
-// for every type except a string that looks like a number or a bool -- which is why
-// cellValues prefers a projected or matched ad whenever there is one.
-func parseCell(s string) any {
-	switch s {
-	case "undefined", "error":
-		return nil
-	case "true":
-		return true
-	case "false":
-		return false
-	}
-	// Integers before reals: ParseFloat accepts "3" and would widen it to 3.0.
-	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return n
-	}
-	// Reject the forms ParseFloat accepts but ClassAd never renders ("inf", "NaN",
-	// "0x1p-2"), so a string attribute spelled that way survives as a string.
-	if isPlainNumber(s) {
-		if f, err := strconv.ParseFloat(s, 64); err == nil {
-			return f
-		}
-	}
-	return s
-}
-
-// isPlainNumber reports whether s is decimal digits with at most one leading sign, one
-// decimal point, and an optional decimal exponent.
-func isPlainNumber(s string) bool {
-	if s == "" {
-		return false
-	}
-	body := strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+")
-	if body == "" {
-		return false
-	}
-	mantissa, exponent, hasExp := body, "", false
-	if i := strings.IndexAny(body, "eE"); i >= 0 {
-		mantissa, exponent, hasExp = body[:i], body[i+1:], true
-	}
-	if !isDecimal(mantissa, true) {
-		return false
-	}
-	if hasExp {
-		exponent = strings.TrimPrefix(strings.TrimPrefix(exponent, "-"), "+")
-		return isDecimal(exponent, false)
-	}
-	return true
-}
-
-// isDecimal reports whether s is digits, optionally with a single '.' when allowPoint.
-func isDecimal(s string, allowPoint bool) bool {
-	digits, points := 0, 0
-	for _, c := range s {
-		switch {
-		case c >= '0' && c <= '9':
-			digits++
-		case c == '.' && allowPoint:
-			points++
-			if points > 1 {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return digits > 0
-}
+// them. The reading is repl.CellValue's, which is the same one the REPL's own readers use,
+// so the C API and the ad-shaped output formats cannot disagree about whether a cell's text
+// is a number. A round trip is exact for every type except a string that looks like a
+// number or a bool -- which is why cellValues prefers a projected or matched ad whenever
+// there is one.
+func parseCell(s string) any { return valueJSON(repl.CellValue(s)) }

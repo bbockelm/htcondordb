@@ -202,26 +202,32 @@ func TestProjectedUndefinedAndErrorKeepTheirColumns(t *testing.T) {
 	assertNamesMatchColumns(t, r)
 }
 
-// An aggregate has no ads -- its rows belong to groups, not to any one ad -- so the ad
-// formats keep synthesizing an ad per group row from the display cells.
-func TestAggregateFormattingUnchanged(t *testing.T) {
+// An aggregate's rows belong to groups rather than to any one ad, but they are projected
+// all the same: a group key arrives as a value beside its label, and an aggregate's output
+// is read back from the text it crosses as. So the ad formats carry each column as the kind
+// it is -- a count is a JSON number, not the string "2".
+func TestAggregateFormatsCarryTypedColumns(t *testing.T) {
 	e, cleanup := newTestExec(t)
 	defer cleanup()
 	mustExec(t, e, "INSERT INTO ads (Key, Machine, Used) VALUES ('a', 'm1', 3)")
 	mustExec(t, e, "INSERT INTO ads (Key, Machine, Used) VALUES ('b', 'm1', 4)")
 
 	r := mustExec(t, e, "SELECT Machine, COUNT(*) FROM ads GROUP BY Machine")
-	if r.Ads != nil || r.Projected != nil {
-		t.Fatalf("an aggregate result carries ads")
+	if r.Ads != nil {
+		t.Fatalf("an aggregate result carries matched ads")
+	}
+	if len(r.Projected) != len(r.Rows) {
+		t.Fatalf("projected %d ads for %d rows", len(r.Projected), len(r.Rows))
 	}
 	if got, want := formatString(r, FormatJSON),
-		"{\"COUNT(*)\":\"2\",\"Machine\":\"m1\"}\n"; got != want {
+		"{\"COUNT(*)\":2,\"Machine\":\"m1\"}\n"; got != want {
 		t.Errorf("JSON gave %q, want %q", got, want)
 	}
 	if got, want := formatString(r, FormatClassAdOld),
-		"COUNT(*) = \"2\"\nMachine = \"m1\"\n\n"; got != want {
+		"COUNT(*) = 2\nMachine = \"m1\"\n\n"; got != want {
 		t.Errorf("classad gave %q, want %q", got, want)
 	}
+	assertNamesMatchColumns(t, r)
 }
 
 // Arrow reaches the same columns by its own route -- it re-evaluates the items through

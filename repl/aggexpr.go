@@ -138,20 +138,74 @@ func (p *aggProjector) keep(group, values []string) bool {
 	return err == nil && b
 }
 
-// row renders one output row from a group tuple and its aggregate values.
-func (p *aggProjector) row(group, values []string) []string {
+// project renders one output row from a group tuple and its aggregate values: the display
+// cells the table prints, and beside them the projected ad -- one attribute per selected
+// item, under the item's header, holding the value that item evaluated to. Both come out of
+// the same pass, so the table and the ad-shaped formats can never disagree about what a
+// cell holds.
+//
+// groupVals is the group tuple AS VALUES, one per group column, aligned with group. Every
+// aggregate reply carries it: the server sends tagged value cells where it can, and the
+// client reads the group's text back where it cannot, so a group key is exact against any
+// server -- which is what keeps the string "123" a string here, where its label alone could
+// only be guessed at. The client-side grouping paths keep the value each key was rendered
+// from and pass it the same way.
+//
+// A nil ad means this row cannot be projected, and the caller then drops the projection for
+// the whole result rather than serializing a guess.
+func (p *aggProjector) project(group []string, groupVals []classad.Value, values []string) ([]string, *classad.ClassAd) {
 	row := make([]string, len(p.items))
+	ad, whole := classad.New(), true
 	for i, it := range p.items {
+		var v classad.Value
 		switch {
 		case p.compiled[i] != nil:
-			row[i] = valueDisplay(p.compiled[i].Eval(p.scope(i, group, values)))
+			v = p.compiled[i].Eval(p.scope(i, group, values))
+			row[i] = valueDisplay(v)
 		case it.IsAggregate():
+			// AN AGGREGATE'S OUTPUT CROSSES AS RENDERED TEXT, which is what separates
+			// it from a group key. A group cell carries the group's faithful text, so
+			// a string key arrives quoted and reads back exactly; an aggregate cell
+			// carries the result the way the table would print it, so a string result
+			// arrives bare and a composite one arrives in Go's own `[1 2 3]` rather
+			// than as a list literal. There is nothing to parse exactly, so the text
+			// is read the way a reader of the table reads it.
+			//
+			// The gap that leaves is narrow. COUNT, SUM, AVG, MIN and MAX produce a
+			// number, `undefined` or `error` and nothing else, so only a user-defined
+			// aggregate returning a string can be retyped here -- and one returning a
+			// string that spells a number arrives as that number. Leaving the cell as
+			// text would not help, since the same text is all that arrives; closing it
+			// takes a typed aggregate cell on the wire.
 			row[i] = at(values, p.aggAt[i])
+			v = CellValue(row[i])
 		default:
-			row[i] = groupDisplay(at(group, p.groupAt[i]))
+			gi := p.groupAt[i]
+			row[i] = groupDisplay(at(group, gi))
+			switch {
+			case gi < 0:
+				// An item that names no group column at all. Its cell is empty, in
+				// the table and in every other format, and an empty string is what
+				// each of them shows -- so the ad says the same thing they do.
+				v = classad.NewStringValue(row[i])
+			case gi < len(groupVals):
+				v = groupVals[gi]
+			default:
+				// No value for a group column. Nothing here can recover one -- a
+				// label is a rendering, and the kinds that render alike are exactly
+				// the ones that matter -- so the row goes untyped rather than
+				// typed wrongly.
+				whole = false
+			}
+		}
+		if whole {
+			insertValue(ad, it.Header(), v)
 		}
 	}
-	return row
+	if !whole {
+		return row, nil
+	}
+	return row, ad
 }
 
 // groupDisplay turns a group label into an output cell.

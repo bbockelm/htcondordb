@@ -240,8 +240,8 @@ func TestRunLoop(t *testing.T) {
 	if !strings.Contains(got, "format: json") {
 		t.Fatalf("missing format switch ack:\n%s", got)
 	}
-	// COUNT(*) rendered as JSON (the .format json took effect).
-	if !strings.Contains(got, `"COUNT(*)":"1"`) {
+	// COUNT(*) rendered as JSON (the .format json took effect), as the number it is.
+	if !strings.Contains(got, `"COUNT(*)":1`) {
 		t.Fatalf("aggregate not rendered as JSON:\n%s", got)
 	}
 	if strings.Contains(got, "SELECT 1") {

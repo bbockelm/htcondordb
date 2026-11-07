@@ -1760,24 +1760,31 @@ func (e *Executor) aggregateJoinRows(st *Statement, rows []*classad.ClassAd) (*R
 		keyExpr[j] = ex
 	}
 
+	// Each key is kept twice, as on the single-table client-side paths: the label that
+	// forms the group, and the value it was rendered from, which is what the output row
+	// carries so a joined group column reaches the ad-shaped formats as the value it is.
 	type group struct {
-		vals []string
-		rows []*classad.ClassAd
+		vals      []string
+		groupVals []classad.Value
+		rows      []*classad.ClassAd
 	}
 	var order []string
 	groups := map[string]*group{}
 	for _, row := range rows {
 		vals := make([]string, 0, len(st.Items))
+		gvals := make([]classad.Value, 0, len(st.Items))
 		for j, it := range st.Items {
 			if it.GroupLevel() || keyExpr[j] == nil {
 				continue
 			}
-			vals = append(vals, valueDisplay(keyExpr[j].Eval(row)))
+			v := keyExpr[j].Eval(row)
+			vals = append(vals, valueDisplay(v))
+			gvals = append(gvals, v)
 		}
 		key := strings.Join(vals, "\x00")
 		g := groups[key]
 		if g == nil {
-			g = &group{vals: vals}
+			g = &group{vals: vals, groupVals: gvals}
 			groups[key] = g
 			order = append(order, key)
 		}
@@ -1795,17 +1802,9 @@ func (e *Executor) aggregateJoinRows(st *Statement, rows []*classad.ClassAd) (*R
 		if !proj.keep(g.vals, vals) {
 			continue
 		}
-		res.Rows = append(res.Rows, proj.row(g.vals, vals))
+		addAggRow(res, proj, g.vals, g.groupVals, vals)
 	}
-	if len(st.OrderBy) > 0 {
-		if err := sortRows(res, st.OrderBy); err != nil {
-			return nil, err
-		}
-	}
-	if st.Limit > 0 && len(res.Rows) > st.Limit {
-		res.Rows = res.Rows[:st.Limit]
-	}
-	return res, nil
+	return finishAggRows(res, st)
 }
 
 // joinExprRefs returns the attribute references of an expression over a joined row, each as
