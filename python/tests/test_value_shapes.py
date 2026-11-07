@@ -256,13 +256,18 @@ class TestAliasedAndComputedColumnTypes:
             getattr(cursor, run)(f"SELECT Owner + 1 AS t FROM {rows}")
             assert cursor.fetchone()[0] is None, run
 
-    def test_aggregate_output_is_typed_from_its_text(self, connection, rows):
-        """The remaining gap, written down rather than left to be discovered.
+    def test_aggregate_group_key_keeps_its_type(self, connection, rows):
+        """A group key is carried as a value, so a string that reads as a number stays one.
 
-        An aggregate's rows were never ads: the server reduces them to strings before they
-        reach the driver, so there is no value left to read a type from and the text is
-        parsed back. A numeric-looking string grouped on therefore arrives as a number.
+        The group a row belongs to is sent as a typed value beside its label, which is also
+        what keeps the string "4" and the number 4 in different groups. A grouped column
+        therefore arrives as what it is rather than as whatever its text parses to.
+
+        An aggregate's own output is the part still read as text: those cells travel as
+        display strings with no typed counterpart, so a user-defined aggregate returning a
+        numeric-looking string arrives as a number. The Go tests pin that one, which needs a
+        registered aggregate to reach.
         """
         cursor = connection.cursor()
         cursor.execute(f"SELECT Owner, COUNT(*) AS n FROM {rows} GROUP BY Owner")
-        assert cursor.fetchall() == [(123, 1)]
+        assert cursor.fetchall() == [("123", 1)]
