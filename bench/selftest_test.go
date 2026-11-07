@@ -152,3 +152,71 @@ func TestConsumerSinkIsPopulated(t *testing.T) {
 		t.Errorf("the value pass left %v; it did not read a typed value", vt)
 	}
 }
+
+// PREPARATION MUST CONVERGE THE COLUMNAR FORM, which one schema-scan pass does not do on a table
+// bigger than the pass budget.
+//
+// A pass rewrites a bounded number of sealed segments (64 by default), so a single call leaves a
+// large archive mostly non-columnar -- and the accelerator's own coverage figure does not show
+// it: it reports every sealed segment covered after the first pass while most records are still
+// rebuilt from the arena on every read. A benchmark preparing with one pass measures a table no
+// deployment runs and reports it as the prepared state.
+func TestPrepareConvergesColumnarization(t *testing.T) {
+	const rows = 120000 // enough segments to exceed one pass's budget
+	cat, err := db.OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	arch, err := cat.CreateArchiveTable("history", db.ArchiveConfig{
+		ValueAttrs: []string{"ClusterId", "CompletionDate"}, ZoneAttrs: []string{"CompletionDate"},
+		SegmentSize: 1 << 18,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := NewGenerator(DefaultGenConfig(ShapeHistory), rows)
+	for i := 0; i < rows; i++ {
+		_, ad := g.Ad(i)
+		if aerr := arch.Append(ad); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+	// One pass, as the naive preparation did: this is the state being guarded against.
+	arch.BuildAndEnableSchemaScan(4000, 8)
+	onePass, ok := sampleArchiveEscape(arch, nil, 5000)
+	if !ok {
+		t.Fatal("could not sample the escape rate")
+	}
+	info := arch.SchemaScanInfo()
+	t.Logf("after ONE pass: %.1f%% reassembled, while coverage reports %d/%d segments",
+		100*onePass, info.CoveredSegments, info.SealedSegments)
+	if onePass < 0.2 {
+		t.Skipf("one pass already converged at this size (%.1f%%); the test needs a table bigger than the pass budget", 100*onePass)
+	}
+	// The coverage figure is the trap: it says fully covered while most records reassemble.
+	if info.CoveredSegments != info.SealedSegments {
+		t.Errorf("coverage reports %d of %d; the premise of this test is that it reports FULL coverage here",
+			info.CoveredSegments, info.SealedSegments)
+	}
+
+	rep := PrepareArchive(arch, DefaultPrepareOptions(ShapeHistory))
+	t.Logf("after preparation: %d passes, %.2f%% reassembled", rep.ColumnarPasses, 100*rep.ResidualEscape)
+	if rep.ColumnarPasses < 2 {
+		t.Errorf("preparation used %d pass(es); a table past the pass budget needs more", rep.ColumnarPasses)
+	}
+	// Not asserted against zero: the probe reads newest-first and the active segment is never
+	// columnarized, so a small residue is correct and permanent.
+	if rep.ResidualEscape > columnarResidualWarn {
+		t.Errorf("preparation left %.1f%% reassembled, want at most %.1f%%",
+			100*rep.ResidualEscape, 100*columnarResidualWarn)
+	}
+	if rep.ColumnarPasses >= maxColumnarPasses {
+		t.Errorf("preparation used the full %d passes; it should stop when passes stop converting anything",
+			maxColumnarPasses)
+	}
+	if rep.ResidualEscape >= onePass {
+		t.Errorf("preparation did not improve on a single pass (%.1f%% vs %.1f%%)",
+			100*rep.ResidualEscape, 100*onePass)
+	}
+}

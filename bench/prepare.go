@@ -54,6 +54,11 @@ type PrepareOptions struct {
 	// RetrainSample is the dictionary training sample; 0 skips training. An untrained store pays
 	// Huffman table setup per record, which is a large share of read CPU.
 	RetrainSample int
+	// EscapeProbeAttrs and EscapeProbeSample configure the convergence probe: which projection
+	// to sample and how many records. Defaults are a plain stored-attribute projection, which
+	// is what shows columnar coverage rather than the cost of shipping an expression.
+	EscapeProbeAttrs  []string
+	EscapeProbeSample int
 }
 
 // DefaultPrepareOptions is the steady state for a generated dataset of the given shape.
@@ -83,6 +88,14 @@ type PrepareReport struct {
 	SchemaScanOn   bool
 	DictTrained    bool
 	DictSampleUsed int
+	// ColumnarPasses is how many schema-scan passes were run. One is not enough on a large
+	// table: a pass rewrites a bounded number of sealed segments, so a single call leaves the
+	// rest to be reassembled on every read. See PrepareArchive.
+	ColumnarPasses int
+	// ResidualEscape is the share of sampled records still reassembled after preparation, 0
+	// when it converged. Reported because it is the number that decides what the sweep is
+	// about to measure, and because the accelerator's own coverage figure does not show it.
+	ResidualEscape float64
 	Notes          []string
 }
 
@@ -98,11 +111,99 @@ func PrepareArchive(t *db.ArchiveTable, o PrepareOptions) PrepareReport {
 	if len(o.HotAttrs) > 0 {
 		r.HotAttrs = t.AddHotAttrs(o.HotAttrs...)
 	}
+	// REPEATED UNTIL IT CONVERGES, which is what "steady state" means here.
+	//
+	// A schema-scan pass rewrites a BOUNDED number of sealed segments into columnar form -- 64
+	// by default -- so that enabling the accelerator over an existing archive does not stall on
+	// hours of I/O. A deployment converges over several maintenance intervals; a benchmark that
+	// called it once would measure a table that is mostly NOT columnar and report it as the
+	// prepared state.
+	//
+	// The accelerator's own coverage figure does not show this: a 478-segment archive reports
+	// 478 of 478 covered after the first pass while 87% of its records are still reassembled on
+	// every read. Measured here instead, by sampling the read, because that is the number that
+	// decides what the sweep measures.
+	// DRIVEN BY THE SEGMENT BACKLOG, not by probing between passes.
+	//
+	// Segments are converted oldest-first and an archive reads newest-first, so a bounded probe
+	// between passes reads the segments converted LAST and reports no improvement until the
+	// final pass -- it looks converged after one pass and after seven alike. The backlog is the
+	// honest signal: a pass converts at most columnarPassBudget segments, so a table with N
+	// sealed segments needs about N/budget of them.
 	r.SchemaScanOn = t.BuildAndEnableSchemaScan(o.SampleMax, o.HotTopN)
+	r.ColumnarPasses = 1
+	if r.SchemaScanOn {
+		sealed := t.SchemaScanInfo().SealedSegments
+		want := 1
+		if sealed > 0 {
+			want = (sealed+columnarPassBudget-1)/columnarPassBudget + 1
+		}
+		if want > maxColumnarPasses {
+			want = maxColumnarPasses
+		}
+		for r.ColumnarPasses < want {
+			if !t.BuildAndEnableSchemaScan(o.SampleMax, o.HotTopN) {
+				break
+			}
+			r.ColumnarPasses++
+		}
+		// One probe over the WHOLE table, after the passes. Bounded probes are biased by the
+		// read order; this is the number that describes what the sweep will measure, and it
+		// costs one scan at setup rather than one per pass.
+		if esc, ok := sampleArchiveEscape(t, o.EscapeProbeAttrs, 0); ok {
+			r.ResidualEscape = esc
+		}
+	}
 	if !r.SchemaScanOn {
 		r.Notes = append(r.Notes, "the columnar accelerator did not build: every projected read is served from records")
+	} else if r.ResidualEscape > columnarResidualWarn {
+		r.Notes = append(r.Notes, fmt.Sprintf(
+			"columnarization did not converge in %d passes: %.1f%% of sampled records are still rebuilt from the arena, so this table is not in the state a maintained deployment reaches",
+			r.ColumnarPasses, 100*r.ResidualEscape))
 	}
 	return r
+}
+
+// maxColumnarPasses bounds the convergence loop. Each pass rewrites a bounded number of segments,
+// so a very large table needs several; the cap stops a table that cannot converge from looping
+// forever, and the residual is reported rather than hidden.
+const maxColumnarPasses = 32
+
+// columnarPassBudget mirrors how many sealed segments one schema-scan pass converts. It is the
+// library's default rather than a value this package controls, so it is used only to SIZE the
+// loop -- the loop is bounded, and the residual is measured afterwards rather than assumed -- and
+// a change to it costs a pass or two, not correctness.
+const columnarPassBudget = 64
+
+// columnarResidualWarn is the residual above which preparation says the table is not in the
+// state a maintained deployment reaches. Not zero, and not a convergence target: the active
+// segment is never columnarized, so a probe reading newest-first always sees some residue.
+const columnarResidualWarn = 0.10
+
+// sampleArchiveEscape reads a bounded sample through the evaluated projection and reports the
+// share of visited records rebuilt from the arena.
+func sampleArchiveEscape(t *db.ArchiveTable, attrs []string, sample int) (float64, bool) {
+	if len(attrs) == 0 {
+		attrs = []string{"ClusterId", "Owner", "JobStatus"}
+	}
+	// sample <= 0 means the whole table, which is what the post-pass probe wants: a bounded
+	// sample of a newest-first archive reads the newest segments and misreports convergence.
+	var st collections.ScanStats
+	seq, err := t.QueryProjectStats("true", attrs, &st)
+	if err != nil {
+		return 0, false
+	}
+	n := 0
+	for range seq {
+		n++
+		if sample > 0 && n >= sample {
+			break
+		}
+	}
+	if st.RecordsVisited == 0 {
+		return 0, false
+	}
+	return float64(st.RecordsReassembled) / float64(st.RecordsVisited), true
 }
 
 // PrepareTable brings a mutable table to steady state.
@@ -168,9 +269,8 @@ func (e Escape) ClosureRate() float64 {
 // Bounded because this is a probe, not the measurement: it exists to say what the sweep is about
 // to measure, and a probe that read the whole table would cost as much as the sweep.
 func MeasureEscape(ctx context.Context, c *dbrpc.Client, table, constraint string, projection []string, sample int) (Escape, error) {
-	if sample <= 0 {
-		sample = 5000
-	}
+	// sample <= 0 means the whole table, which is what the post-pass probe wants: a bounded
+	// sample of a newest-first archive reads the newest segments and misreports convergence.
 	var st collections.ScanStats
 	err := c.QueryRawProjectRefsStreamStats(ctx, table, constraint, projection, sample,
 		func(string) bool { return true }, &st)
