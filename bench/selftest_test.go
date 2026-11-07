@@ -1,7 +1,10 @@
 package bench
 
 import (
+	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -9,38 +12,66 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 )
 
-// benchArchive builds a generated, prepared `history` archive without serving it.
-func benchArchive(t *testing.T, rows int) *db.ArchiveTable {
+// sharedArchive is one generated, prepared `history` archive, built once and reused by every
+// test that only READS it.
+//
+// Building it is the expensive part -- generating and appending ads, which under -race dominates
+// everything else -- and it is identical for each of those tests. Rebuilding it per test cost
+// this package several minutes of the repository's whole-suite timeout for no additional
+// coverage. A test that needs a DIFFERENT state (an unprepared archive, a particular segment
+// size) builds its own.
+var (
+	sharedArchiveOnce sync.Once
+	sharedArchiveTbl  *db.ArchiveTable
+	sharedArchiveErr  error
+)
+
+const sharedArchiveRows = 3000
+
+func sharedArchive(t *testing.T) *db.ArchiveTable {
 	t.Helper()
-	cat, err := db.OpenCatalog(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = cat.Close() })
-	arch, err := cat.CreateArchiveTable("history", db.ArchiveConfig{
-		ValueAttrs:  []string{"ClusterId", "CompletionDate"},
-		ZoneAttrs:   []string{"CompletionDate"},
-		SegmentSize: 1 << 18,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	g := NewGenerator(DefaultGenConfig(ShapeHistory), rows)
-	for i := 0; i < rows; i++ {
-		_, ad := g.Ad(i)
-		if aerr := arch.Append(ad); aerr != nil {
-			t.Fatal(aerr)
+	sharedArchiveOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "bench-shared")
+		if err != nil {
+			sharedArchiveErr = err
+			return
 		}
+		cat, err := db.OpenCatalog(dir)
+		if err != nil {
+			sharedArchiveErr = err
+			return
+		}
+		arch, err := cat.CreateArchiveTable("history", db.ArchiveConfig{
+			ValueAttrs: []string{"ClusterId", "CompletionDate"}, ZoneAttrs: []string{"CompletionDate"},
+			SegmentSize: 32 << 10,
+		})
+		if err != nil {
+			sharedArchiveErr = err
+			return
+		}
+		g := NewGenerator(DefaultGenConfig(ShapeHistory), sharedArchiveRows)
+		for i := 0; i < sharedArchiveRows; i++ {
+			_, ad := g.Ad(i)
+			if aerr := arch.Append(ad); aerr != nil {
+				sharedArchiveErr = aerr
+				return
+			}
+		}
+		if rep := PrepareArchive(arch, DefaultPrepareOptions(ShapeHistory)); !rep.SchemaScanOn {
+			sharedArchiveErr = fmt.Errorf("columnar accelerator did not build: %v", rep.Notes)
+			return
+		}
+		sharedArchiveTbl = arch
+	})
+	if sharedArchiveErr != nil {
+		t.Fatalf("shared archive: %v", sharedArchiveErr)
 	}
-	if rep := PrepareArchive(arch, DefaultPrepareOptions(ShapeHistory)); !rep.SchemaScanOn {
-		t.Fatalf("columnar accelerator did not build: %v", rep.Notes)
-	}
-	return arch
+	return sharedArchiveTbl
 }
 
 // The self-test must produce a rate for every transport and must keep the two forms apart.
 func TestSelfTestCoversEveryTransport(t *testing.T) {
-	arch := benchArchive(t, 20000)
+	arch := sharedArchive(t)
 	rep := SelfTestArchive(arch, SelfTestSpec{
 		Table: "history", Constraint: "true",
 		Projection: []string{"ClusterId", "Owner", "JobStatus"},
@@ -53,8 +84,8 @@ func TestSelfTestCoversEveryTransport(t *testing.T) {
 		if s.Err != nil {
 			t.Fatalf("%s: %v", s.Transport, s.Err)
 		}
-		if s.Rows != 20000 {
-			t.Errorf("%s: %d rows, want 20000", s.Transport, s.Rows)
+		if s.Rows != sharedArchiveRows {
+			t.Errorf("%s: %d rows, want %d", s.Transport, s.Rows, sharedArchiveRows)
 		}
 		if s.RowsPerSec() <= 0 {
 			t.Errorf("%s: no production rate", s.Transport)
@@ -65,7 +96,7 @@ func TestSelfTestCoversEveryTransport(t *testing.T) {
 // The evaluated form produces no serialized bytes, and the report must SAY that rather than
 // print 0.0 MB/s beside real rates -- a zero in a rate column reads as "delivered nothing".
 func TestSelfTestDoesNotInventBytesForTheEvaluatedForm(t *testing.T) {
-	arch := benchArchive(t, 5000)
+	arch := sharedArchive(t)
 	rep := SelfTestArchive(arch, SelfTestSpec{
 		Table: "history", Constraint: "true",
 		Projection: []string{"ClusterId", "Owner"},
@@ -97,7 +128,7 @@ func TestSelfTestDoesNotInventBytesForTheEvaluatedForm(t *testing.T) {
 // a form whose rows need decoding. A consume pass that matched produce would mean the work was
 // skipped or optimized away, and the whole comparison would be of two empty loops.
 func TestSelfTestConsumerPassDoesRealWork(t *testing.T) {
-	arch := benchArchive(t, 20000)
+	arch := sharedArchive(t)
 	rep := SelfTestArchive(arch, SelfTestSpec{
 		Table: "history", Constraint: "true",
 		Projection: []string{"ClusterId", "Owner", "JobStatus"},
@@ -139,7 +170,7 @@ func TestSelfTestConsumerPassDoesRealWork(t *testing.T) {
 // The consumer's results must actually be observable, which is what stops the compiler eliding
 // the work the consuming pass exists to measure.
 func TestConsumerSinkIsPopulated(t *testing.T) {
-	arch := benchArchive(t, 2000)
+	arch := sharedArchive(t)
 	_ = SelfTestArchive(arch, SelfTestSpec{
 		Table: "history", Constraint: "true",
 		Projection: []string{"ClusterId", "Owner"}, Iterations: 1,
@@ -162,7 +193,11 @@ func TestConsumerSinkIsPopulated(t *testing.T) {
 // rebuilt from the arena on every read. A benchmark preparing with one pass measures a table no
 // deployment runs and reports it as the prepared state.
 func TestPrepareConvergesColumnarization(t *testing.T) {
-	const rows = 120000 // enough segments to exceed one pass's budget
+	// Small segments reach the pass budget in a few thousand rows, where a realistic segment
+	// size needs over a hundred thousand -- the property under test is the SEGMENT count, not
+	// the row count, and this package's tests run under -race in CI against a whole-repo
+	// timeout.
+	const rows = 3000
 	cat, err := db.OpenCatalog(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -170,7 +205,7 @@ func TestPrepareConvergesColumnarization(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 	arch, err := cat.CreateArchiveTable("history", db.ArchiveConfig{
 		ValueAttrs: []string{"ClusterId", "CompletionDate"}, ZoneAttrs: []string{"CompletionDate"},
-		SegmentSize: 1 << 18,
+		SegmentSize: 16 << 10,
 	})
 	if err != nil {
 		t.Fatal(err)

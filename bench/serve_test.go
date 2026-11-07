@@ -46,7 +46,7 @@ func TestBuildRefusesForeignDirectoryBeforeOpening(t *testing.T) {
 
 // The built server serves every shape, anonymously and read-only.
 func TestBuiltServerServesAnonymousReads(t *testing.T) {
-	srv, reports, err := Build(ServeConfig{Dir: filepath.Join(t.TempDir(), "scratch"), Rows: 3000}, nil)
+	srv, reports, err := Build(ServeConfig{Dir: filepath.Join(t.TempDir(), "scratch"), Rows: 600}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,8 +80,8 @@ func TestBuiltServerServesAnonymousReads(t *testing.T) {
 				t.Errorf("%s/%s: anonymous read failed: %v", shape, smp.Transport, smp.Err)
 				continue
 			}
-			if smp.Rows != 3000 {
-				t.Errorf("%s/%s: %d rows, want 3000", shape, smp.Transport, smp.Rows)
+			if smp.Rows != 600 {
+				t.Errorf("%s/%s: %d rows, want 600", shape, smp.Transport, smp.Rows)
 			}
 			if smp.Bytes <= 0 {
 				t.Errorf("%s/%s: no bytes measured", shape, smp.Transport)
@@ -94,7 +94,7 @@ func TestBuiltServerServesAnonymousReads(t *testing.T) {
 // a different thing from an anonymous reader and only the second was asked for.
 func TestAnonymousPeerCannotWrite(t *testing.T) {
 	srv, _, err := Build(ServeConfig{Dir: filepath.Join(t.TempDir(), "scratch"),
-		Rows: 200, Shapes: []Shape{ShapeHistory}}, nil)
+		Rows: 150, Shapes: []Shape{ShapeHistory}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestAnonymousPeerCannotWrite(t *testing.T) {
 func TestBuiltDatasetIsReproducible(t *testing.T) {
 	read := func() string {
 		srv, _, err := Build(ServeConfig{Dir: filepath.Join(t.TempDir(), "scratch"),
-			Rows: 500, Shapes: []Shape{ShapeHistory}, Seed: 7}, nil)
+			Rows: 300, Shapes: []Shape{ShapeHistory}, Seed: 7}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

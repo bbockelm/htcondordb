@@ -47,7 +47,7 @@ func serveBoth(t *testing.T, rows int) (Dialer, *Server) {
 
 // The Arrow arm runs beside the ClassAd ones and is counted the same way.
 func TestArrowTransportMeasured(t *testing.T) {
-	dial, _ := serveBoth(t, 3000)
+	dial, _ := serveBoth(t, 1000)
 	rep, err := Run(context.Background(), dial, Spec{
 		Table: "history", Constraint: "true",
 		Projection: []string{"ClusterId", "Owner", "JobStatus"},
@@ -61,8 +61,8 @@ func TestArrowTransportMeasured(t *testing.T) {
 		if s.Err != nil {
 			t.Fatalf("%s: %v (%s)", s.Transport, s.Err, s.Note)
 		}
-		if s.Rows != 3000 {
-			t.Errorf("%s: %d rows, want 3000", s.Transport, s.Rows)
+		if s.Rows != 1000 {
+			t.Errorf("%s: %d rows, want 1000", s.Transport, s.Rows)
 		}
 		if s.Transport == Arrow {
 			arrow = s
@@ -111,7 +111,7 @@ func TestArrowDeclinesAnUntranslatableConstraint(t *testing.T) {
 
 // A declining arm must report itself rather than returning a rate of zero that reads as slow.
 func TestArrowDeclineSurfacesInTheReport(t *testing.T) {
-	dial, _ := serveBoth(t, 500)
+	dial, _ := serveBoth(t, 300)
 	rep, err := Run(context.Background(), dial, Spec{
 		Table: "history", Constraint: "JobStatus == 3",
 		Projection: []string{"ClusterId"},

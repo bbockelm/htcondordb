@@ -69,8 +69,11 @@ func TestDatasetIsScaleInvariant(t *testing.T) {
 		"RequestCpus", "RequestMemory", "RequestDisk", "ResidentSetSize", "ImageSize",
 		"JobStatus", "MemoryUsage", "Owner", "ProjectName", "Cmd",
 	}
-	small := summarise(t, cfg, 5000, attrs)
-	large := summarise(t, cfg, 50000, attrs)
+	// A 5x ratio is what tests scale-dependence: a value defined from the row index moves its
+	// mean by about that factor, which the 2% tolerance below catches easily. Larger samples
+	// cost -race time without making the comparison sharper.
+	small := summarise(t, cfg, 3000, attrs)
+	large := summarise(t, cfg, 15000, attrs)
 
 	for _, a := range attrs {
 		s, l := small[a], large[a]
@@ -82,7 +85,7 @@ func TestDatasetIsScaleInvariant(t *testing.T) {
 				continue // the small sample simply had not drawn them all
 			}
 			if len(l.distinct) > cardinalityCap(cfg, a) {
-				t.Errorf("%s: %d distinct values at 50k, config caps it at %d",
+				t.Errorf("%s: %d distinct values at 15k, config caps it at %d",
 					a, len(l.distinct), cardinalityCap(cfg, a))
 			}
 			continue
@@ -95,13 +98,13 @@ func TestDatasetIsScaleInvariant(t *testing.T) {
 		// sampling does not.
 		sm, lm := s.mean(), l.mean()
 		if rel := math.Abs(sm-lm) / math.Max(math.Abs(lm), 1); rel > 0.02 {
-			t.Errorf("%s: mean %g at 5k but %g at 50k (%.1f%%); this attribute's distribution depends on the row count",
+			t.Errorf("%s: mean %g at 3k but %g at 15k (%.1f%%); this attribute's distribution depends on the row count",
 				a, sm, lm, rel*100)
 		}
 		// And the upper bound must not grow with the row count, which is the shape a value
 		// defined from the row index has even when its mean shift is small.
 		if l.max > s.max*1.05+1 {
-			t.Errorf("%s: max %g at 5k grew to %g at 50k; the attribute's range tracks the row count",
+			t.Errorf("%s: max %g at 3k grew to %g at 15k; the attribute's range tracks the row count",
 				a, s.max, l.max)
 		}
 	}
@@ -124,7 +127,7 @@ func cardinalityCap(cfg GenConfig, attr string) int {
 // sweep -- the same mistake as a value range that grows, in the attribute archives prune on.
 func TestDatasetTimestampsSpanTheConfiguredWindow(t *testing.T) {
 	cfg := DefaultGenConfig(ShapeHistory)
-	for _, rows := range []int{1000, 100000} {
+	for _, rows := range []int{500, 5000} {
 		g := NewGenerator(cfg, rows)
 		var lo, hi int64 = math.MaxInt64, math.MinInt64
 		for i := 0; i < rows; i++ {
@@ -154,7 +157,7 @@ func TestDatasetTimestampsSpanTheConfiguredWindow(t *testing.T) {
 func TestSparseAttributeRateFollowsTheConfig(t *testing.T) {
 	cfg := DefaultGenConfig(ShapeHistory)
 	cfg.SparseFraction = 0.10
-	for _, rows := range []int{20000, 200000} {
+	for _, rows := range []int{5000, 10000} {
 		g := NewGenerator(cfg, rows)
 		present := 0
 		for i := 0; i < rows; i++ {

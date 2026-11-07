@@ -245,36 +245,6 @@ func TestReadinessWarnsWhenNotComparable(t *testing.T) {
 	}
 }
 
-// serveCatalog is serve for a multi-table catalog, which is what a real deployment serves.
-func serveCatalog(t *testing.T, cat *db.Catalog) Dialer {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := dbrpc.NewServerCatalog(cat)
-	s.EnableQueryStats(dbrpc.QueryStatsOptions{})
-	go func() {
-		for {
-			c, aerr := ln.Accept()
-			if aerr != nil {
-				return
-			}
-			go func() { _ = s.ServeConn(dbrpc.NewStreamConn(c)) }()
-		}
-	}()
-	t.Cleanup(func() { _ = ln.Close(); s.Close() })
-	return func(context.Context) (*Conn, error) {
-		c, derr := net.Dial("tcp", ln.Addr().String())
-		if derr != nil {
-			return nil, derr
-		}
-		counted, bytes := NewCountingConn(c)
-		cl := dbrpc.NewClient(dbrpc.NewStreamConn(counted))
-		return &Conn{Client: cl, Close: func() { _ = cl.Close() }, Bytes: bytes}, nil
-	}
-}
-
 // The evaluated form must be measured as its own transport, with bytes counted at the socket: a
 // column-major batch has no per-row length, so a harness summing row lengths would report it as
 // delivering nothing. It is also a different product from the stored form -- about 10x cheaper
@@ -368,5 +338,34 @@ func TestConcurrencyRunsSeparateConnections(t *testing.T) {
 	// K readers each drain the whole table, so the cell totals K times the rows.
 	if s.Rows != int64(k*2000) {
 		t.Errorf("%d rows across %d readers, want %d", s.Rows, k, k*2000)
+	}
+}
+
+// serveCatalogShared is serveCatalog without a *testing.T, for a fixture built once in a
+// sync.Once where no single test owns the cleanup. The listener lives for the test binary.
+func serveCatalogShared(cat *db.Catalog) Dialer {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return func(context.Context) (*Conn, error) { return nil, err }
+	}
+	s := dbrpc.NewServerCatalog(cat)
+	s.EnableQueryStats(dbrpc.QueryStatsOptions{})
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func() { _ = s.ServeConn(dbrpc.NewStreamConn(c)) }()
+		}
+	}()
+	return func(context.Context) (*Conn, error) {
+		c, derr := net.Dial("tcp", ln.Addr().String())
+		if derr != nil {
+			return nil, derr
+		}
+		counted, bytes := NewCountingConn(c)
+		cl := dbrpc.NewClient(dbrpc.NewStreamConn(counted))
+		return &Conn{Client: cl, Close: func() { _ = cl.Close() }, Bytes: bytes}, nil
 	}
 }

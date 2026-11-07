@@ -2,6 +2,9 @@ package bench
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"sync"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -12,33 +15,53 @@ import (
 // is where the columnar accelerator decides the cost -- and because a freshly filled mutable table
 // has no sealed segments, so its scan counters come back unreported and every assertion below
 // would be vacuous.
-func preparedArchive(t *testing.T, rows int) Dialer {
+// sharedServed is the shared archive, served once, for the tests that need a client against a
+// prepared table. Same reasoning as sharedArchive: the build is the cost and it is identical.
+var (
+	sharedServedOnce sync.Once
+	sharedServedDial Dialer
+	sharedServedErr  error
+)
+
+func sharedServed(t *testing.T) Dialer {
 	t.Helper()
-	cat, err := db.OpenCatalog(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = cat.Close() })
-	arch, err := cat.CreateArchiveTable("history", db.ArchiveConfig{
-		ValueAttrs:  []string{"ClusterId", "CompletionDate"},
-		ZoneAttrs:   []string{"CompletionDate"},
-		SegmentSize: 1 << 18,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	g := NewGenerator(DefaultGenConfig(ShapeHistory), rows)
-	for i := 0; i < rows; i++ {
-		_, ad := g.Ad(i)
-		if aerr := arch.Append(ad); aerr != nil {
-			t.Fatal(aerr)
+	sharedServedOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "bench-served")
+		if err != nil {
+			sharedServedErr = err
+			return
 		}
+		cat, cerr := db.OpenCatalog(dir)
+		if cerr != nil {
+			sharedServedErr = cerr
+			return
+		}
+		arch, aerr := cat.CreateArchiveTable("history", db.ArchiveConfig{
+			ValueAttrs: []string{"ClusterId", "CompletionDate"}, ZoneAttrs: []string{"CompletionDate"},
+			SegmentSize: 32 << 10,
+		})
+		if aerr != nil {
+			sharedServedErr = aerr
+			return
+		}
+		g := NewGenerator(DefaultGenConfig(ShapeHistory), sharedArchiveRows)
+		for i := 0; i < sharedArchiveRows; i++ {
+			_, ad := g.Ad(i)
+			if e := arch.Append(ad); e != nil {
+				sharedServedErr = e
+				return
+			}
+		}
+		if rep := PrepareArchive(arch, DefaultPrepareOptions(ShapeHistory)); !rep.SchemaScanOn {
+			sharedServedErr = fmt.Errorf("columnar accelerator did not build: %v", rep.Notes)
+			return
+		}
+		sharedServedDial = serveCatalogShared(cat)
+	})
+	if sharedServedErr != nil {
+		t.Fatalf("shared served archive: %v", sharedServedErr)
 	}
-	rep := PrepareArchive(arch, DefaultPrepareOptions(ShapeHistory))
-	if !rep.SchemaScanOn {
-		t.Fatalf("the columnar accelerator did not build; this test cannot distinguish the paths: %v", rep.Notes)
-	}
-	return serveCatalog(t, cat)
+	return sharedServedDial
 }
 
 // The escape rate must be a property of the PROJECTION, not only of the store.
@@ -49,7 +72,7 @@ func preparedArchive(t *testing.T, rows int) Dialer {
 // the server rebuild each record instead. A harness reporting only "columnarized: yes" would
 // present those two as the same configuration.
 func TestEscapeRateDependsOnTheProjection(t *testing.T) {
-	dial := preparedArchive(t, 20000)
+	dial := sharedServed(t)
 	cn, err := dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +109,7 @@ func TestEscapeRateDependsOnTheProjection(t *testing.T) {
 // A high escape rate must reach the operator as a warning, not only as a field: the whole point is
 // that a rate published beside "columnarized: yes" misrepresents what was measured.
 func TestReadinessWarnsOnHighEscape(t *testing.T) {
-	dial := preparedArchive(t, 20000)
+	dial := sharedServed(t)
 	cn, err := dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +146,7 @@ func TestReadinessWarnsOnHighEscape(t *testing.T) {
 // An ad that SHIPS MemoryUsage must carry the stored expression rather than the value it computes
 // to -- the value is a property of the record, not part of it -- so the record is rebuilt.
 func TestEscapeSplitsOnShippingNotFiltering(t *testing.T) {
-	dial := preparedArchive(t, 20000)
+	dial := sharedServed(t)
 	cn, err := dial(context.Background())
 	if err != nil {
 		t.Fatal(err)

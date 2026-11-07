@@ -14,7 +14,7 @@ import (
 // The Flight endpoint serves the generated data to an unauthenticated client.
 func TestFlightServesAnonymously(t *testing.T) {
 	srv, _, err := Build(ServeConfig{Dir: filepath.Join(t.TempDir(), "scratch"),
-		Rows: 3000, Shapes: []Shape{ShapeHistory}}, nil)
+		Rows: 1000, Shapes: []Shape{ShapeHistory}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,8 +45,8 @@ func TestFlightServesAnonymously(t *testing.T) {
 	if rerr := rdr.Err(); rerr != nil {
 		t.Fatal(rerr)
 	}
-	if rows != 3000 {
-		t.Fatalf("%d rows over Flight, want 3000", rows)
+	if rows != 1000 {
+		t.Fatalf("%d rows over Flight, want 1000", rows)
 	}
 }
 
@@ -59,7 +59,7 @@ func TestFlightServesAnonymously(t *testing.T) {
 // override is pinned separately below for what it does change.
 func TestFlightTypesTheExpressionValuedAttribute(t *testing.T) {
 	srv, _, err := Build(ServeConfig{Dir: filepath.Join(t.TempDir(), "scratch"),
-		Rows: 2000, Shapes: []Shape{ShapeHistory}}, nil)
+		Rows: 800, Shapes: []Shape{ShapeHistory}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,8 +117,8 @@ func TestFlightTypesTheExpressionValuedAttribute(t *testing.T) {
 	if rerr := rdr.Err(); rerr != nil {
 		t.Fatal(rerr)
 	}
-	if rows != 2000 {
-		t.Fatalf("%d rows, want 2000", rows)
+	if rows != 800 {
+		t.Fatalf("%d rows, want 800", rows)
 	}
 	// A column of nulls would satisfy "the column exists" while carrying nothing.
 	if nonNull != rows {
@@ -135,7 +135,7 @@ func TestFlightTypesTheExpressionValuedAttribute(t *testing.T) {
 // asserting the MemoryUsage override does not, because the profile produces that column anyway.
 func TestFlightDeclaresTimestampColumns(t *testing.T) {
 	srv, _, err := Build(ServeConfig{Dir: filepath.Join(t.TempDir(), "scratch"),
-		Rows: 2000, Shapes: []Shape{ShapeHistory}}, nil)
+		Rows: 800, Shapes: []Shape{ShapeHistory}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

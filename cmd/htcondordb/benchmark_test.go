@@ -73,7 +73,7 @@ func TestBenchmarkModeRefusesForeignDirectory(t *testing.T) {
 func TestBenchmarkSelfTestRunsAndReturns(t *testing.T) {
 	var out bytes.Buffer
 	err := runBenchmark(context.Background(), benchmarkConfig{
-		Dir: filepath.Join(t.TempDir(), "scratch"), Rows: 2000, SelfTest: true, Seed: 3,
+		Dir: filepath.Join(t.TempDir(), "scratch"), Rows: 600, SelfTest: true, Seed: 3,
 	}, &out)
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +99,7 @@ func TestBenchmarkServeBindsAndAnnounces(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- runBenchmark(ctx, benchmarkConfig{
-			Dir: filepath.Join(t.TempDir(), "scratch"), Rows: 1000,
+			Dir: filepath.Join(t.TempDir(), "scratch"), Rows: 400,
 			Listen: "127.0.0.1:0", Flight: "127.0.0.1:0", Seed: 5,
 		}, &out)
 	}()
