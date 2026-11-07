@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/PelicanPlatform/classad/collections"
 )
 
 func explainText(t *testing.T, e *Executor, sql string) string {
@@ -103,7 +105,7 @@ func TestExplainAnalyzeBucketedTier(t *testing.T) {
 			t.Errorf("%s bucketed aggregate is missing the scan line:\n%s", name, out)
 		}
 	}
-	if !strings.Contains(fast, "answered by: index / columnar accelerator") {
+	if !strings.Contains(fast, "answered by: index") {
 		t.Errorf("the unconstrained bucketed aggregate should be answered without reading records:\n%s", fast)
 	}
 	if !strings.Contains(fast, "records visited=0") {
@@ -119,5 +121,54 @@ func TestExplainAnalyzeBucketedTier(t *testing.T) {
 	}
 	if fast == slow {
 		t.Errorf("the fast and slow bucketed aggregates rendered identically:\n%s", fast)
+	}
+}
+
+// TestAggregateTierLineNamesTheTier pins what the line is for: the server REPORTS which tier
+// answered, and each one has to read differently. Inferring it from the scan counts could not: only
+// the fall-through scan fills the trailer, so index and columnar both left it zero and printed one
+// undifferentiated "index / columnar accelerator" -- which reads as good news and hid a constrained
+// COUNT(*) answered from per-segment metadata at ten times the cost of the columnar count beside it.
+func TestAggregateTierLineNamesTheTier(t *testing.T) {
+	// Counts that would, under the old inference, have read as "no segment opened, no record read"
+	// for every one of these tiers.
+	zero := collections.ScanStats{}
+
+	lines := map[collections.AggTier]string{}
+	for _, tier := range []collections.AggTier{
+		collections.TierMatchNone,
+		collections.TierIndex,
+		collections.TierColumnar,
+		collections.TierScan,
+	} {
+		s := zero
+		s.Tier = tier
+		lines[tier] = aggregateTierLine(s)
+	}
+
+	for tier, line := range lines {
+		for other, otherLine := range lines {
+			if tier != other && line == otherLine {
+				t.Errorf("tiers %v and %v render identically: %q", tier, other, line)
+			}
+		}
+	}
+
+	// The index line has to say the thing that makes it actionable. A reader who sees "index" and
+	// assumes it is the fast answer draws exactly the wrong conclusion for a selective predicate:
+	// its cost follows the segment count, so it loses to a scan that visits only the matches.
+	if !strings.Contains(lines[collections.TierIndex], "SEGMENTS") {
+		t.Errorf("the index line does not say what drives its cost: %q", lines[collections.TierIndex])
+	}
+
+	// A server too old to report a tier must not be made to look like one that did.
+	old := aggregateTierLine(zero)
+	if !strings.Contains(old, "unreported") {
+		t.Errorf("an unreported tier should say so, got %q", old)
+	}
+	for tier, line := range lines {
+		if old == line {
+			t.Errorf("an unreported tier renders as %v: %q", tier, old)
+		}
 	}
 }

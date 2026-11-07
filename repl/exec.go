@@ -1267,18 +1267,39 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 	return res, nil
 }
 
-// aggregateTierLine names which server-side tier actually answered an aggregate. It is INFERRED
-// from the scan breakdown, not reported by the server: the index and columnar fast paths answer out
-// of per-segment structures without opening a segment or reading a record, so they leave the whole
-// trailer zero, while the fall-through projected scan fills it in. The inference is needed because
-// the plan line above names the opcode the CLIENT chose, which is the same for both -- two
-// aggregates orders of magnitude apart in wall time print the same "columnar aggregate on the
-// archive" -- and "every number is zero" is not something a reader should have to know how to
-// decode. An all-zero trailer can also mean a constraint proven to match nothing, which likewise
-// read no records, so the wording claims only that.
+// aggregateTierLine names which server-side tier actually answered an aggregate. The plan line
+// above names only the opcode the CLIENT chose, which is the same whichever tier runs, so without
+// this two aggregates an order of magnitude apart in wall time print the same "columnar aggregate
+// on the archive".
+//
+// The server reports the tier (ScanStats.Tier); it is not inferred. Inferring it was wrong in the
+// direction that matters: only the fall-through scan fills the trailer, so every fast tier leaves
+// it zero and was reported as one undifferentiated "index / columnar accelerator". That reads as
+// good news, and it hid the case this was built to expose -- a constrained COUNT(*) answered from
+// per-segment metadata, doing work proportional to the ARCHIVE while the scan it outranks does
+// work proportional to the MATCHES. On a 933-segment history table a selective COUNT(*) took 118ms
+// where the same count via a covered column took 11ms, and both printed the identical line.
+//
+// A server too old to report one leaves TierUnreported, where the old inference is still the best
+// available and says only what an all-zero trailer licenses: no segment was opened. That is also
+// what a constraint proven to match nothing produces.
 func aggregateTierLine(s collections.ScanStats) string {
+	switch s.Tier {
+	case collections.TierMatchNone:
+		return "  answered by: match-none (the constraint cannot match; no data read)"
+	case collections.TierIndex:
+		return "  answered by: index -- per-segment metadata (postings, stored counts, zone maps); " +
+			"cost follows the number of SEGMENTS, not the number of matches"
+	case collections.TierColumnar:
+		return "  answered by: columnar accelerator (columns read, records not reassembled)"
+	case collections.TierScan:
+		return fmt.Sprintf("  answered by: record scan (%d record(s) read, %d reassembled) -- the accelerator "+
+			"did not cover this aggregate", s.RecordsVisited, s.RecordsReassembled)
+	}
+	// TierUnreported: a server that predates the tier field. Fall back to the inference.
 	if s.SegmentsTotal == 0 && s.RecordsVisited == 0 {
-		return "  answered by: index / columnar accelerator (no segment opened, no record read)"
+		return "  answered by: index / columnar accelerator, unreported by this server " +
+			"(no segment opened, no record read)"
 	}
 	return fmt.Sprintf("  answered by: record scan (%d record(s) read, %d reassembled) -- the accelerator "+
 		"did not cover this aggregate", s.RecordsVisited, s.RecordsReassembled)
