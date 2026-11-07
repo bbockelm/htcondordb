@@ -1480,12 +1480,20 @@ func (e *Executor) renderJoinRows(st *Statement, p *joinPlan, rows []*classad.Cl
 		}
 		compiled[j] = ex
 	}
+	// As on the single-table path, each item lands twice -- display cell and typed
+	// attribute of this row's projected ad -- so the ad-shaped formats carry the joined
+	// columns the query named rather than every attribute the composite row accumulated.
+	res.Projected = make([]*classad.ClassAd, 0, len(rows))
 	for _, row := range rows {
 		cells := make([]string, len(items))
+		proj := classad.New()
 		for j := range items {
-			cells[j] = valueDisplay(compiled[j].Eval(row))
+			v := compiled[j].Eval(row)
+			cells[j] = valueDisplay(v)
+			insertValue(proj, res.Columns[j], v)
 		}
 		res.Rows = append(res.Rows, cells)
+		res.Projected = append(res.Projected, proj)
 	}
 	return res, nil
 }

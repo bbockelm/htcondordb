@@ -421,9 +421,22 @@ type Result struct {
 	Note     string     // human-readable summary line (e.g. "UPDATE 3")
 
 	// Ads are the matched ads of a plain (non-aggregate) SELECT, in result
-	// order and after LIMIT. They back the JSON / ClassAd output formats, which
-	// serialize whole ads rather than a projected table. Nil for aggregates.
+	// order and after LIMIT. They are the whole matched ads, every attribute the
+	// query touched and the ones it did not. Nil for aggregates.
 	Ads []*classad.ClassAd
+	// Projected holds one ad per row of a SELECT that named its columns: each
+	// selected item under its header, holding the value that item evaluated to.
+	// It is what the ad-shaped output formats serialize, so they answer the
+	// question the SELECT asked rather than the one the scan answered. Nil for
+	// `SELECT *`, whose ads already are the projection, and for aggregates.
+	//
+	// A projected attribute is named by the SELECT, so an alias can carry a private
+	// attribute's value under a name that is not private. The formats that read these
+	// ads serialize private attributes anyway -- the REPL is an admin tool against a
+	// store the caller can already read whole -- so nothing here reaches a reader that
+	// the matched ad would not. Anything that redacts by attribute name must redact the
+	// source ad, not this one.
+	Projected []*classad.ClassAd
 	// Star is true when the SELECT was `SELECT *`.
 	Star bool
 	// Duration is the wall-clock time to execute the statement (set by ExecString).
@@ -1536,16 +1549,27 @@ func (e *Executor) renderSelectRows(st *Statement, limited []*classad.ClassAd) (
 			compiled[j] = ex
 		}
 	}
+	// Each item is evaluated once and lands twice: as the table's display cell, and as a
+	// typed attribute of this row's projected ad. Building the ad here, where the
+	// classad.Value still exists, is what keeps a computed column a number in JSON instead
+	// of the text the table shows; naming it from res.Columns is what keeps the two output
+	// shapes carrying the same names.
+	res.Projected = make([]*classad.ClassAd, 0, len(limited))
 	for _, ad := range limited {
 		row := make([]string, len(st.Items))
+		proj := classad.New()
 		for j, it := range st.Items {
+			var v classad.Value
 			if compiled[j] != nil {
-				row[j] = valueDisplay(compiled[j].Eval(ad))
+				v = compiled[j].Eval(ad)
 			} else {
-				row[j] = valueDisplay(ad.EvaluateAttr(it.Col))
+				v = ad.EvaluateAttr(it.Col)
 			}
+			row[j] = valueDisplay(v)
+			insertValue(proj, res.Columns[j], v)
 		}
 		res.Rows = append(res.Rows, row)
+		res.Projected = append(res.Projected, proj)
 	}
 	return res, nil
 }
@@ -2577,6 +2601,61 @@ func valueDisplay(v classad.Value) string {
 	default:
 		return v.String()
 	}
+}
+
+// insertValue stores an evaluated value in a projected ad under name, keeping its type:
+// an integer stays an integer, so JSON carries 6 rather than "6" and a loader on the far
+// side needs no guess. It is the typed counterpart of valueDisplay and follows the same
+// case order, so the two never disagree about which kind a value is.
+//
+// UNDEFINED and ERROR keep their attribute -- the query named that column, and dropping it
+// would hand back a different column set than the one asked for -- holding the ClassAd
+// keyword for each. In the ClassAd formats those read as `undefined` and `error`; in JSON
+// as null and as the error expression.
+func insertValue(ad *classad.ClassAd, name string, v classad.Value) {
+	switch {
+	case v.IsBool():
+		b, _ := v.BoolValue()
+		ad.InsertAttrBool(name, b)
+	case v.IsString():
+		s, _ := v.StringValue()
+		ad.InsertAttrString(name, s)
+	case v.IsInteger():
+		i, _ := v.IntValue()
+		ad.InsertAttr(name, i)
+	case v.IsReal():
+		r, _ := v.RealValue()
+		ad.InsertAttrFloat(name, r)
+	case v.IsClassAd():
+		nested, err := v.ClassAdValue()
+		if err != nil {
+			insertLiteral(ad, name, "error")
+			return
+		}
+		ad.InsertAttrClassAd(name, nested)
+	default:
+		// Lists, undefined and error. The reference unparser names all three, and one
+		// parse of that text covers them without a case per shape; a value it cannot
+		// name has no faithful ad form, so it reaches the reader as ERROR rather than
+		// as text pretending to be a value.
+		lit, ok := v.Unparse()
+		if !ok {
+			lit = "error"
+		}
+		insertLiteral(ad, name, lit)
+	}
+}
+
+// insertLiteral inserts the attribute named by a ClassAd literal, falling back to ERROR for
+// text that does not parse -- an unnameable value must not become a silent omission.
+func insertLiteral(ad *classad.ClassAd, name, lit string) {
+	ex, err := classad.ParseExpr(lit)
+	if err != nil {
+		if ex, err = classad.ParseExpr("error"); err != nil {
+			return
+		}
+	}
+	ad.InsertExpr(name, ex)
 }
 
 // keyString renders a key Value as the db key string.

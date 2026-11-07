@@ -62,9 +62,10 @@ func (f Format) String() string {
 }
 
 // FormatResult writes r to w in the given format. Non-SELECT results always print
-// their summary line. The ads-carrying JSON/ClassAd formats serialize whole ads
-// (projection is a table-mode feature); an aggregate result, which has no ads,
-// falls back to serializing its computed rows.
+// their summary line. The ads-carrying JSON/ClassAd formats serialize one ad per row
+// holding exactly the columns the SELECT named, under the same headers the table prints:
+// the projected ads for a column list, the whole matched ads for `SELECT *`. An aggregate
+// result, whose rows belong to no one ad, falls back to serializing its computed rows.
 func FormatResult(w io.Writer, r *Result, f Format) {
 	if !r.IsSelect {
 		if r.Duration > 0 {
@@ -86,10 +87,11 @@ func FormatResult(w io.Writer, r *Result, f Format) {
 	}
 }
 
-// formatJSON emits JSONL: whole ads when present, else one object per group row.
+// formatJSON emits JSONL: one object per row when the result is ad-backed, else one per
+// group row.
 func formatJSON(w io.Writer, r *Result) {
-	if r.Ads != nil {
-		for _, ad := range r.Ads {
+	if ads := resultAds(r); ads != nil {
+		for _, ad := range ads {
 			b, err := ad.MarshalJSONWithPrivate()
 			if err != nil {
 				fmt.Fprintf(w, "{\"error\":%q}\n", err.Error())
@@ -122,8 +124,8 @@ func formatClassAd(w io.Writer, r *Result, newFormat bool) {
 		}
 		return ad.MarshalOldWithPrivate()
 	}
-	if r.Ads != nil {
-		for _, ad := range r.Ads {
+	if ads := resultAds(r); ads != nil {
+		for _, ad := range ads {
 			fmt.Fprintln(w, render(ad))
 			if !newFormat {
 				fmt.Fprintln(w) // old-format ads are blank-line separated
@@ -144,6 +146,16 @@ func formatClassAd(w io.Writer, r *Result, newFormat bool) {
 			fmt.Fprintln(w)
 		}
 	}
+}
+
+// resultAds is the ad sequence the ad-shaped formats serialize, one per row: the projected
+// ads of a SELECT that named its columns, otherwise the matched ads, which are themselves
+// the projection of `SELECT *`. Nil for an aggregate, whose rows come from no single ad.
+func resultAds(r *Result) []*classad.ClassAd {
+	if r.Projected != nil {
+		return r.Projected
+	}
+	return r.Ads
 }
 
 // formatTable writes the aligned column table.
