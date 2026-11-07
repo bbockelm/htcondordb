@@ -214,7 +214,8 @@ The literal column is the SQL idiom for saying which branch a row came from.
   shifting the columns.
 - **Named columns match by position**, and the first branch's headers name the output. A
   branch selecting a different number of columns is refused, as is mixing `SELECT *` with
-  named columns.
+  named columns. Every branch reports under those headers in every format, carrying the
+  values its items evaluated to, whatever each branch calls its own columns.
 - **`UNION` de-duplicates, `UNION ALL` does not.** De-duplication compares rendered rows, so
   two `undefined` values count as alike — matching SQL's `DISTINCT`, which treats `NULL`s as
   alike, rather than `==`, under which `undefined == undefined` is undefined. The two forms
@@ -293,9 +294,12 @@ The interactive shell has line editing and command history (arrow keys, Ctrl-A/E
 Ctrl-R), persisted to `~/.htcondordb_history`.
 
 `.format json` emits one JSON object per ad (JSONL); `.format classad` /
-`classad-new` emit each ad in old / new ClassAd format. In non-table formats a
-`SELECT` serializes whole matched ads (projection is a table-mode feature); an
-aggregate result serializes its group rows. One-shot mode takes `-format`:
+`classad-new` emit each ad in old / new ClassAd format. Every format answers the
+question the `SELECT` asked: a column list serializes one ad per row holding
+exactly the columns it named, under the headers the table prints, each carrying
+the value its item evaluated to -- so a string that reads as a number stays a
+string. `SELECT *` serializes the whole matched ad, which is its projection, and
+an aggregate serializes its group rows. One-shot mode takes `-format`:
 
 ```sh
 htcondordb-cli -format json    -e "SELECT * FROM machines WHERE Cpus >= 8"

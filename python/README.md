@@ -333,12 +333,16 @@ Notes:
 - **Requires `classad2`.** Without HTCondor's bindings this raises `InterfaceError` rather
   than falling back to text; live expressions are the whole point. `Cursor.ad_text` gives
   the unparsed text if that is what you want.
-- **`ORDER BY`, `DISTINCT` and aggregates cannot stream** — none can emit a correct first row
-  before seeing the last — so those are computed whole and then iterated.
-- **An aggregate has no ads**, so one is synthesized per group row. Attribute names are
-  derived from the headers: `COUNT(*)` becomes `Count`, `SUM(RequestMemory)` becomes
-  `SumRequestMemory`, and an `AS` alias is used as-is when it is a legal attribute name. Give
-  computed columns an alias if you care what they are called.
+- **`ORDER BY`, `DISTINCT`, `UNION` and aggregates cannot stream** — none can emit a correct
+  first row before seeing the last, and a union is not its first branch — so those are
+  computed whole and then iterated.
+- **A result with no ads of its own** — an aggregate, a `DISTINCT` over named columns, a
+  de-duplicated `UNION` — has one synthesized per row. Attribute names are derived from the
+  headers: `COUNT(*)` becomes `Count`, `SUM(RequestMemory)` becomes `SumRequestMemory`, and
+  an `AS` alias is used as-is when it is a legal attribute name. Give computed columns an
+  alias if you care what they are called. Each attribute carries the value its column
+  evaluated to, so a string that reads as a number stays a string; an aggregate's own result
+  is the exception, since it crosses the wire already rendered.
 - Only `SELECT` is accepted; anything else raises immediately rather than on first
   iteration.
 
