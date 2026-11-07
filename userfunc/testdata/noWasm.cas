@@ -1,0 +1,4 @@
+# A file with one definition, for the test that a daemon configuring script
+# functions alone never builds a WebAssembly runtime.
+def scriptCfgNoWasmOK(n):
+    return n - 1

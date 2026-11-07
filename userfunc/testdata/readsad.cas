@@ -1,0 +1,5 @@
+# A function that reaches the subject ad, which is a perfectly ordinary thing to
+# write inside a script and an impossible registration: a registered function is
+# handed its arguments and has no subject to resolve `Memory` against.
+def scriptCfgReadsAd(requested):
+    return requested + Memory

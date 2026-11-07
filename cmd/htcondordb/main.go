@@ -475,20 +475,22 @@ func run() error {
 			log.Error(logging.DestinationGeneral, "reconfigure: importer manager not reapplied", "err", ierr.Error())
 		}
 	})
-	// Sandboxed user functions: load the WebAssembly modules an administrator configured and
-	// register them, so an ordinary query can call one. Reapplied on reconfigure, but only to ADD
-	// -- a registration cannot be withdrawn. Off unless HTCONDORDB_WASM_FUNCTIONS or
-	// HTCONDORDB_WASM_AGGREGATES names a module.
-	wasmMgr := userfunc.New(ctx, d.Slog())
-	// The loader stays open for the life of the daemon: a registered function is a call into a
-	// loaded module, and the registration outlives any attempt to take it back.
-	defer wasmMgr.Close()
-	if werr := wasmMgr.Apply(cfg); werr != nil {
+	// Sandboxed user functions: load the WebAssembly modules and the ClassAd Script functions an
+	// administrator configured and register them, so an ordinary query can call one. Reapplied on
+	// reconfigure, but only to ADD -- a registration cannot be withdrawn. Off unless
+	// HTCONDORDB_WASM_FUNCTIONS, HTCONDORDB_WASM_AGGREGATES or HTCONDORDB_SCRIPT_FUNCTIONS names
+	// one.
+	udfMgr := userfunc.New(ctx, d.Slog())
+	// The wasm runtime, if one was built, stays open for the life of the daemon: a registered
+	// function is a call into a loaded module, and the registration outlives any attempt to take
+	// it back.
+	defer udfMgr.Close()
+	if werr := udfMgr.Apply(cfg); werr != nil {
 		return werr
 	}
 	d.OnReconfig(func(newCfg *config.Config) {
-		if werr := wasmMgr.Apply(newCfg); werr != nil {
-			log.Error(logging.DestinationGeneral, "reconfigure: wasm user functions not reapplied", "err", werr.Error())
+		if werr := udfMgr.Apply(newCfg); werr != nil {
+			log.Error(logging.DestinationGeneral, "reconfigure: user functions not reapplied", "err", werr.Error())
 		}
 	})
 

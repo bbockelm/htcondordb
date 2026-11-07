@@ -186,6 +186,8 @@ there.
 | `HTCONDORDB_WASM_STEPS` | `10000000` | The deterministic step budget a module charges itself against. |
 | `HTCONDORDB_WASM_TIMEOUT` | `1` | Seconds of wall clock before a call is abandoned. This is the backstop that stops a module which charges itself nothing. |
 | `HTCONDORDB_WASM_MAX_INSTANCES` | `GOMAXPROCS` | Concurrent instances of one module. |
+| `HTCONDORDB_SCRIPT_FUNCTIONS` | — | Names of ClassAd Script functions to register, so a query or a constraint can call one. Each needs `HTCONDORDB_SCRIPT_<NAME>_PATH`. The name is the name of the `def` to take out of that file. See [User functions](user-functions.md). |
+| `HTCONDORDB_SCRIPT_<NAME>_PATH` | — | The script file. Required. Two names may give the same file and pick a different `def` out of it. |
 
 Standard `SEC_*` and `ALLOW_`/`DENY_` knobs configure security and authorization
 — see [Authorization](authorization.md).

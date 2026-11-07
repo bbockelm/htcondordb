@@ -11,23 +11,40 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PelicanPlatform/classad/collections/scriptudf"
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/wasmudf"
 	config "github.com/bbockelm/golang-htcondor/config"
 )
 
 // SANDBOXED USER FUNCTIONS, LOADED FROM CONFIGURATION.
 //
-// classad takes user-defined scalar functions and aggregates, and wasmudf runs one that has been
-// compiled to WebAssembly. Neither is reachable by an administrator: both are Go APIs, called by
-// the program that owns the process. This manager is that caller -- it turns a path in the config
-// file into a function an ordinary query can use.
+// classad takes user-defined scalar functions and aggregates. wasmudf runs one that has been
+// compiled to WebAssembly; scriptudf runs one written in ClassAd Script. None of that is reachable
+// by an administrator: they are Go APIs, called by the program that owns the process. This manager
+// is that caller -- it turns a path in the config file into a function an ordinary query can use.
 //
-// WHY WEBASSEMBLY IS THE ONLY KIND THIS LOADS. A Go function would have to be compiled into this
-// binary, which is not something a site can do. A wasm module is bytes on disk, and the sandbox is
-// what makes loading someone else's bytes into the database daemon a reasonable thing to do: the
-// host offers a guest exactly one import, so there is no I/O, no clock, no randomness and no WASI
-// to reach for -- not as a policy, but as the absence of anything to call. A module asking for more
-// cannot be instantiated and is refused at load, naming what it asked for.
+// WHY THESE TWO KINDS AND NOT A GO ONE. A Go function has to be compiled into this binary, which is
+// not something a site can do. Both kinds here are bytes on disk that a site writes, and each earns
+// its way into the database daemon differently.
+//
+// A WASM MODULE IS SANDBOXED. The host offers a guest exactly one import, so there is no I/O, no
+// clock, no randomness and no WASI to reach for -- not as a policy, but as the absence of anything
+// to call. A module asking for more cannot be instantiated and is refused at load, naming what it
+// asked for. That sandbox is what makes running someone else's compiled bytes reasonable, and the
+// knobs that bound it -- memory, steps, a wall-clock deadline, instances -- are the price of it.
+//
+// A SCRIPT FUNCTION HAS NOTHING TO SANDBOX. The language has no I/O to offer in the first place, and
+// registration refuses any function the compiler cannot prove reads nothing but its arguments, so it
+// cannot reach the subject ad either. What is left is a step budget, which the library fixes and
+// exposes through no public API, so there is no limit here for configuration to set. A `def` also
+// states its own arity, so there is no argument count to declare and get wrong. The script surface
+// is one list and one path per name, and it is short because there is nothing else to say.
+//
+// ONE NAME SPACE FOR BOTH, which is why one manager loads both rather than two managers each loading
+// their own. A query calling pctUsed reaches one registered function; which kind of file it came
+// from is not part of the call. Both kinds therefore share the bookkeeping below, and a name claimed
+// by a wasm module cannot also be claimed by a script function.
 //
 // REGISTRATION IS APPEND-ONLY, WHICH SHAPES EVERYTHING BELOW. classad's registries have no
 // unregister: compiling an expression records that a name was a user function, and compiled
@@ -51,13 +68,23 @@ import (
 //	HTCONDORDB_WASM_STEPS         = 10000000   # the deterministic step budget
 //	HTCONDORDB_WASM_TIMEOUT       = 1          # seconds; the wall-clock backstop
 //	HTCONDORDB_WASM_MAX_INSTANCES = 0          # 0 takes GOMAXPROCS
+//
+//	HTCONDORDB_SCRIPT_FUNCTIONS      = effMemory scoreJob              # scalar functions
+//
+//	HTCONDORDB_SCRIPT_EFFMEMORY_PATH = /etc/condor/scripts/policy.cas  # required
+//	HTCONDORDB_SCRIPT_SCOREJOB_PATH  = /etc/condor/scripts/policy.cas  # one file may back several
+//
+// The configured name is the name of the `def` to register out of that file, so one file holding
+// several definitions backs several functions and is read and parsed once per apply however many
+// names point at it.
 
-// Manager owns the loader and the set of names registered from it.
+// Manager owns the wasm loader and the set of names registered from configuration, of either kind.
 //
 // It holds the loader for the life of the daemon rather than closing it after loading, because a
-// registered function IS a call into a loaded module: closing the runtime would leave every
+// registered wasm function IS a call into a loaded module: closing the runtime would leave every
 // registration pointing at a module that can no longer run, and there is no way to take the
-// registrations back.
+// registrations back. The loader is built on the first wasm module that needs one and not before,
+// so a daemon configured with script functions alone never builds a WebAssembly runtime.
 type Manager struct {
 	parent context.Context
 	logger *slog.Logger
@@ -65,15 +92,21 @@ type Manager struct {
 	mu        sync.Mutex
 	loader    *wasmudf.Loader
 	loaderSig string            // the sandbox settings the loader was built with
-	loaded    map[string]module // by folded name, what is actually registered
+	loaded    map[string]module // by folded name, what is actually registered -- both kinds
 	seen      map[string]bool   // reported "needs a restart" already, so a reconfigure loop says it once
 }
 
-// module is one registered module, as configured. The settings are kept so a later
+// module is one registered function, as configured. The settings are kept so a later
 // reconfigure can tell "already loaded" from "changed, and cannot be".
+//
+// One struct covers both kinds rather than two, because everything the manager does with one -- the
+// name it occupies, the path it came from, whether its configuration has changed since it was
+// loaded -- is the same question for both. Script is what the kind-specific fields hang off: a
+// script function has none of MinArgs, MaxArgs, Trusted or Aggregate, and they stay zero.
 type module struct {
 	Name      string
 	Path      string
+	Script    bool // ClassAd Script source rather than a WebAssembly module
 	Aggregate bool
 	MinArgs   int
 	MaxArgs   int
@@ -82,7 +115,16 @@ type module struct {
 
 // sig is the part of a module's configuration that cannot change without a restart.
 func (m module) sig() string {
-	return fmt.Sprintf("%s|%v|%d|%d|%v", m.Path, m.Aggregate, m.MinArgs, m.MaxArgs, m.Trusted)
+	return fmt.Sprintf("%s|%v|%v|%d|%d|%v", m.Path, m.Script, m.Aggregate, m.MinArgs, m.MaxArgs, m.Trusted)
+}
+
+// kind names the module in an operator message, where "user function" alone would leave someone
+// reading the log unsure which file to go and look at.
+func (m module) kind() string {
+	if m.Script {
+		return "script"
+	}
+	return "wasm"
 }
 
 type settings struct {
@@ -94,23 +136,62 @@ type settings struct {
 // resolveSettings reads the configuration. It does not touch the filesystem: a path that does
 // not exist is a load error, reported per module, not a reason to reject the whole configuration.
 func resolveSettings(cfg *config.Config) (settings, error) {
+	// Checked before anything else, and checked even when nothing is configured, because the
+	// question it answers is "why did the key I set do nothing". HTCONDORDB_SCRIPT_AGGREGATES is
+	// the knob an administrator writes by analogy with the wasm pair, and there is no such thing:
+	// scriptudf registers scalar functions only. Failing here says that; ignoring the key would
+	// leave an aggregate name unregistered and every query using it answering ERROR.
+	if strings.TrimSpace(cfgStr(cfg, "HTCONDORDB_SCRIPT_AGGREGATES")) != "" {
+		return settings{}, fmt.Errorf("HTCONDORDB_SCRIPT_AGGREGATES is set, but there is no such " +
+			"thing as a script aggregate: ClassAd Script defines scalar functions, and an aggregate " +
+			"has to be a WebAssembly module named in HTCONDORDB_WASM_AGGREGATES")
+	}
+
 	fns := strings.Fields(cfgStr(cfg, "HTCONDORDB_WASM_FUNCTIONS"))
 	aggs := strings.Fields(cfgStr(cfg, "HTCONDORDB_WASM_AGGREGATES"))
-	if len(fns) == 0 && len(aggs) == 0 {
+	scripts := strings.Fields(cfgStr(cfg, "HTCONDORDB_SCRIPT_FUNCTIONS"))
+	if len(fns) == 0 && len(aggs) == 0 && len(scripts) == 0 {
 		return settings{}, nil
 	}
 
 	var out settings
+	// One seen set across all three lists, because a name is one function. A client's parser has
+	// to decide whether a name is an aggregate call or an ordinary one before any request exists,
+	// so a name claimed by a wasm module is not available to a script function or the other way
+	// round, whichever registry it would end up in.
 	seen := map[string]bool{}
-	add := func(name string, aggregate bool) error {
+	named := func(name string) error {
 		folded := strings.ToLower(name)
 		if seen[folded] {
-			// One name cannot be both, and loading it twice would fail the second
+			// One name cannot be two functions, and loading it twice would fail the second
 			// registration with a message about a name collision that says nothing
 			// about the config line that caused it.
-			return fmt.Errorf("%q is named twice in HTCONDORDB_WASM_FUNCTIONS/HTCONDORDB_WASM_AGGREGATES", name)
+			return fmt.Errorf("%q is named twice across HTCONDORDB_WASM_FUNCTIONS, "+
+				"HTCONDORDB_WASM_AGGREGATES and HTCONDORDB_SCRIPT_FUNCTIONS; a name is one function", name)
 		}
 		seen[folded] = true
+		return nil
+	}
+
+	// addScript takes only a path. There is no arity to declare -- the `def` states its own -- and
+	// no sandbox to relax, so there is nothing else a script function could be configured with.
+	addScript := func(name string) error {
+		if err := named(name); err != nil {
+			return err
+		}
+		key := "HTCONDORDB_SCRIPT_" + strings.ToUpper(name) + "_PATH"
+		path := cfgStr(cfg, key)
+		if path == "" {
+			return fmt.Errorf("%s is not set, so there is nothing to load for %q", key, name)
+		}
+		out.modules = append(out.modules, module{Name: name, Path: path, Script: true})
+		return nil
+	}
+
+	add := func(name string, aggregate bool) error {
+		if err := named(name); err != nil {
+			return err
+		}
 		p := "HTCONDORDB_WASM_" + strings.ToUpper(name) + "_"
 		m := module{
 			Name:      name,
@@ -148,6 +229,11 @@ func resolveSettings(cfg *config.Config) (settings, error) {
 	}
 	for _, n := range aggs {
 		if err := add(n, true); err != nil {
+			return settings{}, err
+		}
+	}
+	for _, n := range scripts {
+		if err := addScript(n); err != nil {
 			return settings{}, err
 		}
 	}
@@ -191,18 +277,17 @@ func (m *Manager) Apply(cfg *config.Config) error {
 		m.seen = map[string]bool{}
 	}
 
-	if m.loader == nil {
-		l, lerr := wasmudf.NewLoader(m.parent, m.withFailureLog(s.opts))
-		if lerr != nil {
-			return fmt.Errorf("wasm user functions: %w", lerr)
-		}
-		m.loader, m.loaderSig = l, s.optsSig
-	} else if m.loaderSig != s.optsSig {
+	if m.loader != nil && m.loaderSig != s.optsSig {
 		// The sandbox is fixed when the runtime is built, and the modules already loaded
 		// into it cannot be moved to another one.
 		m.warnOnce("sandbox", "the wasm sandbox settings changed; the running modules keep the "+
 			"settings they were loaded with until the daemon restarts")
 	}
+
+	// One parse per distinct file per apply, not one per name: several functions may be registered
+	// out of one script file, and reading and parsing it once each would multiply the work and
+	// report the same syntax error several times over.
+	parsed := map[string]scriptFile{}
 
 	var firstErr error
 	for _, mod := range s.modules {
@@ -215,23 +300,34 @@ func (m *Manager) Apply(cfg *config.Config) error {
 			}
 			continue
 		}
-		if lerr := m.load(mod); lerr != nil {
-			m.logger.Error("wasm user function not loaded", "name", mod.Name, "path", mod.Path, "err", lerr.Error())
+		if lerr := m.load(mod, s, parsed); lerr != nil {
+			m.logger.Error(mod.kind()+" user function not loaded", "name", mod.Name, "path", mod.Path,
+				"err", lerr.Error())
 			if firstErr == nil {
-				firstErr = lerr
+				// Name the function and the file alongside the error. A wasm failure usually
+				// carries the path already, but a script refusal names the `def` and not the file
+				// it was read from, and start-up fails with this text and nothing else.
+				firstErr = fmt.Errorf("%s user function %s (%s): %w", mod.kind(), mod.Name, mod.Path, lerr)
 			}
 			continue
 		}
 		m.loaded[folded] = mod
-		m.logger.Info("wasm user function registered", "name", mod.Name, "path", mod.Path,
-			"aggregate", mod.Aggregate, "trusted", mod.Trusted)
+		if mod.Script {
+			m.logger.Info("script user function registered", "name", mod.Name, "path", mod.Path)
+		} else {
+			m.logger.Info("wasm user function registered", "name", mod.Name, "path", mod.Path,
+				"aggregate", mod.Aggregate, "trusted", mod.Trusted)
+		}
 	}
 	return firstErr
 }
 
 // load reads and registers one module. Reading happens here rather than in resolveSettings so
 // that a file appearing between a failed start-up and a reconfigure is picked up.
-func (m *Manager) load(mod module) error {
+func (m *Manager) load(mod module, s settings, parsed map[string]scriptFile) error {
+	if mod.Script {
+		return m.loadScript(mod, parsed)
+	}
 	// os.ReadFile, not one of the safefile wrappers: this is an administrator's own path from
 	// the daemon's own configuration, read once at start-up, not a path influenced by a
 	// request.
@@ -239,14 +335,70 @@ func (m *Manager) load(mod module) error {
 	if err != nil {
 		return err
 	}
+	loader, err := m.wasmLoader(s)
+	if err != nil {
+		return err
+	}
 	lo := wasmudf.LoadOptions{Trusted: mod.Trusted}
 	if mod.Aggregate {
-		_, err = wasmudf.RegisterAggregateWith(m.parent, m.loader, wasmudf.DBRegistry(), mod.Name, wasm, lo)
+		_, err = wasmudf.RegisterAggregateWith(m.parent, loader, wasmudf.DBRegistry(), mod.Name, wasm, lo)
 	} else {
-		_, err = wasmudf.RegisterWith(m.parent, m.loader, wasmudf.ClassAdRegistry(), mod.Name,
+		_, err = wasmudf.RegisterWith(m.parent, loader, wasmudf.ClassAdRegistry(), mod.Name,
 			mod.MinArgs, mod.MaxArgs, wasm, lo)
 	}
 	return err
+}
+
+// scriptFile is one script file's parse, kept whichever way it went. The failure is cached as well
+// as the success so that two names pointing at a file with a syntax error read it once and fail
+// identically, rather than reporting the same error twice with different line numbers' worth of
+// work behind each.
+type scriptFile struct {
+	mod *vm.ScriptModule
+	err error
+}
+
+// loadScript registers one `def` out of a script file.
+//
+// There is nothing to pass beyond the name. The arity comes from the `def`, and purity is decided by
+// the compiler: a function that reaches the subject ad is refused with vm.ErrReadsAd and never
+// reaches the registry, which matters because a registration cannot be withdrawn. That refusal is
+// returned exactly as the library phrased it -- it names the function and the attribute it reached
+// for, and says to pass that value as a parameter instead, which is the whole of the fix.
+func (m *Manager) loadScript(mod module, parsed map[string]scriptFile) error {
+	sf, ok := parsed[mod.Path]
+	if !ok {
+		// Same os.ReadFile, for the same reason as above.
+		src, err := os.ReadFile(mod.Path)
+		if err != nil {
+			sf = scriptFile{err: err}
+		} else {
+			sf.mod, sf.err = vm.ParseScriptModule(string(src))
+		}
+		parsed[mod.Path] = sf
+	}
+	if sf.err != nil {
+		return sf.err
+	}
+	_, err := scriptudf.Register(sf.mod, scriptudf.ClassAdRegistry(), mod.Name)
+	return err
+}
+
+// wasmLoader returns the WebAssembly runtime, building it on first use.
+//
+// On FIRST USE rather than when the manager is created, and not at all when nothing wasm is
+// configured: a daemon whose user functions are all scripts has no business holding a WebAssembly
+// runtime, and building one would cost memory and goroutines for a guest that never arrives.
+func (m *Manager) wasmLoader(s settings) (*wasmudf.Loader, error) {
+	if m.loader != nil {
+		return m.loader, nil
+	}
+	l, err := wasmudf.NewLoader(m.parent, m.withFailureLog(s.opts))
+	if err != nil {
+		return nil, fmt.Errorf("building the wasm runtime: %w", err)
+	}
+	m.loader, m.loaderSig = l, s.optsSig
+	return l, nil
 }
 
 // withFailureLog attaches the per-call failure callback, if the caller has not set one.
