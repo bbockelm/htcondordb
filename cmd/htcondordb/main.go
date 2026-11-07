@@ -342,13 +342,7 @@ func run() error {
 		return err
 	}
 	boot.mark("listener")
-	boot.done()
 	defer func() { _ = ln.Close() }()
-
-	// Publish the command address so clients (the REPL, followers) can find us.
-	if path := writeAddressFile(d, cfg, ln); path != "" {
-		defer func() { _ = os.Remove(path) }()
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -533,7 +527,6 @@ func run() error {
 	}
 	dbAugment := dbad.Augment(svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, advertisedAddr(d, ln),
 		dbad.WithMirrored(syncMgr.Mirrored), dbad.WithFederation(fedMgr.Summary))
-	startCollectorAdvertise(ctx, d, cfg, syncSources, dbAugment)
 
 	// Point-to-point sync health (DBSyncStatus): answer the same ad over the command port. A
 	// client that found this daemon through its address file has no collector to read the
@@ -594,6 +587,30 @@ func run() error {
 			}
 		}()
 	}
+
+	// Everything a client finds this daemon through is published HERE, with every manager
+	// started and the accept loop next: the address file, and the ClassAd the collector hands
+	// to anyone asking where the database is. Both name the command address, and a command
+	// address that nothing is accepting on is worse than no address at all -- the listener is
+	// bound long before this, so the kernel completes a client's TCP handshake from the
+	// backlog and its connect succeeds, leaving the first request waiting on a server that has
+	// not started. The client cannot tell that from a slow query. Publishing last costs
+	// nothing: the listener is already reachable, so what goes out is immediately good.
+	//
+	// What runs between the bind and here is the part that can take real time -- exporter
+	// subprocesses, schedd-sync tailers, history importers, raft -- which is why the startup
+	// timer covers it and reports below rather than ending at the bind.
+	boot.mark("managers")
+	if path := writeAddressFile(d, cfg, ln); path != "" {
+		defer func() { _ = os.Remove(path) }()
+	}
+	// Logged where it happens, so the log says when this daemon became findable. An operator
+	// reading a client's "connection refused" wants to know whether the daemon was up yet,
+	// and the startup lines around it answer only when it started, not when it was reachable.
+	log.Info(logging.DestinationGeneral, "command address published; daemon is reachable",
+		"address", advertisedAddr(d, ln))
+	startCollectorAdvertise(ctx, d, cfg, syncSources, dbAugment)
+	boot.done()
 
 	selfVer, classadVer := buildIdentity()
 	log.Info(logging.DestinationGeneral, "htcondordb starting",

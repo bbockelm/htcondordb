@@ -14,11 +14,17 @@ import (
 
 // Startup phase timing.
 //
-// Startup logs a line when the daemon begins and another when the command socket is up, with
+// Startup logs a line when the daemon begins and another when it is ready to serve, with
 // everything in between silent. A slow start therefore shows only as a gap between two
 // timestamps -- enough to notice ("suspiciously close to exactly 10s") and not enough to act on,
 // because the gap covers reading security config, building the authorization policy, opening the
-// database, and adopting the listener, any of which could own it.
+// database, adopting the listener, and starting the managers that mirror, export and replicate,
+// any of which could own it.
+//
+// The span runs to the point the daemon advertises itself, not to the bind: the managers start
+// after the listener and are where a startup stalls on something outside this process -- a
+// schedd's job_queue.log, a broker, a raft quorum. A timer that stopped at the bind would report
+// a fast startup for a daemon that then took a minute to become reachable.
 //
 // This records each phase and logs the breakdown, so the next slow start names the culprit
 // instead of prompting an investigation.

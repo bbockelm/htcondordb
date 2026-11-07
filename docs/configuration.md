@@ -111,7 +111,7 @@ there.
 | Knob | Default | Meaning |
 |------|---------|---------|
 | `HTCONDORDB_DIR` | `$(SPOOL)/htcondordb` | On-disk database directory. |
-| `HTCONDORDB_ADDRESS_FILE` | `$(LOG)/.htcondordb_address` | Where the command address is published, and where clients look for it. Also read from the environment. |
+| `HTCONDORDB_ADDRESS_FILE` | `$(LOG)/.htcondordb_address` | Where the command address is published, and where clients look for it. Written once the daemon is ready to serve, so a script that waits for the file has a readiness signal. Also read from the environment. |
 | `HTCONDORDB_HOST` | — | Client fallback when no address file is readable. Also read from the environment. |
 | `HTCONDORDB_QUEUE_POOL_SIZE` | `4` | **Client side** — set in the configuration of the daemon that embeds the C queue client (the schedd answering `condor_q` from a mirror), not this daemon's. How many dbrpc sessions concurrent queries may spread over, so that simultaneous full dumps do not queue behind each other. Raise it on a submit host serving many simultaneous queries; `1` restores a single shared session. Most of the gain is in the first few sessions. |
 | `HTCONDORDB_CLIENT_PPROF` | unset | **Client side**, and a diagnostic — read from the environment of the process that embeds the C client, so for the schedd it is set through `SCHEDD_ENVIRONMENT`. An address (`127.0.0.1:9096`) serves Go pprof for the client half, which neither the schedd's own profiler nor the database's can see. Unset, nothing listens. Keep it on loopback — it serves heap contents, goroutine stacks and CPU profiles; a non-loopback address is accepted but warned about. |
