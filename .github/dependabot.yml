@@ -28,14 +28,20 @@ updates:
     commit-message:
       prefix: "ci(deps)"
 
-  # Go modules, except the modules developed alongside this repo (classad,
-  # cedar, golang-htcondor): those are bumped as a set, by hand, when a
-  # matching change lands on both sides, so they are ignored here. Security
-  # updates ignore this list by GitHub's own rules, so an advisory against one
-  # of them still arrives as a PR.
+  # Go modules, including the ones developed alongside this repo (classad,
+  # cedar, golang-htcondor). Those were bumped by hand for a while, as a set,
+  # when a matching change landed on both sides. Nothing reported when the
+  # hand-bump did not happen, and it stopped happening: the root module sat on
+  # an untagged golang-htcondor commit that was never on that repo's main
+  # through five of its releases, one of which carried the UID_DOMAIN fix an
+  # FS-authenticated peer needs to be authorized at all, and the three sync
+  # modules are further behind still. A weekly PR that has to pass CI is a
+  # better account of where we are than a convention.
   #
   # Every module is listed: grafana/ replaces the root with ../, so a shared
-  # dependency bumped in one leaves the other's go.sum stale.
+  # dependency bumped in one leaves the other's go.sum stale -- and grafana/'s
+  # own CI job only triggers on grafana/**, so it is not the thing that tells
+  # you.
   - package-ecosystem: "gomod"
     directories:
       - "/"
@@ -48,10 +54,6 @@ updates:
     groups:
       go-minor-and-patch:
         update-types: ["minor", "patch"]
-    ignore:
-      - dependency-name: "github.com/PelicanPlatform/classad*"
-      - dependency-name: "github.com/bbockelm/cedar"
-      - dependency-name: "github.com/bbockelm/golang-htcondor*"
     commit-message:
       prefix: "deps"
 
