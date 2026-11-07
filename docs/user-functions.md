@@ -237,6 +237,199 @@ does not bind is an attribute, which inside a script is the point of it; in a
 registered function it is refused, because the function is given its arguments and
 has no subject ad to resolve the name against. Pass the value as a parameter.
 
+## Worked examples
+
+Four functions a site plausibly writes, each doing something no built-in does.
+They are the whole of one file, `/etc/condor/scripts/policy.cas`, which four
+configured names pick out of:
+
+```conf
+HTCONDORDB_SCRIPT_FUNCTIONS          = cpuEfficiency wasteBand claimedCpus memBucket
+HTCONDORDB_SCRIPT_CPUEFFICIENCY_PATH = /etc/condor/scripts/policy.cas
+HTCONDORDB_SCRIPT_WASTEBAND_PATH     = /etc/condor/scripts/policy.cas
+HTCONDORDB_SCRIPT_CLAIMEDCPUS_PATH   = /etc/condor/scripts/policy.cas
+HTCONDORDB_SCRIPT_MEMBUCKET_PATH     = /etc/condor/scripts/policy.cas
+```
+
+For the language itself — the statements, how a local is bound, what `for` walks,
+where a `def` may call itself — the reference is [User-defined functions and
+aggregates][udf] in the `classad` repository. It is written for a Go program that
+embeds the library, so the ClassAd Script material sits among Go registration
+calls you have no use for here; the language half of it is what you want, and it
+is the only place the language is written down in full.
+
+The results below are the answers these functions give for one row of each table
+they read:
+
+```classad
+# FROM history
+[
+  Owner = "alice"; ClusterId = 884;
+  RequestCpus = 4; RequestMemory = 3000;
+  RemoteWallClockTime = 3600; RemoteUserCpu = 2000; RemoteSysCpu = 160
+]
+```
+
+```classad
+# FROM machines
+[
+  Name = "slot1@ep042"; SlotType = "Partitionable"; Cpus = 16;
+  ChildCpus = {4, 4, 8}; ChildState = {"Claimed", "Unclaimed", "Claimed"}
+]
+```
+
+### A ratio, with the absent case chosen
+
+How much of the CPU time a job was allocated it actually burned. A job that asked
+for four cores and used one is a core-hour bill four times its work.
+
+```
+def cpuEfficiency(wallClock, cpuSecs, cpus):
+    if wallClock is undefined:
+        return undefined
+    if cpuSecs is undefined:
+        return undefined
+    # A job that never said how many cores it wanted got one.
+    if cpus is undefined:
+        cpus = 1
+    allocated = wallClock * cpus
+    if allocated <= 0:
+        return error
+    return cpuSecs * 100.0 / allocated
+```
+
+The three absences are three different answers, and picking between them is the
+function's job: a missing `RequestCpus` has a right default, a missing wall clock
+has none, and a job with no wall clock at all is a question with no answer rather
+than a job that was perfectly efficient.
+
+```sql
+SELECT Owner, ClusterId,
+       cpuEfficiency(RemoteWallClockTime, RemoteUserCpu + RemoteSysCpu, RequestCpus) AS eff
+  FROM history
+ WHERE cpuEfficiency(RemoteWallClockTime, RemoteUserCpu + RemoteSysCpu, RequestCpus) < 20
+```
+
+```text
+# history
+cpuEfficiency(RemoteWallClockTime, RemoteUserCpu + RemoteSysCpu, RequestCpus)   15
+cpuEfficiency(RemoteWallClockTime, RemoteUserCpu + RemoteSysCpu, NoSuchAttr)    60
+cpuEfficiency(RemoteWallClockTime, NoSuchAttr, RequestCpus)                     undefined
+cpuEfficiency(0, 100, 4)                                                        error
+```
+
+### Bands, so the conditional is written once
+
+The same number, as a name you can group by. The nesting lives in the file
+instead of in every query, and every report that groups by it cuts the bands in
+the same place.
+
+```
+def wasteBand(wallClock, cpuSecs, cpus):
+    eff = cpuEfficiency(wallClock, cpuSecs, cpus)
+    if eff is undefined:
+        return "unknown"
+    if eff < 10.0:
+        return "idle"
+    if eff < 60.0:
+        return "partial"
+    return "busy"
+```
+
+A `def` calls the other `def`s in its file, which is the reason one file holds
+several: the thresholds are a policy and the ratio is arithmetic, and only the
+thresholds move.
+
+```sql
+SELECT wasteBand(RemoteWallClockTime, RemoteUserCpu + RemoteSysCpu, RequestCpus) AS band,
+       COUNT(*)
+  FROM history
+ GROUP BY wasteBand(RemoteWallClockTime, RemoteUserCpu + RemoteSysCpu, RequestCpus)
+```
+
+```text
+# history
+wasteBand(RemoteWallClockTime, RemoteUserCpu + RemoteSysCpu, RequestCpus)   "partial"
+wasteBand(3600, 100, 4)                                                     "idle"
+wasteBand(3600, 12000, 4)                                                   "busy"
+wasteBand(NoSuchAttr, 1, 1)                                                 "unknown"
+```
+
+### A loop over a list attribute
+
+A partitionable slot carries one entry per dynamic slot cut from it, in parallel
+lists: `ChildCpus` and `ChildState`. How many cores are committed is the sum of
+one list where the other says `Claimed` — two lists walked together, which is
+what a statement language buys over an expression.
+
+```
+def claimedCpus(childCpus, childState):
+    # A static slot has no children, so nothing is committed below it.
+    if childCpus is undefined:
+        return 0
+    total = 0
+    i = 0
+    for c in childCpus:
+        if childState[i] == "Claimed":
+            total = total + c
+        i = i + 1
+    return total
+```
+
+```sql
+SELECT Name, Cpus, claimedCpus(ChildCpus, ChildState) AS busy,
+       Cpus - claimedCpus(ChildCpus, ChildState) AS idle
+  FROM machines
+ WHERE SlotType == "Partitionable"
+```
+
+```text
+# machines
+claimedCpus(ChildCpus, ChildState)          12
+Cpus - claimedCpus(ChildCpus, ChildState)   4
+claimedCpus(NoSuchAttr, NoSuchAttr)         0
+```
+
+### A helper the query never names
+
+Request sizes spread over every value a user typed, so a histogram of them has a
+bar per value. Rounding each up to the next power of two gives a histogram with a
+dozen bars that stay the same from month to month.
+
+```
+def bucketFrom(mb, bucket):
+    if bucket >= mb:
+        return bucket
+    return bucketFrom(mb, bucket * 2)
+
+def memBucket(mb):
+    if mb is undefined:
+        return undefined
+    if mb <= 0:
+        return error
+    return bucketFrom(mb, 128)
+```
+
+`bucketFrom` doubles until it is large enough, calling itself in the position
+where the call's value is the whole answer; `memBucket` is the one in the
+configuration, and seeds it with the smallest bucket the site reports.
+
+```sql
+SELECT memBucket(RequestMemory) AS bucket, COUNT(*)
+  FROM history
+ GROUP BY memBucket(RequestMemory)
+ ORDER BY bucket
+```
+
+```text
+# history
+memBucket(RequestMemory)   4096
+memBucket(100)             128
+memBucket(4096)            4096
+memBucket(NoSuchAttr)      undefined
+memBucket(0)               error
+```
+
 ## Writing a module
 
 Any language that compiles to WebAssembly. The contract a module has to meet —
