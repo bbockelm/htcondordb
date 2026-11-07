@@ -10,10 +10,10 @@ github.com/RoaringBitmap/roaring/v2 v2.29.0 h1:jSjxqZEqiF9W5dHUFsemupb9bnLaQJwZV
 github.com/RoaringBitmap/roaring/v2 v2.29.0/go.mod h1:BZufmFbox589n3j5eOmyTaLSGXbRLc2LmQvjKjzSEGU=
 github.com/bbockelm/cedar v0.7.12 h1:3GVuyjC6Z5UcFKauNnZC5ARs5s8XcnvOMZZ5yiMIt20=
 github.com/bbockelm/cedar v0.7.12/go.mod h1:z9GAnbzlwbUhkmf1YZHIm9RE9YiYxwfd0M7h1ffdIf4=
-github.com/bbockelm/golang-htcondor v0.13.0 h1:z+xgc8eMozQjIp2nkPGO9Ivc75GOXc4O4zSemIWoz4I=
-github.com/bbockelm/golang-htcondor v0.13.0/go.mod h1:1h2rSONhn1Ro8r7ABYlfJsOmTicwsynwexnI73cwcDE=
-github.com/bbockelm/gosssd v0.0.1 h1:p9wJYl+GDn29W1it2ZE2RekriwUNs/1U16aUNNro5SM=
-github.com/bbockelm/gosssd v0.0.1/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
+github.com/bbockelm/golang-htcondor v0.20.2 h1:Ey9BqjLB2v0vlbJbIbTXWPFgLHUEiaBYwz+TlvOAlIc=
+github.com/bbockelm/golang-htcondor v0.20.2/go.mod h1:o4AbJODAeVZMLuLTAdcidPzxWf1M+bBxjVNGESMSLWk=
+github.com/bbockelm/gosssd v0.0.4 h1:VfPc8eqINew99vwq3+si4FC+tpcauXrSntGmaii4zqY=
+github.com/bbockelm/gosssd v0.0.4/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/bits-and-blooms/bitset v1.24.4 h1:95H15Og1clikBrKr/DuzMXkQzECs1M6hhoGXLwLQOZE=
 github.com/bits-and-blooms/bitset v1.24.4/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
