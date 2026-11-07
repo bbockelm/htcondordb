@@ -194,3 +194,75 @@ class TestProjectionKeepsExpressionDependencies:
         # The projection carries the attributes the projected expressions reference, so a
         # narrow SELECT evaluates to what SELECT * reports.
         assert one(connection, f"SELECT Req FROM {rows}") is True
+
+
+class TestAliasedAndComputedColumnTypes:
+    """An alias or an expression does not change a value's type.
+
+    A cell's type comes from the value the SELECT evaluated, so a string attribute whose
+    text reads as a number stays a string however the column is named. Nothing downstream
+    can undo a wrong guess: a report cannot tell a number that was always a number from a
+    job id that a display string was parsed into.
+
+    Each case is asserted through both ways a cursor gets its rows -- the streaming one
+    ``execute`` uses, and the materialized document behind ``execute_with_ads`` -- because
+    they used to disagree, and which one a statement takes is an internal routing decision
+    a caller cannot see.
+    """
+
+    @pytest.fixture
+    def rows(self, connection, table):
+        connection.execute(
+            f"INSERT INTO {table} (Key, Owner, Ticket, Version, Flag, Spelled, Memory) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("k", "123", "0042", "3.5", "true", "undefined", 4096),
+        ).close()
+        return table
+
+    @pytest.mark.parametrize(
+        "column,expected",
+        [
+            ("Owner AS who", "123"),
+            ("Ticket AS t", "0042"),
+            ("Version AS v", "3.5"),
+            ("Flag AS f", "true"),
+            ("Spelled AS s", "undefined"),
+            ("Memory AS m", 4096),
+            ("Memory * 2 AS doubled", 8192),
+            ("strcat(Ticket, '9') AS joined", "00429"),
+            ("Memory", 4096),
+            ("Owner", "123"),
+        ],
+    )
+    def test_alias_keeps_the_value_type(self, connection, rows, column, expected):
+        for run in ("execute", "execute_with_ads"):
+            cursor = connection.cursor()
+            getattr(cursor, run)(f"SELECT {column} FROM {rows}")
+            value = cursor.fetchone()[0]
+            assert value == expected, f"{run}: {column}"
+            assert type(value) is type(expected), (
+                f"{run}: {column} gave {value!r} ({type(value).__name__})"
+            )
+
+    def test_undefined_alias_is_still_none(self, connection, rows):
+        for run in ("execute", "execute_with_ads"):
+            cursor = connection.cursor()
+            getattr(cursor, run)(f"SELECT NoSuchAttribute AS t FROM {rows}")
+            assert cursor.fetchone()[0] is None, run
+
+    def test_erroring_alias_is_none(self, connection, rows):
+        for run in ("execute", "execute_with_ads"):
+            cursor = connection.cursor()
+            getattr(cursor, run)(f"SELECT Owner + 1 AS t FROM {rows}")
+            assert cursor.fetchone()[0] is None, run
+
+    def test_aggregate_output_is_typed_from_its_text(self, connection, rows):
+        """The remaining gap, written down rather than left to be discovered.
+
+        An aggregate's rows were never ads: the server reduces them to strings before they
+        reach the driver, so there is no value left to read a type from and the text is
+        parsed back. A numeric-looking string grouped on therefore arrives as a number.
+        """
+        cursor = connection.cursor()
+        cursor.execute(f"SELECT Owner, COUNT(*) AS n FROM {rows} GROUP BY Owner")
+        assert cursor.fetchall() == [(123, 1)]

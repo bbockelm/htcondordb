@@ -188,25 +188,45 @@ func buildResult(r *repl.Result, opts int, inTxn bool) *sqlResult {
 
 // cellValues types row i's cells.
 //
-// A Result carries its rows only as display strings, so the type of a cell has to be
-// recovered. Where the row came from an ad -- every non-aggregate SELECT -- the ad still
-// holds the real ClassAd value, and a column that names an attribute is read straight from
-// it: a string attribute whose text happens to be "123" stays the string "123". Everything
-// else (aggregate outputs, which the server already reduced to strings before they reached
-// the client, and expression or aliased columns that name no attribute) falls back to
-// parsing the display string, which cannot make that distinction.
+// A Result carries its rows only as display strings, so a cell takes its type from the
+// typed ClassAd value behind it wherever one survives. A SELECT that named its columns
+// carries a projected ad per row -- each selected item under its header, holding the value
+// that item evaluated to -- which types an alias and a computed column as exactly as a
+// plain one: `Owner AS who` over the string "123" is the string "123", not the number 123.
+// `SELECT *` has no projection and its columns are attribute names, so the matched ad
+// answers instead. Only an aggregate has neither: the server reduced its values to strings
+// before they reached the client, so its cells are parsed back out of the display string,
+// which cannot tell a numeric-looking string from a number.
 func cellValues(r *repl.Result, i int) []any {
 	row := r.Rows[i]
-	var ad *classad.ClassAd
+	var proj, ad *classad.ClassAd
+	if i < len(r.Projected) {
+		proj = r.Projected[i]
+	}
 	if i < len(r.Ads) {
 		ad = r.Ads[i]
 	}
+	// Two items may share a header (`SELECT a AS x, b AS x`). The projected ad holds one
+	// attribute of that name -- the later item's value -- so a lookup would give both cells
+	// the same wrong answer. The display strings stay per-cell, so an ambiguous header is
+	// typed from the row instead.
+	ambiguous := repeatedHeaders(r.Columns)
 
 	cells := make([]any, len(r.Columns))
 	for j, col := range r.Columns {
+		// UNDEFINED falls through to the display string, which is "undefined" and converts
+		// to null just the same. The fall-through is what covers a header the projection
+		// could not name as an attribute: that reads as undefined here and is
+		// indistinguishable from a column that evaluated to UNDEFINED, and the row cell is
+		// right for both. ERROR is found as a value, and valueJSON renders it null -- the
+		// same answer the display string "error" takes.
+		if proj != nil && !ambiguous[col] {
+			if v := proj.EvaluateAttr(col); !v.IsUndefined() {
+				cells[j] = valueJSON(v)
+				continue
+			}
+		}
 		if ad != nil {
-			// An attribute that is genuinely undefined falls through to the display
-			// string, which is "undefined" and converts to null just the same.
 			if v := ad.EvaluateAttr(col); !v.IsUndefined() {
 				cells[j] = valueJSON(v)
 				continue
@@ -217,6 +237,26 @@ func cellValues(r *repl.Result, i int) []any {
 		}
 	}
 	return cells
+}
+
+// repeatedHeaders is the set of column headers that appear more than once. Attribute names
+// are case-insensitive, so headers that differ only in case name the same attribute and
+// collide the same way.
+func repeatedHeaders(cols []string) map[string]bool {
+	seen := make(map[string]int, len(cols))
+	for _, c := range cols {
+		seen[strings.ToLower(c)]++
+	}
+	var dup map[string]bool
+	for _, c := range cols {
+		if seen[strings.ToLower(c)] > 1 {
+			if dup == nil {
+				dup = make(map[string]bool, 2)
+			}
+			dup[c] = true
+		}
+	}
+	return dup
 }
 
 // valueJSON converts a ClassAd value to its natural JSON type. Undefined and error both
@@ -251,10 +291,10 @@ func valueJSON(v classad.Value) any {
 	}
 }
 
-// parseCell recovers a type from a display string, for cells with no ad behind them. The
-// order matches how repl renders values (valueDisplay), so a round trip is exact for every
-// type except a string that looks like a number or a bool -- which is why cellValues
-// prefers the ad whenever there is one.
+// parseCell recovers a type from a display string, for cells with no typed value behind
+// them. The order matches how repl renders values (valueDisplay), so a round trip is exact
+// for every type except a string that looks like a number or a bool -- which is why
+// cellValues prefers a projected or matched ad whenever there is one.
 func parseCell(s string) any {
 	switch s {
 	case "undefined", "error":
