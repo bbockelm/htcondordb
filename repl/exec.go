@@ -2403,10 +2403,10 @@ func sortRows(res *Result, terms []OrderTerm) error {
 		idxs[k] = idx
 	}
 	// Sorted as a permutation rather than in place, because the rows are not the only
-	// thing in row order: a result that carries projected ads carries one PER ROW, and a
-	// sort that moved only the rows would hand the ad-shaped formats another row's values
-	// under this row's columns -- a wrong answer that no column count or length check
-	// would catch.
+	// thing in row order: a result that carries projected ads or matched ads carries one
+	// PER ROW, and a sort that moved only the rows would hand the ad-shaped formats and
+	// the cursor another row's values under this row's columns -- a wrong answer that no
+	// column count or length check would catch.
 	order := make([]int, len(res.Rows))
 	for i := range order {
 		order[i] = i
@@ -2429,14 +2429,22 @@ func sortRows(res *Result, terms []OrderTerm) error {
 		rows[i] = res.Rows[from]
 	}
 	res.Rows = rows
-	if len(res.Projected) == len(order) {
-		ads := make([]*classad.ClassAd, len(order))
-		for i, from := range order {
-			ads[i] = res.Projected[from]
-		}
-		res.Projected = ads
-	}
+	res.Projected = permuteAds(res.Projected, order)
+	res.Ads = permuteAds(res.Ads, order)
 	return nil
+}
+
+// permuteAds reorders a per-row ad slice to match a sorted row order, leaving a slice that
+// is not per-row -- a nil one, or one of another length -- alone.
+func permuteAds(ads []*classad.ClassAd, order []int) []*classad.ClassAd {
+	if len(ads) != len(order) {
+		return ads
+	}
+	out := make([]*classad.ClassAd, len(order))
+	for i, from := range order {
+		out[i] = ads[from]
+	}
+	return out
 }
 
 func columnIndex(cols []string, name string) int {
