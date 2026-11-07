@@ -88,12 +88,54 @@ The full language — tables, indexes, aggregates, `MATCH`, output formats, and 
 `.stats`/`.explain`/`.addindex` diagnostics — is in the
 **[REPL reference](docs/repl.md)**.
 
+## Adding your own function
+
+The function your site needs and nobody else does — a scoring expression, a
+local name decoding — is a file on disk, named in the configuration, called like
+a built-in. It is one of two kinds. A **ClassAd Script** needs no toolchain, is
+written in the language `WHERE` clauses already use, and is proven at
+registration not to reach the ad. A **WebAssembly module** is written in any
+language that compiles to wasm, runs sandboxed, and is the only kind that can be
+an aggregate.
+
+A script is a file of `def`s, indented like Python:
+
+```
+# /etc/condor/scripts/policy.cas
+# Memory a job used, as a percentage of what it asked for.
+def memEfficiency(requested, used):
+    if used is undefined:
+        return undefined
+    if requested <= 0:
+        return error
+    return used * 100.0 / requested
+```
+
+Two lines register it; the configured name picks the `def` out of the file, and
+the `def` states the argument count:
+
+```conf
+HTCONDORDB_SCRIPT_FUNCTIONS          = memEfficiency
+HTCONDORDB_SCRIPT_MEMEFFICIENCY_PATH = /etc/condor/scripts/policy.cas
+```
+
+Restart the daemon and a query calls it:
+
+```sql
+SELECT Owner, memEfficiency(RequestMemory, MemoryUsage) AS pct
+  FROM history WHERE memEfficiency(RequestMemory, MemoryUsage) < 25;
+```
+
+Both kinds in full — where the configuration has to go, what bounds a call, and
+what a function cannot reach — are in
+**[User functions](docs/user-functions.md)**.
+
 ## Documentation
 
 - [Schedd sync mode](docs/schedd-sync.md) — mirror a local schedd (primary use case).
 - [REPL reference](docs/repl.md) — the full query language and shell.
 - [Configuration](docs/configuration.md) — every `HTCONDORDB_*` knob.
-- [User functions](docs/user-functions.md) — add your own functions and aggregates, sandboxed.
+- [User functions](docs/user-functions.md) — add your own functions and aggregates, as a ClassAd Script file or a sandboxed WebAssembly module.
 - [Authorization & security](docs/authorization.md) — access levels and getting WRITE.
 - [Federation hub](docs/federation.md) — many access points' mirrors in one catalog.
 - [High availability](docs/ha.md) — leader-follower and raft-consistent modes.
