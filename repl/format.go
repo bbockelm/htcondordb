@@ -65,7 +65,9 @@ func (f Format) String() string {
 // their summary line. The ads-carrying JSON/ClassAd formats serialize one ad per row
 // holding exactly the columns the SELECT named, under the same headers the table prints:
 // the projected ads for a column list, the whole matched ads for `SELECT *`. An aggregate
-// result, whose rows belong to no one ad, falls back to serializing its computed rows.
+// is projected too, so a count reaches JSON as a number and a group key as the kind it is.
+// A result with neither -- one assembled by hand, or a set operation's combined rows --
+// falls back to serializing the display cells.
 func FormatResult(w io.Writer, r *Result, f Format) {
 	if !r.IsSelect {
 		if r.Duration > 0 {
@@ -87,8 +89,8 @@ func FormatResult(w io.Writer, r *Result, f Format) {
 	}
 }
 
-// formatJSON emits JSONL: one object per row when the result is ad-backed, else one per
-// group row.
+// formatJSON emits JSONL: one object per row when the result is ad-backed, else one object
+// of display strings per row.
 func formatJSON(w io.Writer, r *Result) {
 	if ads := resultAds(r); ads != nil {
 		for _, ad := range ads {
@@ -115,8 +117,8 @@ func formatJSON(w io.Writer, r *Result) {
 	}
 }
 
-// formatClassAd emits each ad (or each aggregate row as a synthesized ad) in old
-// or new ClassAd format, blank-line separated.
+// formatClassAd emits each ad (or, for a result carrying none, each row as an ad
+// synthesized from its display cells) in old or new ClassAd format, blank-line separated.
 func formatClassAd(w io.Writer, r *Result, newFormat bool) {
 	render := func(ad *classad.ClassAd) string {
 		if newFormat {
@@ -133,7 +135,7 @@ func formatClassAd(w io.Writer, r *Result, newFormat bool) {
 		}
 		return
 	}
-	// Aggregate rows: synthesize a ClassAd per group row.
+	// No ads: synthesize one per row from the display cells.
 	for _, row := range r.Rows {
 		ad := classad.New()
 		for i, col := range r.Columns {
@@ -149,8 +151,9 @@ func formatClassAd(w io.Writer, r *Result, newFormat bool) {
 }
 
 // resultAds is the ad sequence the ad-shaped formats serialize, one per row: the projected
-// ads of a SELECT that named its columns, otherwise the matched ads, which are themselves
-// the projection of `SELECT *`. Nil for an aggregate, whose rows come from no single ad.
+// ads of a SELECT that named its columns, an aggregate's among them, otherwise the matched
+// ads, which are themselves the projection of `SELECT *`. Nil when the result carries
+// neither, and the display cells are then all there is.
 func resultAds(r *Result) []*classad.ClassAd {
 	if r.Projected != nil {
 		return r.Projected

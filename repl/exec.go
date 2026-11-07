@@ -428,7 +428,13 @@ type Result struct {
 	// selected item under its header, holding the value that item evaluated to.
 	// It is what the ad-shaped output formats serialize, so they answer the
 	// question the SELECT asked rather than the one the scan answered. Nil for
-	// `SELECT *`, whose ads already are the projection, and for aggregates.
+	// `SELECT *`, whose ads already are the projection.
+	//
+	// An aggregate carries one too, though its rows belong to groups rather than to
+	// any one ad: a group key arrives as a value beside its label, a computed item is
+	// evaluated here, and an aggregate's own output is read back from the text it
+	// crosses as. It is all or nothing across a result -- every row or none -- because
+	// a format that reads it reads it for every row.
 	//
 	// A projected attribute is named by the SELECT, so an alias can carry a private
 	// attribute's value under a name that is not private. The formats that read these
@@ -1873,6 +1879,45 @@ func positionalGroupProjector(st *Statement) (*aggProjector, error) {
 	return newAggProjector(st, groupAt, groupCol)
 }
 
+// addAggRow appends one group's output row to res, and beside it the projected ad holding
+// the same cells as values. groupVals is the group tuple as values (see aggProjector.project).
+func addAggRow(res *Result, p *aggProjector, group []string, groupVals []classad.Value, values []string) {
+	row, ad := p.project(group, groupVals, values)
+	res.Rows = append(res.Rows, row)
+	if ad != nil {
+		res.Projected = append(res.Projected, ad)
+	}
+}
+
+// finishAggRows applies the SELECT's ORDER BY and LIMIT to a reduced aggregate result and
+// settles its projection.
+//
+// THE PROJECTION IS ALL OR NOTHING. A format that reads it reads it for every row, so a
+// result whose rows were partly ads and partly display strings would serialize two shapes
+// under one column set, and the rows that fell back would be the ones silently missing
+// their columns. One row that could not be projected therefore drops the projection for the
+// whole result, which leaves every row exactly as it was. The count is the test: project
+// appends an ad per row or none at all, so a short slice is precisely the case.
+//
+// ORDER BY and LIMIT both reach the ads as well as the rows, since the two are parallel.
+func finishAggRows(res *Result, st *Statement) (*Result, error) {
+	if len(res.Projected) != len(res.Rows) {
+		res.Projected = nil
+	}
+	if len(st.OrderBy) > 0 {
+		if err := sortRows(res, st.OrderBy); err != nil {
+			return nil, err
+		}
+	}
+	if st.Limit > 0 && len(res.Rows) > st.Limit {
+		res.Rows = res.Rows[:st.Limit]
+		if len(res.Projected) > st.Limit {
+			res.Projected = res.Projected[:st.Limit]
+		}
+	}
+	return res, nil
+}
+
 // formatAggResult assembles server-side aggregate rows into the SELECT's column order, then
 // applies ORDER BY and LIMIT.
 func formatAggResult(st *Statement, groupIdx map[string]int, rows []dbrpc.AggRow) (*Result, error) {
@@ -1885,17 +1930,9 @@ func formatAggResult(st *Statement, groupIdx map[string]int, rows []dbrpc.AggRow
 		if !proj.keep(gr.Group, gr.Values) {
 			continue
 		}
-		res.Rows = append(res.Rows, proj.row(gr.Group, gr.Values))
+		addAggRow(res, proj, gr.Group, gr.GroupValues, gr.Values)
 	}
-	if len(st.OrderBy) > 0 {
-		if err := sortRows(res, st.OrderBy); err != nil {
-			return nil, err
-		}
-	}
-	if st.Limit > 0 && len(res.Rows) > st.Limit {
-		res.Rows = res.Rows[:st.Limit]
-	}
-	return res, nil
+	return finishAggRows(res, st)
 }
 
 // execAggregateAsOf computes a GROUP BY / aggregate SELECT over a point-in-time
@@ -1911,21 +1948,29 @@ func (e *Executor) execAggregateAsOf(st *Statement, groupBy []string) (*Result, 
 		groupIdx[strings.ToLower(g)] = i
 	}
 	// Bucket ads by their group-column tuple, preserving first-seen order.
+	// groupVals is the tuple the key was rendered FROM, kept beside it so the output row
+	// can carry each group column as the value it is rather than as text that has to be
+	// read back. It is the first member's: members of one group render alike but need not
+	// be identical values, and the key itself does not distinguish them either, so the
+	// label and the value name the same group however the group was formed.
 	type bucket struct {
-		group []string
-		ads   []*classad.ClassAd
+		group     []string
+		groupVals []classad.Value
+		ads       []*classad.ClassAd
 	}
 	var order []string
 	buckets := map[string]*bucket{}
 	for _, ad := range ads {
 		g := make([]string, len(groupBy))
+		gv := make([]classad.Value, len(groupBy))
 		for i, col := range groupBy {
-			g[i] = valueDisplay(ad.EvaluateAttr(col))
+			gv[i] = ad.EvaluateAttr(col)
+			g[i] = valueDisplay(gv[i])
 		}
 		key := strings.Join(g, "\x00")
 		b := buckets[key]
 		if b == nil {
-			b = &bucket{group: g}
+			b = &bucket{group: g, groupVals: gv}
 			buckets[key] = b
 			order = append(order, key)
 		}
@@ -1949,17 +1994,9 @@ func (e *Executor) execAggregateAsOf(st *Statement, groupBy []string) (*Result, 
 		if !proj.keep(b.group, vals) {
 			continue
 		}
-		res.Rows = append(res.Rows, proj.row(b.group, vals))
+		addAggRow(res, proj, b.group, b.groupVals, vals)
 	}
-	if len(st.OrderBy) > 0 {
-		if err := sortRows(res, st.OrderBy); err != nil {
-			return nil, err
-		}
-	}
-	if st.Limit > 0 && len(res.Rows) > st.Limit {
-		res.Rows = res.Rows[:st.Limit]
-	}
-	return res, nil
+	return finishAggRows(res, st)
 }
 
 // hasBucket reports whether any selected item is a time_bucket grouping expression.
@@ -2023,17 +2060,9 @@ func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
 		if !proj.keep(gr.Group, gr.Values) {
 			continue
 		}
-		res.Rows = append(res.Rows, proj.row(gr.Group, gr.Values))
+		addAggRow(res, proj, gr.Group, gr.GroupValues, gr.Values)
 	}
-	if len(st.OrderBy) > 0 {
-		if err := sortRows(res, st.OrderBy); err != nil {
-			return nil, err
-		}
-	}
-	if st.Limit > 0 && len(res.Rows) > st.Limit {
-		res.Rows = res.Rows[:st.Limit]
-	}
-	return res, nil
+	return finishAggRows(res, st)
 }
 
 // execAggregateBucket computes a GROUP BY that includes a time_bucket(...) column.
@@ -2062,14 +2091,19 @@ func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 		}
 		groupExpr[j] = ex
 	}
+	// Each group key is kept twice: as the label that forms the group, and as the value it
+	// was rendered from, so the output row can carry the column as the value it is. A
+	// bucket's value is the floor itself, which is the number the series is indexed by.
 	type group struct {
-		vals []string
-		ads  []*classad.ClassAd
+		vals      []string
+		groupVals []classad.Value
+		ads       []*classad.ClassAd
 	}
 	var order []string
 	groups := map[string]*group{}
 	for _, ad := range ads {
 		vals := make([]string, 0, len(st.Items))
+		gvals := make([]classad.Value, 0, len(st.Items))
 		drop := false
 		for j, it := range st.Items {
 			if it.IsAggregate() {
@@ -2081,14 +2115,23 @@ func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 					drop = true // undefined bucket timestamp: row falls out of the series
 					break
 				}
-				vals = append(vals, bucketFloor(sec, it.BucketWidth))
+				floor, sized := bucketFloorSec(sec, it.BucketWidth)
+				if !sized {
+					drop = true // no width: the row indexes no bucket
+					break
+				}
+				vals = append(vals, strconv.FormatInt(floor, 10))
+				gvals = append(gvals, classad.NewIntValue(floor))
 				continue
 			}
+			var v classad.Value
 			if groupExpr[j] != nil {
-				vals = append(vals, valueDisplay(groupExpr[j].Eval(ad)))
-				continue
+				v = groupExpr[j].Eval(ad)
+			} else {
+				v = ad.EvaluateAttr(it.Col)
 			}
-			vals = append(vals, valueDisplay(ad.EvaluateAttr(it.Col)))
+			vals = append(vals, valueDisplay(v))
+			gvals = append(gvals, v)
 		}
 		if drop {
 			continue
@@ -2096,7 +2139,7 @@ func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 		key := strings.Join(vals, "\x00")
 		g := groups[key]
 		if g == nil {
-			g = &group{vals: vals}
+			g = &group{vals: vals, groupVals: gvals}
 			groups[key] = g
 			order = append(order, key)
 		}
@@ -2114,28 +2157,25 @@ func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 		if !proj.keep(g.vals, vals) {
 			continue
 		}
-		res.Rows = append(res.Rows, proj.row(g.vals, vals))
+		addAggRow(res, proj, g.vals, g.groupVals, vals)
 	}
-	if len(st.OrderBy) > 0 {
-		if err := sortRows(res, st.OrderBy); err != nil {
-			return nil, err
-		}
-	}
-	if st.Limit > 0 && len(res.Rows) > st.Limit {
-		res.Rows = res.Rows[:st.Limit]
-	}
-	return res, nil
+	return finishAggRows(res, st)
 }
 
-// bucketFloor floors unix-epoch seconds to a width-aligned bucket (aligned to the
-// epoch, so bucket boundaries are stable across queries) and returns it as a decimal
-// seconds string -- the same shape the frame layer reads as a time field.
-func bucketFloor(sec float64, width int64) string {
+// bucketFloorSec floors unix-epoch seconds to a width-aligned bucket, aligned to the epoch
+// so bucket boundaries are stable across queries. A non-positive width has no buckets at
+// all and is reported as such rather than floored to anything, which keeps that row out of
+// the series the way an unreadable timestamp does.
+//
+// It returns the NUMBER rather than its decimal text because the floor lands in two places
+// at once -- the group's label, which is that text and is the same shape the frame layer
+// reads as a time field, and the group's value, which is the integer the series is indexed
+// by. Rendering it once and reading it back would make the second a guess at the first.
+func bucketFloorSec(sec float64, width int64) (int64, bool) {
 	if width <= 0 {
-		return ""
+		return 0, false
 	}
-	b := int64(math.Floor(sec/float64(width))) * width
-	return strconv.FormatInt(b, 10)
+	return int64(math.Floor(sec/float64(width))) * width, true
 }
 
 // aggregateAds reduces one aggregate call over a group's ads (client-side, for AS OF and
@@ -2341,9 +2381,19 @@ func sortRows(res *Result, terms []OrderTerm) error {
 		}
 		idxs[k] = idx
 	}
-	sort.SliceStable(res.Rows, func(i, j int) bool {
+	// Sorted as a permutation rather than in place, because the rows are not the only
+	// thing in row order: a result that carries projected ads carries one PER ROW, and a
+	// sort that moved only the rows would hand the ad-shaped formats another row's values
+	// under this row's columns -- a wrong answer that no column count or length check
+	// would catch.
+	order := make([]int, len(res.Rows))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		a, b := res.Rows[order[i]], res.Rows[order[j]]
 		for k, t := range terms {
-			c := compareCells(res.Rows[i][idxs[k]], res.Rows[j][idxs[k]])
+			c := compareCells(a[idxs[k]], b[idxs[k]])
 			if c != 0 {
 				if t.Desc {
 					return c > 0
@@ -2353,6 +2403,18 @@ func sortRows(res *Result, terms []OrderTerm) error {
 		}
 		return false
 	})
+	rows := make([][]string, len(order))
+	for i, from := range order {
+		rows[i] = res.Rows[from]
+	}
+	res.Rows = rows
+	if len(res.Projected) == len(order) {
+		ads := make([]*classad.ClassAd, len(order))
+		for i, from := range order {
+			ads[i] = res.Projected[from]
+		}
+		res.Projected = ads
+	}
 	return nil
 }
 
@@ -2601,6 +2663,84 @@ func valueDisplay(v classad.Value) string {
 	default:
 		return v.String()
 	}
+}
+
+// CellValue reads a display cell back into the value behind it, for a cell whose typed
+// value was not kept anywhere else. The order matches valueDisplay, so a round trip is
+// exact for every kind except a string whose text spells a number or a bool -- those two
+// are indistinguishable from the number and the bool once rendered, which is why every
+// caller that can reach the evaluated value uses that instead and this is the last resort.
+//
+// It is one function rather than one per reader because the readers have to agree: the C
+// API types a cell from this where no value survives, and the aggregate projection reads an
+// aggregate's output cell with it, and a second copy of the rule would be a second answer
+// to "is this a number" for the same text.
+func CellValue(s string) classad.Value {
+	switch s {
+	case "undefined":
+		return classad.NewUndefinedValue()
+	case "error":
+		return classad.NewErrorValue()
+	case "true":
+		return classad.NewBoolValue(true)
+	case "false":
+		return classad.NewBoolValue(false)
+	}
+	// Integers before reals: ParseFloat accepts "3" and would widen it to 3.0.
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return classad.NewIntValue(n)
+	}
+	// Reject the forms ParseFloat accepts but ClassAd never renders ("inf", "NaN",
+	// "0x1p-2"), so a string spelled that way survives as a string.
+	if isPlainNumber(s) {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return classad.NewRealValue(f)
+		}
+	}
+	return classad.NewStringValue(s)
+}
+
+// isPlainNumber reports whether s is decimal digits with at most one leading sign, one
+// decimal point, and an optional decimal exponent.
+func isPlainNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	body := strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+")
+	if body == "" {
+		return false
+	}
+	mantissa, exponent, hasExp := body, "", false
+	if i := strings.IndexAny(body, "eE"); i >= 0 {
+		mantissa, exponent, hasExp = body[:i], body[i+1:], true
+	}
+	if !isDecimal(mantissa, true) {
+		return false
+	}
+	if hasExp {
+		exponent = strings.TrimPrefix(strings.TrimPrefix(exponent, "-"), "+")
+		return isDecimal(exponent, false)
+	}
+	return true
+}
+
+// isDecimal reports whether s is digits, optionally with a single '.' when allowPoint.
+func isDecimal(s string, allowPoint bool) bool {
+	digits, points := 0, 0
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9':
+			digits++
+		case c == '.' && allowPoint:
+			points++
+			if points > 1 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return digits > 0
 }
 
 // insertValue stores an evaluated value in a projected ad under name, keeping its type:
