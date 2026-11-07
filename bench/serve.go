@@ -45,8 +45,10 @@ type ServeConfig struct {
 type Server struct {
 	Catalog *db.Catalog
 	Addr    string
-	Tables  map[Shape]*db.ArchiveTable
-	stop    func()
+	// FlightAddr is the Flight SQL endpoint, bound when ServeFlight runs.
+	FlightAddr string
+	Tables     map[Shape]*db.ArchiveTable
+	stop       func()
 }
 
 // Close shuts the server down and closes the store.
