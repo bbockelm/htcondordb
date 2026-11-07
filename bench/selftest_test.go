@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
+
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -89,4 +91,51 @@ func TestSelfTestDoesNotInventBytesForTheEvaluatedForm(t *testing.T) {
 		t.Errorf("the report does not distinguish production from delivery:\n%s", out)
 	}
 	t.Logf("\n%s", out)
+}
+
+// The consumer pass must do REAL work: it has to be measurably slower than the producer pass for
+// a form whose rows need decoding. A consume pass that matched produce would mean the work was
+// skipped or optimized away, and the whole comparison would be of two empty loops.
+func TestSelfTestConsumerPassDoesRealWork(t *testing.T) {
+	arch := benchArchive(t, 20000)
+	rep := SelfTestArchive(arch, SelfTestSpec{
+		Table: "history", Constraint: "true",
+		Projection: []string{"ClusterId", "Owner", "JobStatus"},
+		Iterations: 1,
+	})
+	for _, s := range rep.Samples {
+		if s.Err != nil {
+			t.Fatalf("%s produce: %v", s.Transport, s.Err)
+		}
+		if s.ConsumeErr != nil {
+			t.Fatalf("%s consume: %v", s.Transport, s.ConsumeErr)
+		}
+		if s.ConsumedRows != s.Rows {
+			t.Errorf("%s: consumed %d rows but produced %d", s.Transport, s.ConsumedRows, s.Rows)
+		}
+		t.Logf("%-22s produce %9.0f rows/s   consume %9.0f rows/s   consumer share %.0f%%",
+			s.Transport, s.RowsPerSec(), s.ConsumeRowsPerSec(), 100*s.ConsumerShare())
+		// The stored forms must decode into an ad, which cannot be free.
+		if !s.Transport.Evaluated() && s.ConsumeElapsed <= s.Elapsed {
+			t.Errorf("%s: consuming (%v) was not slower than producing (%v); the consumer work is not running",
+				s.Transport, s.ConsumeElapsed, s.Elapsed)
+		}
+	}
+}
+
+// The consumer's results must actually be observable, which is what stops the compiler eliding
+// the work the consuming pass exists to measure.
+func TestConsumerSinkIsPopulated(t *testing.T) {
+	arch := benchArchive(t, 2000)
+	_ = SelfTestArchive(arch, SelfTestSpec{
+		Table: "history", Constraint: "true",
+		Projection: []string{"ClusterId", "Owner"}, Iterations: 1,
+	})
+	ad, vt := ConsumerSink()
+	if ad == nil {
+		t.Error("the consuming pass left no parsed ad; its work may have been elided")
+	}
+	if vt == classad.UndefinedValue {
+		t.Errorf("the value pass left %v; it did not read a typed value", vt)
+	}
 }

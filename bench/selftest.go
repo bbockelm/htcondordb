@@ -2,10 +2,12 @@ package bench
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
+	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -25,6 +27,15 @@ import (
 // It also costs nothing to run beside the real thing, which is the honest use: run both, and the
 // gap between them is the serialization and transport cost. A self-test alone cannot tell a slow
 // disk from a slow network, because it never touches the network.
+//
+// PRODUCER AND CONSUMER ARE BOTH MEASURED, because the row a store hands out is not yet anything
+// a caller can use. The producer pass reads rows and touches nothing. The consumer pass reads the
+// same rows and does what a client does with them: parses old-ClassAd text into an ad, decodes a
+// wire row into one, reads the typed values. The difference between the two passes is the
+// consumer's own cost, and it is the term that decides whether a cheaper row FORM is worth
+// anything -- a relay that halves production while doubling the parse at the other end has moved
+// work, not removed it. Measuring only production is how a transport gets adopted on a number its
+// consumer never sees.
 
 // SelfTestSpec is one in-process sweep.
 type SelfTestSpec struct {
@@ -45,6 +56,31 @@ type SelfTestSample struct {
 	Bytes     int64
 	Elapsed   time.Duration
 	Err       error
+	// ConsumeElapsed is the same read with the consumer's work done on every row: the time a
+	// caller pays to turn the stream into usable objects, production included. ConsumeErr is
+	// non-nil when that work failed, which is itself a finding -- a row form whose consumer
+	// cannot decode it is not a faster transport.
+	ConsumeElapsed time.Duration
+	ConsumeErr     error
+	ConsumedRows   int64
+}
+
+// ConsumeRowsPerSec is the end-to-end in-process rate: produced AND turned into usable objects.
+func (s SelfTestSample) ConsumeRowsPerSec() float64 {
+	if s.ConsumeElapsed <= 0 {
+		return 0
+	}
+	return float64(s.ConsumedRows) / s.ConsumeElapsed.Seconds()
+}
+
+// ConsumerShare is the fraction of the consuming pass spent on the consumer's own work rather
+// than on producing the rows. It is the number that says whether a row form moves work or removes
+// it; it is only meaningful when both passes ran.
+func (s SelfTestSample) ConsumerShare() float64 {
+	if s.ConsumeElapsed <= 0 || s.Elapsed <= 0 || s.ConsumeElapsed <= s.Elapsed {
+		return 0
+	}
+	return float64(s.ConsumeElapsed-s.Elapsed) / float64(s.ConsumeElapsed)
 }
 
 // RowsPerSec is the production rate.
@@ -115,13 +151,13 @@ func selfTestCell(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int
 	s := SelfTestSample{Transport: tr, Limit: limit}
 	// One warm pass, untimed: the segments are mmap'd and the first read of them pays page-in
 	// that no later read pays.
-	if _, _, err := selfTestOnce(t, spec, tr, limit); err != nil {
+	if _, _, err := selfTestOnce(t, spec, tr, limit, false); err != nil {
 		s.Err = err
 		return s
 	}
 	start := time.Now()
 	for i := 0; i < spec.Iterations; i++ {
-		rows, bytes, err := selfTestOnce(t, spec, tr, limit)
+		rows, bytes, err := selfTestOnce(t, spec, tr, limit, false)
 		if err != nil {
 			s.Err = err
 			break
@@ -130,10 +166,29 @@ func selfTestCell(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int
 		s.Bytes += bytes
 	}
 	s.Elapsed = time.Since(start)
+
+	// The consuming pass, warmed the same way, over the same rows.
+	if _, _, err := selfTestOnce(t, spec, tr, limit, true); err != nil {
+		s.ConsumeErr = err
+		return s
+	}
+	cstart := time.Now()
+	for i := 0; i < spec.Iterations; i++ {
+		rows, _, err := selfTestOnce(t, spec, tr, limit, true)
+		if err != nil {
+			s.ConsumeErr = err
+			break
+		}
+		s.ConsumedRows += rows
+	}
+	s.ConsumeElapsed = time.Since(cstart)
 	return s
 }
 
-func selfTestOnce(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int) (rows, bytes int64, err error) {
+// selfTestOnce reads one result. With consume set it also does the CONSUMER's work on every row
+// -- the work a caller must do before the row is usable -- so the two passes differ by exactly
+// that and nothing else.
+func selfTestOnce(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int, consume bool) (rows, bytes int64, err error) {
 	stop := func() bool { return limit > 0 && rows >= int64(limit) }
 	switch tr {
 	case TextWhole:
@@ -144,6 +199,11 @@ func selfTestOnce(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int
 		for ad := range seq {
 			rows++
 			bytes += rawAdBytes(ad)
+			if consume {
+				if cerr := consumeRawAd(ad); cerr != nil {
+					return rows, bytes, cerr
+				}
+			}
 			if stop() {
 				break
 			}
@@ -156,6 +216,11 @@ func selfTestOnce(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int
 		for ad := range seq {
 			rows++
 			bytes += rawAdBytes(ad)
+			if consume {
+				if cerr := consumeRawAd(ad); cerr != nil {
+					return rows, bytes, cerr
+				}
+			}
 			if stop() {
 				break
 			}
@@ -168,6 +233,15 @@ func selfTestOnce(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int
 		for row := range seq {
 			rows++
 			bytes += int64(len(row))
+			if consume {
+				node, derr := wire.DecodeInline(row)
+				if derr != nil {
+					return rows, bytes, fmt.Errorf("decoding a wire row: %w", derr)
+				}
+				// FromAST is what a consumer does next; without it the decode is only half
+				// the work and the wire form would look cheaper than it is in use.
+				sink = classad.FromAST(node)
+			}
 			if stop() {
 				break
 			}
@@ -180,8 +254,14 @@ func selfTestOnce(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int
 		// No bytes: a value slice has no serialized size until something serializes it, and
 		// inventing one here would put a fabricated number beside measured ones.
 		for vals := range seq {
-			_ = vals
 			rows++
+			if consume {
+				// Already typed: the consumer's work is reading them, not decoding anything.
+				// That IS the finding for this form, so it is measured rather than skipped.
+				for i := range vals {
+					valSink = vals[i].Type()
+				}
+			}
 			if stop() {
 				break
 			}
@@ -203,6 +283,9 @@ func (r SelfTestReport) String() string {
 		b = append(b, fmt.Sprintf("sampled stored-form read: %.0f%% of %d records rebuilt from the arena\n",
 			100*r.Escape.Rate(), r.Escape.Visited)...)
 	}
+	b = append(b, "\nPRODUCE = rows read, nothing done with them.  CONSUME = the same rows turned into\n"...)
+	b = append(b, "usable objects (text parsed, wire decoded, values read). The gap is the consumer's\n"...)
+	b = append(b, "own cost: a row form that halves production and doubles the parse has moved work.\n"...)
 	for _, s := range r.Samples {
 		lim := "all"
 		if s.Limit > 0 {
@@ -212,19 +295,58 @@ func (r SelfTestReport) String() string {
 		if s.Transport.Evaluated() {
 			form = "evaluated"
 		}
-		switch {
-		case s.Err != nil:
+		if s.Err != nil {
 			b = append(b, fmt.Sprintf("  %-22s %-9s limit=%-5s FAILED: %v\n", s.Transport, form, lim, s.Err)...)
-		case s.Bytes == 0:
-			b = append(b, fmt.Sprintf("  %-22s %-9s limit=%-5s %10.0f rows/s  (no serialized bytes)\n",
-				s.Transport, form, lim, s.RowsPerSec())...)
-		default:
-			b = append(b, fmt.Sprintf("  %-22s %-9s limit=%-5s %10.0f rows/s  %8.1f MB/s\n",
-				s.Transport, form, lim, s.RowsPerSec(), s.MBPerSec())...)
+			continue
+		}
+		byteRate := "  (no serialized bytes)"
+		if s.Bytes > 0 {
+			byteRate = fmt.Sprintf("  %8.1f MB/s", s.MBPerSec())
+		}
+		b = append(b, fmt.Sprintf("  %-22s %-9s limit=%-5s produce %9.0f rows/s%s\n",
+			s.Transport, form, lim, s.RowsPerSec(), byteRate)...)
+		switch {
+		case s.ConsumeErr != nil:
+			b = append(b, fmt.Sprintf("  %-22s %-9s %12s consume FAILED: %v\n", "", "", "", s.ConsumeErr)...)
+		case s.ConsumeElapsed > 0:
+			b = append(b, fmt.Sprintf("  %-22s %-9s %12s consume %9.0f rows/s  (%.0f%% of it the consumer's own work)\n",
+				"", "", "", s.ConsumeRowsPerSec(), 100*s.ConsumerShare())...)
 		}
 	}
 	return string(b)
 }
+
+// consumeRawAd does what a client does with a stored-form row: parses the expression parts back
+// into an ad. The parts alias a buffer the iteration reuses, so this happens before the iterator
+// advances -- which is also why a consumer cannot defer this work in practice.
+func consumeRawAd(ad collections.RawAd) error {
+	var b strings.Builder
+	for _, e := range ad.Exprs {
+		b.Write(e)
+		b.WriteByte('\n')
+	}
+	parsed, err := classad.ParseOld(b.String())
+	if err != nil {
+		return fmt.Errorf("parsing a stored-form row: %w", err)
+	}
+	sink = parsed
+	return nil
+}
+
+// sink and valSink keep the consumer's results reachable so the compiler cannot delete the work
+// being measured. A benchmark whose work is optimized away reports the cost of an empty loop.
+//
+// Package-level and READ by ConsumerSink, rather than written and forgotten: a variable only
+// ever assigned is exactly what a linter calls unused and what an optimizer is entitled to
+// remove, which would quietly turn the consuming pass back into the producing one.
+var (
+	sink    *classad.ClassAd
+	valSink classad.ValueType
+)
+
+// ConsumerSink reports the last values the consuming pass produced. It exists so those values are
+// genuinely read somewhere, which is what keeps the work from being elided.
+func ConsumerSink() (*classad.ClassAd, classad.ValueType) { return sink, valSink }
 
 // rawAdBytes is what the stored form would put on the wire for one ad: the expression parts,
 // which is what a relay writes. Counted rather than rendered, so the self-test does not charge
