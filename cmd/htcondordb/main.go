@@ -68,12 +68,20 @@ func run() error {
 	// -local-name additionally scopes config lookups (HTCONDORDB.<key> beats <key>).
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; accepted for compatibility (fd inherited via CONDOR_INHERIT)")
+	benchFlags := registerBenchmarkFlags()
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("htcondordb", version)
 		fmt.Println("columnar SIMD engine:", simdEngineStatus())
 		return nil
+	}
+
+	// Benchmark mode takes over here, BEFORE any configuration is read. It serves generated
+	// data with anonymous reads, so it must never be holding a SPOOL, a pool password or an
+	// advertise address that it is merely declining to use.
+	if *benchFlags.on {
+		return runBenchmark(context.Background(), benchFlags.cfg, os.Stdout)
 	}
 
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "HTCONDORDB", LocalName: *localName})
