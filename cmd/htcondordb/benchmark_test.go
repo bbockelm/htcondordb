@@ -7,11 +7,34 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bbockelm/htcondordb/bench"
 )
+
+// syncBuffer is a bytes.Buffer safe to read while another goroutine writes it.
+//
+// The serving test polls the output while runBenchmark is writing it from another goroutine, and
+// a bytes.Buffer is not safe for that -- which the race detector caught in CI rather than here,
+// because these packages were not being run under -race locally.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
 
 // Benchmark mode will not fall back to a configured directory. Requiring the flag is what keeps
 // the mode from ever opening a real SPOOL, so an empty -benchmark-dir is an error and not a
@@ -72,7 +95,7 @@ func TestBenchmarkSelfTestRunsAndReturns(t *testing.T) {
 // context.
 func TestBenchmarkServeBindsAndAnnounces(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	var out bytes.Buffer
+	var out syncBuffer
 	done := make(chan error, 1)
 	go func() {
 		done <- runBenchmark(ctx, benchmarkConfig{
