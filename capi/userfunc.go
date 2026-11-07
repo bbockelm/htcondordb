@@ -16,7 +16,8 @@ import (
 // evaluated there; a SELECT item is computed HERE, over the records that came back. So a function
 // loaded only into the daemon works in one half of a query and is unknown in the other, and the
 // person writing the SQL has no way to know which half they are in. This library loads the same
-// modules from the same configuration, for the same reason htcondordb-cli does.
+// functions -- wasm modules and ClassAd Script alike -- from the same configuration, for the same
+// reason htcondordb-cli does.
 
 // userFuncs is process-wide because the registries it writes into are. One manager rather than one
 // per connection: Apply only ever ADDS, so calling it again on a second connection is the no-op it

@@ -1,0 +1,34 @@
+# Fixture for the script user-function tests.
+#
+# ONE FILE, SEVERAL DEFINITIONS, which is the point of it: each name in
+# HTCONDORDB_SCRIPT_FUNCTIONS picks one `def` out of a file, so a site keeps its
+# policy functions together instead of one file per function.
+#
+# The names are unique to these tests because classad's registry is
+# process-wide and has no unregister.
+
+# What fraction of a resource is in use, as a percentage.
+def scriptCfgPct(used, total):
+    # Undefined in, undefined out: an attribute the ad does not carry is not a
+    # mistake, and a Requirements expression that treated it as one would reject
+    # the machine rather than ignore the term.
+    if used is undefined:
+        return undefined
+    if total is undefined:
+        return undefined
+    # A division with no answer. Report it by RETURNING error.
+    if total <= 0:
+        return error
+    return used * 100.0 / total
+
+def scriptCfgDouble(n):
+    return n * 2
+
+def scriptCfgStable(n):
+    return n + 1
+
+def scriptCfgAdded(n):
+    return n + 2
+
+def scriptCfgKind(n):
+    return n

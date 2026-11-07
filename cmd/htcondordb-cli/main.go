@@ -186,9 +186,10 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Load the same user functions the daemon loads, into THIS process.
+	// Load the same user functions the daemon loads, into THIS process. Both kinds: a wasm module
+	// and a ClassAd Script function are the same thing to a query.
 	//
-	// It is the same configuration and the same modules, because a query is evaluated in two
+	// It is the same configuration and the same files, because a query is evaluated in two
 	// places: a WHERE clause goes to the server as an expression, but a SELECT item is computed
 	// here, over the records that came back. A function loaded only on the server would work in
 	// one half of a query and be unknown in the other -- `WHERE f(x) > 1` fine, `SELECT f(x)`
