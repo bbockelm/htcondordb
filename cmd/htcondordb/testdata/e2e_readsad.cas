@@ -1,0 +1,7 @@
+# A function that reaches the subject ad. Inside a script a bare name is an
+# attribute and that is the point of it; in a registered function there is no
+# subject to resolve `Memory` against, so this one is refused at registration
+# and the daemon configuring it does not start.
+
+def e2eScriptReadsAd(requested):
+    return requested + Memory
