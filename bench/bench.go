@@ -352,11 +352,16 @@ func noteForError(err error) string {
 func readOnce(ctx context.Context, c *dbrpc.Client, spec Spec, tr Transport, limit int) (rows, bytes int64, err error) {
 	switch tr {
 	case TextWhole:
-		err = c.QueryRawTableStream(ctx, spec.Table, spec.Constraint, limit, func(row string) bool {
-			rows++
-			bytes += int64(len(row))
-			return true
-		})
+		// The projection op with NO attributes, which is defined to behave like the whole-ad
+		// op and, unlike it, is served from an archive too. Asking for the whole ad through
+		// the whole-ad op fails outright on a history table, which is the one most worth
+		// measuring.
+		err = c.QueryRawProjectStream(ctx, spec.Table, spec.Constraint, nil, limit,
+			func(row string) bool {
+				rows++
+				bytes += int64(len(row))
+				return true
+			})
 	case TextProjected:
 		err = c.QueryRawProjectRefsStream(ctx, spec.Table, spec.Constraint, spec.Projection, limit,
 			func(row string) bool {

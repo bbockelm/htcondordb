@@ -115,10 +115,23 @@ func TestSelfTestConsumerPassDoesRealWork(t *testing.T) {
 		}
 		t.Logf("%-22s produce %9.0f rows/s   consume %9.0f rows/s   consumer share %.0f%%",
 			s.Transport, s.RowsPerSec(), s.ConsumeRowsPerSec(), 100*s.ConsumerShare())
-		// The stored forms must decode into an ad, which cannot be free.
-		if !s.Transport.Evaluated() && s.ConsumeElapsed <= s.Elapsed {
-			t.Errorf("%s: consuming (%v) was not slower than producing (%v); the consumer work is not running",
-				s.Transport, s.ConsumeElapsed, s.Elapsed)
+		// Asserted only for the TEXT forms. Parsing an ad out of text is most of their cost
+		// (measured at 69-79% of the consuming pass), so the margin is far outside timing
+		// noise. The wire form's consumer cost is genuinely about 5% -- decoding it is nearly
+		// free, which is the finding -- so requiring consume > produce there compares two
+		// nearly equal durations and fails intermittently, which it did.
+		//
+		// That wire's consumer work RUNS at all is covered by TestConsumerSinkIsPopulated,
+		// which checks the decoded result rather than a duration.
+		if s.Transport == TextWhole || s.Transport == TextProjected {
+			if s.ConsumeElapsed <= s.Elapsed {
+				t.Errorf("%s: consuming (%v) was not slower than producing (%v); the consumer work is not running",
+					s.Transport, s.ConsumeElapsed, s.Elapsed)
+			}
+			if s.ConsumerShare() < 0.25 {
+				t.Errorf("%s: the consumer accounted for only %.0f%% of the consuming pass; parsing an ad out of text cannot be that cheap",
+					s.Transport, 100*s.ConsumerShare())
+			}
 		}
 	}
 }
