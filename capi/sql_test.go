@@ -2,11 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
+	"net"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/dbrpc"
 	"github.com/bbockelm/htcondordb/repl"
 )
 
@@ -85,9 +90,10 @@ func TestCellValuesPrefersAdTypes(t *testing.T) {
 	}
 }
 
-// With no ad behind the row -- an aggregate, whose values the server already reduced to
-// strings -- cells fall back to parsing the display string.
-func TestCellValuesAggregateFallback(t *testing.T) {
+// With no ad behind the row at all, cells fall back to parsing the display string. That is
+// the last resort, not the aggregate path -- a Result built by hand here, because an
+// aggregate the executor produced carries a projection.
+func TestCellValuesNoAdFallsBackToDisplayStrings(t *testing.T) {
 	r := &repl.Result{
 		IsSelect: true,
 		Columns:  []string{"Owner", "n", "avg_mem"},
@@ -223,5 +229,454 @@ func TestValueJSONNonFinite(t *testing.T) {
 	// A finite real is untouched.
 	if got := valueJSON(classad.NewRealValue(1.5)); got != 1.5 {
 		t.Errorf("valueJSON(1.5) = %#v, want 1.5", got)
+	}
+}
+
+// cellFixture is a real store behind a real executor: what these tests exercise is the
+// typed value the executor carries alongside each row, which only a real SELECT builds.
+func cellFixture(t *testing.T) (*repl.Executor, func()) {
+	t.Helper()
+	ex, _, done := cellFixtureOpts(t)
+	return ex, done
+}
+
+// cellFixtureOpts is cellFixture with client options, so a test can say what the peer
+// advertised, and hands back the client so it can check that the option took.
+func cellFixtureOpts(t *testing.T, opts ...dbrpc.ClientOption) (*repl.Executor, *dbrpc.Client, func()) {
+	t.Helper()
+	d, err := db.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Four strings whose text reads as some other type, and one of every type a cell can
+	// hold, so a wrong guess shows up as a wrong Go type rather than a near miss.
+	const text = `Owner = "alice"
+IntStr = "123"
+FloatStr = "3.5"
+BoolStr = "true"
+UndefStr = "undefined"
+ErrStr = "error"
+Memory = 4096
+Load = 0.75
+Wanted = true
+Items = {1, 2, 3}
+Inner = [ a = 1 ]
+`
+	if err := d.UpdateOld("k1", text); err != nil {
+		t.Fatal(err)
+	}
+	srv := dbrpc.NewServer(d)
+	a, b := net.Pipe()
+	go func() { _ = srv.ServeConn(dbrpc.NewStreamConn(a)) }()
+	cl := dbrpc.NewClient(dbrpc.NewStreamConn(b), opts...)
+	return repl.NewExecutor(cl, repl.ExecConfig{}), cl,
+		func() { _ = cl.Close(); srv.Close(); _ = d.Close() }
+}
+
+// typedGroupFixture is cellFixture against a client that was told the peer sends typed
+// group cells. Over a pipe nothing is advertised, so the plain fixture exercises the
+// fallback; this one exercises the feature, and the two must agree.
+func typedGroupFixture(t *testing.T) (*repl.Executor, func()) {
+	t.Helper()
+	ex, cl, done := cellFixtureOpts(t, dbrpc.WithPeerSessionAttrs(map[string]string{
+		dbrpc.SessionAttrProtocol: strconv.Itoa(dbrpc.ProtocolVersion),
+		dbrpc.SessionAttrFeatures: string(dbrpc.FeatTypedGroups),
+	}))
+	// Checked rather than assumed: if the advertisement stopped taking, this fixture would
+	// quietly become a second copy of the plain one and the feature would go untested.
+	if !cl.SupportsNewer(dbrpc.FeatTypedGroups) {
+		done()
+		t.Fatal("the fixture's client does not take the peer's typed-groups advertisement")
+	}
+	return ex, done
+}
+
+// firstValue is a user-defined aggregate returning the group's first defined argument value
+// WHATEVER KIND IT IS, which is what makes it able to return a string where every built-in
+// returns a number.
+type firstValue struct{}
+
+type firstValueAcc struct{ v classad.Value }
+
+func (firstValue) NewAccumulator() db.Accumulator { return &firstValueAcc{} }
+
+func (a *firstValueAcc) Add(v classad.Value) {
+	if a.v.IsUndefined() && !v.IsUndefined() {
+		a.v = v
+	}
+}
+
+func (a *firstValueAcc) Merge(other db.Accumulator) {
+	if o, ok := other.(*firstValueAcc); ok && a.v.IsUndefined() {
+		a.v = o.v
+	}
+}
+
+func (a *firstValueAcc) Result() classad.Value { return a.v }
+
+// registerFirstValue installs it. The registry is append-only and process-wide, so a second
+// call is a no-op rather than a failure.
+func registerFirstValue(t *testing.T) {
+	t.Helper()
+	if err := db.RegisterAggregate("firstvalue", firstValue{}); err != nil &&
+		!errors.Is(err, db.ErrAggregateExists) {
+		t.Fatal(err)
+	}
+}
+
+// firstRow runs sql and returns its headers and the typed cells of row 0.
+func firstRow(t *testing.T, ex *repl.Executor, sql string) ([]string, []any) {
+	t.Helper()
+	r, err := ex.ExecString(sql)
+	if err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	if len(r.Rows) == 0 {
+		t.Fatalf("%s: no rows", sql)
+	}
+	return r.Columns, cellValues(r, 0)
+}
+
+// An aliased or computed column is typed from the value the SELECT evaluated, not from the
+// text the table prints. The string-that-looks-like-a-number cases are the point: `Owner AS
+// who` over the string "123" has to stay a string, because nothing downstream can tell a
+// number that was always a number from one a display string was guessed into.
+func TestCellValuesAliasedColumnsKeepExactTypes(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	tbl := dbrpc.DefaultTable
+
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want any
+	}{
+		{"string looks like an integer", "SELECT IntStr AS t FROM " + tbl, "123"},
+		{"string looks like a real", "SELECT FloatStr AS t FROM " + tbl, "3.5"},
+		{"string looks like a bool", "SELECT BoolStr AS t FROM " + tbl, "true"},
+		{"string reads undefined", "SELECT UndefStr AS t FROM " + tbl, "undefined"},
+		{"string reads error", "SELECT ErrStr AS t FROM " + tbl, "error"},
+		{"integer", "SELECT Memory AS t FROM " + tbl, int64(4096)},
+		{"real", "SELECT Load AS t FROM " + tbl, 0.75},
+		{"bool", "SELECT Wanted AS t FROM " + tbl, true},
+		{"list keeps its ClassAd text", "SELECT Items AS t FROM " + tbl, "[1 2 3]"},
+		{"nested ad keeps its ClassAd text", "SELECT Inner AS t FROM " + tbl, "[a = 1]"},
+		// UNDEFINED and ERROR are both a missing cell to a reporting client, and JSON has
+		// one spelling for that.
+		{"undefined attribute", "SELECT NoSuchAttr AS t FROM " + tbl, nil},
+		{"expression evaluates to error", "SELECT Owner + 1 AS t FROM " + tbl, nil},
+		// Computed columns, aliased and not: the header is whatever the SELECT named, and
+		// the arithmetic result is an integer rather than text that parses as one.
+		{"computed column with alias", "SELECT Memory * 2 AS d FROM " + tbl, int64(8192)},
+		{"computed column keeps expression header", "SELECT Memory * 2 FROM " + tbl, int64(8192)},
+		{"computed string result", `SELECT strcat(IntStr, "4") AS t FROM ` + tbl, "1234"},
+		// A plain column was already exact and stays so.
+		{"plain column", "SELECT IntStr FROM " + tbl, "123"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, cells := firstRow(t, ex, tc.sql)
+			if len(cells) != 1 {
+				t.Fatalf("got %d cells, want 1", len(cells))
+			}
+			if cells[0] != tc.want {
+				t.Errorf("cell = %#v (%T), want %#v (%T)", cells[0], cells[0], tc.want, tc.want)
+			}
+		})
+	}
+}
+
+// The projection answers the question the SELECT asked; the matched ad answers the one the
+// scan answered. An alias may reuse an attribute name the matched ad also carries under a
+// different value, and the aliased value is the one the caller selected.
+//
+// The expression column is what makes the two disagree: a SELECT of plain columns alone is
+// served by a projected fetch, so the matched ad carries only the attributes the SELECT
+// named and has nothing to disagree with. An expression column takes the whole-ad path.
+func TestCellValuesProjectionBeatsMatchedAd(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	cols, cells := firstRow(t, ex, `SELECT strcat(Owner, "") AS c, IntStr AS Owner FROM `+dbrpc.DefaultTable)
+	if len(cols) != 2 || cols[1] != "Owner" {
+		t.Fatalf("headers = %q, want the second to be Owner", cols)
+	}
+	if cells[1] != "123" {
+		t.Errorf("Owner cell = %#v (%T), want %#v -- the matched ad's own Owner is \"alice\"",
+			cells[1], cells[1], "123")
+	}
+}
+
+// An aggregate carries a projection of its own, so its cells are typed from values rather
+// than guessed from text. A group key is exact: dbrpc fills AggRow.GroupValues on every
+// reply, so the string "123" grouped on arrives as the string "123".
+//
+// The aggregate's OWN output is the part that cannot be exact. It crosses as rendered text,
+// not as a ClassAd literal -- a string result arrives bare, where a string group key
+// arrives quoted -- so it is read the way the table reads it. COUNT, SUM, AVG, MIN and MAX
+// only ever produce a number, `undefined` or `error`, so the gap needs a user-defined
+// aggregate to reach; TestCellValuesUserAggregateOutputIsReadAsText reaches it.
+func TestCellValuesAggregateGroupKeysAreExact(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	tbl := dbrpc.DefaultTable
+
+	r, err := ex.ExecString("SELECT COUNT(*) AS n, AVG(Memory) AS m FROM " + tbl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cells := cellValues(r, 0)
+	if cells[0] != int64(1) || cells[1] != int64(4096) {
+		t.Errorf("aggregate cells = %#v, want [1 4096]", cells)
+	}
+
+	// The three reproductions: a string that reads as an integer, one that reads as a
+	// bool, and one that reads as neither. All three are the string the ad holds.
+	for _, tc := range []struct {
+		col  string
+		want any
+	}{
+		{"IntStr", "123"},
+		{"BoolStr", "true"},
+		{"Owner", "alice"},
+	} {
+		t.Run(tc.col, func(t *testing.T) {
+			_, cells := firstRow(t, ex,
+				"SELECT "+tc.col+", COUNT(*) AS n FROM "+tbl+" GROUP BY "+tc.col)
+			if cells[0] != tc.want {
+				t.Errorf("group key = %#v (%T), want %#v (%T)",
+					cells[0], cells[0], tc.want, tc.want)
+			}
+			if cells[1] != int64(1) {
+				t.Errorf("count = %#v (%T), want int64(1)", cells[1], cells[1])
+			}
+		})
+	}
+}
+
+// Every kind a group key can be, through cellValues. A list and a nested ad group by their
+// canonical text rather than by a relation, but that text is a ClassAd literal, so they
+// arrive as the values they are and not as strings standing in for them -- which is why
+// they are here beside the scalars. Every want below is what the SAME column gives as a
+// plain SELECT (see TestCellValuesAliasedColumnsKeepExactTypes), which is the whole claim:
+// grouping by a column does not change what that column is.
+func TestCellValuesAggregateGroupKeyKinds(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	tbl := dbrpc.DefaultTable
+
+	for _, tc := range []struct {
+		col  string
+		want any
+	}{
+		{"Owner", "alice"},
+		{"Memory", int64(4096)},
+		{"Load", 0.75},
+		{"Wanted", true},
+		{"NoSuchAttr", nil},
+		{"Items", "[1 2 3]"},
+		{"Inner", "[a = 1]"},
+	} {
+		t.Run(tc.col, func(t *testing.T) {
+			_, cells := firstRow(t, ex,
+				"SELECT "+tc.col+", COUNT(*) AS n FROM "+tbl+" GROUP BY "+tc.col)
+			if cells[0] != tc.want {
+				t.Errorf("group key = %#v (%T), want %#v (%T)",
+					cells[0], cells[0], tc.want, tc.want)
+			}
+		})
+	}
+}
+
+// TWO GROUP COLUMNS, so each item has to read ITS OWN position in the group tuple. The two
+// are of different kinds on purpose: a projection that read the tuple off by one would hand
+// the string column the number and still produce a plausible-looking row.
+func TestCellValuesAggregateTwoGroupColumns(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	cols, cells := firstRow(t, ex,
+		"SELECT IntStr, Memory, COUNT(*) AS n FROM "+dbrpc.DefaultTable+" GROUP BY IntStr, Memory")
+	if len(cols) != 3 {
+		t.Fatalf("headers = %q, want three", cols)
+	}
+	if cells[0] != "123" || cells[1] != int64(4096) || cells[2] != int64(1) {
+		t.Errorf("cells = %#v, want [\"123\" 4096 1]", cells)
+	}
+}
+
+// A computed item beside a group key: the group key comes from its value and the expression
+// from its own evaluation, so neither is read out of the other's text.
+func TestCellValuesAggregateComputedItem(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	cols, cells := firstRow(t, ex,
+		`SELECT IntStr, COUNT(*) * 2 AS twice FROM `+dbrpc.DefaultTable+` GROUP BY IntStr`)
+	if len(cols) != 2 {
+		t.Fatalf("headers = %q, want two", cols)
+	}
+	if cells[0] != "123" {
+		t.Errorf("group key = %#v (%T), want the string \"123\"", cells[0], cells[0])
+	}
+	if cells[1] != int64(2) {
+		t.Errorf("computed cell = %#v (%T), want int64(2)", cells[1], cells[1])
+	}
+}
+
+// Two aggregate items may share a header, and an ad holds one attribute of that name. Cells
+// are positional, so a repeated header is typed from the row instead -- the same rule the
+// row-scan path follows, for the same reason.
+func TestCellValuesAggregateRepeatedHeader(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	cols, cells := firstRow(t, ex,
+		`SELECT COUNT(*) AS n, AVG(Memory) AS n FROM `+dbrpc.DefaultTable)
+	if len(cols) != 2 || cols[0] != "n" || cols[1] != "n" {
+		t.Fatalf("headers = %q, want both to be n", cols)
+	}
+	if cells[0] != int64(1) || cells[1] != int64(4096) {
+		t.Errorf("cells = %#v, want [1 4096] -- each cell its own value", cells)
+	}
+}
+
+// A SERVER THAT SENDS TYPED GROUP CELLS answers exactly as one that does not. The fixture
+// above reaches the server over a pipe that advertises nothing, which is the fallback: the
+// group's text is read back into a value by the client. This one advertises the feature, so
+// the group cells arrive as tagged values instead. Both are the same group, and a caller
+// never has to ask which kind of server answered -- so the assertions are the same ones.
+func TestCellValuesAggregateGroupKeysTypedServer(t *testing.T) {
+	ex, done := typedGroupFixture(t)
+	defer done()
+	tbl := dbrpc.DefaultTable
+
+	for _, tc := range []struct {
+		col  string
+		want any
+	}{
+		{"IntStr", "123"},
+		{"BoolStr", "true"},
+		{"Owner", "alice"},
+		{"Memory", int64(4096)},
+		{"Load", 0.75},
+		{"Wanted", true},
+		{"NoSuchAttr", nil},
+		{"Items", "[1 2 3]"},
+		{"Inner", "[a = 1]"},
+	} {
+		t.Run(tc.col, func(t *testing.T) {
+			_, cells := firstRow(t, ex,
+				"SELECT "+tc.col+", COUNT(*) AS n FROM "+tbl+" GROUP BY "+tc.col)
+			if cells[0] != tc.want {
+				t.Errorf("group key = %#v (%T), want %#v (%T)",
+					cells[0], cells[0], tc.want, tc.want)
+			}
+		})
+	}
+}
+
+// AN AGGREGATE'S OWN OUTPUT IS RENDERED TEXT, and this is the gap that leaves. A group key
+// crosses as its faithful text -- a string quoted -- but an aggregate's result crosses as
+// the table would print it, so a string result arrives bare and is read back as whatever
+// its text spells. The built-ins cannot show this: COUNT, SUM, AVG, MIN and MAX produce a
+// number, `undefined` or `error` and nothing else. A user-defined aggregate can, and does.
+func TestCellValuesUserAggregateOutputIsReadAsText(t *testing.T) {
+	registerFirstValue(t)
+	ex, done := cellFixture(t)
+	defer done()
+	tbl := dbrpc.DefaultTable
+
+	_, cells := firstRow(t, ex,
+		"SELECT Owner, firstvalue(IntStr) AS f FROM "+tbl+" GROUP BY Owner")
+	if cells[0] != "alice" {
+		t.Errorf("group key = %#v (%T), want the string \"alice\"", cells[0], cells[0])
+	}
+	// The aggregate returned the STRING "123"; it crossed as the text `123` and reads
+	// back as the number. Closing this needs a typed aggregate cell on the wire.
+	if cells[1] != int64(123) {
+		t.Errorf("aggregate output = %#v (%T), want int64(123) -- an aggregate's output "+
+			"crosses as rendered text, so a string result that spells a number is read "+
+			"back as that number", cells[1], cells[1])
+	}
+}
+
+// SELECT * is unchanged: it carries no projection (its matched ads already are the
+// projection), so every cell comes from the matched ad, exactly as before.
+func TestCellValuesStarReadsMatchedAds(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	r, err := ex.ExecString("SELECT * FROM " + dbrpc.DefaultTable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Projected != nil {
+		t.Fatal("SELECT * carries a projection; this test no longer covers the matched-ad path")
+	}
+	cells := cellValues(r, 0)
+	want := map[string]any{
+		"Owner": "alice", "IntStr": "123", "FloatStr": "3.5", "BoolStr": "true",
+		"UndefStr": "undefined", "ErrStr": "error", "Memory": int64(4096),
+		"Load": 0.75, "Wanted": true,
+	}
+	for j, col := range r.Columns {
+		w, ok := want[col]
+		if !ok {
+			continue
+		}
+		if cells[j] != w {
+			t.Errorf("SELECT * cell %s = %#v (%T), want %#v (%T)", col, cells[j], cells[j], w, w)
+		}
+	}
+}
+
+// Two items may share a header, and the projected ad holds one attribute of that name --
+// the later item's value. Cells are positional, so an ambiguous header is typed from the
+// row instead, which keeps each cell its own value.
+func TestCellValuesAmbiguousHeaderKeepsPerCellValues(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	_, cells := firstRow(t, ex, "SELECT IntStr AS a, Memory AS a FROM "+dbrpc.DefaultTable)
+	if len(cells) != 2 {
+		t.Fatalf("got %d cells, want 2", len(cells))
+	}
+	if cells[0] != int64(123) || cells[1] != int64(4096) {
+		t.Errorf("cells = %#v, want [123 4096]: each cell keeps its own item's value", cells)
+	}
+}
+
+// A header the projection does not carry as an attribute reads as undefined, which is
+// indistinguishable from a column that evaluated to UNDEFINED. Both fall through to the row
+// cell, which is right for either.
+func TestCellValuesUncarriedHeaderFallsThroughToRow(t *testing.T) {
+	proj := classad.New()
+	proj.InsertAttr("kept", 1)
+	r := &repl.Result{
+		IsSelect:  true,
+		Columns:   []string{"kept", "absent"},
+		Rows:      [][]string{{"1", "42"}},
+		Projected: []*classad.ClassAd{proj},
+	}
+	cells := cellValues(r, 0)
+	if cells[0] != int64(1) {
+		t.Errorf("carried cell = %#v, want 1", cells[0])
+	}
+	if cells[1] != int64(42) {
+		t.Errorf("uncarried cell = %#v (%T), want int64(42) from the row cell", cells[1], cells[1])
+	}
+}
+
+// A column that evaluated to UNDEFINED reaches null whichever route it takes: the projected
+// lookup reports undefined, the matched ad has no such attribute, and the display string is
+// "undefined". ERROR is found as a value and renders null too. The two agree on purpose --
+// a reporting client sees one missing cell either way.
+func TestCellValuesUndefinedAndErrorAgreeOnNull(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	tbl := dbrpc.DefaultTable
+	for _, sql := range []string{
+		"SELECT NoSuchAttr AS t FROM " + tbl,
+		"SELECT NoSuchAttr FROM " + tbl,
+		"SELECT Owner + 1 AS t FROM " + tbl,
+	} {
+		_, cells := firstRow(t, ex, sql)
+		if cells[0] != nil {
+			t.Errorf("%s: cell = %#v (%T), want nil", sql, cells[0], cells[0])
+		}
 	}
 }
