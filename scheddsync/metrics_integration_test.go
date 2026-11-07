@@ -201,11 +201,17 @@ func TestJobMetricsIntegration(t *testing.T) {
 			"does not name the same run HTCondor does, so the two tables do not join",
 			RunInstanceAttr, run, got)
 	}
-	// Same run, so the same final numbers. Compared loosely and only for counters BOTH records
-	// carry: the shadow may push one last update between the sample and the epoch write, and the
-	// CPU counters are whole seconds.
+	// Same run, so the same final numbers -- but only for the counters that describe THIS run.
+	// The committed and cumulative families (CommittedTime, CumulativeRemote*Cpu,
+	// RemoteWallClockTime) are not among them: the schedd accrues those into the job ad after
+	// the run ends, and the epoch ad is written before that, so it carries the submit-time 0
+	// however long the run was. Comparing one against a live sample compares two different
+	// moments, not two views of the same one.
+	//
+	// Compared loosely and only for counters BOTH records carry: the shadow may push one last
+	// update between the sample and the epoch write, and the CPU counters are whole seconds.
 	compared := 0
-	for _, a := range []string{"RemoteUserCpu", "RemoteSysCpu", "CommittedTime"} {
+	for _, a := range []string{"RemoteUserCpu", "RemoteSysCpu"} {
 		sv, ok1 := last.EvaluateAttrNumber(a)
 		ev, ok2 := epochs[0].EvaluateAttrNumber(a)
 		if !ok1 || !ok2 {
