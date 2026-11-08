@@ -680,3 +680,82 @@ func TestCellValuesUndefinedAndErrorAgreeOnNull(t *testing.T) {
 		}
 	}
 }
+
+// A UNION's cells are typed exactly too. Its branches are ordinary SELECTs and each hands
+// back the values it evaluated, so the operation carries them on rather than handing the
+// caller the branches' whole matched ads -- which answer the question the scan answered,
+// and for a computed column answer nothing at all.
+//
+// The fixture has one table, so each branch here reads it; what varies is the SELECT, which
+// is what decides the typing. The string that reads as a number is the case that separates
+// a real projection from a lucky parse of the display text.
+func TestCellValuesUnionKeepsExactTypes(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	tbl := dbrpc.DefaultTable
+	both := func(items string) string {
+		return "SELECT " + items + " FROM " + tbl + " UNION ALL SELECT " + items + " FROM " + tbl
+	}
+
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want []any
+	}{
+		{"plain column", both("IntStr"), []any{"123"}},
+		{"two plain columns", both("IntStr, Memory"), []any{"123", int64(4096)}},
+		{"aliased plain column", both("IntStr AS who"), []any{"123"}},
+		{"plain and computed", both("IntStr, Memory * 2 AS d"), []any{"123", int64(8192)}},
+		{"computed only", both("Memory * 2 AS d"), []any{int64(8192)}},
+		{"computed keeps its expression header", both("Memory * 2"), []any{int64(8192)}},
+		{"string result of a computed column", both(`strcat(IntStr, "4") AS t`), []any{"1234"}},
+		{"de-duplicated", "SELECT IntStr FROM " + tbl + " UNION SELECT IntStr FROM " + tbl,
+			[]any{"123"}},
+		{"over aggregates", "SELECT IntStr, COUNT(*) AS n FROM " + tbl + " GROUP BY IntStr " +
+			"UNION ALL SELECT IntStr, COUNT(*) AS n FROM " + tbl + " GROUP BY IntStr",
+			[]any{"123", int64(1)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, cells := firstRow(t, ex, tc.sql)
+			if len(cells) != len(tc.want) {
+				t.Fatalf("got %d cells, want %d", len(cells), len(tc.want))
+			}
+			for j := range tc.want {
+				if cells[j] != tc.want[j] {
+					t.Errorf("cell %d = %#v (%T), want %#v (%T)",
+						j, cells[j], cells[j], tc.want[j], tc.want[j])
+				}
+			}
+		})
+	}
+}
+
+// ORDER BY reorders a UNION's rows, and the typed cells have to move with them. A cell is
+// typed from the ad beside its row, so a sort that moved only the rows would type row i
+// from some other row's values -- and the C API would report a table the REPL never
+// printed.
+func TestCellValuesUnionOrderByStaysWithItsRows(t *testing.T) {
+	ex, done := cellFixture(t)
+	defer done()
+	tbl := dbrpc.DefaultTable
+
+	r, err := ex.ExecString("SELECT Owner, Memory FROM " + tbl +
+		" UNION ALL SELECT IntStr AS Owner, Load AS Memory FROM " + tbl + " ORDER BY Owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(r.Rows))
+	}
+	// "123" sorts before "alice", so the second branch's row comes first.
+	want := [][]any{{"123", 0.75}, {"alice", int64(4096)}}
+	for i := range want {
+		cells := cellValues(r, i)
+		for j := range want[i] {
+			if cells[j] != want[i][j] {
+				t.Errorf("row %d cell %d = %#v (%T), want %#v (%T)",
+					i, j, cells[j], cells[j], want[i][j], want[i][j])
+			}
+		}
+	}
+}

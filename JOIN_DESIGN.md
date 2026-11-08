@@ -16,7 +16,7 @@ planner's main decision. Here is where each one stands.
 | algorithm | applies when | client (`repl`) | store (`db.Join`) |
 |---|---|---|---|
 | **hash join** | the `ON` spine has at least one equality | **done** | **done** |
-| **index-based equi join** | ditto, and the probed side has a built index on the key | **done** (key batching, §6.2) | **done**, awaiting a classad release |
+| **index-based equi join** | ditto, and the probed side has a built index on the key | **done** (key batching, §6.2) | **done**, and reached from a statement |
 | **block nested loops** | no usable equality: non-equi `ON`, `CROSS JOIN` | **declined**; the per-pair allocation it would have masked is fixed instead (§0.5) | **declined** — built, measured flat, backed out (§0.6) |
 
 Three things that table is saying, which are easy to miss:
@@ -30,9 +30,17 @@ Three things that table is saying, which are easy to miss:
   must ask for, which describes the whole table rather than the scan. The store decides from
   three numbers it holds for free — whether an index is **built**, how many rows the hashed
   side holds, and how many segments it spans — and that third number is the one that makes
-  the decision correct rather than plausible. §0.1's own measurement: 23x faster at 16 keys,
-  11x at 32, then **3x slower at 64** and 29x slower at 256, with the crossover predicted by
-  comparing `segments × keys` against the row count and by nothing simpler.
+  the decision correct rather than plausible. With the gate forced off so that every key
+  count actually probes: 23x faster at 16 keys, 11x at 32, then **3x slower at 64** and 29x
+  slower at 256, with the crossover predicted by comparing `segments × keys` against the row
+  count and by nothing simpler. **With the gate live, which is what a statement gets, only
+  the left half of that table is reachable.** Measured end to end through `repl` over dbrpc
+  against 8,192 records in 210 segments, median of six readings per arm: 16.3x faster at 16
+  keys (0.44 ms against 7.19 ms), 9.9x at 32 (0.75 ms against 7.45 ms), and from 64 keys up
+  the gate declines — naming the lookups it would have cost against the records it would have
+  read — and the two arms land within 1% of each other. The win is smaller end to end because
+  a statement pays for the transport and the rendering too; the loss does not appear at all,
+  because the decision is the thing that prevents it.
 - **Block nested loops exists nowhere, and the reasons to want it are now both gone.**
   §0.5 measured the equality-free loop on the client and found its per-pair cost flat across
   a 16x change in working-set size, which is the opposite of what a locality problem looks
@@ -56,11 +64,11 @@ Three things that table is saying, which are easy to miss:
 | `EXPLAIN` over a join | 6 | **done** |
 | `ORDER BY`, `DISTINCT`, `GROUP BY`, aggregates, `HAVING` | 10 | **done** (client-side) |
 | `UNION`, `UNION ALL` over joins | — | **done** (`SETOPS_DESIGN.md`) |
-| `opJoin` (69) + feature advertisement, no probing | 10 | **done**, off by default — see §6.2 |
+| `opJoin` (69) + feature advertisement, no probing | 10 | **done**, taken by default up to the link's crossover — see §6.2 |
 | Window functions / `QUALIFY` over a join | — | refused |
 | `INTERSECT`, `EXCEPT` | — | refused |
 | **Joining more than two tables** | 0.4 | **done** (client-side, left-deep, up to 8) |
-| Index-based equi join inside the store | §0.1 | **done** in classad, awaiting a release |
+| Index-based equi join inside the store | §0.1 | **done**, in `db/v0.38.0` and reached from a statement |
 | `LEFT JOIN` anti-join correctness | 0.4 | **fixed** in both implementations |
 | Block nested loops | 7 | **declined on both sides** — §0.5 for the client, §0.6 for the store |
 | Zone-map block skipping | 7 | **declined** — the ceiling was measured and the index probe already reaches it (§0.6) |
@@ -679,8 +687,8 @@ with this measurement as the reason. A flag rather than deleted code, because th
 be exercised and re-measured as the rest of Phase 3 lands.
 
 *Superseded by the re-measurement below: the 1.4x is gone and the store is faster at every
-expansion factor. The flag is still off, but what it is now waiting on is a link, not an
-estimate.*
+expansion factor. What decides the arm is the link, and the default that follows from it is
+two sections down.*
 
 #### Re-measured once the store's join stopped rendering: the time objection is gone
 
@@ -789,9 +797,85 @@ turns out to be a single threshold that the expansion factor sets:
   above it is still faster at every k measured; below that it inverts, reaching 1.4x slower.
 
 So the honest default is not one flag but a conditional, and **the condition is already
-computable.** The count the previous section added -- the right side's size, for one round trip --
-is exactly `k = right rows / left rows`. The estimate the flag was originally waiting for is the
-same estimate the batching decision already fetches.
+computable.** `k = right rows / left rows`, and the count the previous section added -- the right
+side's size, for one round trip -- is one half of it. The other half is the left side's size,
+which is a count of exactly the same cheap kind. What the batching decision cannot supply is the
+TIMING: it learns its count after the left side has crossed the wire, and a placement decided
+there is decided after the cost it exists to avoid has been paid.
+
+#### The default, and where it is decided
+
+The conditional is what ships. A join's rows are paired in the store when
+
+	joinLinkCrossoverMbps * (k - 1)  <=  the link's capacity in Mbps
+
+and here otherwise, with `k` the expansion factor and `joinLinkCrossoverMbps` 91 — the
+capacity one extra copy of the left side needs before it is worth the CPU the store saves,
+taken from the k=2 cell above: 51,121 extra bytes against a 4.49 ms advantage. For `k <= 1`
+the left-hand side is zero or negative and the store runs whatever the link is, which is the
+first bullet above restated as arithmetic.
+
+**It is a model and not a table lookup**, because the sweep stops at k=8 and a join does not.
+The crossover grows with the extra bytes, which are the left side repeated `k-1` times, so
+the rule is linear in `k-1` and a join at k=32 asks for proportionally more link rather than
+falling off the end of a measured row. Holding the CPU advantage fixed at its k=2 value is
+the conservative reading: the advantage in fact grows with k (4.49 ms at k=2, 9.12 ms at
+k=8), so the rule asks for 637 Mbps at k=8 where the measurement puts the crossover near 390,
+and errs towards pairing here. **The rule picks the faster arm in all sixteen cells of the
+sweep above**, which is the check worth having on it and which
+`TestJoinPlacementModelAgreesWithTheMeasuredSweep` pins.
+
+**The link is a deployment property, so it is configuration**: `ExecConfig.LinkCapacityMbps`,
+named for the link rather than for the join, because what it describes is the connection and
+not the statement. Unstated, it is 500 Mbps. That is an assumption about deployments, stated
+as one, and the shape it buys is that the store takes every join up to about k=6.5 and the
+conditional catches the expanding tail beyond it. A site on a gigabit link raises the number
+and gets the store arm at every k this sweeps; a site that knows its link is worse lowers it,
+and at 10 Mbps only joins that do not expand go to the store.
+
+The sweep has no reading at 500 Mbps — it brackets 100 Mbps and 1 Gbps — so the default rests
+on the model rather than on a measurement at that capacity. That is sound only because the
+model is the conservative side of the agreement above: holding the CPU advantage at its k=2
+value understates it, so the rule declines joins the measurements would have allowed. k=8 is
+the case to watch, since it is the one measured on both sides of the bracket: the store wins
+it at a gigabit and loses it at 100 Mbps, and the default declines it.
+`ExecConfig.ServerSideJoin` and `ExecConfig.JoinPlacement` force an arm outright, in both
+directions, for an operator holding a better number than this computes.
+
+**Where `k` is known is not where the batching decision learns it.** The right side's count is
+the one the batching decision fetches, but that decision runs after the left side has already
+crossed the wire — which is the cost the store arm exists to avoid, so a placement chosen
+there would be chosen too late to act on. The placement is decided before either side is
+read, from two counts of the cheap kind: an O(1) length for a mutable table, a zone-pruned
+count for an archive. The right side's is then reused by the batching decision rather than
+asked for twice, so the arm that pairs here pays one round trip more than it otherwise would
+and the arm that pairs in the store pays two. When either count cannot be had cheaply there
+is no `k`, and a join whose expansion is unknown is paired here, which is the arm that never
+ships more.
+
+**What `k` from two whole-table counts assumes.** It takes the per-left-row expansion to be a
+property of the key relationship rather than of either side's filter, which is the ordinary
+uniformity assumption. It errs in one known direction and not in the other: a constraint on
+the right side can only reduce how many rows match, so a self-filtering right side makes `k`
+an over-estimate and moves the decision towards pairing here. What it does not capture is a
+left side whose join key has few distinct values, where one left row matches far more right
+rows than the ratio of table sizes suggests — that is the NDV §7b still does not have, and it
+is bounded here by the cost of being wrong, which the sweep puts at 1.4x.
+
+**Re-measured at the capacity the default assumes**, median of six readings per arm with the
+arm order flipped between rounds, left=2048, on a machine at load average 10-12:
+
+| k | in the store | client-side | | bytes the server sent |
+|---|---|---|---|---|
+| 0.25 | 12.39 ms (11.55-18.67) | 19.43 ms (19.20-19.71) | 1.57x faster | 43,526 against 107,022 |
+| 1 | 33.54 ms (33.12-35.71) | 39.48 ms (37.90-40.75) | 1.18x faster | 174,030 against 188,402 |
+| 2 | 46.34 ms (43.41-49.32) | 47.01 ms (45.75-54.57) | 1.01x faster | 348,044 against 296,923 |
+| 8 | 156.40 ms (153.57-161.81) | 138.86 ms (134.90-148.56) | **1.13x slower** | 1,392,088 against 948,009 |
+
+The byte counts are identical to the sweep's, which is the fixture identifying itself. The
+directions are identical too, and the magnitudes are smaller at every k — a loaded machine
+compresses a ratio towards 1 in both directions. Which arm the rule picks is unchanged in all
+four cells, and k=2 at this capacity is a tie rather than a win either way.
 
 #### Where the store-side join's time actually goes, and why columnar does not help it yet
 

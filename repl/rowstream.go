@@ -25,6 +25,11 @@ import (
 //
 //   - A window function : ROW_NUMBER and friends rank a row against the others, so no ad
 //     carries the answer.
+//   - A set operation : a UNION's rows come from several SELECTs and may be de-duplicated
+//     against each other, so the result is not any one branch's ads -- and a de-duplicated
+//     one has no ads behind its rows at all. The columns are named by the first branch
+//     while a later branch may spell its own differently, so an evaluator built from the
+//     statement's items would read the wrong attribute off the wrong branch's ad.
 //
 //   - DISTINCT over named columns : de-duplication IS grouping -- `SELECT DISTINCT a, b` is
 //     `GROUP BY a, b` -- so the ads behind it are gone by the time a row exists, and the ones
@@ -41,7 +46,9 @@ func (e *Executor) RowStreamer(st *Statement) ([]string, func(*classad.ClassAd) 
 	if st.Kind != StmtSelect {
 		return nil, nil, fmt.Errorf("only SELECT produces rows")
 	}
-	if len(effectiveGroupBy(st)) > 0 || hasAggregate(st) {
+	// effectiveGroupBy, not st.GroupBy: a DISTINCT is a grouping the statement does not
+	// spell, and its rows reach here as groups rather than as ads.
+	if len(effectiveGroupBy(st)) > 0 || hasAggregate(st) || st.IsSetOp() {
 		return nil, nil, nil
 	}
 	for _, it := range st.Items {

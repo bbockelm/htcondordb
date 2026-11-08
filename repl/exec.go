@@ -63,32 +63,32 @@ type ExecConfig struct {
 	// SyncControl, and reports it is unavailable when both are nil.
 	Retire func(schedd string) error
 
-	// ServerSideJoin asks the store to pair a join's rows, when it advertises that it can.
+	// ServerSideJoin forces the store to pair a join's rows whenever the statement's shape
+	// can be sent at all, whatever the conditional below would have chosen. It is the
+	// long-standing spelling of JoinPlacement: JoinPlacementStore, kept because it is what
+	// existing configurations set; the two are read together and either one forces the store.
 	//
-	// STILL OFF BY DEFAULT, but no longer for the reason it was. It was off because the
-	// store's join ran 1.4x slower end to end at two right rows per left row. That is gone:
-	// the store now reads only the attributes the join uses, carries its rows as the bytes
-	// storage produced rather than as decoded ads, and answers with wire-form rows batched
-	// many per frame instead of one rendered row per frame. Re-measured over the same
-	// statement and store, sweeping the expansion factor k from 0.25 to 8 right rows per left
-	// row, the store is faster at every k -- 1.0x to 1.3x with both arms reading wire rows,
-	// and 1.9x to 5.1x over archives, where the client's side reads come back as rendered
-	// text because an archive has no wire row stream.
-	//
-	// WHAT STILL ARGUES THE OTHER WAY IS BYTES, and only bytes. A joined row carries both
-	// sides, so an expanding join repeats the left ad once per output row: with k right rows
-	// per left row and per-side widths l and r the store ships |L|*k*(l+r) against the
-	// client's |L|*(l + k*r), below 1 exactly when k < 1. That crossover is at k=1 whatever
-	// the widths, and no encoding moves it, because an encoding scales both arms alike.
-	// Measured in the store, the store moves 0.63x the bytes at k=0.25 and 1.36x at k=8.
-	//
-	// So the trade is now 1.0-5x less CPU against up to ~1.36x more bytes, and which wins
-	// depends on the link. The measurement above is over an in-memory pipe, which prices
-	// those bytes at nearly nothing; a bandwidth-constrained link does not. That is a
-	// deployment property rather than a statement property, so it stays a flag -- but the
-	// default should follow whichever side the deployments that matter sit on, and on a local
-	// or well-provisioned link that is the store.
+	// It also skips the handshake check, so it reaches a store that serves the join opcode
+	// without advertising it. A store that refuses the opcode still falls back to pairing
+	// here, so forcing it on cannot fail a statement.
 	ServerSideJoin bool
+
+	// JoinPlacement overrides where a join's rows are paired. The zero value decides per
+	// statement from the expansion factor and the link (see joinplace.go); the other two
+	// force one arm or the other, in both directions, for an operator who has measured their
+	// own deployment and disagrees.
+	JoinPlacement JoinPlacement
+
+	// LinkCapacityMbps is how much bandwidth this session's connection to the store has, in
+	// megabits per second. It describes the LINK, not the join: it is the one input the
+	// placement decision cannot learn by asking the store, because it is a property of the
+	// deployment rather than of the statement or the data.
+	//
+	// Zero means unstated, and an unstated link is assumed to carry
+	// defaultLinkCapacityMbps. Raising it moves the placement decision towards the store,
+	// which is faster but ships more whenever a join expands; the reasoning, and what each
+	// capacity was measured to do, is in joinplace.go.
+	LinkCapacityMbps int
 }
 
 // WriteKind identifies a mutation in a write batch.
@@ -120,8 +120,19 @@ type Executor struct {
 	resync     func(target string) error
 	syncCtl    func(action, target string, args []string) (string, error)
 	retire     func(schedd string) error
-	// serverJoin opts into asking the store to pair a join (see ExecConfig.ServerSideJoin).
+	// serverJoin forces a join into the store (see ExecConfig.ServerSideJoin), placement
+	// overrides the per-statement decision (ExecConfig.JoinPlacement), and linkMbps is the
+	// capacity that decision prices the extra bytes against (ExecConfig.LinkCapacityMbps).
 	serverJoin bool
+	placement  JoinPlacement
+	linkMbps   int
+
+	// rowCounts memoizes the cheap whole-table row counts one statement asks for, so the
+	// placement decision and the key-batch decision that follows it do not each pay a round
+	// trip for the same number. Held for one statement only -- execJoin installs it and
+	// clears it -- because a count is a fact about the store at a moment, not a fact about
+	// the table.
+	rowCounts map[string]int
 
 	// dialect selects how a predicate's expressions are read: as ClassAd expressions (the
 	// default and the historical behaviour) or lowered from ANSI SQL as the Flight SQL
@@ -226,7 +237,7 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps}
 }
 
 // SyncControl sends one DBSyncControl request to the daemon (see ExecConfig.SyncControl).
@@ -1826,6 +1837,9 @@ func (e *Executor) archiveAggregateColRows(table, where string, groups []dbrpc.G
 // whether to scan a whole history table is worse than not deciding at all. Any error at all
 // reports not-known, so an older server simply leaves the caller with its prior behavior.
 func (e *Executor) cheapRowCount(table string) (int, bool) {
+	if n, ok := e.rowCounts[table]; ok {
+		return n, true
+	}
 	aggs := []dbrpc.AggSpec{{Func: dbrpc.AggCount, Arg: "*"}}
 	var rows []dbrpc.AggRow
 	var err error
@@ -1840,6 +1854,9 @@ func (e *Executor) cheapRowCount(table string) (int, bool) {
 	n, cerr := strconv.Atoi(rows[0].Values[0])
 	if cerr != nil || n < 0 {
 		return 0, false
+	}
+	if e.rowCounts != nil {
+		e.rowCounts[table] = n
 	}
 	return n, true
 }
@@ -2412,10 +2429,10 @@ func sortRows(res *Result, terms []OrderTerm) error {
 		idxs[k] = idx
 	}
 	// Sorted as a permutation rather than in place, because the rows are not the only
-	// thing in row order: a result that carries projected ads carries one PER ROW, and a
-	// sort that moved only the rows would hand the ad-shaped formats another row's values
-	// under this row's columns -- a wrong answer that no column count or length check
-	// would catch.
+	// thing in row order: a result that carries projected ads or matched ads carries one
+	// PER ROW, and a sort that moved only the rows would hand the ad-shaped formats and
+	// the cursor another row's values under this row's columns -- a wrong answer that no
+	// column count or length check would catch.
 	order := make([]int, len(res.Rows))
 	for i := range order {
 		order[i] = i
@@ -2438,14 +2455,22 @@ func sortRows(res *Result, terms []OrderTerm) error {
 		rows[i] = res.Rows[from]
 	}
 	res.Rows = rows
-	if len(res.Projected) == len(order) {
-		ads := make([]*classad.ClassAd, len(order))
-		for i, from := range order {
-			ads[i] = res.Projected[from]
-		}
-		res.Projected = ads
-	}
+	res.Projected = permuteAds(res.Projected, order)
+	res.Ads = permuteAds(res.Ads, order)
 	return nil
+}
+
+// permuteAds reorders a per-row ad slice to match a sorted row order, leaving a slice that
+// is not per-row -- a nil one, or one of another length -- alone.
+func permuteAds(ads []*classad.ClassAd, order []int) []*classad.ClassAd {
+	if len(ads) != len(order) {
+		return ads
+	}
+	out := make([]*classad.ClassAd, len(order))
+	for i, from := range order {
+		out[i] = ads[from]
+	}
+	return out
 }
 
 func columnIndex(cols []string, name string) int {
