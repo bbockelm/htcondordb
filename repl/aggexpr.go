@@ -208,6 +208,21 @@ func (p *aggProjector) project(group []string, groupVals []classad.Value, values
 	return row, ad
 }
 
+// groupLabel renders a value as a group LABEL: the key a client-side grouping path groups
+// on, in the same spelling the store's own group keys arrive in.
+//
+// It is v.String(), not valueDisplay, and the difference is the whole point. A label decides
+// which rows are one row of the answer, so it has to tell apart the values that print alike:
+// a string arrives quoted, which keeps the string "4" out of the group of the number 4 and
+// the string "true" out of the group of the boolean. Every other kind renders identically
+// either way, so a number, a bool, undefined, error, a list and a nested ad all label exactly
+// as they display.
+//
+// groupDisplay takes the quotes back off for the output cell, and setLiteral reads the label
+// back as the value it names when a projected expression or a HAVING reads a group column by
+// name -- so one faithful spelling serves the grouping, the cell and the scope.
+func groupLabel(v classad.Value) string { return v.String() }
+
 // groupDisplay turns a group label into an output cell.
 //
 // A group label is FAITHFUL: it is the key the store grouped on as well as the name it

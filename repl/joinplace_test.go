@@ -73,7 +73,7 @@ func newPlacementFixture(t testing.TB, leftRows, rightRows int, cfgs ...ExecConf
 		go func() {
 			_ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{
 				Privileged: true,
-				QueryLog:   func(q dbrpc.QueryLog) { ops.add(q.Op) },
+				QueryLog:   func(q dbrpc.QueryLog) { ops.addLog(q) },
 			})
 		}()
 		c := dbrpc.NewClient(dbrpc.NewStreamConn(cp), dbrpc.WithPeerSessionAttrs(s.SessionAttrs()))

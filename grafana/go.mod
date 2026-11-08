@@ -8,8 +8,8 @@ go 1.26.5
 toolchain go1.27.0
 
 require (
-	github.com/PelicanPlatform/classad v0.38.0
-	github.com/PelicanPlatform/classad/dbrpc v0.38.0
+	github.com/PelicanPlatform/classad v0.38.1
+	github.com/PelicanPlatform/classad/dbrpc v0.38.1
 	github.com/apache/arrow-go/v18 v18.8.0
 	github.com/bbockelm/cedar v0.7.12
 	github.com/bbockelm/golang-htcondor v0.21.0

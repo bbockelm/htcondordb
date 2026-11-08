@@ -105,7 +105,7 @@ func newProbeFixture(t testing.TB, leftKeys, rightRows int, indexed bool) *probe
 	go func() {
 		_ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{
 			Privileged: true,
-			QueryLog:   func(q dbrpc.QueryLog) { ops.add(q.Op) },
+			QueryLog:   func(q dbrpc.QueryLog) { ops.addLog(q) },
 		})
 	}()
 	c := dbrpc.NewClient(dbrpc.NewStreamConn(cp), dbrpc.WithPeerSessionAttrs(s.SessionAttrs()))

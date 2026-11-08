@@ -12,15 +12,17 @@ import (
 //
 // It returns (nil, nil, nil) -- not an error -- when the statement's rows cannot be produced
 // from matched ads alone, in which case the caller must run Exec and read Result.Rows instead.
-// Three shapes are like that, and the reason is the same each time: the row is a property of
+// Four shapes are like that, and the reason is the same each time: the row is a property of
 // the result set rather than of any one ad.
 //
 //   - SELECT * : the header is the union of every matched ad's attributes (starColumns), so it
 //     is not known until the last ad has been seen. Streaming it would mean a column list that
 //     grows underneath the caller.
+//
 //   - An aggregate or GROUP BY : rows are synthesized from group tuples. The ads StreamSelect
 //     yields for those are themselves synthesized, and evaluating COUNT(*) against one is
 //     meaningless.
+//
 //   - A window function : ROW_NUMBER and friends rank a row against the others, so no ad
 //     carries the answer.
 //   - A set operation : a UNION's rows come from several SELECTs and may be de-duplicated
@@ -29,16 +31,24 @@ import (
 //     while a later branch may spell its own differently, so an evaluator built from the
 //     statement's items would read the wrong attribute off the wrong branch's ad.
 //
-// ORDER BY and DISTINCT are deliberately absent from that list. Both need the whole result
-// before the first row is correct, but their rows still come from ads, so StreamSelect
-// collects internally and delivers through the same path. The caller gets identical values
-// either way and only the memory differs -- which is exactly the distinction that should not
-// leak into a public API.
+//   - DISTINCT over named columns : de-duplication IS grouping -- `SELECT DISTINCT a, b` is
+//     `GROUP BY a, b` -- so the ads behind it are gone by the time a row exists, and the ones
+//     StreamSelect yields are synthesized from the groups. Evaluating `Used * 2` against one
+//     of those reads undefined, because the ad holds the result under the column's name and
+//     no longer holds Used at all.
+//
+// ORDER BY is deliberately absent from that list. It needs the whole result before the first
+// row is correct, but its rows still come from ads -- the matched ones, reordered -- so
+// StreamSelect collects internally and delivers through the same path. The caller gets
+// identical values either way and only the memory differs, which is exactly the distinction
+// that should not leak into a public API.
 func (e *Executor) RowStreamer(st *Statement) ([]string, func(*classad.ClassAd) []classad.Value, error) {
 	if st.Kind != StmtSelect {
 		return nil, nil, fmt.Errorf("only SELECT produces rows")
 	}
-	if len(st.GroupBy) > 0 || hasAggregate(st) || st.IsSetOp() {
+	// effectiveGroupBy, not st.GroupBy: a DISTINCT is a grouping the statement does not
+	// spell, and its rows reach here as groups rather than as ads.
+	if len(effectiveGroupBy(st)) > 0 || hasAggregate(st) || st.IsSetOp() {
 		return nil, nil, nil
 	}
 	for _, it := range st.Items {

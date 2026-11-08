@@ -62,8 +62,25 @@ const (
 	// into this process.
 	maxJoinSideRows = 500000
 	// maxJoinKeyBatch caps how many left-side key values are folded into the right side's
-	// membership constraint. Past it the constraint would be longer than the scan it saves.
-	maxJoinKeyBatch = 512
+	// membership constraint. It is a CORRECTNESS guard rail and no longer a cost decision:
+	// whether a constraint is worth what it costs is a trade between the key count and the
+	// right table, which joinbatch.go prices and which no constant in the key count alone can
+	// answer.
+	//
+	// What it bounds instead is how deeply the constraint nests. The terms are joined with
+	// `||`, so an n-value constraint is an expression nested n deep, and the evaluator stops
+	// recursing at a fixed depth -- measured here at 1,998 terms, where 1,997 answers
+	// correctly and 1,998 answers with no rows at all. That failure is SILENT: too deep is
+	// not an error, it is a predicate that matches nothing, so a join past the limit returns
+	// an empty result rather than a complaint. Nothing about this is specific to a join -- a
+	// hand-written WHERE of the same shape does the same -- but a join is the one place that
+	// builds a predicate of unbounded length without a person looking at it.
+	//
+	// 1024 is half the measured limit, which leaves room for whatever the plan wraps around
+	// the constraint: a side that carries its own predicate is ANDed with this one, and the
+	// statement's own conjuncts nest further still. It is also twice the cost-based cap it
+	// replaces, and the key counts between the two are measured to pay (see JOIN_DESIGN.md).
+	maxJoinKeyBatch = 1024
 	// maxJoinOutputRows caps the rows a join may produce. The result is materialized here
 	// to be sorted and rendered, so an unbounded one is an out-of-memory, not a slow query.
 	// It bounds every INTERMEDIATE result too, not only the last one: a chain of joins can
@@ -976,8 +993,12 @@ func (e *Executor) runJoinPipeline(st *Statement, p *joinPlan) ([]*classad.Class
 		// Whether that is cheaper than reading the whole table depends on how big the whole
 		// table is, which is what decideKeyBatch weighs. It applies at every step, because
 		// a step's input is a composite row either way.
-		if d := e.decideKeyBatch(step, side, rows); d.constraint != "" {
+		d := e.decideKeyBatch(step, side, rows)
+		if d.batching() {
 			side.where = andText(side.where, d.constraint)
+		}
+		if e.explain != nil {
+			e.explain.keyBatch = append(e.explain.keyBatch, d.why)
 		}
 		ads, ferr := e.fetchJoinSide(st, side, step.side)
 		if ferr != nil {
@@ -1284,59 +1305,6 @@ func (step *joinStep) batchConstraintFor(lits []string) string {
 		terms[i] = step.batchAttr + " == " + l
 	}
 	return "(" + strings.Join(terms, " || ") + ")"
-}
-
-// minRightRowsPerKey is how many rows the right side must hold per left-side key before
-// narrowing its scan to those keys is worth the constraint's own cost.
-//
-// The constraint is not free: its cost grows with the key count, while the scan it avoids
-// grows with the right table's size, so whether it pays is a trade between two quantities
-// and not a property of either alone. Measured at 400 keys, batching cost 4.0x MORE against
-// a 1,024-row right table and 1.5x more at 4,096 rows, broke even around 8,000, and was 2.0x
-// better at 16,384 and 8.0x better at 65,536 -- break-even near 20 rows per key.
-//
-// A var rather than a const so a test can move it, and so a site whose data disagrees with
-// the fixture this was measured on has somewhere to change it. The figure is one shape's
-// break-even, not a law.
-var minRightRowsPerKey = 20
-
-// keyBatchDecision is why the join did or did not narrow the right side's scan, so EXPLAIN
-// can say which and on what basis.
-type keyBatchDecision struct {
-	constraint string // "" = not batching
-	keys       int
-	rightRows  int
-	knownRows  bool // false = the right side's size could not be learned cheaply
-}
-
-// decideKeyBatch chooses whether to narrow the right side's scan to the left side's keys.
-//
-// Knowing the key count is only half the trade; the other half is how many rows the
-// unbatched scan would read. That number is on the server, so it is asked for only when the
-// answer can change the decision -- there is something to batch on, and the right side
-// carries no constraint of its own, which would make a whole-table count an overestimate of
-// what the scan actually reads. When it cannot be learned cheaply the decision falls back to
-// the key count alone, which is what this did before the cost was measured.
-func (e *Executor) decideKeyBatch(step *joinStep, side joinSide, rows []joinTuple) keyBatchDecision {
-	lits := step.keyLiterals(rows)
-	d := keyBatchDecision{keys: len(lits)}
-	if len(lits) == 0 {
-		return d
-	}
-	if side.where != "" {
-		// This side already filters itself, so its whole-table count would overstate the
-		// scan being avoided. Keep the pre-measurement behavior rather than decide on a
-		// number that does not describe this plan.
-		d.constraint = step.batchConstraintFor(lits)
-		return d
-	}
-	n, ok := e.cheapRowCount(side.ref.Table)
-	d.rightRows, d.knownRows = n, ok
-	if ok && n < len(lits)*minRightRowsPerKey {
-		return d // the scan this would avoid is smaller than the constraint costs
-	}
-	d.constraint = step.batchConstraintFor(lits)
-	return d
 }
 
 // literalOf renders a scalar value as the ClassAd literal naming it, for the membership
@@ -1656,10 +1624,17 @@ func (e *Executor) describeJoinPlan(st *Statement) []string {
 		if step.batchAttr != "" {
 			// The decision needs the keys the rows so far actually hold, which EXPLAIN
 			// without ANALYZE has not read, so this reports what is available to batch on
-			// and the rule that will be applied to it rather than the outcome.
+			// and the rule that will be applied to it rather than the outcome. What it CAN
+			// state outright is the statistic the rule will weigh those keys against, since
+			// NDV comes from index metadata and needs no row read -- and a plan that rests
+			// on an estimate reads exactly like one that rests on a count unless the plan
+			// says which it had.
 			out = append(out, fmt.Sprintf("  key batching: %s.%s can be narrowed to the keys "+
-				"of the rows so far (at most %d, and only if %s holds at least %d row(s) per key)",
-				s.ref.Alias, step.batchAttr, maxJoinKeyBatch, s.ref.Alias, minRightRowsPerKey))
+				"of the rows so far (at most %d), when skipping the rest of %s saves more than "+
+				"the constraint costs (about %d row(s) of scan per key up to %d keys, more past it)",
+				s.ref.Alias, step.batchAttr, maxJoinKeyBatch, s.ref.Alias,
+				minRightRowsPerKey, keyProbeLinearKeys))
+			out = append(out, "    "+e.describeKeyNDV(s, step))
 		}
 	}
 	out = append(out, fmt.Sprintf("after the last join: %d post-filter term(s)", len(p.post)))

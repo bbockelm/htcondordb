@@ -981,6 +981,124 @@ measurement, and conflating the two would risk a regression to chase an improvem
 `minRightRowsPerKey` is a `var`, not a `const`: one fixture's break-even is not a law, and a
 site whose data disagrees needs somewhere to change it.
 
+#### The other direction, priced: NDV, and what the cap was really holding back
+
+The section above prices the regime where batching is wrongly CHOSEN and leaves the other
+direction alone: `maxJoinKeyBatch` forbidding a win still worth 8x at the cap, which it calls a
+separate question needing its own measurement. This is that measurement, and it answers a
+different question than the one it asks.
+
+**The constant it leaves in place.** The cap is a flat refusal: past 512 distinct key values
+`keyLiterals` yields nothing and the right side is scanned whole, whatever it holds. It is the
+only cost input in the key count, and the key count is the one variable a client can see --
+which is the mispricing §6.2 names, a curve in two variables decided by a constant in one of
+them.
+
+**What NDV adds that two row counts cannot.** Both sweeps above hold one thing fixed that is
+not fixed in general: how much of the right table the keys select. The fixture repeats each key
+twice, so 400 keys really do select 800 rows and the batched arm really does read a slice. A
+right side whose join key has FEW DISTINCT VALUES inverts that -- 400 keys against an attribute
+with 10 distinct values select the whole table -- and the batched arm then reads everything the
+unbatched arm reads AND pays the constraint on top. The ratio of the two tables' sizes is
+identical in both cases, so no rule built on it can tell them apart. `Catalog.AttrNDV` can,
+from per-segment index summaries, without reading a record.
+
+**The rule**, with `keys` measured (the left side is already read, so its distinct count is a
+fact) and the other two asked of the store:
+
+	probe reads   ~ rightRows * min(1, keys / ndv)
+	scan avoided  = rightRows - probe reads
+	the constraint costs  minRightRowsPerKey * keys, superlinearly past keyProbeLinearKeys
+
+and batching pays when what it avoids covers what it costs. **With no NDV the probe's read is
+taken as zero, which collapses the rule to `rightRows >= keys * minRightRowsPerKey` -- the
+decision that shipped, down to the comparison.** The NDV term appears on the benefit side and
+nowhere else, so consulting it can only DECLINE a narrowing the old rule would have made and
+can never make one it would have declined. A wrong NDV costs a missed win; it cannot produce
+the 4x pessimization the sweep found at the small end.
+
+**What each accuracy class is worth here.** NDV sits in a denominator, so the rule needs a
+LOWER bound on it; a reading that can only be too low is already one, and a reading that can be
+too high is not a bound at all until it is brought down. Exact and low-bounded readings are
+taken as reported. High-bounded readings and estimates bounded in neither direction are taken
+at half, which is what the two measured worst cases ask for from both directions at once: an
+index behind the writes reads about 50% low, and one still posting superseded record versions
+reads about 96% high, and 1/1.96 is 0.51. `RelErr` is deliberately not used to size that,
+because an answer that is unbounded for three reasons carries only the sketch's 3% and says
+nothing about the other two. An attribute no index covers answers "not known", which is left
+out of the rule rather than guessed at -- and is kept distinct from a count of ONE, which is
+the degenerate key whose every row matches and where narrowing is worthless. A reported count
+of zero means no record posted a keyable value, so there is nothing to reason from.
+
+**The rule picks the faster arm in all nine cells of the two sweeps above**, with NDV and
+without it, which is the check worth having on it and which
+`TestKeyBatchModelAgreesWithTheMeasuredSweep` pins.
+
+**But the cap is not raised, because it was holding back something other than cost.** The
+terms are joined with `||`, so an n-value constraint is an expression nested n deep, and the
+evaluator stops recursing at a fixed depth. Measured against this store: a 1,997-term
+constraint answers correctly and a 1,998-term one returns NO ROWS. The failure is silent --
+too deep is not an error, it is a predicate that matches nothing -- so a join past the limit
+answers an empty result to a statement with thousands of keys, and nothing anywhere says why.
+Nothing about this is specific to a join; a hand-written `WHERE` of the same shape does the
+same thing, and `SELECT ... WHERE (ClusterId == 1 || ... )` was confirmed to do it with no join
+in the statement at all. A join is simply the one place that builds a predicate of unbounded
+length with nobody reading it.
+
+So `maxJoinKeyBatch` stays, at 1024, and stops being a cost decision: it is a correctness
+guard rail at half the measured limit, leaving ~970 levels of nesting for whatever the plan
+wraps around the constraint. The cost decision is the rule above, and between 512 and 1024 keys
+it now decides what the constant used to refuse.
+
+**Measured past the old cap**, against a 131,072-row right side (65,536 clusters, two epoch
+rows each), both arms in one binary, arm order flipped between rounds, median of six readings
+per arm with min-max, on a machine at load average 3.9-8.0:
+
+| left keys | batched | unbatched | batching is | the rule says |
+|---|---|---|---|---|
+| 256 | 15.5 ms (15.2-15.9) | 193.9 ms (191.9-211.5) | **12.5x better** | narrow |
+| 512 | 43.5 ms (42.6-46.7) | 196.2 ms (192.2-201.6) | **4.5x better** | narrow |
+| 1,024 | 126.3 ms (123.2-145.6) | 206.5 ms (197.8-215.7) | **1.6x better** | narrow |
+
+1,024 keys is twice what the cap allowed and is still 1.6x better, so the win the cap forbade
+is now measured rather than extrapolated. What is charged: both arms fetch whole ads in process
+through the same planner, and the only difference is whether the constraint is applied. What is
+not: no wire, no cold read, and no key count above 1,024, which is unreachable for the reason
+above rather than uninteresting.
+
+**One disagreement, recorded and acted on only where it is safe to.** Break-even per key is not
+the same on this fixture as on the one `minRightRowsPerKey` was fitted to. The 16,384-row sweep
+implies an unbatched scan costing about 5.7 microseconds per row; at 131,072 rows it costs about
+1.5, because a larger scan amortizes better -- and break-even in ROWS scales inversely with that
+rate. So the measured break-even here is near 10,500 rows at 256 keys, 29,000 at 512 and 80,000
+at 1,024, where the linear figure asks for 5,120, 10,240 and 27,000: it under-charges by 2.0x,
+2.8x and 3.0x. The rows-per-key figure is therefore not a constant of the data; it is a function
+of the scan it is being compared against.
+
+The DIRECTION is right in every cell measured here and in all nine above -- rule and clock agree
+on which arm wins -- so no measured cell contradicts anything in this document. What the
+disagreement bears on is the band this change opens. `minRightRowsPerKey` is left exactly where
+it is, because moving a number the shipped measurements were taken against on the strength of a
+second fixture is how a document ends up with two numbers and no reading. But the band above 512
+keys is charged at the measured curve instead of at the linear extrapolation, because a plan the
+cap used to refuse and the rule now permits has to be better than the refusal, and at 1,024 keys
+the extrapolation would license narrowing against a 27,000-row right side where the clock says
+80,000 is break-even -- about 3x worse than scanning. The step between the two charges at 512
+keys is the two measurements disagreeing, left visible rather than smoothed, because smoothing
+it means picking one.
+
+Both exponents agree even though the break-evens do not: 1.43 fitted on the first sweep, 1.47 on
+this one.
+
+**Where the statistic comes from, and where it does not.** `Catalog.AttrNDV` is in-process. No
+dbrpc opcode carries NDV, so a session reaching a store over a connection has no way to ask and
+takes the absent path -- which is today's decision exactly, which is why absence had to collapse
+cleanly. `ExecConfig.AttrNDV` is where a session that holds the catalog supplies it. The
+alternative on the wire, `COUNT(DISTINCT)`, is a scan, and a planning decision that scans the
+table it is deciding whether to scan is worse than not deciding. Putting NDV on the wire is the
+next step, and it is the same shape §7b argues for: the decision belongs where the statistics
+are.
+
 ## 7. Block-looping and zone-map block skipping
 
 > **Status: both halves of this section were measured and declined. See §0.6.** The block
@@ -1179,20 +1297,24 @@ will actually need costs, in rough order of what they are worth:
 4. **Hash vs indexed nested loop vs block-nested loop**, which is only decidable with an
    estimate of how many right-side rows a left row will probe.
 5. **Whether to key-batch at all**, which §6.2 measures as a two-variable trade (key count
-   against right-table size) currently decided by a constant in one of them. This is the
-   first of these decisions with a measured cost curve, so it is the natural first customer
-   for a real estimator.
+   against right-table size). This is the first of these decisions with a measured cost curve,
+   so it is the first customer for a real estimator, and it is priced rather than capped --
+   see §6.2, "The other direction, priced". `maxJoinKeyBatch` survives it as a correctness
+   bound on how deeply the constraint may nest, which is a different question from cost.
 
 **What exists.** `planFrac`, `estimateCandidates` and `conjunctSelectivity` already give
 per-side selectivity, with the independence assumption deliberately damped rather than
 multiplied raw. The equi-depth value-index histogram gives distribution. Zone maps give
 ranges.
 
-**What is missing is NDV** -- the number of distinct values of a join key. The standard
-join-cardinality estimate is `|L| * |R| / max(ndv(L.k), ndv(R.k))`, and nothing in the
-store reports NDV today. The equi-depth histogram is the natural place to derive it, and it
-is worth noting that the degenerate-hash refusal above is exactly an NDV failure caught at
-run time instead of at plan time.
+**NDV** -- the number of distinct values of a join key -- is what the standard
+join-cardinality estimate `|L| * |R| / max(ndv(L.k), ndv(R.k))` sits on. `Catalog.AttrNDV`
+reports it from per-segment index summaries, with an accuracy class and an error direction,
+and the key-batch decision (§6.2) is its first consumer. It is in-process only: no dbrpc
+opcode carries it, so a session over a connection has none and falls back to the rule that
+preceded it. It is worth noting that the degenerate-hash refusal above is exactly an NDV
+failure caught at run time instead of at plan time, and that NDV sitting in a DENOMINATOR is
+why a planner needs the accuracy class and not only the number.
 
 Two things specific to this store are worth building the planner around rather than
 retrofitting:
