@@ -288,7 +288,10 @@ func TestExplainSaysWhichJoinPath(t *testing.T) {
 	if !strings.Contains(render(sres), "executed in the store") {
 		t.Errorf("EXPLAIN against an advertising server does not say the store runs it:\n%s", render(sres))
 	}
-	if !strings.Contains(render(cres), "not enabled") {
+	// The non-advertising peer's reason is the handshake, which is the one a reader most
+	// needs told apart from "the statement could not be sent": it is fixed by upgrading the
+	// server, not by rewriting the query.
+	if !strings.Contains(render(cres), "does not advertise a server-side join") {
 		t.Errorf("EXPLAIN against an executor with the server-side join off does not say why it "+
 			"runs here:\n%s", render(cres))
 	}
