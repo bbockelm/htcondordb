@@ -119,6 +119,12 @@ type SelfTestReport struct {
 	Escape Escape
 }
 
+// selfTestTransports is what the in-process sweep measures: the same set a client sweep does,
+// since the point is to compare the two.
+func selfTestTransports() []Transport {
+	return []Transport{TextWhole, TextProjected, Wire, WireRefs, Values}
+}
+
 // SelfTestArchive runs the sweep in process against an archive table.
 func SelfTestArchive(t *db.ArchiveTable, spec SelfTestSpec) SelfTestReport {
 	if spec.Iterations < 1 {
@@ -153,7 +159,7 @@ func SelfTestArchive(t *db.ArchiveTable, spec SelfTestSpec) SelfTestReport {
 		}
 	}
 
-	for _, tr := range []Transport{TextWhole, TextProjected, Wire, Values} {
+	for _, tr := range selfTestTransports() {
 		for _, limit := range spec.Limits {
 			rep.Samples = append(rep.Samples, selfTestCell(t, spec, tr, limit))
 		}
@@ -257,6 +263,28 @@ func selfTestOnce(t *db.ArchiveTable, spec SelfTestSpec, tr Transport, limit int
 				if cerr := consumeRawAd(ad); cerr != nil {
 					return rows, bytes, cerr
 				}
+			}
+			if stop() {
+				break
+			}
+		}
+	case WireRefs:
+		// The reference-chasing wire projection, which is what TextProjected is in the stored
+		// form; Wire below is the cheaper subset. Comparing TextProjected against Wire would
+		// charge one arm for a closure the other was not asked to produce.
+		seq, serr := t.QueryRawWireRefs(spec.Constraint, spec.Projection, false)
+		if serr != nil {
+			return 0, 0, serr
+		}
+		for row := range seq {
+			rows++
+			bytes += int64(len(row))
+			if consume {
+				node, derr := wire.DecodeInline(row)
+				if derr != nil {
+					return rows, bytes, fmt.Errorf("decoding a wire row: %w", derr)
+				}
+				sink = classad.FromAST(node)
 			}
 			if stop() {
 				break
