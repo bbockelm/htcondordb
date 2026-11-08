@@ -305,18 +305,24 @@ func TestJoinPlacementModelAgreesWithTheMeasuredSweep(t *testing.T) {
 }
 
 // The assumed link is an assumption, and the shape of the default is what it buys: the store
-// arm for every join up to roughly k=2, which is most of them.
-func TestDefaultLinkCapacityAcceptsExpansionUpToTwo(t *testing.T) {
+// arm for every join up to about k=6.5, and the conditional for the expanding tail past it.
+//
+// k=8 is the boundary worth pinning, because it is the one the sweep measured on both sides:
+// the store wins it at a gigabit and loses it at 100 Mbps. The default must decline it, since
+// nothing measured says a 500 Mbps link carries it.
+func TestDefaultLinkCapacityAcceptsExpansionPastSix(t *testing.T) {
 	accepts := func(k float64) bool {
 		return joinLinkCrossoverMbps*(k-1) <= float64(defaultLinkCapacityMbps)
 	}
-	if !accepts(2) {
-		t.Errorf("the assumed %d Mbps link declines k=2, which it was measured to win at",
-			defaultLinkCapacityMbps)
+	for _, k := range []float64{0.25, 1, 2, 6} {
+		if !accepts(k) {
+			t.Errorf("the assumed %d Mbps link declines k=%g, which it carries",
+				defaultLinkCapacityMbps, k)
+		}
 	}
-	if accepts(3) {
-		t.Errorf("the assumed %d Mbps link accepts k=3, which is past where the bytes it "+
-			"ships were measured to be worth the CPU it saves", defaultLinkCapacityMbps)
+	if accepts(8) {
+		t.Errorf("the assumed %d Mbps link accepts k=8, which the sweep measured as a loss "+
+			"below a gigabit", defaultLinkCapacityMbps)
 	}
 }
 
@@ -362,8 +368,11 @@ func TestExplainShowsTheJoinPlacementArithmetic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The capacity comes from the constant rather than from a literal, so raising the
+	// assumed link cannot leave this assertion pinning a number the code no longer prints.
 	for _, want := range []string{"executed client-side", "k=8.00", "512 row(s) in righttab",
-		"64 in lefttab", "637 Mbps", "the link carries 100"} {
+		"64 in lefttab", "637 Mbps",
+		fmt.Sprintf("the link carries %d", defaultLinkCapacityMbps)} {
 		if !strings.Contains(render(res), want) {
 			t.Errorf("EXPLAIN does not report %q:\n%s", want, render(res))
 		}

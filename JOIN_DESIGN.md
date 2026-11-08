@@ -827,12 +827,18 @@ sweep above**, which is the check worth having on it and which
 
 **The link is a deployment property, so it is configuration**: `ExecConfig.LinkCapacityMbps`,
 named for the link rather than for the join, because what it describes is the connection and
-not the statement. Unstated, it is 100 Mbps. That is an assumption about deployments — that a
-connection to a store carries at least 100 Mbps, with a gigabit a reasonable expectation —
-stated as one, and the shape it buys is that the store takes every join up to about k=2 and
-the conditional catches the expanding tail beyond it. A site on a gigabit link raises the
-number and gets the store arm at every k this sweeps; a site that knows its link is worse
-lowers it, and at 10 Mbps only joins that do not expand go to the store.
+not the statement. Unstated, it is 500 Mbps. That is an assumption about deployments, stated
+as one, and the shape it buys is that the store takes every join up to about k=6.5 and the
+conditional catches the expanding tail beyond it. A site on a gigabit link raises the number
+and gets the store arm at every k this sweeps; a site that knows its link is worse lowers it,
+and at 10 Mbps only joins that do not expand go to the store.
+
+The sweep has no reading at 500 Mbps — it brackets 100 Mbps and 1 Gbps — so the default rests
+on the model rather than on a measurement at that capacity. That is sound only because the
+model is the conservative side of the agreement above: holding the CPU advantage at its k=2
+value understates it, so the rule declines joins the measurements would have allowed. k=8 is
+the case to watch, since it is the one measured on both sides of the bracket: the store wins
+it at a gigabit and loses it at 100 Mbps, and the default declines it.
 `ExecConfig.ServerSideJoin` and `ExecConfig.JoinPlacement` force an arm outright, in both
 directions, for an operator holding a better number than this computes.
 
