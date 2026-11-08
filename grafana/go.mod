@@ -19,8 +19,8 @@ require (
 
 require (
 	github.com/BurntSushi/toml v1.6.0 // indirect
-	github.com/PelicanPlatform/classad/collections v0.38.0 // indirect
-	github.com/PelicanPlatform/classad/db v0.38.0 // indirect
+	github.com/PelicanPlatform/classad/collections v0.38.1 // indirect
+	github.com/PelicanPlatform/classad/db v0.38.1 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.29.0 // indirect
 	github.com/bbockelm/gosssd v0.0.4 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
