@@ -102,6 +102,21 @@ arrow subcommand:
   ipc.open_stream. A report of what got no column, and of any value altered
   or nulled to fit one, goes to stderr so it cannot corrupt the stream.
 
+function subcommand:
+  htcondordb-cli function list
+  htcondordb-cli function register pctUsed -file pct.cas
+  htcondordb-cli function register mean -kind wasm -file mean.wasm -arity 2
+  htcondordb-cli function replace pctUsed -file pct2.cas
+  htcondordb-cli function remove pctUsed
+  -file <path>        the source: ClassAd Script text, or a .wasm module
+  -kind <k>           script | wasm (default: wasm for a .wasm file, else script)
+  -arity <n>          argument count; required for wasm, read off the def for a script
+  -max-arity <n>      largest accepted count (-1 variadic); default: -arity
+
+  User functions stored in the database, registered at start-up and callable from
+  any query. A replacement may not change the argument count -- a compiled query
+  has already captured it. Registering requires DAEMON or ADMINISTRATOR.
+
   -version            print version and exit
 
 Interactive meta-commands: .tables .use .help .format .dialect .output .quit
@@ -214,6 +229,14 @@ func run() error {
 	// Subcommand: `arrow` writes a table out as an Arrow IPC stream.
 	if len(fs.args) > 0 && fs.args[0] == "arrow" {
 		return runArrow(ctx, cfg, addr, fs)
+	}
+
+	// Subcommand: `function` is the administrative path to the user functions stored in the
+	// database -- register, replace, remove, list. It carries a file, which is why it is a
+	// subcommand rather than a shell meta-command, and it is authorized at DAEMON or
+	// ADMINISTRATOR rather than WRITE.
+	if len(fs.args) > 0 && fs.args[0] == "function" {
+		return runFunction(ctx, cfg, addr, fs.args[1:])
 	}
 
 	dbc, closeConn, err := connectDB(ctx, cfg, addr)

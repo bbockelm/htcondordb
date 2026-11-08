@@ -1,7 +1,8 @@
 # Design sketch: user functions stored in the collection
 
-**Status:** DECIDED, not built. The questions that decide the shape are answered in §6; §7 is what
-remains open.
+**Status:** BUILT, server side. The questions that decide the shape are answered in §6; §7 is what
+remains open, and the client half of it is untouched: a client still loads its own functions from
+its own configuration.
 **Problem owner:** "an admin client should be able to register a function, and the modules should
 live in the collection rather than only in a config file".
 **Siblings:** [user-functions.md](../user-functions.md) (what configuration does today).
