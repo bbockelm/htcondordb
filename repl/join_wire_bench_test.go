@@ -809,7 +809,7 @@ func newExpansionJoinFixture(b testing.TB, left int, k float64, archive bool) (*
 		go func() {
 			_ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{
 				Privileged: true,
-				QueryLog:   func(q dbrpc.QueryLog) { ops.add(q.Op) },
+				QueryLog:   func(q dbrpc.QueryLog) { ops.addLog(q) },
 			})
 		}()
 		conn := dbrpc.NewStreamConn(cp)
