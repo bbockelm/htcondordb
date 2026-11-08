@@ -88,14 +88,20 @@ var (
 
 	// defaultLinkCapacityMbps is what an unstated link is assumed to carry.
 	//
-	// It is an assumption about the deployment, and it is stated as one: connections to a
-	// store are taken to be at least 100 Mbps, with a gigabit a reasonable expectation. At
-	// 100 Mbps the store arm is chosen up to roughly k=2, which is most joins, and the
-	// conditional exists to catch the expanding tail beyond it. A site on a faster link
-	// raises ExecConfig.LinkCapacityMbps and gets the store arm at every k the sweep
-	// measured; a site that knows its link is worse lowers it, and at 10 Mbps the store arm
-	// is chosen only for joins that do not expand.
-	defaultLinkCapacityMbps = 100
+	// It is an assumption about the deployment, and it is stated as one: a connection to a
+	// store is taken to carry 500 Mbps. At that capacity the store arm is chosen up to about
+	// k=6.5, which covers every join that does not expand by a large multiple, and the
+	// conditional exists to catch the tail beyond it. A site on a gigabit link raises
+	// ExecConfig.LinkCapacityMbps and gets the store arm at every k the sweep measured; a
+	// site that knows its link is worse lowers it, and at 10 Mbps the store arm is chosen
+	// only for joins that do not expand.
+	//
+	// The sweep has no reading at this capacity -- it brackets 100 Mbps and 1 Gbps -- so what
+	// stands behind the default is the model, which was checked against all sixteen of the
+	// sweep's cells. The model is the conservative side of that check: it holds the CPU
+	// advantage at its k=2 value although the advantage grows with k, so it declines joins
+	// nearer the crossover than the measurements require, and errs towards the client.
+	defaultLinkCapacityMbps = 500
 )
 
 // joinPlacement is where one statement's rows will be paired, and why.
