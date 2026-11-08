@@ -113,32 +113,6 @@ HTCONDORDB_SCRIPT_BETA_PATH = /etc/condor/scripts/policy.cas
 	}
 }
 
-// TestScriptAggregatesAreRefused -- there is no such knob, and an administrator reaching for it by
-// analogy with the wasm pair has to be told so. Ignoring the key would leave the aggregate
-// unregistered and every query using it answering ERROR with nothing explaining why.
-func TestScriptAggregatesAreRefused(t *testing.T) {
-	_, err := resolveSettings(wasmCfg(t, `
-HTCONDORDB_SCRIPT_AGGREGATES = scriptCfgP95
-HTCONDORDB_SCRIPT_SCRIPTCFGP95_PATH = /etc/condor/scripts/policy.cas
-`))
-	if err == nil {
-		t.Fatal("HTCONDORDB_SCRIPT_AGGREGATES was accepted")
-	}
-	for _, want := range []string{"HTCONDORDB_SCRIPT_AGGREGATES", "HTCONDORDB_WASM_AGGREGATES"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the error does not mention %s: %v", want, err)
-		}
-	}
-}
-
-// TestScriptAggregatesAreRefusedOnTheirOwn -- the check cannot sit behind "is anything configured",
-// because the whole symptom is that setting the key alone did nothing.
-func TestScriptAggregatesAreRefusedOnTheirOwn(t *testing.T) {
-	if _, err := resolveSettings(wasmCfg(t, "HTCONDORDB_SCRIPT_AGGREGATES = scriptCfgLonely\n")); err == nil {
-		t.Fatal("HTCONDORDB_SCRIPT_AGGREGATES on its own was accepted")
-	}
-}
-
 // TestScriptAndWasmShareOneNameSpace -- a query calling a name reaches one registered function, and
 // which kind of file it came from is not part of the call. Catching the collision while reading the
 // configuration names the two lists; letting it through would fail the second registration with a

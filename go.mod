@@ -18,8 +18,8 @@ toolchain go1.27.0
 require (
 	github.com/PelicanPlatform/classad v0.38.0
 	github.com/PelicanPlatform/classad/changefeed v0.38.0
-	github.com/PelicanPlatform/classad/collections v0.38.0
-	github.com/PelicanPlatform/classad/db v0.38.0
+	github.com/PelicanPlatform/classad/collections v0.38.1
+	github.com/PelicanPlatform/classad/db v0.38.1
 	github.com/PelicanPlatform/classad/dbrpc v0.38.0
 	github.com/PelicanPlatform/classad/wasmudf v0.38.0
 	github.com/apache/arrow-go/v18 v18.8.0

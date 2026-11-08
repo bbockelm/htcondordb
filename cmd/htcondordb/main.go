@@ -486,8 +486,8 @@ func run() error {
 	// Sandboxed user functions: load the WebAssembly modules and the ClassAd Script functions an
 	// administrator configured and register them, so an ordinary query can call one. Reapplied on
 	// reconfigure, but only to ADD -- a registration cannot be withdrawn. Off unless
-	// HTCONDORDB_WASM_FUNCTIONS, HTCONDORDB_WASM_AGGREGATES or HTCONDORDB_SCRIPT_FUNCTIONS names
-	// one.
+	// HTCONDORDB_WASM_FUNCTIONS, HTCONDORDB_WASM_AGGREGATES, HTCONDORDB_SCRIPT_FUNCTIONS or
+	// HTCONDORDB_SCRIPT_AGGREGATES names one.
 	udfMgr := userfunc.New(ctx, d.Slog())
 	// The wasm runtime, if one was built, stays open for the life of the daemon: a registered
 	// function is a call into a loaded module, and the registration outlives any attempt to take

@@ -1,0 +1,103 @@
+# Fixture for the script-aggregate tests.
+#
+# AN AGGREGATE IS FOUR `def`s THREADING A STATE VALUE, and the configured name picks them out of a
+# file by prefix, so one file backs several aggregates exactly as it backs several scalar
+# functions.
+#
+# The names are unique to these tests because classad's registries are process-wide and have no
+# unregister.
+
+# The mean, which is the aggregate a scalar state cannot carry: the answer needs a sum and a count
+# at once, so the state is a two-element list.
+def scriptCfgMean_init():
+    return {0, 0}
+
+def scriptCfgMean_add(s, v):
+    # A row whose attribute is absent, or holds something that is not a number, contributes
+    # nothing. Skipping it is the script's decision, exactly as it is a built-in's.
+    if isReal(v) || isInteger(v):
+        return {s[0] + v, s[1] + 1}
+    return s
+
+def scriptCfgMean_merge(a, b):
+    return {a[0] + b[0], a[1] + b[1]}
+
+def scriptCfgMean_result(s):
+    if s[1] > 0:
+        return real(s[0]) / s[1]
+    return undefined
+
+# The maximum, spelled so that no name fits the prefix rule: this one is configured by naming each
+# `def` for the role it fills. The state is the running maximum itself.
+def mkFloor():
+    return undefined
+
+def foldMax(s, v):
+    if !(isReal(v) || isInteger(v)):
+        return s
+    if isUndefined(s):
+        return v
+    if v > s:
+        return v
+    return s
+
+def joinMax(a, b):
+    if isUndefined(a):
+        return b
+    if isUndefined(b):
+        return a
+    if a > b:
+        return a
+    return b
+
+def takeMax(s):
+    return s
+
+# Three of the four roles. The missing `scriptCfgNoMerge_merge` is the point of it.
+def scriptCfgNoMerge_init():
+    return 0
+
+def scriptCfgNoMerge_add(s, v):
+    return s
+
+def scriptCfgNoMerge_result(s):
+    return s
+
+# `add` takes the state and one row's value, so a `def` of one parameter cannot fill the role.
+def scriptCfgBadArity_init():
+    return 0
+
+def scriptCfgBadArity_add(s):
+    return s
+
+def scriptCfgBadArity_merge(a, b):
+    return a + b
+
+def scriptCfgBadArity_result(s):
+    return s
+
+# Counting aggregates for the reconfigure test, where what matters is that a name registers rather
+# than what it answers.
+def scriptCfgStableAgg_init():
+    return 0
+
+def scriptCfgStableAgg_add(s, v):
+    return s + 1
+
+def scriptCfgStableAgg_merge(a, b):
+    return a + b
+
+def scriptCfgStableAgg_result(s):
+    return s
+
+def scriptCfgAddedAgg_init():
+    return 0
+
+def scriptCfgAddedAgg_add(s, v):
+    return s + 1
+
+def scriptCfgAddedAgg_merge(a, b):
+    return a + b
+
+def scriptCfgAddedAgg_result(s):
+    return s

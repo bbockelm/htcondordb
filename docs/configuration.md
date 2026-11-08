@@ -187,7 +187,9 @@ there.
 | `HTCONDORDB_WASM_TIMEOUT` | `1` | Seconds of wall clock before a call is abandoned. This is the backstop that stops a module which charges itself nothing. |
 | `HTCONDORDB_WASM_MAX_INSTANCES` | `GOMAXPROCS` | Concurrent instances of one module. |
 | `HTCONDORDB_SCRIPT_FUNCTIONS` | — | Names of ClassAd Script functions to register, so a query or a constraint can call one. Each needs `HTCONDORDB_SCRIPT_<NAME>_PATH`. The name is the name of the `def` to take out of that file. See [User functions](user-functions.md). |
+| `HTCONDORDB_SCRIPT_AGGREGATES` | — | Names of ClassAd Script **aggregates** to register, reduced the way `SUM` is. Each needs `HTCONDORDB_SCRIPT_<NAME>_PATH`. An aggregate is four `def`s, taken out of that file by prefix: `<name>_init`, `<name>_add`, `<name>_merge` and `<name>_result`. |
 | `HTCONDORDB_SCRIPT_<NAME>_PATH` | — | The script file. Required. Two names may give the same file and pick a different `def` out of it. |
+| `HTCONDORDB_SCRIPT_<NAME>_INIT` | `<name>_init` | The `def` that gives an aggregate's identity, for a file whose definitions are spelled some other way. `_ADD`, `_MERGE` and `_RESULT` name the other three. A `def` named here and absent from the file fails start-up, saying which one it looked for. |
 
 Standard `SEC_*` and `ALLOW_`/`DENY_` knobs configure security and authorization
 — see [Authorization](authorization.md).
