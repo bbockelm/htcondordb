@@ -279,13 +279,13 @@ func TestJoinUnknownAliasIsRefused(t *testing.T) {
 
 func TestJoinRefusesUnsupportedForms(t *testing.T) {
 	cases := map[string]string{
-		`SELECT j.Owner FROM jobs j RIGHT JOIN hist h ON j.ClusterId == h.ClusterId`:                  "LEFT JOIN",
-		`SELECT j.Owner FROM jobs j FULL JOIN hist h ON j.ClusterId == h.ClusterId`:                   "LEFT JOIN",
-		`SELECT j.Owner FROM jobs j NATURAL JOIN hist h`:                                              "ON",
-		`SELECT j.Owner FROM jobs j JOIN hist h USING (ClusterId)`:                                    "ON",
-		`SELECT j.Owner FROM jobs j, hist h`:                                                          "JOIN",
-		`SELECT j.Owner FROM jobs j CROSS JOIN hist h ON j.ClusterId == h.ClusterId`:                  "no ON",
-		`SELECT j.Owner FROM jobs j JOIN hist h`:                                                      "needs an ON",
+		`SELECT j.Owner FROM jobs j RIGHT JOIN hist h ON j.ClusterId == h.ClusterId`:                     "LEFT JOIN",
+		`SELECT j.Owner FROM jobs j FULL JOIN hist h ON j.ClusterId == h.ClusterId`:                      "LEFT JOIN",
+		`SELECT j.Owner FROM jobs j NATURAL JOIN hist h`:                                                 "ON",
+		`SELECT j.Owner FROM jobs j JOIN hist h USING (ClusterId)`:                                       "ON",
+		`SELECT j.Owner FROM jobs j, hist h`:                                                             "JOIN",
+		`SELECT j.Owner FROM jobs j CROSS JOIN hist h ON j.ClusterId == h.ClusterId`:                     "no ON",
+		`SELECT j.Owner FROM jobs j JOIN hist h`:                                                         "needs an ON",
 		`SELECT j.Owner FROM jobs j JOIN hist h ON j.ClusterId == h.ClusterId JOIN hist h ON h.a == j.a`: "duplicate table alias",
 	}
 	for q, want := range cases {

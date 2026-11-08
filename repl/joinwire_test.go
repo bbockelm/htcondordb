@@ -96,9 +96,32 @@ func TestJoinFallsBackWhenTheServerRefusesTheWireReply(t *testing.T) {
 	if len(res.Rows) == 0 {
 		t.Fatal("the fallback returned no rows, which is what a silently-dropped stream looks like")
 	}
-	// The wire reply is tried, refused, and the text one takes over: two ops, in that order.
-	if got := ops.waitOps(t, 2); len(got) != 2 || got[0] != "JoinWire" || got[1] != "Join" {
-		t.Errorf("want the wire reply tried and then the text one, saw %v", got)
+	// The wire reply is tried, refused, and the text one takes over.
+	//
+	// Asserted on WHAT EACH OP DID, not on the order they were logged in. The log is written
+	// from a deferred call in each request's own handler goroutine, so the refused wire op can
+	// be recorded after the text one that followed it -- the client issues them in order, the
+	// logging does not promise to record them in that order, and a test that required it failed
+	// in CI as "saw [Join JoinWire]".
+	//
+	// What distinguishes a fallback from a plain text join is that BOTH ops ran and the wire one
+	// yielded nothing, which is stronger evidence than their order and does not depend on
+	// scheduling.
+	got := ops.waitOps(t, 2)
+	if len(got) != 2 {
+		t.Fatalf("want two server ops, saw %v", got)
+	}
+	wire, sawWire := ops.logFor("JoinWire")
+	text, sawText := ops.logFor("Join")
+	if !sawWire || !sawText {
+		t.Fatalf("want the wire reply tried and the text one to take over, saw %v", got)
+	}
+	if wire.Rows != 0 {
+		t.Errorf("the wire reply returned %d rows; it was supposed to be refused before any row",
+			wire.Rows)
+	}
+	if text.Rows == 0 {
+		t.Error("the text reply returned no rows, so nothing took over from the refused wire one")
 	}
 }
 
