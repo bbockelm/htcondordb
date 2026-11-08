@@ -93,6 +93,14 @@ func (e *Executor) streamable(st *Statement) bool {
 	if len(st.OrderBy) > 0 || st.Distinct || st.AsOf != "" {
 		return false
 	}
+	// A set operation's rows come from several SELECTs, and everything that makes them one
+	// result -- de-duplication, the operation's own ORDER BY and LIMIT -- happens only once
+	// every branch has run. The statement carries the first branch's table and predicate,
+	// so streaming it as an ordinary SELECT would quietly hand back that branch alone and
+	// call it the union.
+	if st.IsSetOp() {
+		return false
+	}
 	if len(effectiveGroupBy(st)) > 0 || hasAggregate(st) {
 		return false
 	}
@@ -103,7 +111,8 @@ func (e *Executor) streamable(st *Statement) bool {
 }
 
 // streamResult hands a materialized Result's rows to yield as ClassAds: its own ads for a
-// plain SELECT, synthesized ones for an aggregate.
+// plain SELECT, synthesized ones for a result that has none -- an aggregate, a DISTINCT
+// over named columns, a de-duplicated UNION.
 func streamResult(res *Result, yield func(*classad.ClassAd) bool) error {
 	if !res.IsSelect {
 		return fmt.Errorf("statement returned no rows")
@@ -117,27 +126,69 @@ func streamResult(res *Result, yield func(*classad.ClassAd) bool) error {
 		return nil
 	}
 	names := aggregateAttrNames(res.Columns)
-	for _, row := range res.Rows {
-		if !yield(aggregateAd(names, row)) {
+	ambiguous := repeatedHeaders(res.Columns)
+	for i, row := range res.Rows {
+		var proj *classad.ClassAd
+		if i < len(res.Projected) {
+			proj = res.Projected[i]
+		}
+		if !yield(rowAd(names, res.Columns, ambiguous, proj, row)) {
 			return nil
 		}
 	}
 	return nil
 }
 
-// aggregateAd builds one ClassAd from an aggregate result row, using names derived from
-// the column headers. Cells are typed the way the display strings read -- an aggregate's
-// values reach the client already reduced to text, so this is the same recovery the
-// tabular and JSON renderings do.
-func aggregateAd(names []string, row []string) *classad.ClassAd {
+// rowAd builds one ClassAd from a result row that has no ad of its own.
+//
+// NAMES COME FROM THE HEADERS AND VALUES FROM THE ROW'S PROJECTION, and the two are kept
+// apart on purpose. A header is whatever the user wrote and is often not a legal attribute
+// name, so an ad has to be given folded names (see aggregateAttrNames) -- but the
+// projected ad is addressed by the header, which is the name the evaluated value was filed
+// under. Reading one and writing the other is what lets a cell keep the type it evaluated
+// to without any name reaching the caller changing.
+//
+// The display text is read back only where no value reaches the cell. That is an
+// aggregate's own output, which crosses the wire already rendered, and a column the
+// projection cannot answer for: a result carrying no projection at all, a header two items
+// share -- where one attribute holds one item's value and the rows are the only per-cell
+// answer -- and a value that is genuinely UNDEFINED, which the text spells too and which
+// an ad spells by leaving the attribute out.
+func rowAd(names, columns []string, ambiguous map[string]bool, proj *classad.ClassAd, row []string) *classad.ClassAd {
 	ad := classad.New()
 	for i, name := range names {
 		if i >= len(row) {
 			break
 		}
+		if proj != nil && !ambiguous[columns[i]] {
+			if v := proj.EvaluateAttr(columns[i]); !v.IsUndefined() {
+				insertValue(ad, name, v)
+				continue
+			}
+		}
 		setAggregateAttr(ad, name, row[i])
 	}
 	return ad
+}
+
+// repeatedHeaders is the set of column headers that appear more than once. Attribute names
+// are case-insensitive, so headers that differ only in case name the same attribute and
+// collide the same way.
+func repeatedHeaders(cols []string) map[string]bool {
+	seen := make(map[string]int, len(cols))
+	for _, c := range cols {
+		seen[strings.ToLower(c)]++
+	}
+	var dup map[string]bool
+	for _, c := range cols {
+		if seen[strings.ToLower(c)] > 1 {
+			if dup == nil {
+				dup = make(map[string]bool, 2)
+			}
+			dup[c] = true
+		}
+	}
+	return dup
 }
 
 // attrNameSafe matches a legal ClassAd attribute name.
@@ -218,7 +269,8 @@ func scrubName(s string) string {
 	return b.String()
 }
 
-// setAggregateAttr inserts one aggregate cell, typed from its display text.
+// setAggregateAttr inserts one cell, typed from its display text. It is the last resort:
+// see rowAd for when a cell gets here rather than carrying its evaluated value.
 func setAggregateAttr(ad *classad.ClassAd, name, cell string) {
 	switch cell {
 	case "undefined", "":

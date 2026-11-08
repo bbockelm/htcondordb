@@ -77,7 +77,12 @@ jobs:
         run: |
           go vet ./...
           go build ./...
-          go test -race -count=1 -timeout 15m -skip '^TestFederationIntegration$' ./...
+          # 30m, not 15m. This runs the whole root module under -race, which is several times
+          # slower than a plain run, and the suite has outgrown the old budget: the simd leg was
+          # already using 9m54s of it before bench/ existed. A timeout is a guard against a hang,
+          # not a performance budget -- a merely slow job should report which test failed rather
+          # than a timeout panic, which says nothing about what broke.
+          go test -race -count=1 -timeout 30m -skip '^TestFederationIntegration$' ./...
 
       # The federation hub's end-to-end test (real htcondordb processes over FS-authenticated
       # CEDAR; no HTCondor needed), as its own visible step. HTCONDORDB_REQUIRE_FEDERATION_TEST

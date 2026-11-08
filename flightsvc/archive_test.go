@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -40,6 +41,35 @@ type catHarness struct {
 
 	mu   sync.Mutex
 	logs []dbrpc.QueryLog
+}
+
+// logCount is how many reads the server has logged so far, across all tables.
+func (h *catHarness) logCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.logs)
+}
+
+// awaitLog waits until the server has logged more than `before` reads.
+//
+// The log is written by the SERVER, from a deferred call that runs when its stream handler
+// returns -- which can be after the client has finished draining the rows. So a test that reads
+// the log as soon as rows() returns can see the PREVIOUS query's entry, or none at all. That is
+// not a hypothetical: it failed in CI as "the store was asked for Limit 0, want 1", which is the
+// preceding unlimited query's entry being read for this one.
+//
+// Waiting here rather than in each test means every assertion on the log is synchronised with
+// the query that produced it, including ones added later.
+func (h *catHarness) awaitLog(t *testing.T, before int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.logCount() > before {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("the server logged no read within 5s of the query completing (had %d before)", before)
 }
 
 // queries returns the logged reads for one table, newest last.
@@ -158,6 +188,7 @@ func catalogHarness(t *testing.T) (*catHarness, func()) {
 func (h *catHarness) rows(t *testing.T, q string) []arrow.Record {
 	t.Helper()
 	ctx := context.Background()
+	before := h.logCount()
 	info, err := h.cl.Execute(ctx, q)
 	if err != nil {
 		t.Fatalf("Execute(%q): %v", q, err)
@@ -176,6 +207,9 @@ func (h *catHarness) rows(t *testing.T, q string) []arrow.Record {
 	if rerr := rdr.Err(); rerr != nil {
 		t.Fatalf("read(%q): %v", q, rerr)
 	}
+	// The server logs the read from a deferred call that can run after the client has drained
+	// it, so a test asserting on the log must not race ahead of it. See awaitLog.
+	h.awaitLog(t, before)
 	return out
 }
 

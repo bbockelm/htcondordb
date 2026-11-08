@@ -23,6 +23,11 @@ import (
 //     meaningless.
 //   - A window function : ROW_NUMBER and friends rank a row against the others, so no ad
 //     carries the answer.
+//   - A set operation : a UNION's rows come from several SELECTs and may be de-duplicated
+//     against each other, so the result is not any one branch's ads -- and a de-duplicated
+//     one has no ads behind its rows at all. The columns are named by the first branch
+//     while a later branch may spell its own differently, so an evaluator built from the
+//     statement's items would read the wrong attribute off the wrong branch's ad.
 //
 // ORDER BY and DISTINCT are deliberately absent from that list. Both need the whole result
 // before the first row is correct, but their rows still come from ads, so StreamSelect
@@ -33,7 +38,7 @@ func (e *Executor) RowStreamer(st *Statement) ([]string, func(*classad.ClassAd) 
 	if st.Kind != StmtSelect {
 		return nil, nil, fmt.Errorf("only SELECT produces rows")
 	}
-	if len(st.GroupBy) > 0 || hasAggregate(st) {
+	if len(st.GroupBy) > 0 || hasAggregate(st) || st.IsSetOp() {
 		return nil, nil, nil
 	}
 	for _, it := range st.Items {

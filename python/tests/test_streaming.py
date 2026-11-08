@@ -131,6 +131,7 @@ class TestParity:
             ("SELECT * FROM {t}", False),
             ("SELECT COUNT(*) FROM {t}", False),
             ("SELECT Owner, COUNT(*) FROM {t} GROUP BY Owner", False),
+            ("SELECT Idx FROM {t} UNION ALL SELECT Idx FROM {t}", False),
         ],
     )
     def test_streamed_flag_reports_what_happened(self, connection, rows, sql, streamed):
@@ -146,6 +147,85 @@ class TestParity:
         cursor = connection.execute(f"SELECT * FROM {rows}")
         assert len(cursor.fetchall()) == 250
         assert {name for name, *_ in cursor.description} >= {"Owner", "RequestMemory", "Idx"}
+
+
+class TestUnion:
+    """A UNION is not its first branch, and the rows it returns have to say so."""
+
+    @pytest.fixture
+    def pair(self, connection, table):
+        """Two tables holding one row each, whose Ticket is a string that reads as a number."""
+        other = table + "_b"
+        connection.execute(f"CREATE TABLE {other}").close()
+        connection.execute(
+            f"INSERT INTO {table} (Key, Name, Count, Ticket) VALUES ('r1', 'alice', 1, '0042')"
+        ).close()
+        connection.execute(
+            f"INSERT INTO {other} (Key, Name, Count, Ticket) VALUES ('r2', 'bob', 2, '0043')"
+        ).close()
+        try:
+            yield table, other
+        finally:
+            try:
+                connection.execute(f"DROP TABLE {other}").close()
+            except Exception:  # pragma: no cover - cleanup is best effort
+                pass
+
+    def test_every_branch_is_returned(self, connection, pair):
+        left, right = pair
+        rows = connection.execute(
+            f"SELECT Name FROM {left} UNION ALL SELECT Name FROM {right}"
+        ).fetchall()
+        assert sorted(name for (name,) in rows) == ["alice", "bob"]
+
+    def test_deduplicated_union_returns_both_branches(self, connection, pair):
+        left, right = pair
+        rows = connection.execute(
+            f"SELECT Name FROM {left} UNION SELECT Name FROM {right}"
+        ).fetchall()
+        assert sorted(name for (name,) in rows) == ["alice", "bob"]
+
+    def test_cells_keep_their_types(self, connection, pair):
+        # The string that reads as a number is the case that separates a typed cell from a
+        # parse of the display text, and it has to hold for an alias and a computed column
+        # as well as a plain one.
+        left, right = pair
+        for sql in (
+            "SELECT Ticket FROM {l} UNION ALL SELECT Ticket FROM {r}",
+            "SELECT Ticket AS t FROM {l} UNION ALL SELECT Ticket AS t FROM {r}",
+            "SELECT Ticket AS t FROM {l} UNION SELECT Ticket AS t FROM {r}",
+        ):
+            rows = connection.execute(sql.format(l=left, r=right)).fetchall()
+            tickets = sorted(t for (t,) in rows)
+            assert tickets == ["0042", "0043"], sql
+            assert all(isinstance(t, str) for (t,) in rows), sql
+
+    def test_computed_columns_are_evaluated(self, connection, pair):
+        left, right = pair
+        rows = connection.execute(
+            f"SELECT Count * 2 AS d FROM {left} UNION ALL SELECT Count * 2 AS d FROM {right}"
+        ).fetchall()
+        assert sorted(d for (d,) in rows) == [2, 4]
+
+    def test_order_by_spans_the_branches(self, connection, pair):
+        left, right = pair
+        rows = connection.execute(
+            f"SELECT Name, Count FROM {left} UNION ALL SELECT Name, Count FROM {right} "
+            "ORDER BY Name DESC"
+        ).fetchall()
+        assert rows == [("bob", 2), ("alice", 1)]
+
+    def test_ads_carry_the_selected_columns(self, connection, pair):
+        # conn.mappings() reads the same per-row ads the ad cursor does, so a column the
+        # SELECT named has to be there under the name it gave it.
+        left, right = pair
+        rows = list(
+            connection.mappings(
+                f"SELECT Ticket AS t FROM {left} UNION SELECT Ticket AS t FROM {right}"
+            )
+        )
+        assert sorted(row["t"] for row in rows) == ["0042", "0043"]
+        assert all(isinstance(row["t"], str) for row in rows)
 
 
 class TestRowcount:

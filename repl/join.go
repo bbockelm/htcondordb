@@ -923,15 +923,24 @@ func (e *Executor) execJoin(st *Statement) (*Result, error) {
 		return nil, err
 	}
 
-	// Ask the store to join, when it can. Only the joined rows then cross the wire, where
-	// joining here ships both sides whole first -- a flat ~2.2x on a narrow projection and
-	// ~4.2x unprojected, before any network. The server also holds one side where this
-	// holds both. Everything after the pairing is unchanged: the rows that come back are
-	// the same composite ads the pipeline would have built.
-	if rows, ok, serr := e.joinServerSide(st, p); serr != nil {
-		return nil, serr
-	} else if ok {
-		return e.finishJoin(st, p, rows)
+	// One statement, one set of row counts: the placement decision below asks for both
+	// sides' sizes, and the key-batch decision inside the pipeline asks for the right side's
+	// again. Memoizing them for the statement means the arm that pairs here pays one round
+	// trip more than it used to rather than two.
+	e.rowCounts = map[string]int{}
+	defer func() { e.rowCounts = nil }()
+
+	// Ask the store to join, when that is the cheaper arm (see joinplace.go: it turns on how
+	// much the join expands and how fast the link is). Only the joined rows then cross the
+	// wire, where joining here ships both sides whole first. Everything after the pairing is
+	// unchanged: the rows that come back are the same composite ads the pipeline would have
+	// built.
+	if e.placeJoin(st, p).store {
+		if rows, ok, serr := e.joinServerSide(st, p); serr != nil {
+			return nil, serr
+		} else if ok {
+			return e.finishJoin(st, p, rows)
+		}
 	}
 
 	rows, err := e.runJoinPipeline(st, p)
@@ -1659,40 +1668,21 @@ func (e *Executor) describeJoinPlan(st *Statement) []string {
 			"(%d group term(s), %d aggregate(s)); the server aggregate is single-table",
 			len(st.GroupBy), len(aggCallOrder(st))))
 	}
-	if e.serverJoinEligible(st, p) && e.c.SupportsNewer(dbrpc.FeatJoin) {
+	// Which arm will run, and on what arithmetic. The decision is re-taken here rather than
+	// described, so EXPLAIN reports what the statement would actually do: an arm that was
+	// not taken for a reason reads exactly like an arm that was never available.
+	d := e.placeJoin(st, p)
+	if d.store {
 		reply := "rendered one row per frame"
 		if e.c.SupportsNewer(dbrpc.FeatJoinWire) {
 			reply = "wire-form rows, batched many per frame"
 		}
-		out = append(out, "  executed in the store: only the joined rows cross the wire, and one "+
-			"side is held rather than both; reply is "+reply)
+		out = append(out, "  executed in the store: "+d.why+
+			"; only the joined rows cross the wire, and one side is held rather than both; reply is "+reply)
 	} else {
-		out = append(out, "  executed client-side: "+whyNotServerSide(e, st, p))
+		out = append(out, "  executed client-side: "+d.why)
 	}
 	return out
-}
-
-// whyNotServerSide says which reason a join is being paired here, because "client-side" on
-// its own leaves a reader unable to tell a server that cannot join from a statement that
-// cannot be sent -- and those have different answers.
-func whyNotServerSide(e *Executor, st *Statement, p *joinPlan) string {
-	switch {
-	case st.AsOf != "":
-		return "AS OF reads both sides at one instant, which the join opcode cannot ask for"
-	case !p.twoTable():
-		return fmt.Sprintf("the join opcode carries two tables and this statement joins %d",
-			len(p.sides))
-	case p.readsInTx(e):
-		return "a read inside a transaction must see that transaction's own writes, and the " +
-			"store joins committed state"
-	case !e.serverJoin:
-		return "the server-side join is not enabled; measured it is faster at every expansion " +
-			"factor, but it still moves more data whenever the join expands rather than filters"
-	case !e.c.SupportsNewer(dbrpc.FeatJoin):
-		return "this server does not advertise a server-side join, so no join opcode is sent"
-	default:
-		return "the plan could not be expressed for the store"
-	}
 }
 
 // resolveJoinOrderAliases rewrites each ORDER BY term that is a bare name matching a
@@ -1858,9 +1848,6 @@ func joinExprRefs(src string) []string {
 // equality halves that drive the hash -- so the server executes a decision this package
 // made rather than making its own.
 func (e *Executor) joinServerSide(st *Statement, p *joinPlan) ([]*classad.ClassAd, bool, error) {
-	if !e.serverJoinEligible(st, p) {
-		return nil, false, nil
-	}
 	left, right, step := p.sides[0], p.sides[1], &p.steps[0]
 	req := dbrpc.JoinRequest{Spec: db.JoinSpec{
 		Kind:  serverJoinKind(step.kind),
@@ -1953,41 +1940,6 @@ func (e *Executor) joinTextRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool
 		return nil, false, err
 	}
 	return rows, true, nil
-}
-
-// serverJoinEligible reports whether this statement's join can run in the store.
-//
-// Each refusal is a shape the opcode does not carry, not a performance judgement. A
-// point-in-time join would have to read both sides at one instant, which the op has no way
-// to ask for. A read inside a transaction must see that transaction's own uncommitted
-// writes, and the store joins committed state. And a plan whose predicates did not survive
-// being rendered to text cannot be sent at all.
-func (e *Executor) serverJoinEligible(st *Statement, p *joinPlan) bool {
-	if !e.serverJoin {
-		return false
-	}
-	if st.AsOf != "" {
-		return false
-	}
-	// The opcode carries exactly two sides. A longer chain is paired here; the store
-	// gaining an n-way join would be a protocol change, not a planner one.
-	if !p.twoTable() {
-		return false
-	}
-	if p.readsInTx(e) {
-		return false
-	}
-	step := &p.steps[0]
-	if len(step.cond) != len(step.condSrc) || len(p.post) != len(p.postSrc) ||
-		len(step.equi) != len(step.equiSrc) {
-		return false
-	}
-	for _, eq := range step.equiSrc {
-		if eq.accStripped == "" {
-			return false
-		}
-	}
-	return true
 }
 
 // readsInTx reports whether any side is a table the open transaction has written, whose
