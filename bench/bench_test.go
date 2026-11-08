@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -93,8 +94,10 @@ func TestRunMeasuresEveryTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rep.Samples) != 4 {
-		t.Fatalf("%d samples, want 4 (one per transport)", len(rep.Samples))
+	// Derived from the default transport list rather than written down, so adding a transport
+	// does not fail this test for the wrong reason.
+	if want := len(defaultTransports()); len(rep.Samples) != want {
+		t.Fatalf("%d samples, want %d (one per transport)", len(rep.Samples), want)
 	}
 	for _, s := range rep.Samples {
 		if s.Err != nil {
@@ -367,5 +370,55 @@ func serveCatalogShared(cat *db.Catalog) Dialer {
 		counted, bytes := NewCountingConn(c)
 		cl := dbrpc.NewClient(dbrpc.NewStreamConn(counted))
 		return &Conn{Client: cl, Close: func() { _ = cl.Close() }, Bytes: bytes}, nil
+	}
+}
+
+// A projection either chases references or it does not, and the comparison must pair arms that
+// make the same choice.
+//
+// TextProjected chases them, so each row it ships is self-contained; Wire does not. Pairing those
+// two charges one arm for a closure the other was never asked to produce and reports the
+// difference as the transport's. WireRefs is the arm that pairs with TextProjected.
+//
+// Asserted on the BYTES, which is where the closure shows: a reference-chasing projection ships
+// the attributes the projected expressions read, so it cannot be narrower than the subset form
+// over a projection that names an expression.
+func TestWireRefsIsTheArmThatPairsWithTextProjected(t *testing.T) {
+	srv, _, err := Build(ServeConfig{Dir: filepath.Join(t.TempDir(), "scratch"),
+		Rows: 1000, Shapes: []Shape{ShapeHistory}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	addr, err := srv.ServeAnonymous(context.Background(), "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Run(context.Background(), dialAddr(t, addr), Spec{
+		Table: "history", Constraint: "true",
+		// MemoryUsage is an expression over ResidentSetSize, which the projection omits, so a
+		// reference-chasing projection must add it and a subset projection must not.
+		Projection: []string{"ClusterId", "Owner", "MemoryUsage"},
+		Transports: []Transport{TextProjected, Wire, WireRefs},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[Transport]Sample{}
+	for _, s := range rep.Samples {
+		if s.Err != nil {
+			t.Fatalf("%s: %v (%s)", s.Transport, s.Err, s.Note)
+		}
+		by[s.Transport] = s
+	}
+	for _, tr := range []Transport{TextProjected, Wire, WireRefs} {
+		if by[tr].Rows != 1000 {
+			t.Fatalf("%s: %d rows, want 1000", tr, by[tr].Rows)
+		}
+		t.Logf("%-20s %7.1f B/row", tr, by[tr].BytesPerRow())
+	}
+	if !(by[WireRefs].BytesPerRow() > by[Wire].BytesPerRow()) {
+		t.Errorf("wire-refs ships %.1f B/row against wire's %.1f; the reference closure is not reaching the wire arm, so it is not the counterpart of text-projected",
+			by[WireRefs].BytesPerRow(), by[Wire].BytesPerRow())
 	}
 }
