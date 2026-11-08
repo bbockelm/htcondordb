@@ -131,15 +131,11 @@ func (s *Server) runAnalytic(ctx context.Context, db *dbrpc.Client, an *analytic
 			"the result has %d columns and the promised schema has %d",
 			len(res.Columns), len(decisions))
 	}
+	// The cells come from the executor's typed values wherever one reaches them, and from
+	// the rendered row only where none does; see repl.ArrowRowValues.
 	vals := make([]classad.Value, len(decisions))
-	for _, row := range res.Rows {
-		for i := range decisions {
-			cell := ""
-			if i < len(row) {
-				cell = row[i]
-			}
-			vals[i] = repl.ArrowCellValue(cell, decisions[i])
-		}
+	for i := range res.Rows {
+		repl.ArrowRowValues(res, i, decisions, vals)
 		if err := enc.AppendValues(vals); err != nil {
 			return err
 		}
