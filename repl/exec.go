@@ -1487,7 +1487,15 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 		// read (only the grouped rows cross the wire). Fall back to client-side
 		// bucketing for an AS OF read (the server aggregate has no time-travel
 		// variant) or against a server too old to implement the bucketed opcode.
-		if hasBucket(st) || groupByHasBucket(st) || groupByHasExpr(st) {
+		//
+		// A COMPUTED key is grouped client-side whichever way the statement spells it:
+		// `SELECT Used * 2 AS d, COUNT(*) ... GROUP BY d` and `SELECT DISTINCT Used * 2`
+		// both group rows by what the arithmetic evaluates to, and neither has an attribute
+		// the server could group by. The two predicates are taken together once, because a
+		// routing decision made on one of them and re-made on the other is how a DISTINCT
+		// over an expression came to be sent off as a GROUP BY an attribute of that name.
+		exprKey := groupByHasExpr(st) || distinctHasExpr(st)
+		if hasBucket(st) || groupByHasBucket(st) || exprKey {
 			// Both table kinds push the bucketing down; only an AS OF read has no server-side
 			// aggregate variant and must bucket client-side. On an archive this is what makes
 			// "jobs per group per day" answerable from the per-segment indexes instead of by
@@ -1495,7 +1503,7 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 			//
 			// A computed group key is the exception whichever table it is: the server groups
 			// by raw attribute values, so an expression key cannot be pushed down at all.
-			if st.AsOf == "" && !groupByHasExpr(st) {
+			if st.AsOf == "" && !exprKey {
 				res, err := e.execAggregateBucketServer(st)
 				if err == nil {
 					return res, nil
@@ -2032,7 +2040,7 @@ func (e *Executor) execAggregateAsOf(st *Statement, groupBy []string) (*Result, 
 		gv := make([]classad.Value, len(groupBy))
 		for i, col := range groupBy {
 			gv[i] = ad.EvaluateAttr(col)
-			g[i] = valueDisplay(gv[i])
+			g[i] = groupLabel(gv[i])
 		}
 		key := strings.Join(g, "\x00")
 		b := buckets[key]
@@ -2132,13 +2140,14 @@ func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
 	return finishAggRows(res, st)
 }
 
-// execAggregateBucket computes a GROUP BY that includes a time_bucket(...) column.
+// execAggregateBucket computes a grouping the server cannot do: one whose key is a
+// time_bucket(...) floor, a computed GROUP BY term, or a DISTINCT over a computed column.
 // It fetches the matching rows (honoring an AS OF instant) and groups/reduces them
-// client-side, flooring the bucket attribute -- the server aggregate can only group
-// by raw attribute values, so a computed bucket key can't be pushed down (Phase 0).
-// Grouping is driven by the projected non-aggregate items (validateSelect ensures
-// those are exactly the GROUP BY terms when bucketing), so the group tuple lines up
-// with the output columns positionally.
+// client-side -- the server aggregate can only group by raw attribute values, so none of
+// those keys can be pushed down. Grouping is driven by the projected non-aggregate items
+// (validateSelect ensures those are exactly the GROUP BY terms when bucketing, and a
+// DISTINCT names no other terms at all), so the group tuple lines up with the output
+// columns positionally.
 func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 	ads, err := e.queryAdsForClientScan(st)
 	if err != nil {
@@ -2197,7 +2206,7 @@ func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 			} else {
 				v = ad.EvaluateAttr(it.Col)
 			}
-			vals = append(vals, valueDisplay(v))
+			vals = append(vals, groupLabel(v))
 			gvals = append(gvals, v)
 		}
 		if drop {

@@ -74,8 +74,12 @@ DELETE FROM jobs WHERE JobStatus == 4;
   sums stay exact, an int+real mix promotes to real, booleans coerce to 0/1,
   undefined is skipped, an error propagates, and `MIN`/`MAX` are numeric (a string
   argument yields `error`).
-- **`DISTINCT`** over explicit columns is `GROUP BY` those columns (server-side
-  de-duplication); `DISTINCT *` de-duplicates whole ads.
+- **`DISTINCT`** over explicit columns is `GROUP BY` those columns. Plain columns
+  de-duplicate server-side (only the distinct values cross the wire); a computed
+  column has no attribute the server can group by, so such a query is grouped
+  client-side, like a computed `GROUP BY` key. `DISTINCT *` de-duplicates whole ads.
+  The key is the VALUE, not the text it prints as, so the string `"4"` and the number
+  `4` are two rows; two `undefined` rows are one, as SQL's `DISTINCT` treats `NULL`s.
 - **`ORDER BY`** one or more columns/aggregates, each `ASC` (default) or `DESC`;
   numeric values sort numerically, applied before `LIMIT`.
 - **`JOIN`** reads two tables; see [JOIN](#join--two-tables-one-row). Subqueries are
