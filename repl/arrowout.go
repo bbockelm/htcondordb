@@ -26,9 +26,11 @@ import (
 //     exactly as the endpoint's `SELECT *` does. The projection is the table.
 //   - A plain projection evaluates each item per ad, through the same RowStreamer the other
 //     output formats use, so a cell reaches Arrow as a classad.Value and is never rendered.
-//   - An aggregate has no ads -- its rows are per GROUP -- so its cells are parsed back from
-//     the executor's display text against their DECLARED types (ArrowCellValue). That is a
-//     text round trip, and it is confined to the one shape that cannot avoid one.
+//   - A result with no ads -- an aggregate, whose rows are per GROUP, a DISTINCT, a
+//     de-duplicated UNION -- takes its cells from the row's projected ad, where the value
+//     each item evaluated to still exists. An aggregate's OWN output is the exception: it
+//     crosses the wire already rendered, so that cell is read back from the display text
+//     against its declared type (ArrowRowValues).
 //
 // BINARY OUTPUT, so this refuses a terminal. An Arrow IPC stream written to a tty is a
 // screenful of control characters and a confused user, and the mistake is easy to make because
@@ -85,15 +87,11 @@ func (e *Executor) WriteArrow(w io.Writer, st *Statement, r *Result) error {
 			}
 		}
 	default:
+		// Rows that belong to a group or to a combination of results rather than to
+		// any one ad. Their values come from the row's projection; see ArrowRowValues.
 		vals := make([]classad.Value, len(decisions))
-		for _, cells := range r.Rows {
-			for i := range decisions {
-				cell := ""
-				if i < len(cells) {
-					cell = cells[i]
-				}
-				vals[i] = ArrowCellValue(cell, decisions[i])
-			}
+		for i := range r.Rows {
+			ArrowRowValues(r, i, decisions, vals)
 			if err := enc.AppendValues(vals); err != nil {
 				return err
 			}

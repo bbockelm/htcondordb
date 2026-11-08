@@ -77,8 +77,8 @@ func TestSelfTestCoversEveryTransport(t *testing.T) {
 		Projection: []string{"ClusterId", "Owner", "JobStatus"},
 		Iterations: 1,
 	})
-	if len(rep.Samples) != 4 {
-		t.Fatalf("%d samples, want 4", len(rep.Samples))
+	if want := len(selfTestTransports()); len(rep.Samples) != want {
+		t.Fatalf("%d samples, want %d", len(rep.Samples), want)
 	}
 	for _, s := range rep.Samples {
 		if s.Err != nil {

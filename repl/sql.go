@@ -1926,6 +1926,31 @@ func groupByHasExpr(st *Statement) bool {
 	return false
 }
 
+// distinctHasExpr reports whether a DISTINCT supplies the grouping and at least one of the
+// columns it de-duplicates on is computed rather than a plain attribute.
+//
+// `SELECT DISTINCT a, b` is `GROUP BY a, b`, and effectiveGroupBy spells it exactly that way
+// so the server can group by those attributes. A computed item has no attribute for the
+// server to group by: its name is the source text, `Used * 2`, which no ad carries. Asking
+// for it anyway yields one group whose key is undefined for every row -- a single row reading
+// `undefined` where the same SELECT without DISTINCT prints the arithmetic, with no error to
+// say so. Such a query is grouped client-side instead, where the expression is evaluated per
+// row, which is what a computed GROUP BY key already does.
+func distinctHasExpr(st *Statement) bool {
+	// effectiveGroupBy returns the projected columns only when DISTINCT is the thing doing
+	// the grouping; an explicit GROUP BY, an aggregate or `*` each rule that out, and
+	// groupByHasExpr answers for the first of those.
+	if len(st.GroupBy) > 0 || len(effectiveGroupBy(st)) == 0 {
+		return false
+	}
+	for _, it := range st.Items {
+		if it.Expr != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // parseBucketWidth parses a time_bucket width literal into whole seconds. It
 // accepts a bare integer (seconds) or an integer with a unit suffix: s (second),
 // m (minute), h (hour), d (day), w (week) -- e.g. "30s", "5m", "1h", "1d". This

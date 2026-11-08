@@ -79,6 +79,21 @@ type ExecConfig struct {
 	// own deployment and disagrees.
 	JoinPlacement JoinPlacement
 
+	// AttrNDV, if set, reports how many distinct values a table's attribute takes, from index
+	// metadata rather than by reading records. It is what lets the key-batch decision price
+	// the half of its trade that the ratio of two table sizes cannot see: a join key the right
+	// side repeats many times, where narrowing the scan to the left side's keys excludes
+	// nothing and the constraint is paid for nothing (see joinbatch.go).
+	//
+	// A FUNCTION rather than a client call because this is not on the wire. The store computes
+	// it from per-segment index summaries -- db.Catalog.AttrNDV -- and no dbrpc opcode carries
+	// it, so a session reaching a store over a connection has no way to ask and leaves this
+	// nil. Nil is a supported state and not a degraded one: the decision then rests on the key
+	// count and the right side's size alone, which is what it rested on before NDV existed.
+	// The alternative on offer over the wire, COUNT(DISTINCT), is a scan, and a planning
+	// decision that scans the table it is deciding whether to scan is worse than not deciding.
+	AttrNDV func(table, attr string) (collections.NDVEstimate, bool)
+
 	// LinkCapacityMbps is how much bandwidth this session's connection to the store has, in
 	// megabits per second. It describes the LINK, not the join: it is the one input the
 	// placement decision cannot learn by asking the store, because it is a property of the
@@ -126,6 +141,9 @@ type Executor struct {
 	serverJoin bool
 	placement  JoinPlacement
 	linkMbps   int
+	// attrNDV is the session's statistics source for distinct-value counts, and is nil when
+	// it has none. See ExecConfig.AttrNDV.
+	attrNDV ndvSource
 
 	// rowCounts memoizes the cheap whole-table row counts one statement asks for, so the
 	// placement decision and the key-batch decision that follows it do not each pay a round
@@ -237,7 +255,7 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps, attrNDV: cfg.AttrNDV}
 }
 
 // SyncControl sends one DBSyncControl request to the daemon (see ExecConfig.SyncControl).
@@ -1245,6 +1263,11 @@ type explainTrace struct {
 	// clear, and the report says so.
 	scan   collections.ScanStats
 	scanOK bool
+	// keyBatch is one sentence per join step saying whether that step narrowed the next
+	// side's scan to the keys in hand, and on what numbers. Plain EXPLAIN can only state the
+	// rule, because the key count is a fact about rows it has not read; ANALYZE has read
+	// them, so it reports the decision itself.
+	keyBatch []string
 }
 
 // execExplain implements EXPLAIN [ANALYZE] <SELECT>. Plain EXPLAIN reports the chosen plan; with
@@ -1288,6 +1311,12 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 			lines = append(lines, scanStatsLines(tr)...)
 		} else {
 			lines = append(lines, "  (server-side aggregate: only the result crosses the wire; no per-segment scan breakdown on this path)")
+		}
+		if len(tr.keyBatch) > 0 {
+			lines = append(lines, "key batching:")
+			for _, l := range tr.keyBatch {
+				lines = append(lines, "  "+l)
+			}
 		}
 	}
 	res := &Result{IsSelect: true, Columns: []string{"QUERY PLAN"}}
@@ -1458,7 +1487,15 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 		// read (only the grouped rows cross the wire). Fall back to client-side
 		// bucketing for an AS OF read (the server aggregate has no time-travel
 		// variant) or against a server too old to implement the bucketed opcode.
-		if hasBucket(st) || groupByHasBucket(st) || groupByHasExpr(st) {
+		//
+		// A COMPUTED key is grouped client-side whichever way the statement spells it:
+		// `SELECT Used * 2 AS d, COUNT(*) ... GROUP BY d` and `SELECT DISTINCT Used * 2`
+		// both group rows by what the arithmetic evaluates to, and neither has an attribute
+		// the server could group by. The two predicates are taken together once, because a
+		// routing decision made on one of them and re-made on the other is how a DISTINCT
+		// over an expression came to be sent off as a GROUP BY an attribute of that name.
+		exprKey := groupByHasExpr(st) || distinctHasExpr(st)
+		if hasBucket(st) || groupByHasBucket(st) || exprKey {
 			// Both table kinds push the bucketing down; only an AS OF read has no server-side
 			// aggregate variant and must bucket client-side. On an archive this is what makes
 			// "jobs per group per day" answerable from the per-segment indexes instead of by
@@ -1466,7 +1503,7 @@ func (e *Executor) execSelect(st *Statement) (*Result, error) {
 			//
 			// A computed group key is the exception whichever table it is: the server groups
 			// by raw attribute values, so an expression key cannot be pushed down at all.
-			if st.AsOf == "" && !groupByHasExpr(st) {
+			if st.AsOf == "" && !exprKey {
 				res, err := e.execAggregateBucketServer(st)
 				if err == nil {
 					return res, nil
@@ -2003,7 +2040,7 @@ func (e *Executor) execAggregateAsOf(st *Statement, groupBy []string) (*Result, 
 		gv := make([]classad.Value, len(groupBy))
 		for i, col := range groupBy {
 			gv[i] = ad.EvaluateAttr(col)
-			g[i] = valueDisplay(gv[i])
+			g[i] = groupLabel(gv[i])
 		}
 		key := strings.Join(g, "\x00")
 		b := buckets[key]
@@ -2103,13 +2140,14 @@ func (e *Executor) execAggregateBucketServer(st *Statement) (*Result, error) {
 	return finishAggRows(res, st)
 }
 
-// execAggregateBucket computes a GROUP BY that includes a time_bucket(...) column.
+// execAggregateBucket computes a grouping the server cannot do: one whose key is a
+// time_bucket(...) floor, a computed GROUP BY term, or a DISTINCT over a computed column.
 // It fetches the matching rows (honoring an AS OF instant) and groups/reduces them
-// client-side, flooring the bucket attribute -- the server aggregate can only group
-// by raw attribute values, so a computed bucket key can't be pushed down (Phase 0).
-// Grouping is driven by the projected non-aggregate items (validateSelect ensures
-// those are exactly the GROUP BY terms when bucketing), so the group tuple lines up
-// with the output columns positionally.
+// client-side -- the server aggregate can only group by raw attribute values, so none of
+// those keys can be pushed down. Grouping is driven by the projected non-aggregate items
+// (validateSelect ensures those are exactly the GROUP BY terms when bucketing, and a
+// DISTINCT names no other terms at all), so the group tuple lines up with the output
+// columns positionally.
 func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 	ads, err := e.queryAdsForClientScan(st)
 	if err != nil {
@@ -2168,7 +2206,7 @@ func (e *Executor) execAggregateBucket(st *Statement) (*Result, error) {
 			} else {
 				v = ad.EvaluateAttr(it.Col)
 			}
-			vals = append(vals, valueDisplay(v))
+			vals = append(vals, groupLabel(v))
 			gvals = append(gvals, v)
 		}
 		if drop {
