@@ -45,13 +45,30 @@ const (
 	TextWhole Transport = "dbrpc/text-whole"
 	// TextProjected is a named projection, reference-chased the way a schedd's is.
 	TextProjected Transport = "dbrpc/text-projected"
-	// Wire is the binary relay row, with the old-ClassAd render left to the client edge.
+	// Wire is the binary relay row with a plain SUBSET projection: the named attributes and
+	// nothing else.
 	Wire Transport = "dbrpc/wire"
+	// WireRefs is the binary relay row with a REFERENCE-CHASING projection, so each row is
+	// self-contained. It is the like-for-like counterpart of TextProjected; Wire is not.
+	WireRefs Transport = "dbrpc/wire-refs"
 	// Values is the EVALUATED projection: typed values, column-major, which is what a
 	// consumer with a typed schema (Arrow, SQL) needs.
 	Values Transport = "dbrpc/values"
 )
 
+// COMPARE LIKE WITH LIKE: A PROJECTION IS NOT ONE THING.
+//
+// A projection either chases the references its attributes make or it does not. A
+// reference-chasing projection returns a SELF-CONTAINED row -- an attribute whose value is an
+// expression arrives with the attributes that expression reads -- and that costs more than
+// shipping the named attributes alone.
+//
+// So TextProjected (reference-chasing) pairs with WireRefs, and Wire is the cheaper subset form
+// with no text counterpart here. Pairing TextProjected against Wire measures the closure as if
+// it were the transport, and flatters the wire side for work it was not asked to do. The
+// transports are listed in pairs for that reason, and anyone reading one number against another
+// should check they chase references alike.
+//
 // TWO PROJECTION FORMS, AND THEY ARE NOT INTERCHANGEABLE.
 //
 // TextWhole, TextProjected and Wire ship the STORED form: an ad carries the expression it was
@@ -68,6 +85,12 @@ const (
 // to the other -- which is exactly the mistake that reads a raw-form reassembly rate as if it
 // described a typed consumer.
 func (t Transport) Evaluated() bool { return t == Values || t == Arrow }
+
+// defaultTransports is what a sweep measures when the caller names none: both stored-form
+// projections paired with their wire counterparts, the whole ad, and the evaluated form.
+func defaultTransports() []Transport {
+	return []Transport{TextWhole, TextProjected, Wire, WireRefs, Values}
+}
 
 // Conn is one measured client connection.
 type Conn struct {
@@ -257,7 +280,7 @@ func Run(ctx context.Context, dial Dialer, spec Spec) (Report, error) {
 		spec.Limits = []int{0}
 	}
 	if len(spec.Transports) == 0 {
-		spec.Transports = []Transport{TextWhole, TextProjected, Wire, Values}
+		spec.Transports = defaultTransports()
 	}
 	conns := make([]*Conn, 0, spec.Concurrency)
 	defer func() {
@@ -384,6 +407,13 @@ func readOnce(ctx context.Context, cn *Conn, spec Spec, tr Transport, limit int)
 			})
 	case Wire:
 		err = c.QueryRawWireStream(ctx, spec.Table, spec.Constraint, spec.Projection, limit, false,
+			func(row []byte) bool {
+				rows++
+				bytes += int64(len(row))
+				return true
+			})
+	case WireRefs:
+		err = c.QueryRawWireRefsStream(ctx, spec.Table, spec.Constraint, spec.Projection, limit, false,
 			func(row []byte) bool {
 				rows++
 				bytes += int64(len(row))

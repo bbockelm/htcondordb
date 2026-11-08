@@ -90,7 +90,7 @@ func joinExecutor(t *testing.T, s *dbrpc.Server, attrs map[string]string, privil
 	go func() {
 		_ = s.ServeConnOpts(dbrpc.NewStreamConn(sp), dbrpc.ServeOptions{
 			Privileged: privileged,
-			QueryLog:   func(q dbrpc.QueryLog) { ops.add(q.Op) },
+			QueryLog:   func(q dbrpc.QueryLog) { ops.addLog(q) },
 		})
 	}()
 	conn := dbrpc.NewStreamConn(cp)
@@ -104,14 +104,31 @@ func joinExecutor(t *testing.T, s *dbrpc.Server, attrs map[string]string, privil
 // opRecorder notes which ops a server was actually asked to run, which is the only direct
 // evidence of which path a statement took. EXPLAIN says what WILL happen; this says what did.
 type opRecorder struct {
-	mu  sync.Mutex
-	ops []string
+	mu   sync.Mutex
+	ops  []string
+	logs []dbrpc.QueryLog
 }
 
-func (r *opRecorder) add(op string) {
+// addLog records the whole log entry, so a test can assert what an op DID rather than only that
+// it happened -- which matters where the op names alone cannot be ordered reliably. See
+// logFor and TestJoinFallsBackWhenTheServerRefusesTheWireReply.
+func (r *opRecorder) addLog(q dbrpc.QueryLog) {
 	r.mu.Lock()
-	r.ops = append(r.ops, op)
+	r.ops = append(r.ops, q.Op)
+	r.logs = append(r.logs, q)
 	r.mu.Unlock()
+}
+
+// logFor returns the recorded entry for an op, and whether it was seen.
+func (r *opRecorder) logFor(op string) (dbrpc.QueryLog, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, q := range r.logs {
+		if q.Op == op {
+			return q, true
+		}
+	}
+	return dbrpc.QueryLog{}, false
 }
 
 func (r *opRecorder) saw(op string) bool {

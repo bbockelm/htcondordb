@@ -79,6 +79,21 @@ type ExecConfig struct {
 	// own deployment and disagrees.
 	JoinPlacement JoinPlacement
 
+	// AttrNDV, if set, reports how many distinct values a table's attribute takes, from index
+	// metadata rather than by reading records. It is what lets the key-batch decision price
+	// the half of its trade that the ratio of two table sizes cannot see: a join key the right
+	// side repeats many times, where narrowing the scan to the left side's keys excludes
+	// nothing and the constraint is paid for nothing (see joinbatch.go).
+	//
+	// A FUNCTION rather than a client call because this is not on the wire. The store computes
+	// it from per-segment index summaries -- db.Catalog.AttrNDV -- and no dbrpc opcode carries
+	// it, so a session reaching a store over a connection has no way to ask and leaves this
+	// nil. Nil is a supported state and not a degraded one: the decision then rests on the key
+	// count and the right side's size alone, which is what it rested on before NDV existed.
+	// The alternative on offer over the wire, COUNT(DISTINCT), is a scan, and a planning
+	// decision that scans the table it is deciding whether to scan is worse than not deciding.
+	AttrNDV func(table, attr string) (collections.NDVEstimate, bool)
+
 	// LinkCapacityMbps is how much bandwidth this session's connection to the store has, in
 	// megabits per second. It describes the LINK, not the join: it is the one input the
 	// placement decision cannot learn by asking the store, because it is a property of the
@@ -126,6 +141,9 @@ type Executor struct {
 	serverJoin bool
 	placement  JoinPlacement
 	linkMbps   int
+	// attrNDV is the session's statistics source for distinct-value counts, and is nil when
+	// it has none. See ExecConfig.AttrNDV.
+	attrNDV ndvSource
 
 	// rowCounts memoizes the cheap whole-table row counts one statement asks for, so the
 	// placement decision and the key-batch decision that follows it do not each pay a round
@@ -237,7 +255,7 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps, attrNDV: cfg.AttrNDV}
 }
 
 // SyncControl sends one DBSyncControl request to the daemon (see ExecConfig.SyncControl).
@@ -1245,6 +1263,11 @@ type explainTrace struct {
 	// clear, and the report says so.
 	scan   collections.ScanStats
 	scanOK bool
+	// keyBatch is one sentence per join step saying whether that step narrowed the next
+	// side's scan to the keys in hand, and on what numbers. Plain EXPLAIN can only state the
+	// rule, because the key count is a fact about rows it has not read; ANALYZE has read
+	// them, so it reports the decision itself.
+	keyBatch []string
 }
 
 // execExplain implements EXPLAIN [ANALYZE] <SELECT>. Plain EXPLAIN reports the chosen plan; with
@@ -1288,6 +1311,12 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 			lines = append(lines, scanStatsLines(tr)...)
 		} else {
 			lines = append(lines, "  (server-side aggregate: only the result crosses the wire; no per-segment scan breakdown on this path)")
+		}
+		if len(tr.keyBatch) > 0 {
+			lines = append(lines, "key batching:")
+			for _, l := range tr.keyBatch {
+				lines = append(lines, "  "+l)
+			}
 		}
 	}
 	res := &Result{IsSelect: true, Columns: []string{"QUERY PLAN"}}

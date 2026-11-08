@@ -179,7 +179,7 @@ func newLinkJoinFixture(b testing.TB, left int, k float64, bytesPerSec int64) *l
 		go func() {
 			_ = s.ServeConnOpts(dbrpc.NewStreamConn(sc), dbrpc.ServeOptions{
 				Privileged: true,
-				QueryLog:   func(q dbrpc.QueryLog) { ops.add(q.Op) },
+				QueryLog:   func(q dbrpc.QueryLog) { ops.addLog(q) },
 			})
 		}()
 		conn := dbrpc.NewStreamConn(cc)
