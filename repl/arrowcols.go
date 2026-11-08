@@ -220,3 +220,56 @@ func ArrowCellValue(cell string, d arrowtype.Decision) classad.Value {
 		return classad.NewStringValue(cell)
 	}
 }
+
+// ArrowRowValues types row i of a result whose rows are not a property of any one ad -- an
+// aggregate, whose rows are per group, a DISTINCT, a de-duplicated UNION -- into out, one
+// value per decision.
+//
+// THE VALUES COME FROM THE ROW'S PROJECTED AD: each selected item under its header, holding
+// the value that item evaluated to. That is the same source the JSON and ClassAd formats,
+// the C API and the streaming cursor read, and reading it is what keeps the string "123" a
+// string -- a display cell spells a string that looks like a number exactly as it spells
+// the number, and spells the string "undefined" exactly as it spells a missing value.
+//
+// The display cell is the last resort, read against its DECLARED column type
+// (ArrowCellValue). It covers an aggregate's own output, which crosses the wire already
+// rendered and has no typed counterpart; a result carrying no projection at all; and a
+// header two items share.
+//
+// A VALUE IS NEVER BENT TO FIT ITS COLUMN. Arrow is typed per column and a column's type is
+// a measurement of the table, so a projected value can disagree with it -- a string in a
+// column whose sample saw only integers. The encoder settles that by its own rules: a
+// faithful rendering where one exists (any value in a text column), a counted null where
+// none does. Retyping the cell to match the declaration is the guess this path deletes.
+func ArrowRowValues(r *Result, i int, decisions []arrowtype.Decision, out []classad.Value) {
+	var proj *classad.ClassAd
+	if i < len(r.Projected) {
+		proj = r.Projected[i]
+	}
+	var row []string
+	if i < len(r.Rows) {
+		row = r.Rows[i]
+	}
+	// Two items may share a header (`SELECT a AS x, b AS x`). The projected ad holds one
+	// attribute of that name -- the later item's value -- so a lookup would give both
+	// cells the same WRONG VALUE, not merely the wrong type. The display cells stay
+	// per-cell, so an ambiguous header is typed from the row instead.
+	ambiguous := repeatedHeaders(r.Columns)
+	for j := range decisions {
+		cell := ""
+		if j < len(row) {
+			cell = row[j]
+		}
+		if proj != nil && j < len(r.Columns) && !ambiguous[r.Columns[j]] {
+			// UNDEFINED falls through to the cell, which spells it the same way.
+			// That fall-through is also what covers a header the projection cannot
+			// name: an ad spells a missing attribute by leaving it out, and the two
+			// are indistinguishable here.
+			if v := proj.EvaluateAttr(r.Columns[j]); !v.IsUndefined() {
+				out[j] = v
+				continue
+			}
+		}
+		out[j] = ArrowCellValue(cell, decisions[j])
+	}
+}
