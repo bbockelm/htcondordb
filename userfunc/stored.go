@@ -14,6 +14,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/db/scriptagg"
 	"github.com/PelicanPlatform/classad/wasmudf"
 )
 
@@ -51,6 +52,33 @@ import (
 // call site captured, so it is the one thing a replacement cannot move without making a cached
 // program wrong.
 //
+// AN AGGREGATE IS A ROLE, NOT A KIND, AND NONE OF THE PARAGRAPH ABOVE APPLIES TO IT. A record says
+// two independent things: what its source IS -- ClassAd Script text or a WebAssembly module, which
+// is Kind and decides how the source is compiled -- and what the name is registered AS, which is
+// Role and decides which registry it goes into and what may later be done to it. Script and wasm
+// each take either role, so the two are separate attributes rather than four kinds; and a record
+// that names no role is a scalar function, which is what every record written before the role
+// existed is.
+//
+// The aggregate registry takes a replacement and a withdrawal, because an aggregate name is
+// resolved ONCE PER QUERY, when the reduction is set up, and nothing caches that resolution past
+// the query that made it. An aggregate registration also carries NO ARITY at all -- one spec, one
+// argument attribute, whatever the aggregate -- so a replacement has no signature it could
+// disagree with. Two consequences, both of which this file takes:
+//
+//   - A stored aggregate needs NO TRAMPOLINE. db.ReplaceAggregate installs the new implementation
+//     under the name directly, and db.UnregisterAggregate takes the name back.
+//   - A stored aggregate's ARITY IS NOT IMMUTABLE, because there is no arity. A record that is an
+//     aggregate carries none, and a replacement may change anything about the source at all.
+//
+// What an aggregate's author owes instead is the laws the reduction relies on: `merge` has to be
+// associative AND commutative, and `result` has to repeat without disturbing the state. The
+// columnar pass fans out across segment windows and which worker draws which segment is a race, so
+// an order-sensitive merge is right in every test its author writes and wrong in production. No
+// registration can check that -- db.CheckAggregate tests one against the laws, over samples only
+// the author can choose, since samples picked here would be integers for an aggregate over host
+// names and would prove nothing.
+//
 // A MODULE THAT DOES NOT LOAD MARKS THE FUNCTION BAD. IT DOES NOT STOP THE DAEMON. This is where
 // the stored path deliberately differs from the configured one, where a module that fails to load
 // fails start-up (see Apply). The difference is not an inconsistency, and three things make it the
@@ -65,15 +93,30 @@ import (
 //   - Otherwise anyone who may register a function could stop the daemon starting, which turns an
 //     administrative privilege into an availability one.
 //
-// A BAD FUNCTION IS REGISTERED, under its stored arity, pointing at an implementation that answers
-// ERROR. It is NOT left unregistered. Leaving the name out would change how the CALL SITE compiles
-// -- an unregistered name compiles to something else entirely -- and that decision is the one that
-// cannot be taken back. Registering it keeps the name's shape fixed and puts the failure in the
-// value, where a query can see it, which is what calling a name that does not exist already gives.
+// A BAD SCALAR FUNCTION IS REGISTERED, under its stored arity, pointing at an implementation that
+// answers ERROR. It is NOT left unregistered. Leaving the name out would change how the CALL SITE
+// compiles -- an unregistered name compiles to something else entirely -- and that decision is the
+// one that cannot be taken back. Registering it keeps the name's shape fixed and puts the failure
+// in the value, where a query can see it, which is what calling a name that does not exist already
+// gives.
 //
-// And bad is a STATE, NOT A SILENCE: it is logged at start-up, written into the function's own
-// record, and reported by the listing. An operator should be able to find out that pctUsed is bad
-// without first noticing that a column has gone to ERROR.
+// A BAD AGGREGATE IS NOT REGISTERED, and the opposite answer has the same cause: nothing captures
+// an aggregate name, so there is no shape to keep. What decides it is which failure an operator
+// gets. A registered aggregate that answers ERROR for every group produces a column of ERROR in a
+// query that SUCCEEDS -- a result that looks like a result. An unregistered one fails the query
+// outright, naming the aggregate, which is also what db does with an aggregate nobody ever
+// registered. Between a plausible wrong answer and a loud refusal that says which name is the
+// problem, the refusal is the one to hand an operator.
+//
+// And bad is a STATE, NOT A SILENCE, in either role: it is logged at start-up, written into the
+// function's own record, and reported by the listing. An operator should be able to find out that
+// pctUsed is bad without first noticing that a column has gone to ERROR, or that p95 is bad
+// without first running a query that fails.
+//
+// THE NAME IS HELD EITHER WAY. Bad or good, scalar or aggregate, the name stays claimed in THIS
+// manager's bookkeeping, so a configured module and a second record cannot contend for it. That
+// bookkeeping is this file's and not classad's, which is why a name whose aggregate was never
+// registered is still not available to anyone else.
 //
 // TRUST IS NEVER STORED. A trusted wasm module runs with no wall-clock deadline and cannot be
 // interrupted, which is a capability an operator grants a file they pointed at. A stored module is
@@ -96,11 +139,27 @@ const Table = "user_functions"
 
 // The attributes of a stored function's record.
 const (
-	AttrName     = "Name"     // the name as registered, in the spelling the administrator chose
-	AttrKind     = "Kind"     // KindScript or KindWasm
-	AttrSource   = "Source"   // ClassAd Script text, or base64-encoded wasm bytes
-	AttrArity    = "Arity"    // the argument count; the part that cannot change
+	AttrName   = "Name"   // the name as registered, in the spelling the administrator chose
+	AttrKind   = "Kind"   // KindScript or KindWasm: what the source IS
+	AttrSource = "Source" // ClassAd Script text, or base64-encoded wasm bytes
+	// AttrRole is what the name is registered AS: RoleFunction or RoleAggregate. ABSENT MEANS
+	// RoleFunction, which is what makes every record written without it a scalar function and
+	// keeps it loading unchanged.
+	AttrRole = "Role"
+	// The argument count. A scalar function's, and the part of it that cannot change; an
+	// aggregate carries neither attribute, because an aggregate registration has no arity for
+	// anything to disagree with.
+	AttrArity    = "Arity"
 	AttrMaxArity = "MaxArity" // the largest accepted count; absent means exactly Arity, -1 variadic
+	// The four `def`s a SCRIPT AGGREGATE is built from, each optional. The default is the
+	// configured surface's prefix rule -- <name>_init, <name>_add, <name>_merge, <name>_result --
+	// so a file written for one surface loads on the other, and a record names a `def` only where
+	// its file spells things otherwise. They are suffixed Def because a record attribute called
+	// "Add" beside Name, Kind and Source reads like an instruction rather than a name.
+	AttrInitDef   = "InitDef"
+	AttrAddDef    = "AddDef"
+	AttrMergeDef  = "MergeDef"
+	AttrResultDef = "ResultDef"
 	// AttrChecksum is the instance identity: a checksum over the source, computed by the daemon.
 	//
 	// A name is not enough to explain a result, because the thing behind a name changes -- two
@@ -121,11 +180,17 @@ const (
 	AttrStateAt     = "StateAt"
 )
 
-// The kinds of stored function. They are the two kinds the configured path loads, minus the
-// aggregate: see Register for why a stored aggregate is refused rather than registered.
+// The kinds of source a record can carry, which is what decides how it is compiled.
 const (
 	KindScript = "script"
 	KindWasm   = "wasm"
+)
+
+// The roles a stored name can be registered in, which is what decides which registry it goes into
+// and what may later be done to it. A record that states no role is a function.
+const (
+	RoleFunction  = "function"
+	RoleAggregate = "aggregate"
 )
 
 // The states a stored function can be in.
@@ -159,11 +224,16 @@ var ErrNoStore = errors.New("stored user functions are not available on this dae
 // reason is the bad case: a record whose source will not parse still has to be registered under
 // its argument count, and a source that will not parse cannot be asked what that count is. So the
 // count is written down at registration, when the source did parse, and the load then checks the
-// source against it.
+// source against it. An AGGREGATE has no argument count to carry: it is named in one spec against
+// one argument attribute whatever it is, so both fields are left unset and nothing reads them.
 type Record struct {
-	Name         string
-	Kind         string
-	Source       string
+	Name   string
+	Kind   string
+	Role   string // RoleFunction (the default when empty) or RoleAggregate
+	Source string
+	// Defs names the four `def`s a script aggregate is built from. An empty role falls back to
+	// the prefix rule; the field is ignored entirely for anything but a script aggregate.
+	Defs         aggDefs
 	Arity        int
 	MaxArity     int
 	Checksum     string
@@ -176,6 +246,37 @@ type Record struct {
 	// TrustRequested records that the record asked to be trusted. It is never honoured; it is
 	// kept so the answer can say the attribute was ignored instead of silently dropping it.
 	TrustRequested bool
+}
+
+// role is the role the record claims, with the empty spelling resolved. Every test of what a
+// record is goes through this or through aggregate, so "absent means a function" is stated once.
+func (r Record) role() string {
+	if r.Role == "" {
+		return RoleFunction
+	}
+	return strings.ToLower(r.Role)
+}
+
+// aggregate reports whether this record registers an aggregate rather than a scalar function.
+func (r Record) aggregate() bool { return r.role() == RoleAggregate }
+
+// defs resolves the four `def` names a script aggregate is built from, filling in the prefix rule
+// for each role the record does not name. Resolved HERE rather than left to the library's own
+// defaults so that one rule -- the configured surface's -- spells them for both surfaces: a file
+// written for HTCONDORDB_SCRIPT_AGGREGATES registers from this table unchanged.
+func (r Record) defs() aggDefs {
+	pick := func(given, dflt string) string {
+		if strings.TrimSpace(given) == "" {
+			return dflt
+		}
+		return strings.TrimSpace(given)
+	}
+	return aggDefs{
+		Init:   pick(r.Defs.Init, r.Name+"_init"),
+		Add:    pick(r.Defs.Add, r.Name+"_add"),
+		Merge:  pick(r.Defs.Merge, r.Name+"_merge"),
+		Result: pick(r.Defs.Result, r.Name+"_result"),
+	}
 }
 
 // sourceBytes returns the source as the loader consumes it: the decoded module bytes for wasm,
@@ -222,8 +323,28 @@ func (r Record) Ad() *classad.ClassAd {
 	ad.InsertAttrString(AttrName, r.Name)
 	ad.InsertAttrString(AttrKind, r.Kind)
 	ad.InsertAttrString(AttrSource, r.Source)
-	ad.InsertAttr(AttrArity, int64(r.Arity))
-	ad.InsertAttr(AttrMaxArity, int64(r.maxArity()))
+	if r.aggregate() {
+		// Written only for an aggregate, so that a record carrying no Role attribute at all is
+		// exactly a scalar function's and reads back as one.
+		ad.InsertAttrString(AttrRole, RoleAggregate)
+		// The four `def` names, each written only where the record names one. The prefix rule
+		// fills the rest in at load, so writing the resolved names would freeze into the record
+		// an answer that the rule already gives.
+		for _, d := range []struct{ attr, name string }{
+			{AttrInitDef, r.Defs.Init}, {AttrAddDef, r.Defs.Add},
+			{AttrMergeDef, r.Defs.Merge}, {AttrResultDef, r.Defs.Result},
+		} {
+			if strings.TrimSpace(d.name) != "" {
+				ad.InsertAttrString(d.attr, d.name)
+			}
+		}
+	} else {
+		// An aggregate carries NO argument count, so the attributes are absent rather than zero:
+		// zero is a legitimate count for a function, and a reader has to be able to tell a record
+		// that states none from one that states none-at-all.
+		ad.InsertAttr(AttrArity, int64(r.Arity))
+		ad.InsertAttr(AttrMaxArity, int64(r.maxArity()))
+	}
 	ad.InsertAttrString(AttrChecksum, r.Checksum)
 	if r.RegisteredBy != "" {
 		ad.InsertAttrString(AttrRegisteredBy, r.RegisteredBy)
@@ -252,7 +373,12 @@ func recordFromAd(key string, ad *classad.ClassAd) Record {
 		r.Name = key
 	}
 	r.Kind, _ = ad.EvaluateAttrString(AttrKind)
+	r.Role, _ = ad.EvaluateAttrString(AttrRole)
 	r.Source, _ = ad.EvaluateAttrString(AttrSource)
+	r.Defs.Init, _ = ad.EvaluateAttrString(AttrInitDef)
+	r.Defs.Add, _ = ad.EvaluateAttrString(AttrAddDef)
+	r.Defs.Merge, _ = ad.EvaluateAttrString(AttrMergeDef)
+	r.Defs.Result, _ = ad.EvaluateAttrString(AttrResultDef)
 	if n, ok := ad.EvaluateAttrInt(AttrArity); ok {
 		r.Arity = int(n)
 	} else {
@@ -304,15 +430,62 @@ func (m *Manager) registryOrDefault() registry {
 	return classAdRegistry{}
 }
 
+// aggRegistry is db's aggregate registry, as the stored path uses it.
+//
+// An interface for the reason the scalar one is, and for one more: this registry DOES take a
+// withdrawal, so a test can register a name, take it back, and register it again -- but the
+// registry is still process-wide, so two tests sharing a name would still interfere through it.
+// A test that wants a registry to itself supplies one.
+//
+// The three methods are the three things a stored aggregate needs, and each is a different
+// question. RegisterAggregate claims a free name and FAILS if something else holds it, which is
+// how a first registration finds out about a collision this manager did not know of.
+// ReplaceAggregate installs over whatever is there, which is the correction path and also the
+// repair path for a name that is bad and therefore absent. UnregisterAggregate takes the name
+// back, which is what makes removing a stored aggregate give the name up immediately.
+type aggRegistry interface {
+	RegisterAggregate(name string, agg db.Aggregate) error
+	ReplaceAggregate(name string, agg db.Aggregate) error
+	UnregisterAggregate(name string) bool
+}
+
+type classAdAggRegistry struct{}
+
+func (classAdAggRegistry) RegisterAggregate(name string, agg db.Aggregate) error {
+	return db.RegisterAggregate(name, agg)
+}
+
+func (classAdAggRegistry) ReplaceAggregate(name string, agg db.Aggregate) error {
+	return db.ReplaceAggregate(name, agg)
+}
+
+func (classAdAggRegistry) UnregisterAggregate(name string) bool {
+	return db.UnregisterAggregate(name)
+}
+
+// aggRegistryOrDefault is the aggregate registry to register into. Called with the lock held.
+func (m *Manager) aggRegistryOrDefault() aggRegistry {
+	if m.aggReg != nil {
+		return m.aggReg
+	}
+	return classAdAggRegistry{}
+}
+
 // implementation is what sits behind a trampoline: the function of the moment, and the identity of
 // the code it runs.
 type implementation struct {
+	// fn is a scalar function's callable, and agg an aggregate's registration. Exactly one of
+	// them is set, decided by the record's role; they share a struct because everything else here
+	// -- the identity of the code, the module it came from, why it errors -- is the same question
+	// for both, and a second struct would duplicate all of it to separate two fields.
 	fn       classad.Func
+	agg      db.Aggregate
 	checksum string
-	// udf is the loaded module a wasm implementation came from, nil for a script. Kept so that
-	// what is running can be INSPECTED and not only called -- its trust, its per-call statistics
-	// -- which a bare func value cannot answer for.
-	udf *wasmudf.UDF
+	// udf and udaf are the loaded module a wasm implementation came from, nil for a script. Kept
+	// so that what is running can be INSPECTED and not only called -- its trust, its per-call
+	// statistics -- which a bare func value cannot answer for.
+	udf  *wasmudf.UDF
+	udaf *wasmudf.UDAF
 	// reason, when set, is why this implementation answers ERROR: the function is bad, or its
 	// record has been removed. It is carried with the implementation rather than beside it so that
 	// a call and a listing cannot disagree about which code is running.
@@ -371,7 +544,12 @@ func arityText(minArgs, maxArgs int) string {
 // against, and the record that last described it.
 type storedFn struct {
 	tramp *trampoline
-	rec   Record
+	// impl is an AGGREGATE's implementation, held here because an aggregate has no trampoline to
+	// hold it: db's registry takes the replacement directly, so the indirection a scalar name
+	// needs would be a pointer nothing ever reads through. It is what the listing reports the
+	// identity of, and nil while an aggregate is bad.
+	impl *implementation
+	rec  Record
 	// state and reason are the live state, which is what the listing reports. The record carries
 	// the same pair, written back so it survives a restart; this copy is what a listing can report
 	// without reading the table.
@@ -381,15 +559,22 @@ type storedFn struct {
 
 // Status is one line of the listing: what is registered, in what state, running which code.
 type Status struct {
-	Name     string
-	Kind     string
-	Origin   string // "stored" or "configured"
-	Arity    int
-	MaxArity int
-	Checksum string // a stored function's instance identity
-	Path     string // a configured function's file
-	State    string
-	Reason   string
+	Name string
+	// Kind is for a reader, not for a parser: it names the source and the role together --
+	// "script", "wasm", "script aggregate", "wasm aggregate" -- because those four are what an
+	// operator scanning a listing wants to tell apart, and splitting them into two columns would
+	// put a mostly empty one beside a mostly redundant one.
+	Kind   string
+	Origin string // "stored" or "configured"
+	// Aggregate is the role as a FACT rather than as text, so that a renderer can leave the
+	// argument count out instead of printing a zero for a thing that has no count.
+	Aggregate bool
+	Arity     int
+	MaxArity  int
+	Checksum  string // a stored function's instance identity
+	Path      string // a configured function's file
+	State     string
+	Reason    string
 
 	RegisteredBy string
 	RegisteredAt int64
@@ -476,6 +661,11 @@ func (m *Manager) loadStoredRecord(key string, rec Record) {
 		return
 	}
 
+	if rec.aggregate() {
+		m.loadStoredAggregate(folded, rec)
+		return
+	}
+
 	t := &trampoline{name: rec.Name, minArgs: rec.Arity, maxArgs: rec.maxArity()}
 	// The name is registered BEFORE the source is compiled, and whether or not the source
 	// compiles. That is the point of a bad function being a state: the call site's shape is fixed
@@ -514,12 +704,60 @@ func (m *Manager) loadStoredRecord(key string, rec Record) {
 	}
 }
 
+// loadStoredAggregate registers one stored aggregate. Called with the lock held.
+//
+// THE SOURCE IS COMPILED FIRST AND THE NAME REGISTERED SECOND, which is the opposite order from
+// the scalar path two functions up, and the reason is the whole of what an aggregate registration
+// is not. There, the name has to be claimed whether or not the source compiles, because leaving it
+// out changes how a call site compiles and that decision cannot be revisited. Here nothing
+// captures the name, so there is no shape to fix in advance -- and registering an aggregate that
+// does not work would turn a query that fails, naming the aggregate, into a query that succeeds
+// with a column of ERROR in it.
+func (m *Manager) loadStoredAggregate(folded string, rec Record) {
+	m.stored[folded] = &storedFn{rec: rec}
+	impl, err := m.compile(rec)
+	if err != nil {
+		m.badLocked(folded, err)
+		return
+	}
+	// RegisterAggregate, which fails on a name already held, rather than ReplaceAggregate, which
+	// does not. The names this manager knows about have been checked already; what this catches is
+	// a name held by something else in this process, which is a collision nobody here can see.
+	if err := m.aggRegistryOrDefault().RegisterAggregate(rec.Name, impl.agg); err != nil {
+		m.badLocked(folded, fmt.Errorf("the name could not be registered as an aggregate: %w", err))
+		return
+	}
+	sf := m.stored[folded]
+	sf.impl, sf.state, sf.reason = impl, StateOK, ""
+	m.logger.Info("stored aggregate registered", "name", rec.Name, "kind", rec.Kind,
+		"checksum", impl.checksum)
+	if rec.TrustRequested {
+		m.logger.Warn("stored user function asked to be trusted and is loaded untrusted; "+
+			"trust is configuration, not something a stored module can claim", "name", rec.Name)
+	}
+	if rec.State != StateOK {
+		m.markState(folded, StateOK, "")
+	}
+}
+
 // badLocked marks a registered stored function bad: in the log, in the live state the listing
 // reports, in the record, and in the value a call produces. Called with the lock held.
 func (m *Manager) badLocked(folded string, err error) {
 	sf := m.stored[folded]
 	reason := err.Error()
 	sf.state, sf.reason = StateBad, reason
+	if sf.rec.aggregate() {
+		// Nothing is registered, and the implementation is dropped rather than replaced by one
+		// that errors. A query naming the aggregate then fails, naming it, which is the same
+		// answer db gives for an aggregate nobody ever registered -- and a better one to hand an
+		// operator than a column of ERROR inside a query that reports success.
+		sf.impl = nil
+		m.logger.Error("stored aggregate is BAD and is not registered; a query naming it fails, "+
+			"rather than answering a column of ERROR that looks like an answer",
+			"name", sf.rec.Name, "err", reason)
+		m.markState(folded, StateBad, reason)
+		return
+	}
 	// Pointed at an erroring implementation EXPLICITLY rather than left pointing at nothing. The
 	// nil case answers ERROR too, but a bad function and a function whose implementation was never
 	// installed are different situations, and only one of them has a reason to report.
@@ -536,6 +774,12 @@ func (m *Manager) badLocked(folded string, err error) {
 func (r Record) validShape() error {
 	if err := r.validDescription(); err != nil {
 		return err
+	}
+	if r.aggregate() {
+		// There is no argument count to check and no name to register under one. An aggregate is
+		// named in one spec against one argument attribute whatever it is, so a record that
+		// describes an aggregate at all describes it completely.
+		return nil
 	}
 	if r.Arity < 0 {
 		return errors.New("the record does not state an argument count, and the count is what the " +
@@ -561,23 +805,52 @@ func (r Record) validDescription() error {
 	case KindScript, KindWasm:
 	case "":
 		return fmt.Errorf("the record does not say what kind of function this is (%s or %s)", KindScript, KindWasm)
-	case "aggregate":
-		// Worth its own message, because an administrator reaching for this is reasoning by
-		// analogy with the configured surface, where an aggregate is a module like any other.
-		// An aggregate name is resolved once per query rather than captured by a call site, so
-		// replacing one would be perfectly well defined -- but the aggregate registry has no
-		// replace to do it with, and a stored aggregate that could never be corrected would be
-		// the configuration file again with more moving parts.
-		return errors.New("an aggregate cannot be stored: the aggregate registry has no way to " +
-			"replace one, so a stored aggregate could never be corrected. Configure it with " +
-			"HTCONDORDB_SCRIPT_AGGREGATES or HTCONDORDB_WASM_AGGREGATES")
+	case RoleAggregate:
+		// Worth its own message, because the two axes are easy to conflate and an administrator
+		// who reaches for this has the right idea in the wrong field. Script and wasm each take
+		// either role, so what the source is and what it is registered as are separate things.
+		return fmt.Errorf("%q is a role rather than a kind: set %s to %s or %s -- what the source "+
+			"is -- and %s to %s", RoleAggregate, AttrKind, KindScript, KindWasm, AttrRole, RoleAggregate)
 	default:
 		return fmt.Errorf("%q is not a kind of user function (%s or %s)", r.Kind, KindScript, KindWasm)
+	}
+	switch r.role() {
+	case RoleFunction:
+	case RoleAggregate:
+		// A built-in aggregate name is not available either, and for a reason the scalar
+		// built-in check does not cover: a client's parser reads COUNT, SUM, AVG, MIN and MAX as
+		// aggregates before it consults any registry, so a registration under one of those names
+		// succeeds and is then unreachable. Refusing it here says so, where a silent success
+		// would leave an administrator to discover it by writing a query.
+		if builtinAggregateName(r.Name) {
+			return fmt.Errorf("%q is a built-in aggregate, which a stored one may not shadow", r.Name)
+		}
+	default:
+		return fmt.Errorf("%q is not a role a user function can have (%s or %s)", r.Role, RoleFunction, RoleAggregate)
 	}
 	if strings.TrimSpace(r.Source) == "" {
 		return errors.New("the record carries no source")
 	}
 	return nil
+}
+
+// builtinAggregateName reports whether a query's parser reads name as one of the aggregates the
+// language already has, in which case nothing registered under it is ever resolved.
+//
+// Four of the five are built-in scalar FUNCTIONS as well, and are refused as those whatever role
+// they are asked for; COUNT is not, so this is the only rule that catches it.
+//
+// The list is written out here rather than asked of the parser, because the parser lives in the
+// package that reads SQL and this one is loaded by the daemon that has none. It is five words and
+// it has not moved; what keeps it honest is that a name wrongly on it is merely refused, which an
+// administrator reports, while a name wrongly off it is refused by nothing and silently does
+// nothing, which they cannot.
+func builtinAggregateName(name string) bool {
+	switch strings.ToUpper(name) {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		return true
+	}
+	return false
 }
 
 // validName mirrors what classad's registry will accept, so a bad name is refused with the reason
@@ -620,12 +893,75 @@ func (m *Manager) compile(rec Record) (*implementation, error) {
 			"(record says %s, source is %s): the record has been damaged or changed outside the "+
 			"administrative path", rec.Checksum, sum)
 	}
-	switch rec.Kind {
-	case KindScript:
+	switch {
+	case rec.aggregate() && rec.Kind == KindScript:
+		return m.compileScriptAggregate(rec, string(src), sum)
+	case rec.aggregate():
+		return m.compileWasmAggregate(rec, src, sum)
+	case rec.Kind == KindScript:
 		return m.compileScript(rec, string(src), sum)
 	default:
 		return m.compileWasm(rec, src, sum)
 	}
+}
+
+// compileScriptAggregate builds one aggregate out of the four `def`s in stored script text.
+//
+// It builds and does not register, which is what lets the start-up load decide afterwards whether
+// to claim the name and lets a replacement prove the new source before the old one stops running.
+// The library refuses three things here, each of which would otherwise be a column of ERROR for
+// every caller with nothing saying why: a `def` the record names and the source does not define,
+// one whose parameter count does not fit the role the engine calls it in, and an `init` that does
+// not produce an identity. Those refusals are the library's own words and name the `def` and the
+// role, which is what says which line of the source to open.
+//
+// The purity gate applies to all four exactly as it does to a scalar `def`. There is no Columnar
+// opt-in: it is a promise about value order and about which rows are offered that only the author
+// can make, the configured surface does not offer it either, and an aggregate that does not make
+// it is served by the record scan, which is correct and slower.
+func (m *Manager) compileScriptAggregate(rec Record, text, sum string) (*implementation, error) {
+	mod, err := vm.ParseScriptModule(text)
+	if err != nil {
+		return nil, err
+	}
+	defs := rec.defs()
+	a, err := scriptagg.New(mod, scriptagg.Spec{
+		Init:   defs.Init,
+		Add:    defs.Add,
+		Merge:  defs.Merge,
+		Result: defs.Result,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &implementation{agg: a, checksum: sum}, nil
+}
+
+// compileWasmAggregate loads stored module bytes as an aggregate.
+//
+// THE LOADER KEY CARRIES THE CHECKSUM, for the reason compileWasm's does: the loader refuses to
+// load one name twice and has no unload, and a stored aggregate's whole point is that a second
+// module can take the first one's place. The name a query reduces with is the bare one, under
+// which this registers in db; the loader's is only a key, since an aggregate module's exports are
+// fixed names the key does not reach.
+//
+// The residue is that every superseded module stays compiled for the life of the daemon. That is
+// the price of a loader whose only withdrawal is closing the runtime out from under every
+// registration still pointing into it, and a daemon that replaces an aggregate a handful of times
+// pays it in compiled modules nobody calls.
+//
+// LoadOptions carries no Trusted, here as everywhere else in this file.
+func (m *Manager) compileWasmAggregate(rec Record, wasm []byte, sum string) (*implementation, error) {
+	loader, err := m.wasmLoader()
+	if err != nil {
+		return nil, err
+	}
+	key := rec.Name + "@" + strings.TrimPrefix(sum, "sha256:")[:12]
+	u, err := loader.LoadAggregateWith(m.parent, key, wasm, wasmudf.LoadOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return &implementation{agg: u.Aggregate(), checksum: sum, udaf: u}, nil
 }
 
 // compileScript compiles one `def` out of stored script text.
@@ -740,6 +1076,9 @@ func (m *Manager) Register(rec Record) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
+	if rec.aggregate() {
+		return m.registerAggregate(folded, rec, impl, store)
+	}
 
 	t := &trampoline{name: rec.Name, minArgs: rec.Arity, maxArgs: rec.maxArity()}
 	if err := m.registryOrDefault().RegisterFunction(rec.Name, t.minArgs, t.maxArgs, t.call); err != nil {
@@ -767,12 +1106,50 @@ func (m *Manager) Register(rec Record) (Record, error) {
 	return rec, nil
 }
 
+// registerAggregate is Register's second half for an aggregate: claim the name, write the record,
+// and -- unlike the scalar case -- be able to undo the first if the second fails.
+//
+// A SCALAR THAT CANNOT BE WRITTEN STAYS REGISTERED AND SAYS SO, because a registration cannot be
+// withdrawn and reporting a clean failure would leave the name quietly claimed. An aggregate CAN
+// be withdrawn, so the failure is made clean instead: the name is given back and the registrant is
+// told the registration did not happen, which is both true and the state they would want. Called
+// with the lock held.
+func (m *Manager) registerAggregate(folded string, rec Record, impl *implementation, store *db.DB) (Record, error) {
+	reg := m.aggRegistryOrDefault()
+	if err := reg.RegisterAggregate(rec.Name, impl.agg); err != nil {
+		return Record{}, fmt.Errorf("registering the aggregate %s: %w", rec.Name, err)
+	}
+	rec.State, rec.StateReason, rec.StateAt = StateOK, "", time.Now().Unix()
+	tx := store.Begin()
+	tx.NewClassAd(folded, rec.Ad())
+	if err := tx.Commit(); err != nil {
+		reg.UnregisterAggregate(rec.Name)
+		return Record{}, fmt.Errorf("the record for %s could not be written, so it is not "+
+			"registered and the name is free: %w", rec.Name, err)
+	}
+	m.stored[folded] = &storedFn{impl: impl, rec: rec, state: StateOK}
+	m.logger.Info("stored aggregate registered", "name", rec.Name, "kind", rec.Kind,
+		"checksum", rec.Checksum, "by", rec.RegisteredBy)
+	return rec, nil
+}
+
 // Replace points an existing stored function at new source, in place.
 //
 // This is what the trampoline is for, and the argument count is what it cannot absorb. It is also
 // the repair path for a bad function: new source that loads clears the state. Source that does not
 // load changes nothing -- the record and whatever is running stay as they were -- and the error
 // says why, which is the difference between "fix the source" and "this runtime will not have it".
+//
+// AN AGGREGATE IS REPLACED OUTRIGHT, with nothing fixed. There is no trampoline because db's
+// registry takes the new implementation under the name directly, and no argument count to keep
+// because an aggregate registration carries none -- so a replacement may change everything about
+// the source, and a bad aggregate, which is a name db does not hold at all, is repaired by the
+// same call that corrects a working one.
+//
+// A ROLE CANNOT BE REPLACED, either way round. A name that is an aggregate and becomes a scalar
+// function, or the reverse, is a different thing in a different registry answering a differently
+// parsed call, and nothing about pointing one at new source describes that. It is a new name, or a
+// removal and a registration.
 func (m *Manager) Replace(rec Record) (Record, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -781,7 +1158,19 @@ func (m *Manager) Replace(rec Record) (Record, error) {
 	if !ok {
 		return Record{}, fmt.Errorf("%q is not a stored user function here; register it first", rec.Name)
 	}
-	if sf.tramp == nil {
+	// A replacement that names no role takes the one the name already has. "Absent means a
+	// function" is how a RECORD reads, because a record describes a registration completely; a
+	// replacement describes a change to one, and the thing it says nothing about is the thing it
+	// is not changing. An explicitly different role is still refused, below.
+	if rec.Role == "" {
+		rec.Role = sf.rec.role()
+	}
+	if rec.role() != sf.rec.role() {
+		return Record{}, fmt.Errorf("%q is a stored %s and the replacement is a %s; a replacement "+
+			"points a name at new source and cannot change what the name IS. Remove it and register "+
+			"the other, or pick another name", sf.rec.Name, sf.rec.role(), rec.role())
+	}
+	if !sf.rec.aggregate() && sf.tramp == nil {
 		return Record{}, fmt.Errorf("%q was never registered in this daemon (%s), so there is "+
 			"nothing to replace in place; fix the record and restart", rec.Name, sf.reason)
 	}
@@ -798,6 +1187,9 @@ func (m *Manager) Replace(rec Record) (Record, error) {
 	rec, impl, err := m.prepare(rec)
 	if err != nil {
 		return Record{}, err
+	}
+	if rec.aggregate() {
+		return m.replaceAggregate(folded, sf, rec, impl, store)
 	}
 	if err := sf.tramp.install(impl, rec.Arity, rec.maxArity()); err != nil {
 		return Record{}, err
@@ -821,13 +1213,57 @@ func (m *Manager) Replace(rec Record) (Record, error) {
 	return rec, nil
 }
 
+// replaceAggregate is Replace's second half for an aggregate. Called with the lock held.
+//
+// THE RECORD IS WRITTEN AND THE REGISTRATION IS ROLLED BACK IF IT CANNOT BE, which is the opposite
+// of what the scalar path does with the same failure. There, the new code is already answering and
+// cannot be taken back, so the only honest thing is to say the record and the running daemon now
+// disagree. Here the registry takes a second replacement as readily as the first, so the old
+// implementation goes back under the name and the daemon and its record agree again -- which is
+// worth more than the fact that a query running in the window reduced with the new code, something
+// that is true of any replacement and that no ordering here could prevent.
+func (m *Manager) replaceAggregate(folded string, sf *storedFn, rec Record, impl *implementation, store *db.DB) (Record, error) {
+	reg := m.aggRegistryOrDefault()
+	prevImpl, prev := sf.impl, sf.rec.Checksum
+	if err := reg.ReplaceAggregate(rec.Name, impl.agg); err != nil {
+		return Record{}, fmt.Errorf("registering the aggregate %s: %w", rec.Name, err)
+	}
+	rec.State, rec.StateReason, rec.StateAt = StateOK, "", time.Now().Unix()
+	tx := store.Begin()
+	tx.NewClassAd(folded, rec.Ad())
+	if err := tx.Commit(); err != nil {
+		was := prev + " is still what runs"
+		if prevImpl != nil {
+			_ = reg.ReplaceAggregate(sf.rec.Name, prevImpl.agg)
+		} else {
+			// It was bad, so nothing held the name before this call and nothing holds it now.
+			reg.UnregisterAggregate(sf.rec.Name)
+			was = "it is still bad, and a query naming it still fails"
+		}
+		return Record{}, fmt.Errorf("the record for %s could not be written, so the replacement "+
+			"is undone and %s: %w", rec.Name, was, err)
+	}
+	sf.impl, sf.rec, sf.state, sf.reason = impl, rec, StateOK, ""
+	m.logger.Info("stored aggregate replaced", "name", rec.Name, "was", prev,
+		"checksum", rec.Checksum, "by", rec.RegisteredBy)
+	return rec, nil
+}
+
 // Remove deletes a stored function's record.
 //
-// THE NAME IS NOT GIVEN BACK. A registration cannot be withdrawn, so for the rest of this
-// daemon's life the name stays registered and answers ERROR, and the listing keeps saying so. What
-// removal actually does is stop the next restart from registering it, after which the name is
-// free. The returned note says exactly that, because an administrator who removes a function and
-// immediately registers another under the same name needs to know why it is refused.
+// A SCALAR FUNCTION'S NAME IS NOT GIVEN BACK. A scalar registration cannot be withdrawn, so for
+// the rest of this daemon's life the name stays registered and answers ERROR, and the listing
+// keeps saying so. What removal actually does is stop the next restart from registering it, after
+// which the name is free. The returned note says exactly that, because an administrator who
+// removes a function and immediately registers another under the same name needs to know why it is
+// refused.
+//
+// AN AGGREGATE'S NAME IS GIVEN BACK, IMMEDIATELY. db's registry takes a withdrawal, so removing a
+// stored aggregate withdraws it: a query naming it afterwards fails, exactly as it would for a
+// name nobody ever registered, and the name is free for anything -- a new aggregate, a scalar
+// function, a configured module at the next reconfigure. Nothing is left in the listing to report,
+// because there is nothing left: the entry goes, where a removed scalar leaves a tombstone saying
+// the name is still taken.
 func (m *Manager) Remove(name string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -846,6 +1282,15 @@ func (m *Manager) Remove(name string) (string, error) {
 		return "", fmt.Errorf("removing the record for %s: %w", sf.rec.Name, err)
 	}
 	note := fmt.Sprintf("%s is removed from the table", sf.rec.Name)
+	if sf.rec.aggregate() {
+		// Withdrawn whether or not it was registered: a bad aggregate never reached the registry,
+		// and asking for a name it does not hold is how this call reports that.
+		m.aggRegistryOrDefault().UnregisterAggregate(sf.rec.Name)
+		delete(m.stored, folded)
+		m.logger.Info("stored aggregate removed", "name", sf.rec.Name, "checksum", sf.rec.Checksum)
+		return note + " and withdrawn from this daemon; a query naming it now fails, and the name " +
+			"is free again with no restart", nil
+	}
 	if sf.tramp != nil {
 		sf.tramp.impl.Store(&implementation{checksum: sf.rec.Checksum,
 			reason: "the function has been removed; the name stays registered until this daemon restarts"})
@@ -874,10 +1319,22 @@ func (m *Manager) claimable(folded string, rec Record) error {
 // prepare fills in a record's computed parts and compiles it, leaving nothing to do but register
 // and store. It is the half Register and Replace share.
 func (m *Manager) prepare(rec Record) (Record, *implementation, error) {
+	// Normalized to one spelling before anything is written or compared: a role is a fixed word
+	// and not a name the registrant chose, so a record that says "Aggregate" and one that says
+	// "aggregate" are the same record and should read back as the same record.
+	rec.Role = rec.role()
+	if rec.aggregate() {
+		// Normalized to "no count" rather than carried, so that nothing downstream -- the record
+		// that gets written, the listing, a later replacement -- is handed a number that looks
+		// like an argument count and constrains nothing. A request that STATED one is refused
+		// where a stated count can still be told from an unstated one, which is the command that
+		// read it; by here they are the same.
+		rec.Arity, rec.MaxArity = -1, -1
+	}
 	// A script `def` states its own argument count, so a registration need not repeat it and
 	// cannot get it wrong. A wasm module cannot be asked -- the count is checked before the guest
 	// runs -- so there it has to be declared.
-	if rec.Arity < 0 {
+	if !rec.aggregate() && rec.Arity < 0 {
 		if rec.Kind != KindScript {
 			return rec, nil, errors.New("a wasm function's argument count has to be declared: it is " +
 				"checked before the module runs, and the module cannot be asked for it")
@@ -898,7 +1355,9 @@ func (m *Manager) prepare(rec Record) (Record, *implementation, error) {
 	// Computed here, never taken from the caller. An identity the registrant chose would name
 	// whatever they wanted rather than the code that runs.
 	rec.Checksum = checksumOf(src)
-	rec.MaxArity = rec.maxArity()
+	if !rec.aggregate() {
+		rec.MaxArity = rec.maxArity()
+	}
 	if rec.RegisteredAt == 0 {
 		rec.RegisteredAt = time.Now().Unix()
 	}
@@ -964,7 +1423,7 @@ func (m *Manager) List() []Status {
 		st := Status{Name: mod.Name, Kind: mod.kind(), Origin: "configured", State: StateOK,
 			Arity: mod.MinArgs, MaxArity: mod.MaxArgs, Path: mod.Path}
 		if mod.Aggregate {
-			st.Kind = "wasm aggregate"
+			st.Kind, st.Aggregate = mod.kind()+" aggregate", true
 		}
 		out = append(out, st)
 	}
@@ -973,6 +1432,9 @@ func (m *Manager) List() []Status {
 			Arity: sf.rec.Arity, MaxArity: sf.rec.maxArity(), Checksum: sf.rec.Checksum,
 			State: sf.state, Reason: sf.reason,
 			RegisteredBy: sf.rec.RegisteredBy, RegisteredAt: sf.rec.RegisteredAt}
+		if sf.rec.aggregate() {
+			st.Kind, st.Aggregate = sf.rec.Kind+" aggregate", true
+		}
 		if st.State == "" {
 			st.State = StateOK
 		}
@@ -988,8 +1450,15 @@ func (s Status) Ad() *classad.ClassAd {
 	ad.InsertAttrString(AttrName, s.Name)
 	ad.InsertAttrString(AttrKind, s.Kind)
 	ad.InsertAttrString("Origin", s.Origin)
-	ad.InsertAttr(AttrArity, int64(s.Arity))
-	ad.InsertAttr(AttrMaxArity, int64(s.MaxArity))
+	if s.Aggregate {
+		// The role, and no argument count: an aggregate has none, and a renderer that found a
+		// zero here would print one.
+		ad.InsertAttrString(AttrRole, RoleAggregate)
+	} else {
+		ad.InsertAttrString(AttrRole, RoleFunction)
+		ad.InsertAttr(AttrArity, int64(s.Arity))
+		ad.InsertAttr(AttrMaxArity, int64(s.MaxArity))
+	}
 	if s.Checksum != "" {
 		ad.InsertAttrString(AttrChecksum, s.Checksum)
 	}

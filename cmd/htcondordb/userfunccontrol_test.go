@@ -232,3 +232,89 @@ func TestUserFuncTableIsOwnedByTheDaemon(t *testing.T) {
 		t.Errorf("%s is writable under another spelling", strings.ToUpper(userfunc.Table))
 	}
 }
+
+// aggregateRequest is a registration of a small script aggregate: four `def`s threading a state
+// value, named by the prefix rule the configured surface uses.
+func aggregateRequest(name string) *classad.ClassAd {
+	req := classad.New()
+	req.InsertAttrString("Action", "register")
+	req.InsertAttrString("Name", name)
+	req.InsertAttrString(userfunc.AttrKind, userfunc.KindScript)
+	req.InsertAttrString(userfunc.AttrRole, userfunc.RoleAggregate)
+	req.InsertAttrString(userfunc.AttrSource, strings.ReplaceAll(`
+def NAME_init():
+    return 0
+
+def NAME_add(s, v):
+    if isReal(v) || isInteger(v):
+        return s + v
+    return s
+
+def NAME_merge(a, b):
+    return a + b
+
+def NAME_result(s):
+    return s
+`, "NAME", name))
+	return req
+}
+
+// TestUserFuncControlRegistersAnAggregate: the command carries a role as well as a kind, and the
+// role is what decides which registry the name lands in. The two are separate because script and
+// wasm each take either one.
+func TestUserFuncControlRegistersAnAggregate(t *testing.T) {
+	h := newUFHarness(t, "READ", "WRITE", "ADMINISTRATOR")
+	resp, err := h.exchange(aggregateRequest("ufCtlAggregate"))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if ok, _ := resp.EvaluateAttrBool("Ok"); !ok {
+		msg, _ := resp.EvaluateAttrString("Error")
+		t.Fatalf("register: %s", msg)
+	}
+	note, _ := resp.EvaluateAttrString("Note")
+	// The answer says what was registered and which code is running it, because "registered" alone
+	// leaves an administrator unable to tell an aggregate from a function they mistyped the role of.
+	for _, want := range []string{"aggregate", "GROUP BY", "sha256:"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("the answer does not mention %q: %s", want, note)
+		}
+	}
+	if _, ok := db.LookupAggregate("ufCtlAggregate"); !ok {
+		t.Error("the name is not in the aggregate registry, so a GROUP BY cannot name it")
+	}
+	for _, st := range h.mgr.List() {
+		if strings.EqualFold(st.Name, "ufCtlAggregate") {
+			if !st.Aggregate || st.Kind != "script aggregate" {
+				t.Errorf("the listing does not say it is an aggregate: %+v", st)
+			}
+			if st.RegisteredBy != ufIdentity {
+				t.Errorf("provenance says %q, want the authenticated %q", st.RegisteredBy, ufIdentity)
+			}
+		}
+	}
+}
+
+// TestUserFuncControlRefusesAnArityOnAnAggregate: the command is the last place a count that was
+// STATED can be told from one that was not, so it is where the refusal belongs. A registrant who
+// declared a count believes the registration will be checked against it, and an aggregate's never
+// is -- it is named against one argument attribute whatever it is.
+func TestUserFuncControlRefusesAnArityOnAnAggregate(t *testing.T) {
+	h := newUFHarness(t, "READ", "WRITE", "ADMINISTRATOR")
+	req := aggregateRequest("ufCtlAggArity")
+	req.InsertAttr(userfunc.AttrArity, int64(1))
+	resp, err := h.exchange(req)
+	if err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+	if ok, _ := resp.EvaluateAttrBool("Ok"); ok {
+		t.Fatal("an aggregate registration declaring an argument count was accepted")
+	}
+	msg, _ := resp.EvaluateAttrString("Error")
+	if !strings.Contains(msg, "no argument count") {
+		t.Errorf("the refusal does not say why: %s", msg)
+	}
+	if _, ok := db.LookupAggregate("ufCtlAggArity"); ok {
+		t.Error("the aggregate was registered anyway")
+	}
+}

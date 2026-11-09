@@ -33,6 +33,7 @@ import (
 //	htcondordb-cli function list
 //	htcondordb-cli function register pctUsed -file pct.cas
 //	htcondordb-cli function register mean -kind wasm -file mean.wasm -arity 2
+//	htcondordb-cli function register p95 -file p95.cas -role aggregate
 //	htcondordb-cli function replace pctUsed -file pct2.cas
 //	htcondordb-cli function remove pctUsed
 //
@@ -50,10 +51,17 @@ const functionUsage = `htcondordb-cli function <list|register|replace|remove> [n
 
   -file <path>               the source: ClassAd Script text, or a .wasm module
   -kind <script|wasm>        default: wasm for a .wasm file, script otherwise
-  -arity <n>                 argument count; required for wasm, taken from the def for a script
+  -role <function|aggregate> default: function
+  -arity <n>                 argument count; required for a wasm function, taken from the def for
+                             a script function, and not accepted for an aggregate
   -max-arity <n>             largest accepted count (-1 variadic); default: -arity
+  -init/-add/-merge/-result  the four defs a script aggregate is built from, for a file that does
+                             not spell them <name>_init, <name>_add, <name>_merge, <name>_result
 
-A replacement may not change the argument count: a compiled query has already captured it.
+-kind is what the source IS; -role is what the name is registered AS, and a GROUP BY can name an
+aggregate where SUM would go. A replacement may not change a function's argument count, which a
+compiled query has already captured, nor a name's role; an aggregate has no argument count and a
+replacement may change everything else about it.
 Registering requires DAEMON or ADMINISTRATOR at the daemon.
 `
 
@@ -63,6 +71,8 @@ type functionArgs struct {
 	name   string
 	file   string
 	kind   string
+	role   string
+	defs   map[string]string // the four `def` names a script aggregate names explicitly
 	arity  int
 	// maxArity is only meaningful when maxAritySet is, because -1 is a VALUE here -- a variadic
 	// function -- and cannot double as "not given".
@@ -72,7 +82,7 @@ type functionArgs struct {
 
 // parseFunctionArgs reads the subcommand's own flags out of what the global parser left behind.
 func parseFunctionArgs(args []string) (functionArgs, error) {
-	fa := functionArgs{arity: -1}
+	fa := functionArgs{arity: -1, defs: map[string]string{}}
 	var positional []string
 	for i := 0; i < len(args); i++ {
 		next := func() (string, bool) {
@@ -95,6 +105,19 @@ func parseFunctionArgs(args []string) (functionArgs, error) {
 				return fa, fmt.Errorf("-kind needs a value")
 			}
 			fa.kind = strings.ToLower(v)
+		case "-role", "--role":
+			v, ok := next()
+			if !ok {
+				return fa, fmt.Errorf("-role needs a value")
+			}
+			fa.role = strings.ToLower(v)
+		case "-init", "--init", "-add", "--add", "-merge", "--merge", "-result", "--result":
+			role := strings.TrimLeft(args[i], "-")
+			v, ok := next()
+			if !ok {
+				return fa, fmt.Errorf("-%s needs the name of a def", role)
+			}
+			fa.defs[role] = v
 		case "-arity", "--arity":
 			v, ok := next()
 			if !ok {
@@ -160,6 +183,20 @@ func (fa functionArgs) request() (*classad.ClassAd, error) {
 		}
 	}
 	req.InsertAttrString(userfunc.AttrKind, kind)
+	if fa.role != "" {
+		req.InsertAttrString(userfunc.AttrRole, fa.role)
+	}
+	// Sent only where named. The daemon fills the rest in from the name, by the same prefix rule
+	// the configured surface uses, so a file written for one surface registers from the other
+	// unchanged.
+	for flag, attr := range map[string]string{
+		"init": userfunc.AttrInitDef, "add": userfunc.AttrAddDef,
+		"merge": userfunc.AttrMergeDef, "result": userfunc.AttrResultDef,
+	} {
+		if v := fa.defs[flag]; v != "" {
+			req.InsertAttrString(attr, v)
+		}
+	}
 	if kind == userfunc.KindWasm {
 		req.InsertAttrString(userfunc.AttrSource, base64.StdEncoding.EncodeToString(body))
 	} else {
@@ -268,14 +305,18 @@ func printFunctionList(w io.Writer, rows []*classad.ClassAd) {
 		if ident == "" {
 			ident, _ = ad.EvaluateAttrString("Path")
 		}
-		minA, _ := ad.EvaluateAttrInt(userfunc.AttrArity)
-		maxA, _ := ad.EvaluateAttrInt(userfunc.AttrMaxArity)
-		args := strconv.FormatInt(minA, 10)
-		switch {
-		case maxA < 0:
-			args += "+"
-		case maxA != minA:
-			args += ".." + strconv.FormatInt(maxA, 10)
+		// An aggregate carries no argument count, and the column says so rather than printing a
+		// zero: it is named against one argument attribute whatever it is.
+		args := "-"
+		if minA, ok := ad.EvaluateAttrInt(userfunc.AttrArity); ok {
+			maxA, _ := ad.EvaluateAttrInt(userfunc.AttrMaxArity)
+			args = strconv.FormatInt(minA, 10)
+			switch {
+			case maxA < 0:
+				args += "+"
+			case maxA != minA:
+				args += ".." + strconv.FormatInt(maxA, 10)
+			}
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", name, kind, origin, args, state, shortIdentity(ident))
 		if why, _ := ad.EvaluateAttrString(userfunc.AttrStateReason); why != "" {

@@ -144,6 +144,8 @@ type Manager struct {
 	// reg is the scalar registry stored functions are registered into. Nil means classad's own,
 	// which is what the daemon uses; a test supplies one it can inspect (see registry).
 	reg registry
+	// aggReg is the same for stored aggregates. Nil means db's own (see aggRegistry).
+	aggReg aggRegistry
 }
 
 // module is one registered function, as configured. The settings are kept so a later

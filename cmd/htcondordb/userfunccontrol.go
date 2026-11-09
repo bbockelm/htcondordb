@@ -35,9 +35,15 @@ func claimUserFuncTable(owners *server.TableOwners) error {
 // Request attributes:
 //
 //	Action = "list"     (default if absent)
-//	Action = "register"  Name, Kind ("script" | "wasm"), Source, Arity, MaxArity
-//	Action = "replace"   Name, Kind, Source, Arity, MaxArity   (the argument count may not change)
+//	Action = "register"  Name, Kind ("script" | "wasm"), Role ("function" | "aggregate"), Source,
+//	                     Arity, MaxArity, and for a script aggregate InitDef/AddDef/MergeDef/ResultDef
+//	Action = "replace"   the same (a scalar function's argument count may not change, and neither
+//	                     may a name's role)
 //	Action = "remove"    Name
+//
+// Kind is what the source IS and Role is what the name is registered AS; absent, Role is a scalar
+// function. An aggregate carries no Arity, because an aggregate is named against one argument
+// attribute whatever it is.
 //
 // Response: Ok (bool); on failure Error (string); on success Note (string) and, for a listing,
 // Count (int) followed by Count further ClassAds on the stream, one per registered function.
@@ -96,6 +102,10 @@ func (uc *userFuncController) register(reqAd *classad.ClassAd, who string) (stri
 	if err != nil {
 		return "", err
 	}
+	if stored.Role == userfunc.RoleAggregate {
+		return fmt.Sprintf("%s is registered as a %s aggregate, running %s; a GROUP BY can name it "+
+			"where SUM would go", stored.Name, stored.Kind, stored.Checksum) + trustNote(rec), nil
+	}
 	return fmt.Sprintf("%s is registered as a %s user function taking %d argument(s), running %s",
 		stored.Name, stored.Kind, stored.Arity, stored.Checksum) + trustNote(rec), nil
 }
@@ -108,6 +118,11 @@ func (uc *userFuncController) replace(reqAd *classad.ClassAd, who string) (strin
 	stored, err := uc.mgr.Replace(rec)
 	if err != nil {
 		return "", err
+	}
+	if stored.Role == userfunc.RoleAggregate {
+		return fmt.Sprintf("%s now runs %s; every query that names it from now on reduces with the "+
+			"new code, and one already running finishes with the old", stored.Name, stored.Checksum) +
+			trustNote(rec), nil
 	}
 	return fmt.Sprintf("%s now runs %s; every query that names it reaches the new code from now on, "+
 		"with no restart", stored.Name, stored.Checksum) + trustNote(rec), nil
@@ -131,7 +146,22 @@ func recordFromRequest(reqAd *classad.ClassAd, who string) (userfunc.Record, err
 	rec := userfunc.Record{Arity: -1, MaxArity: -1}
 	rec.Name, _ = reqAd.EvaluateAttrString("Name")
 	rec.Kind, _ = reqAd.EvaluateAttrString(userfunc.AttrKind)
+	rec.Role, _ = reqAd.EvaluateAttrString(userfunc.AttrRole)
 	rec.Source, _ = reqAd.EvaluateAttrString(userfunc.AttrSource)
+	rec.Defs.Init, _ = reqAd.EvaluateAttrString(userfunc.AttrInitDef)
+	rec.Defs.Add, _ = reqAd.EvaluateAttrString(userfunc.AttrAddDef)
+	rec.Defs.Merge, _ = reqAd.EvaluateAttrString(userfunc.AttrMergeDef)
+	rec.Defs.Result, _ = reqAd.EvaluateAttrString(userfunc.AttrResultDef)
+	_, arityGiven := reqAd.EvaluateAttrInt(userfunc.AttrArity)
+	_, maxGiven := reqAd.EvaluateAttrInt(userfunc.AttrMaxArity)
+	// REFUSED HERE AND NOWHERE DEEPER, because this is the last place a count that was STATED can
+	// be told from one that was not: past this point an aggregate's record carries -1 either way.
+	// A registrant who declared a count believes this registration will be checked against it, and
+	// it will not be -- an aggregate is named against one argument attribute whatever it is.
+	if strings.EqualFold(rec.Role, userfunc.RoleAggregate) && (arityGiven || maxGiven) {
+		return rec, fmt.Errorf("an aggregate takes no argument count: it is named against one " +
+			"argument attribute whatever it is, so there is nothing to declare")
+	}
 	if n, ok := reqAd.EvaluateAttrInt(userfunc.AttrArity); ok {
 		rec.Arity = int(n)
 	}
