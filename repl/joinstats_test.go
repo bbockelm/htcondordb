@@ -21,10 +21,13 @@ func TestExplainAnalyzeJoinReportsTheStoreAccessPath(t *testing.T) {
 	defer cleanup()
 
 	plan := explainText(t, srv, joinStatsSQL)
-	if _, ok := ops.logFor("JoinWire"); !ok {
-		if _, ok := ops.logFor("Join"); !ok {
-			t.Fatalf("the join did not run in the store, so there is nothing to report:\n%s", plan)
-		}
+	// Waited for, not read: the op log is written from a deferred call in the server's own
+	// handler goroutine, so it lands after the client's call has already returned. One op is
+	// the whole statement, because forcing the pairing into the store skips the row counts
+	// the placement decision would otherwise ask for.
+	if got := ops.waitOps(t, 1); got[0] != "JoinWire" && got[0] != "Join" {
+		t.Fatalf("the join did not run in the store (server ops %v), so there is nothing to "+
+			"report:\n%s", got, plan)
 	}
 	mustContain(t, plan, "store join statistics:")
 	mustContain(t, plan, "work: hashed=")
