@@ -197,17 +197,25 @@ const (
 const (
 	// StateOK: the source loaded and the name answers it.
 	StateOK = "ok"
-	// StateBad: the name is registered, under its stored arity, and answers ERROR. The reason
-	// says why, and is the thing to fix.
+	// StateBad: the source did not load, and the reason says why and is the thing to fix. What
+	// the name does meanwhile depends on the role, because the two have different reasons to
+	// hold a name at all. A FUNCTION stays registered under its stored arity and answers ERROR,
+	// since the call site's shape is fixed at registration and leaving the name out would change
+	// how callers compile. An AGGREGATE is not registered: nothing captures an aggregate name, so
+	// a query naming it fails and names it, which is the same answer db gives for a name nobody
+	// registered -- better than a query that succeeds with a column of ERROR in it. The manager
+	// holds the name either way, so nothing else can take it while the record is here.
 	StateBad = "bad"
-	// StateRemoved: the record is gone but the NAME IS NOT FREE until the daemon restarts, because
-	// a registration cannot be withdrawn. It stays in the listing saying exactly that, rather than
-	// disappearing and leaving an administrator to discover by experiment that the name is taken.
+	// StateRemoved: the record is gone and the NAME IS NOT FREE until the daemon restarts, because
+	// a scalar registration cannot be withdrawn. It stays in the listing saying exactly that,
+	// rather than disappearing and leaving an administrator to discover by experiment that the
+	// name is taken. Only a function reaches this state: an aggregate's name is withdrawn and
+	// given back at once, so its record is dropped rather than left as a tombstone.
 	StateRemoved = "removed"
-	// StateInvalid: the record does not say what to register -- no usable name, kind, or argument
-	// count. Nothing is registered for it, because there is no arity to register it under, and a
-	// record that never loaded has never changed how a call site compiles. It is listed and logged
-	// so it is not a silence either.
+	// StateInvalid: the record does not say what to register -- no usable name, kind, or, for a
+	// function, argument count. Nothing is registered for it, and a record that never loaded has
+	// never changed how a call site compiles. It is listed and logged so it is not a silence
+	// either.
 	StateInvalid = "invalid"
 )
 
