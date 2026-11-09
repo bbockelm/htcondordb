@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"google.golang.org/grpc"
@@ -33,6 +34,10 @@ import (
 // TimeAttrs are the half that genuinely changes the schema: without them the epoch-second
 // attributes stay integers instead of timestamps, and a consumer's date functions have nothing
 // to work on.
+
+// benchmarkSchemaTTL matches the daemon's own default. A benchmark server configured
+// differently from the thing it stands in for measures its own configuration.
+const benchmarkSchemaTTL = 30 * time.Second
 
 // DefaultDeriveOptions are the Arrow type decisions for the generated dataset: its epoch-second
 // attributes declared as timestamps, and its expression-valued attribute declared so it has a
@@ -79,7 +84,17 @@ func (s *Server) ServeFlight(ctx context.Context, listen string) (string, error)
 		cat.Close()
 		return "", fmt.Errorf("building flight sessions: %w", err)
 	}
-	svc, err := flightsvc.NewSessionServer(sessions, derive, nil)
+	// THROUGH THE SETTINGS, so the benchmark measures a server configured the way a daemon is.
+	//
+	// The schema cache is the one that decides the number. It exists only when a host asks for
+	// it, and a statement needs a schema TWICE -- GetFlightInfo answers the shape, DoGet builds
+	// the encoder -- so without it every query pays two profile scans that sample the table.
+	// Measured over 200000 history rows, asking for it took the Arrow arm from 577k rows/s to
+	// the rate below: the sweep had been reporting the cost of deriving a schema per RPC as if
+	// it were the cost of delivering Arrow.
+	svc, err := flightsvc.NewSessionFlightServer(sessions, nil, flightsvc.Settings{
+		SchemaTTL: benchmarkSchemaTTL,
+	})
 	if err != nil {
 		cat.Close()
 		return "", fmt.Errorf("building flight server: %w", err)
@@ -90,7 +105,7 @@ func (s *Server) ServeFlight(ctx context.Context, listen string) (string, error)
 		return "", fmt.Errorf("listening on %s: %w", listen, err)
 	}
 	gsrv := grpc.NewServer()
-	flight.RegisterFlightServiceServer(gsrv, flightsvc.NewFlightServer(svc, nil))
+	flight.RegisterFlightServiceServer(gsrv, svc)
 	go func() { _ = gsrv.Serve(ln) }()
 	go func() { <-ctx.Done(); gsrv.Stop() }()
 	prev := s.stop

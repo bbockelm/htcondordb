@@ -24,9 +24,9 @@ cores measures itself as much as the daemon. An in-process sweep of this workloa
 concurrent readers as slower than one *and* slower than eight — contention between the clients
 and the server they were timing, not a scaling curve.
 
-The server it points at need not be a benchmark server. A live daemon's `jobs`, `history` or
-`epoch_history` answers the same ops: generated data says what the hardware can do, a production
-table says what it does do.
+It dials a **plain, unauthenticated** dbrpc socket, which is what benchmark mode serves. A live
+daemon's dbrpc port authenticates with CEDAR, so pointing this at one does not work yet; measuring
+a production `jobs` or `history` table needs the CEDAR dialer the CLI uses.
 
 `-benchmark-self-test` measures in process and exits. It accepts the contention above to stay a
 single command; it is for a quick look, not for a number about a deployment.

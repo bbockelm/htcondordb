@@ -23,9 +23,9 @@ import (
 // -benchmark-self-test accepts that cost to stay a single command; this mode is what produces a
 // number about a deployment.
 //
-// THE SERVER IT POINTS AT NEED NOT BE A BENCHMARK SERVER. A live daemon's jobs, history or
-// epoch_history answers the same ops, which is the case worth measuring: generated data says what
-// the hardware can do, a production table says what it does do.
+// IT DIALS A PLAIN, UNAUTHENTICATED SOCKET, which is what benchmark mode serves. A live daemon's
+// dbrpc port authenticates with CEDAR, so measuring a production jobs or history table needs the
+// dialer the CLI uses and does not work through this flag yet.
 
 // benchmarkClientConfig is the client's settings, separated from the flags so the mode is
 // testable without a command line.
