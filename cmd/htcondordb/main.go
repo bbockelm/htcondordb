@@ -69,6 +69,7 @@ func run() error {
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; accepted for compatibility (fd inherited via CONDOR_INHERIT)")
 	benchFlags := registerBenchmarkFlags()
+	benchClientFlags := registerBenchmarkClientFlags()
 	flag.Parse()
 
 	if *showVersion {
@@ -82,6 +83,16 @@ func run() error {
 	// advertise address that it is merely declining to use.
 	if *benchFlags.on {
 		return runBenchmark(context.Background(), benchFlags.cfg, os.Stdout)
+	}
+
+	// The client half of benchmark mode, intercepted in the same place and for the same reason:
+	// it talks to a server over a plain socket and has no use for this host's configuration.
+	if benchClientFlags.cfg.Addr != "" {
+		ccfg, cerr := benchClientFlags.resolve(benchFlags.cfg.Clients, benchFlags.cfg.Iterations)
+		if cerr != nil {
+			return cerr
+		}
+		return runBenchmarkClient(context.Background(), ccfg, os.Stdout)
 	}
 
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "HTCONDORDB", LocalName: *localName})

@@ -86,9 +86,14 @@ const (
 // described a typed consumer.
 func (t Transport) Evaluated() bool { return t == Values || t == Arrow }
 
-// defaultTransports is what a sweep measures when the caller names none: both stored-form
+// DefaultTransports is what a sweep measures when the caller names none: both stored-form
 // projections paired with their wire counterparts, the whole ad, and the evaluated form.
-func defaultTransports() []Transport {
+//
+// ARROW IS NOT IN IT, because it is the one transport that needs a second server endpoint. A
+// sweep that included it by default would report it as failed against every server without
+// Flight SQL, which reads as a slow transport rather than an absent one. A caller that has a
+// Flight address adds it.
+func DefaultTransports() []Transport {
 	return []Transport{TextWhole, TextProjected, Wire, WireRefs, Values}
 }
 
@@ -280,7 +285,7 @@ func Run(ctx context.Context, dial Dialer, spec Spec) (Report, error) {
 		spec.Limits = []int{0}
 	}
 	if len(spec.Transports) == 0 {
-		spec.Transports = defaultTransports()
+		spec.Transports = DefaultTransports()
 	}
 	conns := make([]*Conn, 0, spec.Concurrency)
 	defer func() {

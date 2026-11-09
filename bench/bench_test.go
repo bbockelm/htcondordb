@@ -96,7 +96,7 @@ func TestRunMeasuresEveryTransport(t *testing.T) {
 	}
 	// Derived from the default transport list rather than written down, so adding a transport
 	// does not fail this test for the wrong reason.
-	if want := len(defaultTransports()); len(rep.Samples) != want {
+	if want := len(DefaultTransports()); len(rep.Samples) != want {
 		t.Fatalf("%d samples, want %d (one per transport)", len(rep.Samples), want)
 	}
 	for _, s := range rep.Samples {

@@ -64,7 +64,7 @@ func registerBenchmarkFlags() *benchmarkFlags {
 		"in benchmark mode, measure the store in process and exit instead of serving")
 	flag.Int64Var(&f.cfg.Seed, "benchmark-seed", 1, "dataset seed; the same seed gives the same data")
 	flag.IntVar(&f.cfg.Clients, "benchmark-clients", 1,
-		"concurrent readers for -benchmark-self-test")
+		"concurrent readers, for -benchmark-self-test and -benchmark-client alike")
 	flag.IntVar(&f.cfg.Iterations, "benchmark-iterations", 5,
 		"reads per reader; one iteration does not resolve on a small table")
 	return f
