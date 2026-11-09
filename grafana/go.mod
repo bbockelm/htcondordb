@@ -8,8 +8,8 @@ go 1.26.5
 toolchain go1.27.0
 
 require (
-	github.com/PelicanPlatform/classad v0.38.1
-	github.com/PelicanPlatform/classad/dbrpc v0.38.1
+	github.com/PelicanPlatform/classad v0.38.2
+	github.com/PelicanPlatform/classad/dbrpc v0.38.2
 	github.com/apache/arrow-go/v18 v18.8.0
 	github.com/bbockelm/cedar v0.7.12
 	github.com/bbockelm/golang-htcondor v0.21.0
@@ -19,8 +19,8 @@ require (
 
 require (
 	github.com/BurntSushi/toml v1.6.0 // indirect
-	github.com/PelicanPlatform/classad/collections v0.38.1 // indirect
-	github.com/PelicanPlatform/classad/db v0.38.1 // indirect
+	github.com/PelicanPlatform/classad/collections v0.38.2 // indirect
+	github.com/PelicanPlatform/classad/db v0.38.2 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.29.0 // indirect
 	github.com/bbockelm/gosssd v0.0.4 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
