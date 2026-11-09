@@ -570,7 +570,7 @@ func (r Record) validDescription() error {
 		// the configuration file again with more moving parts.
 		return errors.New("an aggregate cannot be stored: the aggregate registry has no way to " +
 			"replace one, so a stored aggregate could never be corrected. Configure it with " +
-			"HTCONDORDB_WASM_AGGREGATES")
+			"HTCONDORDB_SCRIPT_AGGREGATES or HTCONDORDB_WASM_AGGREGATES")
 	default:
 		return fmt.Errorf("%q is not a kind of user function (%s or %s)", r.Kind, KindScript, KindWasm)
 	}

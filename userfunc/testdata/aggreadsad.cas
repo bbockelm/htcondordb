@@ -1,0 +1,15 @@
+# An aggregate whose `add` reaches the subject ad: a bare name the body does not bind is an
+# attribute, which is the point of it inside a script and impossible in a registration. The
+# compiler refuses it, so the four `def`s never reach the registry.
+
+def scriptCfgImpureAgg_init():
+    return 0
+
+def scriptCfgImpureAgg_add(s, v):
+    return s + v * Memory
+
+def scriptCfgImpureAgg_merge(a, b):
+    return a + b
+
+def scriptCfgImpureAgg_result(s):
+    return s

@@ -14,6 +14,7 @@ import (
 	"github.com/PelicanPlatform/classad/collections/scriptudf"
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/db"
+	"github.com/PelicanPlatform/classad/db/scriptagg"
 	"github.com/PelicanPlatform/classad/wasmudf"
 	config "github.com/bbockelm/golang-htcondor/config"
 )
@@ -21,9 +22,10 @@ import (
 // SANDBOXED USER FUNCTIONS, LOADED FROM CONFIGURATION.
 //
 // classad takes user-defined scalar functions and aggregates. wasmudf runs one that has been
-// compiled to WebAssembly; scriptudf runs one written in ClassAd Script. None of that is reachable
-// by an administrator: they are Go APIs, called by the program that owns the process. This manager
-// is that caller -- it turns a path in the config file into a function an ordinary query can use.
+// compiled to WebAssembly; scriptudf and scriptagg run one written in ClassAd Script, the scalar
+// and the aggregate respectively. None of that is reachable by an administrator: they are Go APIs,
+// called by the program that owns the process. This manager is that caller -- it turns a path in
+// the config file into a function an ordinary query can use.
 //
 // WHY THESE TWO KINDS AND NOT A GO ONE. A Go function has to be compiled into this binary, which is
 // not something a site can do. Both kinds here are bytes on disk that a site writes, and each earns
@@ -40,12 +42,25 @@ import (
 // cannot reach the subject ad either. What is left is a step budget, which the library fixes and
 // exposes through no public API, so there is no limit here for configuration to set. A `def` also
 // states its own arity, so there is no argument count to declare and get wrong. The script surface
-// is one list and one path per name, and it is short because there is nothing else to say.
+// is two lists and one path per name, plus the four `def`s an aggregate is built from, and it is
+// short because there is nothing else to say.
 //
-// ONE NAME SPACE FOR BOTH, which is why one manager loads both rather than two managers each loading
-// their own. A query calling pctUsed reaches one registered function; which kind of file it came
-// from is not part of the call. Both kinds therefore share the bookkeeping below, and a name claimed
-// by a wasm module cannot also be claimed by a script function.
+// AN AGGREGATE IS FOUR PURE `def`s THREADING A STATE VALUE -- `init` gives the identity, `add`
+// folds one row's value in, `merge` combines two partial states, `result` renders the group's
+// answer -- and the four are compiled, arity-checked and run through `init` at load, so an
+// aggregate that cannot work is a start-up failure rather than a column of ERROR. The laws the
+// reduction relies on, that `merge` is associative and commutative and that `result` repeats, are
+// the script author's to keep: they are the author's code and nothing here can check them. An
+// order-sensitive `merge` is wrong only sometimes, because the columnar pass fans out across
+// segment windows, so the author tests one with db.CheckAggregate before configuring it.
+//
+// ONE NAME SPACE FOR ALL FOUR LISTS, which is why one manager loads them all rather than one
+// manager per kind. A query calling pctUsed reaches one registered function; which kind of file it
+// came from is not part of the call. An aggregate goes into a different registry from a scalar
+// function, but it shares the same name space anyway, because a client's parser has to decide
+// whether p95(x) is an aggregate call or an ordinary one before any request exists. Every kind
+// therefore shares the bookkeeping below, and a name claimed by one list cannot be claimed by
+// another.
 //
 // REGISTRATION IS APPEND-ONLY, WHICH SHAPES EVERYTHING BELOW. classad's registries have no
 // unregister: compiling an expression records that a name was a user function, and compiled
@@ -71,13 +86,30 @@ import (
 //	HTCONDORDB_WASM_MAX_INSTANCES = 0          # 0 takes GOMAXPROCS
 //
 //	HTCONDORDB_SCRIPT_FUNCTIONS      = effMemory scoreJob              # scalar functions
+//	HTCONDORDB_SCRIPT_AGGREGATES     = jobMean                         # aggregates
 //
 //	HTCONDORDB_SCRIPT_EFFMEMORY_PATH = /etc/condor/scripts/policy.cas  # required
 //	HTCONDORDB_SCRIPT_SCOREJOB_PATH  = /etc/condor/scripts/policy.cas  # one file may back several
+//	HTCONDORDB_SCRIPT_JOBMEAN_PATH   = /etc/condor/scripts/policy.cas
+//
+//	HTCONDORDB_SCRIPT_JOBMEAN_INIT   = jobMean_init      # default: <name>_init
+//	HTCONDORDB_SCRIPT_JOBMEAN_ADD    = jobMean_add       # default: <name>_add
+//	HTCONDORDB_SCRIPT_JOBMEAN_MERGE  = jobMean_merge     # default: <name>_merge
+//	HTCONDORDB_SCRIPT_JOBMEAN_RESULT = jobMean_result    # default: <name>_result
 //
 // The configured name is the name of the `def` to register out of that file, so one file holding
 // several definitions backs several functions and is read and parsed once per apply however many
 // names point at it.
+//
+// AN AGGREGATE NEEDS FOUR `def`s, AND THE CONFIGURED NAME PICKS THEM OUT BY PREFIX: jobMean is
+// built from jobMean_init, jobMean_add, jobMean_merge and jobMean_result. That is the scalar rule
+// -- the configured name is the name of the `def` -- carried to a thing that takes four of them,
+// and it keeps one file backing several aggregates without a key per function. A file that spells
+// its definitions otherwise names them: _INIT, _ADD, _MERGE and _RESULT each replace one.
+//
+// NOTHING IS GUESSED. A `def` the rule names and the file does not define fails the load, naming
+// the `def` it looked for and the role that `def` fills. Falling back to some other spelling would
+// eventually pick the wrong four functions and be convincing about it.
 
 // Manager owns the wasm loader and the set of names registered from configuration, of either kind.
 //
@@ -117,10 +149,11 @@ type Manager struct {
 // module is one registered function, as configured. The settings are kept so a later
 // reconfigure can tell "already loaded" from "changed, and cannot be".
 //
-// One struct covers both kinds rather than two, because everything the manager does with one -- the
-// name it occupies, the path it came from, whether its configuration has changed since it was
-// loaded -- is the same question for both. Script is what the kind-specific fields hang off: a
-// script function has none of MinArgs, MaxArgs, Trusted or Aggregate, and they stay zero.
+// One struct covers every kind rather than one per kind, because everything the manager does with
+// one -- the name it occupies, the path it came from, whether its configuration has changed since
+// it was loaded -- is the same question for all of them. Script and Aggregate are what the
+// kind-specific fields hang off: a script function has none of MinArgs, MaxArgs, Trusted or Defs,
+// and they stay zero.
 type module struct {
 	Name      string
 	Path      string
@@ -129,11 +162,21 @@ type module struct {
 	MinArgs   int
 	MaxArgs   int
 	Trusted   bool
+	Defs      aggDefs // a script aggregate's four `def` names
+}
+
+// aggDefs names the four `def`s one script aggregate is built from, after the defaults and any
+// per-role override have been resolved. They are config, so they are part of sig: a file whose
+// `add` is renamed is a different aggregate, and swapping one for another is a change a running
+// registration cannot take.
+type aggDefs struct {
+	Init, Add, Merge, Result string
 }
 
 // sig is the part of a module's configuration that cannot change without a restart.
 func (m module) sig() string {
-	return fmt.Sprintf("%s|%v|%v|%d|%d|%v", m.Path, m.Script, m.Aggregate, m.MinArgs, m.MaxArgs, m.Trusted)
+	return fmt.Sprintf("%s|%v|%v|%d|%d|%v|%s/%s/%s/%s", m.Path, m.Script, m.Aggregate,
+		m.MinArgs, m.MaxArgs, m.Trusted, m.Defs.Init, m.Defs.Add, m.Defs.Merge, m.Defs.Result)
 }
 
 // kind names the module in an operator message, where "user function" alone would leave someone
@@ -154,17 +197,6 @@ type settings struct {
 // resolveSettings reads the configuration. It does not touch the filesystem: a path that does
 // not exist is a load error, reported per module, not a reason to reject the whole configuration.
 func resolveSettings(cfg *config.Config) (settings, error) {
-	// Checked before anything else, and checked even when nothing is configured, because the
-	// question it answers is "why did the key I set do nothing". HTCONDORDB_SCRIPT_AGGREGATES is
-	// the knob an administrator writes by analogy with the wasm pair, and there is no such thing:
-	// scriptudf registers scalar functions only. Failing here says that; ignoring the key would
-	// leave an aggregate name unregistered and every query using it answering ERROR.
-	if strings.TrimSpace(cfgStr(cfg, "HTCONDORDB_SCRIPT_AGGREGATES")) != "" {
-		return settings{}, fmt.Errorf("HTCONDORDB_SCRIPT_AGGREGATES is set, but there is no such " +
-			"thing as a script aggregate: ClassAd Script defines scalar functions, and an aggregate " +
-			"has to be a WebAssembly module named in HTCONDORDB_WASM_AGGREGATES")
-	}
-
 	var out settings
 	// The sandbox knobs are read whether or not anything is CONFIGURED, because a function stored
 	// in the database is loaded into the same runtime and bounded by the same numbers. Reading
@@ -184,11 +216,12 @@ func resolveSettings(cfg *config.Config) (settings, error) {
 	fns := strings.Fields(cfgStr(cfg, "HTCONDORDB_WASM_FUNCTIONS"))
 	aggs := strings.Fields(cfgStr(cfg, "HTCONDORDB_WASM_AGGREGATES"))
 	scripts := strings.Fields(cfgStr(cfg, "HTCONDORDB_SCRIPT_FUNCTIONS"))
-	if len(fns) == 0 && len(aggs) == 0 && len(scripts) == 0 {
+	scriptAggs := strings.Fields(cfgStr(cfg, "HTCONDORDB_SCRIPT_AGGREGATES"))
+	if len(fns) == 0 && len(aggs) == 0 && len(scripts) == 0 && len(scriptAggs) == 0 {
 		return out, nil
 	}
 
-	// One seen set across all three lists, because a name is one function. A client's parser has
+	// One seen set across all four lists, because a name is one function. A client's parser has
 	// to decide whether a name is an aggregate call or an ordinary one before any request exists,
 	// so a name claimed by a wasm module is not available to a script function or the other way
 	// round, whichever registry it would end up in.
@@ -200,24 +233,37 @@ func resolveSettings(cfg *config.Config) (settings, error) {
 			// registration with a message about a name collision that says nothing
 			// about the config line that caused it.
 			return fmt.Errorf("%q is named twice across HTCONDORDB_WASM_FUNCTIONS, "+
-				"HTCONDORDB_WASM_AGGREGATES and HTCONDORDB_SCRIPT_FUNCTIONS; a name is one function", name)
+				"HTCONDORDB_WASM_AGGREGATES, HTCONDORDB_SCRIPT_FUNCTIONS and "+
+				"HTCONDORDB_SCRIPT_AGGREGATES; a name is one function", name)
 		}
 		seen[folded] = true
 		return nil
 	}
 
-	// addScript takes only a path. There is no arity to declare -- the `def` states its own -- and
-	// no sandbox to relax, so there is nothing else a script function could be configured with.
-	addScript := func(name string) error {
+	// addScript takes a path, and for an aggregate the four `def`s to build it from. There is no
+	// arity to declare -- each `def` states its own -- and no sandbox to relax, so there is nothing
+	// else a script function could be configured with.
+	addScript := func(name string, aggregate bool) error {
 		if err := named(name); err != nil {
 			return err
 		}
-		key := "HTCONDORDB_SCRIPT_" + strings.ToUpper(name) + "_PATH"
-		path := cfgStr(cfg, key)
+		p := "HTCONDORDB_SCRIPT_" + strings.ToUpper(name) + "_"
+		path := cfgStr(cfg, p+"PATH")
 		if path == "" {
-			return fmt.Errorf("%s is not set, so there is nothing to load for %q", key, name)
+			return fmt.Errorf("%s is not set, so there is nothing to load for %q", p+"PATH", name)
 		}
-		out.modules = append(out.modules, module{Name: name, Path: path, Script: true})
+		m := module{Name: name, Path: path, Script: true, Aggregate: aggregate}
+		if aggregate {
+			// Resolved here rather than at load time so that the names are part of sig() and a
+			// reconfigure that repoints one role is a change the manager can see and report.
+			m.Defs = aggDefs{
+				Init:   cfgDef(cfg, p+"INIT", name+"_init"),
+				Add:    cfgDef(cfg, p+"ADD", name+"_add"),
+				Merge:  cfgDef(cfg, p+"MERGE", name+"_merge"),
+				Result: cfgDef(cfg, p+"RESULT", name+"_result"),
+			}
+		}
+		out.modules = append(out.modules, m)
 		return nil
 	}
 
@@ -266,7 +312,12 @@ func resolveSettings(cfg *config.Config) (settings, error) {
 		}
 	}
 	for _, n := range scripts {
-		if err := addScript(n); err != nil {
+		if err := addScript(n, false); err != nil {
+			return settings{}, err
+		}
+	}
+	for _, n := range scriptAggs {
+		if err := addScript(n, true); err != nil {
 			return settings{}, err
 		}
 	}
@@ -357,7 +408,8 @@ func (m *Manager) Apply(cfg *config.Config) error {
 		}
 		m.loaded[folded] = mod
 		if mod.Script {
-			m.logger.Info("script user function registered", "name", mod.Name, "path", mod.Path)
+			m.logger.Info("script user function registered", "name", mod.Name, "path", mod.Path,
+				"aggregate", mod.Aggregate)
 		} else {
 			m.logger.Info("wasm user function registered", "name", mod.Name, "path", mod.Path,
 				"aggregate", mod.Aggregate, "trusted", mod.Trusted)
@@ -402,13 +454,18 @@ type scriptFile struct {
 	err error
 }
 
-// loadScript registers one `def` out of a script file.
+// loadScript registers one `def` out of a script file, or the four an aggregate is built from.
 //
-// There is nothing to pass beyond the name. The arity comes from the `def`, and purity is decided by
-// the compiler: a function that reaches the subject ad is refused with vm.ErrReadsAd and never
+// There is nothing to pass beyond the names. The arity comes from the `def`, and purity is decided
+// by the compiler: a function that reaches the subject ad is refused with vm.ErrReadsAd and never
 // reaches the registry, which matters because a registration cannot be withdrawn. That refusal is
 // returned exactly as the library phrased it -- it names the function and the attribute it reached
 // for, and says to pass that value as a parameter instead, which is the whole of the fix.
+//
+// An aggregate is refused for three more reasons, all of them at load: a `def` the configuration
+// names and the file does not define, one whose parameter count does not fit the role the engine
+// calls it in, and an `init` that does not produce an identity. Each of those would otherwise be a
+// query answering ERROR in a column, for every caller, with nothing saying why.
 func (m *Manager) loadScript(mod module, parsed map[string]scriptFile) error {
 	sf, ok := parsed[mod.Path]
 	if !ok {
@@ -423,6 +480,17 @@ func (m *Manager) loadScript(mod module, parsed map[string]scriptFile) error {
 	}
 	if sf.err != nil {
 		return sf.err
+	}
+	if mod.Aggregate {
+		// db's own registry, not the scalar one: an aggregate is resolved by a GROUP BY against
+		// a separate key space.
+		_, err := scriptagg.Register(mod.Name, sf.mod, scriptagg.Spec{
+			Init:   mod.Defs.Init,
+			Add:    mod.Defs.Add,
+			Merge:  mod.Defs.Merge,
+			Result: mod.Defs.Result,
+		})
+		return err
 	}
 	_, err := scriptudf.Register(sf.mod, scriptudf.ClassAdRegistry(), mod.Name)
 	return err
@@ -550,6 +618,14 @@ func cfgStr(cfg *config.Config, key string) string {
 func cfgInt(cfg *config.Config, key string) int {
 	n, _ := strconv.Atoi(strings.TrimSpace(cfgStr(cfg, key)))
 	return n
+}
+
+// cfgDef reads one role's `def` name, falling back to the name the prefix rule spells for it.
+func cfgDef(cfg *config.Config, key, dflt string) string {
+	if v := strings.TrimSpace(cfgStr(cfg, key)); v != "" {
+		return v
+	}
+	return dflt
 }
 
 func cfgBool(cfg *config.Config, key string) bool {

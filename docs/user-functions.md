@@ -18,7 +18,7 @@ folding, and the same three kinds of answer — a value, `undefined`, or `error`
 | Written in             | ClassAd Script                         | anything that compiles to WebAssembly      |
 | What you need to build | nothing; it is a text file             | a compiler and a build                     |
 | Argument count         | the `def` states it                    | you declare it in the configuration        |
-| Can be an aggregate    | no                                     | yes                                        |
+| Can be an aggregate    | yes; four `def`s                       | yes                                        |
 | Reaching the rest of the ad | refused at start-up, by the compiler | impossible; it is handed values and nothing else |
 | What bounds a call     | a step budget fixed in the engine      | memory, steps, a deadline, all configurable |
 
@@ -27,10 +27,12 @@ argument count cannot disagree with the function, and a function that reaches fo
 an attribute you did not pass it is refused at start-up with the attribute named
 rather than answering `error` for the life of the daemon.
 
-**Reach for WebAssembly** when you want an aggregate, which only a module can be;
-when the function is one you already have in a language that compiles to wasm; or
-when it runs over every row of a large table and the module's batch entry point
-is worth the build.
+**Reach for WebAssembly** when the function is one you already have in a language
+that compiles to wasm, or when it runs over every row of a large table and the
+module's batch entry point is worth the build.
+
+Either kind can be an aggregate — the thing a `GROUP BY` names where `SUM` would
+go.
 
 ## Put the same configuration where your clients read it
 
@@ -85,6 +87,112 @@ language has no I/O, and it cannot reach the ad, because registration refuses a
 function that does. What is left is a step budget, which the engine fixes and does
 not expose — a function that loops forever ends that call with `error` rather than
 hanging the scan.
+
+## Adding a script aggregate
+
+An aggregate is four `def`s threading a state value, and the configured name
+picks them out of the file by prefix:
+
+```
+HTCONDORDB_SCRIPT_AGGREGATES        = jobMean
+HTCONDORDB_SCRIPT_JOBMEAN_PATH      = /etc/condor/scripts/policy.cas
+```
+
+```
+def jobMean_init():
+    return {0, 0}
+
+def jobMean_add(s, v):
+    if isReal(v) || isInteger(v):
+        return {s[0] + v, s[1] + 1}
+    return s
+
+def jobMean_merge(a, b):
+    return {a[0] + b[0], a[1] + b[1]}
+
+def jobMean_result(s):
+    if s[1] > 0:
+        return real(s[0]) / s[1]
+    return undefined
+```
+
+It is then usable wherever `SUM` is:
+
+```sql
+SELECT Owner, jobMean(RequestMemory) FROM history GROUP BY Owner
+```
+
+The mean is the example worth copying because its state is a **sum and a count**,
+and a single number cannot carry both. That is what a `def` buys you over a
+`SELECT` expression: the state is an ordinary ClassAd value, so a list holds as
+many numbers as the answer needs.
+
+Each of the four does one thing, and the engine supplies their arguments, so each
+has a fixed shape:
+
+| `def`           | Takes                       | Returns                                         |
+| --------------- | --------------------------- | ----------------------------------------------- |
+| `<name>_init`   | nothing                     | the identity — the answer for a group with no rows |
+| `<name>_add`    | the state, one row's value  | the state with that value folded in             |
+| `<name>_merge`  | two states                  | the two combined                                |
+| `<name>_result` | the state                   | the group's answer                              |
+
+`add` sees **every value a row can hold**, including `undefined` for a row that
+does not carry the attribute and `error` for one whose expression failed. Deciding
+what to do with those is the aggregate's job, exactly as it is a built-in's: the
+example above folds numbers and ignores everything else, so a group of five rows
+two of which have no `RequestMemory` averages the three that do.
+
+**One file backs several aggregates**, as it does several functions, because the
+prefix keeps their definitions apart. A file whose definitions are spelled some
+other way names them for the role each fills:
+
+```
+HTCONDORDB_SCRIPT_AGGREGATES        = p95
+HTCONDORDB_SCRIPT_P95_PATH          = /etc/condor/scripts/percentile.cas
+HTCONDORDB_SCRIPT_P95_INIT          = emptySketch
+HTCONDORDB_SCRIPT_P95_ADD           = observe
+HTCONDORDB_SCRIPT_P95_MERGE         = combine
+HTCONDORDB_SCRIPT_P95_RESULT        = percentile95
+```
+
+Nothing is guessed. A `def` the configuration names and the file does not define
+fails start-up, naming the `def` it looked for and the role that `def` fills, and
+so does one whose parameter count does not match the role. `init` is **called** at
+load too, so an aggregate whose identity is itself a failure is a start-up error
+rather than a column of `error` later.
+
+### Test the merge laws before you configure it
+
+The reduction relies on three things no loader can check, because they are your
+code:
+
+- `merge` is **associative and commutative** — it gives the same answer whatever
+  order and grouping the partial states arrive in.
+- `result` is **repeatable** and does not change the state it is given.
+- `add` gives the same answer whatever order it sees a group's values in, because
+  a group is folded by several workers and each sees only part of it.
+
+Getting this wrong is the bad kind of wrong. Which worker reads which part of the
+table is a race, so an order-sensitive `merge` is right in every query you try and
+wrong in production, plausibly, and only sometimes.
+
+`db.CheckAggregate`, in the [`classad`][udf] library, tests an aggregate against
+those laws over a sample of values — four values at least, since fewer cannot
+split three ways. It is a Go call, so reach for it if your site builds against the
+library; otherwise read the three laws above against your four `def`s before you
+configure one, and pick an `add` that ignores what it cannot fold rather than one
+that depends on what arrives first. Try the sample over the values your rows
+really hold, including a string and an `undefined`, not only the numbers you wrote
+it for.
+
+### Where it runs
+
+The aggregate runs on the **server**, which is where the rows are, so the file has
+to be readable there. Configure the client too: it is the client's parser that has
+to decide whether `jobMean(x)` is an aggregate call or an ordinary one before any
+request exists, and a name it does not know is read as an ordinary function and
+fails.
 
 ## Adding a WebAssembly module
 
@@ -184,9 +292,11 @@ existing. Rather than pretend, the daemon logs that the configuration changed an
 keeps running the function it has. Check the log after a reconfigure if you edited
 a path and the behaviour did not change.
 
-A name belongs to one function. A name in `HTCONDORDB_SCRIPT_FUNCTIONS` that is
-also in one of the wasm lists is refused while the configuration is read, which
-says which lists to look at.
+A name belongs to one function. A name that appears in more than one of the four
+lists is refused while the configuration is read, which says which lists to look
+at. An aggregate goes into a registry of its own, and shares the name space
+anyway: a client's parser has to decide whether `p95(x)` is an aggregate call
+before any request exists, so one name cannot be both.
 
 ## Storing a function in the database
 
@@ -212,7 +322,7 @@ asked of it.
 once per call site, so replacing one would be perfectly well defined — but the
 aggregate registry has no replace to do it with, and a stored aggregate that
 could never be corrected would be the config file again with extra steps. Keep
-aggregates in `HTCONDORDB_WASM_AGGREGATES`.
+aggregates in `HTCONDORDB_SCRIPT_AGGREGATES` or `HTCONDORDB_WASM_AGGREGATES`.
 
 **Registering requires DAEMON or ADMINISTRATOR, not WRITE.** A user function runs
 inside every query that names it, the name space is global and shared, and a name
@@ -309,6 +419,11 @@ For a script, the three ways that happens are a file that cannot be read, a
 syntax error, and a function that reaches the ad. The third reads, in part,
 `reads the attribute Memory: a registered function is given its arguments and
 nothing else`, and the fix is in the message.
+
+A script aggregate has three more, all of them about the four `def`s: one the
+configuration names and the file does not define, one whose parameter count does
+not fit the role it fills, and an `init` that does not produce an identity. Each
+message names the `def` and the role, so it says which line of the file to open.
 
 A *stored* function that does not load does not fail start-up: it is marked bad,
 answers `error`, and says so in the log, in its record and in `function list`.
