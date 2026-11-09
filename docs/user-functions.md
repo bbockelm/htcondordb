@@ -188,6 +188,117 @@ A name belongs to one function. A name in `HTCONDORDB_SCRIPT_FUNCTIONS` that is
 also in one of the wasm lists is refused while the configuration is read, which
 says which lists to look at.
 
+## Storing a function in the database
+
+A function can live in the database instead of in a config file, in the table
+`user_functions`, one record per function. The daemon registers what the table
+holds when it starts, so a stored function behaves exactly like a configured one
+from a query's point of view — and unlike a configured one, **it can be replaced
+while the daemon runs**.
+
+```
+htcondordb-cli function register pctUsed -file pct.cas
+htcondordb-cli function register mean -kind wasm -file mean.wasm -arity 2
+htcondordb-cli function replace pctUsed -file pct2.cas
+htcondordb-cli function remove pctUsed
+htcondordb-cli function list
+```
+
+A script states its own argument count in its `def`, so `-arity` is only needed
+for a module, where the count is checked before the guest runs and cannot be
+asked of it.
+
+**Scalar functions only.** An aggregate is resolved once per query rather than
+once per call site, so replacing one would be perfectly well defined — but the
+aggregate registry has no replace to do it with, and a stored aggregate that
+could never be corrected would be the config file again with extra steps. Keep
+aggregates in `HTCONDORDB_WASM_AGGREGATES`.
+
+**Registering requires DAEMON or ADMINISTRATOR, not WRITE.** A user function runs
+inside every query that names it, the name space is global and shared, and a name
+that has been claimed cannot be given back — so whoever may register `pctUsed`
+decides what that word means for everyone, permanently. That is a different
+privilege from writing rows, which is where your analysts are. The table itself is
+owned by the daemon and is read-only to every session, at every level: the command
+above is the only way in.
+
+### What a replacement may and may not change
+
+**The argument count is fixed; everything else can change.** Compiling a query
+records that a name is a user function *of a given arity*, and compiled queries
+are cached and shared, so that much cannot be taken back. The implementation
+behind the name can: `function replace` points it at new source and the next call
+runs it, with no restart.
+
+A replacement that changes the count is refused, naming both counts. Use a
+different name, or restart the daemon, after which the name is registered afresh.
+
+Each function carries a **checksum over its source**, which `function list` shows
+and every registration and replacement reports. It is what makes an answer
+explicable: a name says what was called, the checksum says which code answered,
+and two daemons that loaded the same function separately agree on it.
+
+### A stored module is never trusted
+
+`HTCONDORDB_WASM_<NAME>_TRUSTED` is configuration and stays configuration. A
+stored record asking for trust is loaded untrusted and told so, because a
+capability a module can claim is a request rather than a capability. A stored
+module is bounded exactly as an untrusted configured one is: the step budget, the
+deadline, the memory cap, and — for a script — the purity gate.
+
+### A stored module that does not load marks the function bad
+
+A *configured* module that does not load fails start-up. A *stored* one does not:
+it is marked **bad** and the daemon starts anyway. Three things make that the
+right way round. A stored record cannot be edited on the host, so a daemon that
+refused to start could not be used to fix the record stopping it. A module can
+stop loading without anyone touching it — a wasm guest valid under one runtime
+version and rejected by the next — which would make an upgrade a coin toss. And
+otherwise anyone who may register a function could stop the daemon starting.
+
+A bad function is **registered**, under its stored argument count, and answers
+`error` when called — the same answer a name that does not exist gives. It is not
+left out, because leaving it out would change how the *call site* compiles, which
+is the decision that cannot be revisited.
+
+Bad is a state, not a silence. It is in the daemon's log at start-up, in the
+function's own record (`State` and `StateReason`), and in `function list`:
+
+```
+NAME      KIND    ORIGIN      ARGS  STATE  IDENTITY
+pctUsed   wasm    stored      2     bad    sha256:0f3a9c71be42
+
+pctUsed: wasmudf: pctUsed@0f3a9c71be42: invalid magic number
+```
+
+Replacing the source repairs it in place — the argument count is unchanged, so
+the trampoline absorbs it. A function that is bad because the *runtime* rejects
+the module will stay bad however often it is re-registered, and the reason says
+which of the two it is.
+
+`function remove` deletes the record, which stops the next restart registering
+it. It does **not** give the name back in the running daemon: the name stays
+registered and answers `error`, and the listing says so, until a restart.
+
+### One name space
+
+Configured and stored functions share one name space, because a query calling a
+name reaches one function and does not know where it came from. A configured name
+is claimed first, at start-up; a stored record asking for a name the
+configuration holds is marked bad saying so, and a reconfigure that adds a name
+the table already holds is reported rather than applied. `function list` shows
+both, with an `ORIGIN` column.
+
+### What clients do with a stored function
+
+Nothing, yet. A `SELECT` item is computed by whoever asked the question, so a
+client still loads its own functions from its own configuration: a stored
+function works in a `WHERE` clause, which the server evaluates, and a `SELECT`
+item naming it answers `error` on a client that has not configured it. Whether a
+client fetches stored modules from the server — and whether it should be able to
+refuse to — is a separate question, with its own trust decision, and it is not
+settled here.
+
 ## When something is wrong
 
 A function that does not load **fails start-up**, naming the function and the
@@ -198,6 +309,9 @@ For a script, the three ways that happens are a file that cannot be read, a
 syntax error, and a function that reaches the ad. The third reads, in part,
 `reads the attribute Memory: a registered function is given its arguments and
 nothing else`, and the fix is in the message.
+
+A *stored* function that does not load does not fail start-up: it is marked bad,
+answers `error`, and says so in the log, in its record and in `function list`.
 
 A function that loads but then fails a call produces `error` for that value. For
 a module the first failure of each kind is logged with the reason — a trap, the

@@ -501,6 +501,28 @@ func run() error {
 			log.Error(logging.DestinationGeneral, "reconfigure: user functions not reapplied", "err", werr.Error())
 		}
 	})
+	// User functions stored in the database: register what the user_functions table holds, so a
+	// function an administrator added survives a restart without a config edit on every host.
+	//
+	// AFTER the configured ones, which is the order that decides a collision: a name an operator
+	// configured on this host is claimed first, and a stored record asking for the same name is
+	// marked bad rather than contending for it.
+	//
+	// Nothing here fails start-up. A stored module that will not load marks its function bad --
+	// registered, under its arity, answering ERROR, and saying so in the log, in its own record
+	// and in the listing -- because a daemon that refuses to start cannot be used to fix the
+	// record that stops it starting, and because a module can stop loading (a runtime upgrade)
+	// without anyone having touched it.
+	udfMgr.LoadStored(svc.Catalog())
+	// The table belongs to this daemon, so no remote session writes it at any level. A record
+	// written by a client would become a registered function at the next restart, which is the
+	// administrative act below reached by a route that is not gated as one.
+	if oerr := claimUserFuncTable(svc.Owners()); oerr != nil {
+		return oerr
+	}
+	// The administrative path (DBUserFuncControl): register, replace, remove and list, at DAEMON
+	// or ADMINISTRATOR.
+	registerUserFuncControl(srv, &userFuncController{mgr: udfMgr})
 
 	// Last: the managers refused above because another one still held a table it has now let go.
 	d.OnReconfig(func(newCfg *config.Config) {

@@ -55,4 +55,16 @@ const (
 	// READ-level, unlike the DAEMON-level DBSyncControl above: this only reads health, and the
 	// clients that need it (readers deciding whether to trust the mirror) are readers.
 	DBSyncStatus = Base + 5 // 74005
+
+	// DBUserFuncControl carries administrative control of the user functions stored in the
+	// database: register a new one, replace one in place, remove one, and list what this daemon
+	// has registered. A ClassAd request/response protocol, like DBSyncControl.
+	//
+	// DAEMON or ADMINISTRATOR, and deliberately NOT WRITE. A user function runs inside every
+	// query that names it, on the server and on every client that loads it, and the function name
+	// space is global: whoever can register pctUsed decides what that word means for everyone,
+	// and -- because a registration cannot be withdrawn -- can take a name permanently. Reading a
+	// table and claiming a word in the query language are not the same privilege, and WRITE is
+	// where the analysts are.
+	DBUserFuncControl = Base + 6 // 74006
 )

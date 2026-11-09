@@ -13,6 +13,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/collections/scriptudf"
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/wasmudf"
 	config "github.com/bbockelm/golang-htcondor/config"
 )
@@ -92,8 +93,25 @@ type Manager struct {
 	mu        sync.Mutex
 	loader    *wasmudf.Loader
 	loaderSig string            // the sandbox settings the loader was built with
-	loaded    map[string]module // by folded name, what is actually registered -- both kinds
+	loaded    map[string]module // by folded name, what is CONFIGURED and registered -- both kinds
 	seen      map[string]bool   // reported "needs a restart" already, so a reconfigure loop says it once
+
+	// The sandbox settings the next wasm module is loaded with, kept from the last Apply. The
+	// stored path needs them too and has no configuration of its own to read: a stored module is
+	// bounded by the same knobs as a configured untrusted one, and keeping one copy is what makes
+	// that true rather than merely stated.
+	opts    wasmudf.Options
+	optsSig string
+
+	// The stored half (stored.go): the catalog the records live in, the table once it exists, and
+	// what is registered out of it, by folded name. One manager holds both halves because a name
+	// is one function whichever way it arrived.
+	cat    Catalog
+	store  *db.DB
+	stored map[string]*storedFn
+	// reg is the scalar registry stored functions are registered into. Nil means classad's own,
+	// which is what the daemon uses; a test supplies one it can inspect (see registry).
+	reg registry
 }
 
 // module is one registered function, as configured. The settings are kept so a later
@@ -147,14 +165,29 @@ func resolveSettings(cfg *config.Config) (settings, error) {
 			"has to be a WebAssembly module named in HTCONDORDB_WASM_AGGREGATES")
 	}
 
+	var out settings
+	// The sandbox knobs are read whether or not anything is CONFIGURED, because a function stored
+	// in the database is loaded into the same runtime and bounded by the same numbers. Reading
+	// them only when a path is configured would silently give a daemon whose functions are all
+	// stored the library's defaults instead of the operator's.
+	out.opts = wasmudf.Options{
+		MemoryLimitPages: uint32(cfgInt(cfg, "HTCONDORDB_WASM_MEMORY_PAGES")),
+		Steps:            uint64(cfgInt(cfg, "HTCONDORDB_WASM_STEPS")),
+		MaxInstances:     cfgInt(cfg, "HTCONDORDB_WASM_MAX_INSTANCES"),
+	}
+	if secs := cfgInt(cfg, "HTCONDORDB_WASM_TIMEOUT"); secs > 0 {
+		out.opts.Timeout = time.Duration(secs) * time.Second
+	}
+	out.optsSig = fmt.Sprintf("%d|%d|%d|%s", out.opts.MemoryLimitPages, out.opts.Steps,
+		out.opts.MaxInstances, out.opts.Timeout)
+
 	fns := strings.Fields(cfgStr(cfg, "HTCONDORDB_WASM_FUNCTIONS"))
 	aggs := strings.Fields(cfgStr(cfg, "HTCONDORDB_WASM_AGGREGATES"))
 	scripts := strings.Fields(cfgStr(cfg, "HTCONDORDB_SCRIPT_FUNCTIONS"))
 	if len(fns) == 0 && len(aggs) == 0 && len(scripts) == 0 {
-		return settings{}, nil
+		return out, nil
 	}
 
-	var out settings
 	// One seen set across all three lists, because a name is one function. A client's parser has
 	// to decide whether a name is an aggregate call or an ordinary one before any request exists,
 	// so a name claimed by a wasm module is not available to a script function or the other way
@@ -238,16 +271,6 @@ func resolveSettings(cfg *config.Config) (settings, error) {
 		}
 	}
 
-	out.opts = wasmudf.Options{
-		MemoryLimitPages: uint32(cfgInt(cfg, "HTCONDORDB_WASM_MEMORY_PAGES")),
-		Steps:            uint64(cfgInt(cfg, "HTCONDORDB_WASM_STEPS")),
-		MaxInstances:     cfgInt(cfg, "HTCONDORDB_WASM_MAX_INSTANCES"),
-	}
-	if secs := cfgInt(cfg, "HTCONDORDB_WASM_TIMEOUT"); secs > 0 {
-		out.opts.Timeout = time.Duration(secs) * time.Second
-	}
-	out.optsSig = fmt.Sprintf("%d|%d|%d|%s", out.opts.MemoryLimitPages, out.opts.Steps,
-		out.opts.MaxInstances, out.opts.Timeout)
 	return out, nil
 }
 
@@ -265,6 +288,11 @@ func (m *Manager) Apply(cfg *config.Config) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Kept whether or not anything is configured: the stored path loads into this runtime too,
+	// and a daemon with no configured modules still has an operator's sandbox settings.
+	if m.loader == nil {
+		m.opts, m.optsSig = s.opts, s.optsSig
+	}
 	if len(s.modules) == 0 {
 		if len(m.loaded) > 0 {
 			m.warnOnce("", "user functions were removed from the configuration but stay registered "+
@@ -292,6 +320,22 @@ func (m *Manager) Apply(cfg *config.Config) error {
 	var firstErr error
 	for _, mod := range s.modules {
 		folded := strings.ToLower(mod.Name)
+		// A name a stored function holds is not available to a configured one. The stored
+		// registration is already live -- registered against a trampoline whose arity compiled
+		// queries have captured -- so re-registering the name would fail with a message about a
+		// collision that named neither the config line nor the record. This cannot happen at
+		// start-up, where the configured path runs first; it is a reconfigure adding a name the
+		// table already claimed.
+		if sf, ok := m.stored[folded]; ok {
+			err := fmt.Errorf("%s user function %s: the name is a stored user function (%s), and "+
+				"a name is one function; remove the stored one and restart, or configure another name",
+				mod.kind(), mod.Name, sf.rec.Checksum)
+			m.logger.Error("configured user function not loaded", "name", mod.Name, "err", err.Error())
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
 		if prev, ok := m.loaded[folded]; ok {
 			if prev.sig() != mod.sig() {
 				m.warnOnce(folded, fmt.Sprintf("the configuration for %q changed, but a "+
@@ -300,7 +344,7 @@ func (m *Manager) Apply(cfg *config.Config) error {
 			}
 			continue
 		}
-		if lerr := m.load(mod, s, parsed); lerr != nil {
+		if lerr := m.load(mod, parsed); lerr != nil {
 			m.logger.Error(mod.kind()+" user function not loaded", "name", mod.Name, "path", mod.Path,
 				"err", lerr.Error())
 			if firstErr == nil {
@@ -324,7 +368,7 @@ func (m *Manager) Apply(cfg *config.Config) error {
 
 // load reads and registers one module. Reading happens here rather than in resolveSettings so
 // that a file appearing between a failed start-up and a reconfigure is picked up.
-func (m *Manager) load(mod module, s settings, parsed map[string]scriptFile) error {
+func (m *Manager) load(mod module, parsed map[string]scriptFile) error {
 	if mod.Script {
 		return m.loadScript(mod, parsed)
 	}
@@ -335,7 +379,7 @@ func (m *Manager) load(mod module, s settings, parsed map[string]scriptFile) err
 	if err != nil {
 		return err
 	}
-	loader, err := m.wasmLoader(s)
+	loader, err := m.wasmLoader()
 	if err != nil {
 		return err
 	}
@@ -389,15 +433,15 @@ func (m *Manager) loadScript(mod module, parsed map[string]scriptFile) error {
 // On FIRST USE rather than when the manager is created, and not at all when nothing wasm is
 // configured: a daemon whose user functions are all scripts has no business holding a WebAssembly
 // runtime, and building one would cost memory and goroutines for a guest that never arrives.
-func (m *Manager) wasmLoader(s settings) (*wasmudf.Loader, error) {
+func (m *Manager) wasmLoader() (*wasmudf.Loader, error) {
 	if m.loader != nil {
 		return m.loader, nil
 	}
-	l, err := wasmudf.NewLoader(m.parent, m.withFailureLog(s.opts))
+	l, err := wasmudf.NewLoader(m.parent, m.withFailureLog(m.opts))
 	if err != nil {
 		return nil, fmt.Errorf("building the wasm runtime: %w", err)
 	}
-	m.loader, m.loaderSig = l, s.optsSig
+	m.loader, m.loaderSig = l, m.optsSig
 	return l, nil
 }
 
@@ -444,16 +488,23 @@ func (m *Manager) warnOnce(key, msg string) {
 	m.logger.Warn(msg)
 }
 
-// Names returns the registered names, for operator messages. The order is unspecified.
+// Names returns the registered names, of either origin, for operator messages. The order is
+// unspecified.
+//
+// Both origins, because the names are one name space: a caller asking what this daemon has
+// registered is not asking where it came from. List reports the difference.
 func (m *Manager) Names() []string {
 	if m == nil {
 		return nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]string, 0, len(m.loaded))
+	out := make([]string, 0, len(m.loaded)+len(m.stored))
 	for _, mod := range m.loaded {
 		out = append(out, mod.Name)
+	}
+	for _, sf := range m.stored {
+		out = append(out, sf.rec.Name)
 	}
 	return out
 }
