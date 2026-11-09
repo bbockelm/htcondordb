@@ -45,7 +45,7 @@ same thing on two nodes that were loaded separately.
 Nothing here is a new storage mechanism. It is an ordinary table with an in-process writer, which
 is the existing answer to "who may write this".
 
-## 3. The constraint that shapes everything: the registry is append-only
+## 3. The constraint that shapes everything: the scalar registry is append-only
 
 `classad`'s scalar registry has no unregister, and the reason is specific: **compiling an
 expression records that a name is a user function**, and compiled programs are cached and shared.
@@ -68,15 +68,16 @@ This gives a sharp and checkable rule:
 That falls out of what the compiled program actually captured, rather than being a restriction we
 chose, which is the kind of rule that survives contact with users.
 
-## 4. Aggregates are the easier half, and already say so
+## 4. Aggregates are the easier half
 
-`db.RegisterAggregate` is append-only too, but for a different reason, and it says so in as many
-words: an aggregate name is resolved **once per query**, so withdrawing one would be perfectly well
-defined; it is append-only "because nothing needs the other thing — a reason that would stop
-applying if a caller turned up".
+The aggregate registry offers replacement and withdrawal, and the scalar one does not. Two things
+make that safe. An aggregate name is resolved **once per query**, and nothing caches that
+resolution, so withdrawing a name cannot strand a compiled program the way §3 describes. And an
+aggregate registration carries **no arity** — one spec, one argument — so a replacement has no
+signature that could disagree with what a call site already captured.
 
-A caller has turned up. Aggregates therefore need no trampoline: give the registry a replace and a
-remove, and a stored aggregate can be changed outright, arity included.
+Aggregates therefore need no trampoline: `db.ReplaceAggregate` and `db.UnregisterAggregate` change
+a stored aggregate outright, arity included.
 
 So the two halves land differently, and the documentation has to say so rather than implying a
 uniform feature.
@@ -166,5 +167,3 @@ and visible to an admin listing what is registered. An operator should be able t
   two it is.
 - **Whether a client refuses stored modules.** §5 argues it should be able to; nothing here says
   what the default is.
-- **Script aggregates do not exist yet.** `scriptudf` registers scalar functions only, so the
-  aggregate half of this applies to wasm until that changes.
