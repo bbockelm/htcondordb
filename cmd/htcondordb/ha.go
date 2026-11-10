@@ -89,8 +89,8 @@ func detectHA(cfg *config.Config) (*haRuntime, error) {
 // consistent mode) the raft coordinator and its CEDAR command handlers. srv is
 // the command server the raft/control handlers are registered on (before Serve);
 // advertise is this daemon's externally reachable command address, and nodeAddr the
-// same address without the certificate alias, which names this node to raft. It
-// returns immediately; background work runs until ctx is cancelled.
+// stable identity that names this node to raft (see nodeIdentity). It returns
+// immediately; background work runs until ctx is cancelled.
 func (h *haRuntime) start(ctx context.Context, d *daemon.Daemon, cfg *config.Config, svc *server.Service, srv *cedarserver.Server, advertise, nodeAddr string) error {
 	switch {
 	case h.mode == modeLeaderFollower && h.role == "follower":
@@ -170,9 +170,10 @@ func (h *haRuntime) startConsistent(ctx context.Context, d *daemon.Daemon, cfg *
 	nodeID := strings.TrimSpace(getStr(cfg, "HTCONDORDB_NODE_ID"))
 	if nodeID == "" {
 		// nodeAddr, not advertise: a node's raft identity must not move when something
-		// about how it is *reached* changes. The certificate alias is one such thing --
-		// attaching it renamed every self-joined node on upgrade, leaving the old names
-		// in the configuration as unreachable voters.
+		// about how it is *reached* changes. Every parameter the advertised address
+		// carries -- the certificate alias, the IPv6 address, a CCB contact -- is one
+		// such thing, and each would rename every self-joined node on upgrade, leaving
+		// the old names in the configuration as unreachable voters.
 		nodeID = nodeAddr
 	}
 	peers, err := parsePeers(getStr(cfg, "HTCONDORDB_RAFT_PEERS"))

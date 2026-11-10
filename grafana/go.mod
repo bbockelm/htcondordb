@@ -12,7 +12,7 @@ require (
 	github.com/PelicanPlatform/classad/dbrpc v0.38.2
 	github.com/apache/arrow-go/v18 v18.8.0
 	github.com/bbockelm/cedar v0.7.12
-	github.com/bbockelm/golang-htcondor v0.21.0
+	github.com/bbockelm/golang-htcondor v0.22.1
 	github.com/bbockelm/htcondordb v0.0.0
 	github.com/grafana/grafana-plugin-sdk-go v0.298.0
 )

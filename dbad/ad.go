@@ -52,9 +52,9 @@ type Capabilities struct {
 // Input is the HTCondorDB-specific state AddAttrs writes onto an ad. It holds no live handles,
 // so AddAttrs is pure and testable; the Augment closure fills it from the live catalog/sources.
 type Input struct {
-	// MyAddress is the daemon's authoritative reachable command address. The generic base ad
-	// (daemon.PublishAd) only knows the shared-port sinful; the caller (which has the listener)
-	// supplies the address that also covers the non-shared-port fallback.
+	// MyAddress is the daemon's reachable command address. It is the same address
+	// daemon.PublishAd already writes, repeated here so an ad built outside a daemon --
+	// a test, a tool -- can still carry one. Leave it empty to keep PublishAd's.
 	MyAddress    string
 	Tables       []TableStat
 	Capabilities Capabilities
