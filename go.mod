@@ -24,7 +24,7 @@ require (
 	github.com/PelicanPlatform/classad/wasmudf v0.38.2
 	github.com/apache/arrow-go/v18 v18.8.0
 	github.com/bbockelm/cedar v0.7.12
-	github.com/bbockelm/golang-htcondor v0.21.0
+	github.com/bbockelm/golang-htcondor v0.22.1
 	github.com/chzyer/readline v1.5.1
 	github.com/dustin/go-humanize v1.1.0
 	github.com/hashicorp/go-hclog v1.6.3
