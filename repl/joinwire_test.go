@@ -152,8 +152,12 @@ func TestJoinArmsReadArchivesAsTextAndTablesAsWire(t *testing.T) {
 			if _, err := fix.exec.ExecString(expansionJoinSQL); err != nil {
 				t.Fatal(err)
 			}
-			// Two side reads; a row count for the key-batch decision may sit between them.
-			got := ops.waitOpsB(t, 2)
+			// Three ops: the two side reads, with the row count the key-batch decision
+			// weighs them against between them. The count has to be the number the
+			// statement actually issues -- waiting for fewer returns while one is still in
+			// flight, and that straggler lands after the reset below, where it reads as the
+			// store arm's first op.
+			got := ops.waitOps(t, 3)
 			reads := 0
 			for _, op := range got {
 				if op == tc.want {

@@ -1268,6 +1268,14 @@ type explainTrace struct {
 	// rule, because the key count is a fact about rows it has not read; ANALYZE has read
 	// them, so it reports the decision itself.
 	keyBatch []string
+	// joinStats is the same kind of account for a join the STORE ran: which attribute each
+	// step narrowed on, how many keys, and -- when a step did not narrow -- why not.
+	// joinStatsAsked marks a store-side join that produced the rows, which is where the
+	// scanOK precedent stops: whether anything came back is a separate question with three
+	// answers, and the report carries them itself (see joinstats.go). Folding them into one
+	// bool would print a store that never spoke as a join that narrowed on nothing.
+	joinStats      dbrpc.JoinStatsReport
+	joinStatsAsked bool
 }
 
 // execExplain implements EXPLAIN [ANALYZE] <SELECT>. Plain EXPLAIN reports the chosen plan; with
@@ -1275,7 +1283,8 @@ type explainTrace struct {
 // (path, projection/limit push-down, ordering), the client phase timings, and -- for the ops that
 // carry a stats trailer (projected row scans and top-K) -- the server-side scan breakdown (segments
 // scanned/pruned, records decided from columns vs reassembled). The aggregate ops do not yet carry
-// that trailer.
+// that trailer. A join the store ran carries one of its own, and reports which side's scan each of
+// its steps narrowed, or why none did.
 func (e *Executor) execExplain(st *Statement) (*Result, error) {
 	inner := st.Inner
 	if inner == nil {
@@ -1318,6 +1327,10 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 				lines = append(lines, "  "+l)
 			}
 		}
+		// The store-side counterpart of the key-batching block above: the same decision,
+		// taken where no EXPLAIN here can watch it. The two never both appear, because a
+		// join either ran in the store or ran through the pipeline.
+		lines = append(lines, joinStatsLines(tr)...)
 	}
 	res := &Result{IsSelect: true, Columns: []string{"QUERY PLAN"}}
 	for _, l := range lines {

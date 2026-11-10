@@ -1842,10 +1842,16 @@ func (e *Executor) joinServerSide(st *Statement, p *joinPlan) ([]*classad.ClassA
 	}
 
 	rows, ok, err := e.joinWireRows(req)
-	if ok || err != nil {
-		return rows, ok, err
+	if !ok && err == nil {
+		rows, ok, err = e.joinTextRows(req)
 	}
-	return e.joinTextRows(req)
+	// The statistics describe a join the STORE ran. A statement that got this far and then
+	// fell back to the pipeline did not run one, and a report left behind by the attempt
+	// would attribute this process's work to the store.
+	if ok && e.explain != nil {
+		e.explain.joinStatsAsked = true
+	}
+	return rows, ok, err
 }
 
 // joinWireRows asks for the joined rows as wire-form records rather than as rendered
@@ -1863,7 +1869,7 @@ func (e *Executor) joinWireRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool
 	// it asks for, and a privileged one is entitled to what the text reply would have given
 	// it. Asking for redaction here would withhold private attributes from the one caller
 	// allowed to see them.
-	err := e.c.JoinWire(e.opCtx(), req, false, func(row []byte) bool {
+	err := e.c.JoinWireStats(e.opCtx(), req, false, func(row []byte) bool {
 		// row ALIASES the frame buffer and dies when this returns. DecodeInline builds an
 		// AST that owns its strings, so what is kept here outlives the frame.
 		a, derr := wire.DecodeInline(row)
@@ -1873,7 +1879,7 @@ func (e *Executor) joinWireRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool
 		}
 		rows = append(rows, classad.FromAST(a))
 		return true
-	})
+	}, e.joinStatsReport())
 	if errors.Is(err, dbrpc.ErrJoinWireUnsupported) {
 		return nil, false, nil // take the text reply
 	}
@@ -1893,7 +1899,7 @@ func (e *Executor) joinWireRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool
 func (e *Executor) joinTextRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool, error) {
 	var rows []*classad.ClassAd
 	var parseErr error
-	err := e.c.Join(e.opCtx(), req, func(row string) bool {
+	err := e.c.JoinStats(e.opCtx(), req, func(row string) bool {
 		ad, perr := classad.Parse(row)
 		if perr != nil {
 			// Stopping the stream without recording why ends it the same way a caller that
@@ -1904,7 +1910,7 @@ func (e *Executor) joinTextRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool
 		}
 		rows = append(rows, ad)
 		return true
-	})
+	}, e.joinStatsReport())
 	if errors.Is(err, dbrpc.ErrJoinUnsupported) {
 		return nil, false, nil // join it here, as before
 	}
