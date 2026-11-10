@@ -392,8 +392,9 @@ Notes:
     term must also be selected.
   - HAVING filters groups after aggregation (WHERE filters rows before it):
     SELECT Owner, SUM(Cpus) FROM jobs GROUP BY Owner HAVING SUM(Cpus) > 100;
-  - JOIN reads two tables; its ON clause is a ClassAd expression, like WHERE, and every
-    attribute must be alias-qualified (SELECT j.Owner FROM jobs j JOIN hist h ON
+  - JOIN reads two or more tables (each JOIN folds in another, up to eight); its ON
+    clause is a ClassAd expression, like WHERE, and every attribute must be
+    alias-qualified (SELECT j.Owner FROM jobs j JOIN hist h ON
     j.ClusterId == h.ClusterId). UNION [ALL] stacks two results where a JOIN would pair
     them -- live jobs plus completed ones is a UNION. Subqueries are not supported.
     Matchmaking is MATCH, which is bilateral, not a join.

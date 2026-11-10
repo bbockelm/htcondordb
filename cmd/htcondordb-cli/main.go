@@ -122,10 +122,11 @@ function subcommand:
 Interactive meta-commands: .tables .use .help .format .dialect .output .quit
   (type .help in the shell)
 
-Language: multiple tables (no joins). SELECT / INSERT / UPDATE / DELETE with
-DISTINCT, aggregates (COUNT/SUM/AVG/MIN/MAX), GROUP BY, ORDER BY, LIMIT;
-CREATE/DROP TABLE and CREATE/DROP INDEX. WHERE is a ClassAd expression
-(==, =?=, undefined, regexp(), ...). Writing requires WRITE at the daemon.
+Language: SELECT / INSERT / UPDATE / DELETE with DISTINCT, aggregates
+(COUNT/SUM/AVG/MIN/MAX), GROUP BY, HAVING, ORDER BY, LIMIT; INNER/LEFT/CROSS
+JOIN and UNION [ALL] across tables; CREATE/DROP TABLE and CREATE/DROP INDEX.
+WHERE, and a JOIN's ON, are ClassAd expressions (==, =?=, undefined,
+regexp(), ...). Writing requires WRITE at the daemon.
 `
 
 // version is stamped at build time via `-ldflags "-X main.version=..."` (see the

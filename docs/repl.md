@@ -32,7 +32,8 @@ daemons, and running the query against the wrong database is worse than a
 refusal.
 
 The database holds one or more **tables**, each an independent ClassAd
-collection (no joins) with its own indexes, hot set, and persisted config. The
+collection with its own indexes, hot set, and persisted config; a `JOIN` reads
+across them. The
 default table is `ads`; create more with DDL. Each row's primary key lives in a
 key attribute (default `Key`): `INSERT` stamps it into the ad so `SELECT` can
 show it and `UPDATE`/`DELETE` can recover the key of every matched row.
@@ -82,12 +83,12 @@ DELETE FROM jobs WHERE JobStatus == 4;
   `4` are two rows; two `undefined` rows are one, as SQL's `DISTINCT` treats `NULL`s.
 - **`ORDER BY`** one or more columns/aggregates, each `ASC` (default) or `DESC`;
   numeric values sort numerically, applied before `LIMIT`.
-- **`JOIN`** reads two tables; see [JOIN](#join--two-tables-one-row). Subqueries are
-  still rejected with a clear error.
+- **`JOIN`** reads two or more tables; see [JOIN](#join--several-tables-one-row).
+  Subqueries are still rejected with a clear error.
 - **`time_bucket(attr, 'width')`** groups rows by a floored unix-epoch timestamp
   attribute for time-series output. See the [time-series design](design/time-series.md).
 
-## JOIN — two tables, one row
+## JOIN — several tables, one row
 
 ```sql
 SELECT <items>
@@ -161,10 +162,14 @@ single-table and has no notion of a composite row — and `EXPLAIN` says so. Ove
 table an aggregate still takes a bare attribute name, since there is no second table for a
 qualified one to refer to.
 
-**Not supported yet**, each refused with the reason: `RIGHT`/`FULL OUTER` (swap the tables
+Each `JOIN` after the first folds in another table, up to eight in one statement; beyond
+that the statement is refused, because the join order is the order the tables are written
+and no planner reorders them.
+
+**Not supported**, each refused with the reason: `RIGHT`/`FULL OUTER` (swap the tables
 and use `LEFT JOIN`), `NATURAL JOIN` and `USING` (write the condition with `ON`),
-comma-separated `FROM` lists, more than two tables, sub-selects, and window functions over
-a join.
+comma-separated `FROM` lists (write `CROSS JOIN`, so an unbounded pairing is asked for
+rather than typed by accident), sub-selects, and window functions over a join.
 
 **Guard rails.** A join refuses rather than runs away when it would examine too many
 candidate pairs — either because the `ON` clause has no equality between the tables, so

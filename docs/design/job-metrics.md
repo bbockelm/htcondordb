@@ -323,11 +323,14 @@ Two things the measurement changed about how to think of this table:
 
 ### 3.4 Derive the rates at ingest, not at query time
 
-The SQL surface has **no window functions, no `LAG`, no self-join** — `JOIN` and subqueries
-are rejected outright (`docs/repl.md`). So `rate(counter)`, the thing Prometheus does for
-free, cannot be expressed as a query over stored counters. Either every dashboard
-reimplements it (wrongly, around restarts and gaps) or **the sampler does it once at write
-time**, where it already holds the previous observation.
+A `rate(counter)` needs each row paired with the previous observation of the same series.
+A self-join on the series key pairs rows, but nothing in the language picks out *the
+previous* one: that is an ordered offset, and the SQL surface has no `LAG`/`LEAD` (its
+window functions are `ROW_NUMBER`, `RANK` and `DENSE_RANK`, and none of them run over a
+join). So `rate(counter)`, the thing Prometheus does for free, cannot be expressed as a
+query over stored counters. Either every dashboard reimplements it (wrongly, around
+restarts and gaps) or **the sampler does it once at write time**, where it already holds
+the previous observation.
 
 Do it at write time:
 

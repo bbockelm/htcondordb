@@ -75,12 +75,13 @@ htcondordb-cli -e 'SELECT Name, Cpus, Memory FROM machines WHERE Cpus >= 8'
 ## Using the query language
 
 `WHERE` is a full ClassAd expression (not a SQL dialect), aggregation and
-`GROUP BY` run server-side, and cross-table work is HTCondor matchmaking
-(`MATCH`), not a join:
+`GROUP BY` run server-side, `JOIN` pairs rows across tables, and matchmaking is
+its own bilateral statement (`MATCH`) rather than a join:
 
 ```sql
 SELECT COUNT(*), AVG(Cpus), MAX(Memory) FROM machines WHERE State == "Unclaimed";
 SELECT Owner, COUNT(*), SUM(RequestCpus) FROM jobs GROUP BY Owner ORDER BY COUNT(*) DESC;
+SELECT j.Owner, h.ExitCode FROM jobs j LEFT JOIN history h ON j.ClusterId == h.ClusterId;
 MATCH jobs TO machines WHERE Owner == "alice" WHERE TARGET Arch == "X86_64" LIMIT 1;
 ```
 

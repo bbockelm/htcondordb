@@ -88,7 +88,8 @@ func (e *Executor) StreamSelect(st *Statement, yield func(*classad.ClassAd) bool
 //
 // ORDER BY and DISTINCT are row-set operations: neither can emit a correct first row
 // before it has seen the last. An aggregate is excluded because its rows are synthesized,
-// not streamed. An archive or AS OF read has no streaming client op.
+// not streamed. A join and a set operation both read more tables than the one the statement
+// names. An archive or AS OF read has no streaming client op.
 func (e *Executor) streamable(st *Statement) bool {
 	if len(st.OrderBy) > 0 || st.Distinct || st.AsOf != "" {
 		return false
@@ -99,6 +100,13 @@ func (e *Executor) streamable(st *Statement) bool {
 	// so streaming it as an ordinary SELECT would quietly hand back that branch alone and
 	// call it the union.
 	if st.IsSetOp() {
+		return false
+	}
+	// A join's rows are built here, out of every side, and the statement's Table names only
+	// the first of them. Streaming it as an ordinary SELECT would read that one table with
+	// the statement's raw WHERE and hand the rows back as the join's -- the left table
+	// alone, with no member for any other side, and no error to say so.
+	if st.IsJoin() {
 		return false
 	}
 	if len(effectiveGroupBy(st)) > 0 || hasAggregate(st) {

@@ -78,7 +78,7 @@ Three things follow, all of them worth knowing before a large query:
 |---|---|
 | `fetchall()` materializes | It hands back everything, by definition. Iterate instead to keep a large result out of memory. |
 | `rowcount` counts what you fetched | For a SELECT it is `-1` before the first fetch and grows as rows arrive, because the total is not known until the result is exhausted. PEP 249 allows this and `sqlite3` does the same. For DML it is the affected count, unchanged. |
-| Some shapes cannot stream *as tuples* | `SELECT *` needs its column list before row 1, and that list is the union of every matched ad's attributes — see `conn.mappings()` below, which streams it. Aggregates, `GROUP BY` and window functions cannot stream in any row shape: their rows are synthesized from groups rather than read from ads. Those run whole and are served from memory; the rows are identical, only the memory differs. |
+| Some shapes cannot stream *as tuples* | `SELECT *` needs its column list before row 1, and that list is the union of every matched ad's attributes — see `conn.mappings()` below, which streams it. Aggregates, `GROUP BY` and window functions cannot stream in any row shape: their rows are synthesized from groups rather than read from ads. A `JOIN` and a `UNION` cannot either: they read more tables than the statement names, and the rows are built once every side has been read. Those run whole and are served from memory; the rows are identical, only the memory differs. |
 
 **Name your columns.** `SELECT Owner, RequestMemory FROM jobs` streams *and* pushes a
 projection to the server, so only those attributes cross the wire. `SELECT *` does neither.
@@ -103,7 +103,8 @@ Values are **evaluated**, so an attribute holding an expression arrives as what 
 needing HTCondor's `classad2` bindings; `mappings()` needs nothing beyond the driver.
 
 Aggregates and `GROUP BY` are still computed whole here — that limit is about synthesizing rows,
-not about their shape — but they do come back as dicts.
+not about their shape — as are a `JOIN` and a `UNION`, which are built from more than one table.
+All of them do come back as dicts.
 
 An unfinished statement holds the daemon's per-connection executor lock, so starting another one
 on the same connection first drains the open one into memory. Two cursors on one connection stay
@@ -333,9 +334,10 @@ Notes:
 - **Requires `classad2`.** Without HTCondor's bindings this raises `InterfaceError` rather
   than falling back to text; live expressions are the whole point. `Cursor.ad_text` gives
   the unparsed text if that is what you want.
-- **`ORDER BY`, `DISTINCT`, `UNION` and aggregates cannot stream** — none can emit a correct
-  first row before seeing the last, and a union is not its first branch — so those are
-  computed whole and then iterated.
+- **`ORDER BY`, `DISTINCT`, `UNION`, `JOIN` and aggregates cannot stream** — none can emit a
+  correct first row before seeing the last, and neither a union nor a join is its first
+  table — so those are computed whole and then iterated. A joined row is one ad per pairing,
+  with a member per side under its alias.
 - **A result with no ads of its own** — an aggregate, a `DISTINCT` over named columns, a
   de-duplicated `UNION` — has one synthesized per row. Attribute names are derived from the
   headers: `COUNT(*)` becomes `Count`, `SUM(RequestMemory)` becomes `SumRequestMemory`, and
