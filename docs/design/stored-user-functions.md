@@ -79,8 +79,33 @@ signature that could disagree with what a call site already captured.
 Aggregates therefore need no trampoline: `db.ReplaceAggregate` and `db.UnregisterAggregate` change
 a stored aggregate outright, arity included.
 
-So the two halves land differently, and the documentation has to say so rather than implying a
-uniform feature.
+So a record says two independent things. **Kind** is what the source *is*, script or wasm, and
+decides how it is compiled. **Role** is what the name is registered *as*, and decides which registry
+it goes into and what may later be done to it. Script and wasm each take either role, so these are
+two attributes and not four kinds — and a record that states no role is a scalar function, which is
+what makes every record written against §2 alone go on meaning what it meant.
+
+Three things follow, and all three run the other way from §3:
+
+- **A stored aggregate carries no arity**, so nothing about it is immutable. A replacement may
+  change everything.
+- **A bad stored aggregate is not registered.** §6 says why a bad *function* has to be, and the
+  reason — the call site's shape — does not exist here. What is left is which failure to hand an
+  operator: a registered aggregate that errors makes a query *succeed* with a column of `error` in
+  it, where an unregistered one fails the query and names the aggregate, which is also what `db`
+  does with a name nobody ever registered.
+- **Removing one gives the name back**, immediately and with no restart, because the registration
+  can be withdrawn. A removed function leaves a tombstone in the listing saying the name is still
+  taken; a removed aggregate leaves nothing, because nothing is left.
+
+So the two halves land differently, and the documentation says so rather than implying a uniform
+feature.
+
+**The merge laws stay the author's.** `merge` has to be associative and commutative and `result`
+has to repeat, and no registration can check either: `db.CheckAggregate` tests one over samples
+only the author can choose, since values invented in the daemon would be integers for an aggregate
+over host names and would prove nothing. The columnar pass fans out across segment windows, so an
+order-sensitive `merge` is right in every test its author writes and wrong in production.
 
 ## 5. Authorization
 
@@ -146,24 +171,31 @@ fails to load fails start-up. Three things justify the difference:
 - Otherwise anyone who may register could stop the daemon starting, which turns an administrative
   privilege into an availability one.
 
-**A bad function is an error when called**, which is what a name that does not exist already gives.
+**A bad scalar function is an error when called**, which is what a name that does not exist already gives.
 It is registered, under its arity, pointing at an implementation that errors — not left
 unregistered. Leaving it out would change how the *call site* compiles, which is exactly the
 decision §3 says cannot be taken back; registering it keeps the name's shape fixed and puts the
 failure in the value, where a query can see it.
 
-Bad is a **state, not a silence**: it is in the daemon's log at start-up, in the function's record,
-and visible to an admin listing what is registered. An operator should be able to find out that
-`pctUsed` is bad without first noticing that a column has gone to `error`.
+A **bad aggregate is unregistered**, for the reasons in §4, and a query naming it fails.
+
+Bad is a **state, not a silence**, in either role: it is in the daemon's log at start-up, in the
+function's record, and visible to an admin listing what is registered. An operator should be able
+to find out that `pctUsed` is bad without first noticing that a column has gone to `error`, or that
+`jobMean` is bad without first running a query that fails.
+
+**The name is held by this daemon's own bookkeeping, bad or good.** That is what keeps one name
+space across the configured and stored surfaces whichever registry a name ends up in, and it is why
+a name whose aggregate was never registered is still not available to anything else.
 
 ## 7. What this does not settle
 
 - **When a client notices a change.** Modules fetched per session, per query, or cached with
   invalidation are three different designs, and the trampoline only fixes the server half. The
   checksum gives the cache a key.
-- **Whether a bad function can be repaired without a restart.** Replacing the source is a write the
-  trampoline can absorb, so it should be possible — but a function that is bad because the *runtime*
-  rejects it will stay bad however often it is re-registered, and the error has to say which of the
-  two it is.
+- **Whether a bad module can be repaired without a restart.** Replacing the source is a write the
+  trampoline can absorb and a write the aggregate registry takes outright, so it is possible for
+  both — but a module that is bad because the *runtime* rejects it will stay bad however often it
+  is re-registered, and the error has to say which of the two it is.
 - **Whether a client refuses stored modules.** §5 argues it should be able to; nothing here says
   what the default is.

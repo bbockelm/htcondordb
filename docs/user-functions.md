@@ -19,6 +19,7 @@ folding, and the same three kinds of answer — a value, `undefined`, or `error`
 | What you need to build | nothing; it is a text file             | a compiler and a build                     |
 | Argument count         | the `def` states it                    | you declare it in the configuration        |
 | Can be an aggregate    | yes; four `def`s                       | yes                                        |
+| Can be stored in the database | yes, either role                | yes, either role                           |
 | Reaching the rest of the ad | refused at start-up, by the compiler | impossible; it is handed values and nothing else |
 | What bounds a call     | a step budget fixed in the engine      | memory, steps, a deadline, all configurable |
 
@@ -309,6 +310,7 @@ while the daemon runs**.
 ```
 htcondordb-cli function register pctUsed -file pct.cas
 htcondordb-cli function register mean -kind wasm -file mean.wasm -arity 2
+htcondordb-cli function register jobMean -file aggregates.cas -role aggregate
 htcondordb-cli function replace pctUsed -file pct2.cas
 htcondordb-cli function remove pctUsed
 htcondordb-cli function list
@@ -318,11 +320,30 @@ A script states its own argument count in its `def`, so `-arity` is only needed
 for a module, where the count is checked before the guest runs and cannot be
 asked of it.
 
-**Scalar functions only.** An aggregate is resolved once per query rather than
-once per call site, so replacing one would be perfectly well defined — but the
-aggregate registry has no replace to do it with, and a stored aggregate that
-could never be corrected would be the config file again with extra steps. Keep
-aggregates in `HTCONDORDB_SCRIPT_AGGREGATES` or `HTCONDORDB_WASM_AGGREGATES`.
+### Kind and role are two different things
+
+`-kind` is what the source **is** — ClassAd Script text or a WebAssembly module —
+and `-role` is what the name is registered **as**: a scalar function, or an
+aggregate a `GROUP BY` names where `SUM` would go. Script and wasm each take
+either role, so the two are separate and `-role` defaults to `function`.
+
+A stored script aggregate is the same four `def`s as a configured one, picked out
+of the source by the same prefix rule: `jobMean` is built from `jobMean_init`,
+`jobMean_add`, `jobMean_merge` and `jobMean_result`. A file that spells them some
+other way names each one — `-init`, `-add`, `-merge`, `-result` — so a file
+written for `HTCONDORDB_SCRIPT_AGGREGATES` registers out of the table unchanged.
+
+**An aggregate has no argument count.** It is named against one argument
+attribute whatever it is, so `-arity` is refused rather than ignored: a count you
+declared would constrain nothing, and nothing would tell you so.
+
+**The merge laws are yours to keep.** `merge` has to be associative *and*
+commutative and `result` has to repeat without disturbing the state. Nothing in
+the daemon can check that — the samples that would check it are yours, since
+values invented here would be integers for an aggregate over host names and would
+prove nothing. Test one with [`db.CheckAggregate`][udf] before you register it,
+and keep the test. The columnar pass fans out across segment windows, so an
+order-sensitive `merge` is right in every test you write and wrong in production.
 
 **Registering requires DAEMON or ADMINISTRATOR, not WRITE.** A user function runs
 inside every query that names it, the name space is global and shared, and a name
@@ -334,14 +355,27 @@ above is the only way in.
 
 ### What a replacement may and may not change
 
-**The argument count is fixed; everything else can change.** Compiling a query
-records that a name is a user function *of a given arity*, and compiled queries
-are cached and shared, so that much cannot be taken back. The implementation
-behind the name can: `function replace` points it at new source and the next call
-runs it, with no restart.
+**For a function, the argument count is fixed and everything else can change.**
+Compiling a query records that a name is a user function *of a given arity*, and
+compiled queries are cached and shared, so that much cannot be taken back. The
+implementation behind the name can: `function replace` points it at new source and
+the next call runs it, with no restart.
 
 A replacement that changes the count is refused, naming both counts. Use a
 different name, or restart the daemon, after which the name is registered afresh.
+
+**For an aggregate, everything can change**, because there is no argument count to
+keep. An aggregate name is resolved once per query, when the reduction is set up,
+and nothing caches that resolution — so the registry takes a replacement outright.
+A query already running finishes with the implementation it started with, and one
+started afterwards reduces with the new code. Two queries seconds apart can
+therefore compute different things, which is inherent in being able to correct a
+definition at all; the checksum is what says which code answered.
+
+**A name's role is fixed either way.** A name that is an aggregate and becomes a
+function, or the reverse, is a different thing in a different registry answering a
+differently parsed call, and pointing a name at new source does not describe that.
+Remove it and register the other, or pick another name.
 
 Each function carries a **checksum over its source**, which `function list` shows
 and every registration and replacement reports. It is what makes an answer
@@ -356,7 +390,7 @@ capability a module can claim is a request rather than a capability. A stored
 module is bounded exactly as an untrusted configured one is: the step budget, the
 deadline, the memory cap, and — for a script — the purity gate.
 
-### A stored module that does not load marks the function bad
+### A stored module that does not load marks it bad
 
 A *configured* module that does not load fails start-up. A *stored* one does not:
 it is marked **bad** and the daemon starts anyway. Three things make that the
@@ -366,29 +400,42 @@ stop loading without anyone touching it — a wasm guest valid under one runtime
 version and rejected by the next — which would make an upgrade a coin toss. And
 otherwise anyone who may register a function could stop the daemon starting.
 
-A bad function is **registered**, under its stored argument count, and answers
+A bad **function** is registered, under its stored argument count, and answers
 `error` when called — the same answer a name that does not exist gives. It is not
 left out, because leaving it out would change how the *call site* compiles, which
 is the decision that cannot be revisited.
 
-Bad is a state, not a silence. It is in the daemon's log at start-up, in the
-function's own record (`State` and `StateReason`), and in `function list`:
+A bad **aggregate** is not registered at all, and the opposite answer has the same
+cause: nothing captures an aggregate name, so there is no call-site shape to keep.
+What is left to decide is which failure you would rather have. An aggregate that
+errors for every group gives you a query that *succeeds* with a column of `error`
+in it, which looks like an answer; an unregistered one fails the query and names
+the aggregate, which is what db does with an aggregate nobody ever registered.
+
+Either way bad is a state, not a silence. It is in the daemon's log at start-up,
+in the record (`State` and `StateReason`), and in `function list`:
 
 ```
-NAME      KIND    ORIGIN      ARGS  STATE  IDENTITY
-pctUsed   wasm    stored      2     bad    sha256:0f3a9c71be42
+NAME      KIND             ORIGIN   ARGS  STATE  IDENTITY
+jobMean   script aggregate stored   -     bad    sha256:4d1e7a08c33b
+pctUsed   wasm             stored   2     bad    sha256:0f3a9c71be42
 
+jobMean: scriptagg: the module does not define a usable aggregate: merge: no such def: jobMean_merge
 pctUsed: wasmudf: pctUsed@0f3a9c71be42: invalid magic number
 ```
 
-Replacing the source repairs it in place — the argument count is unchanged, so
-the trampoline absorbs it. A function that is bad because the *runtime* rejects
-the module will stay bad however often it is re-registered, and the reason says
-which of the two it is.
+Replacing the source repairs either — for a function because the argument count is
+unchanged, for an aggregate because the registry installs an absent name as
+readily as a present one. A module that is bad because the *runtime* rejects it
+will stay bad however often it is re-registered, and the reason says which of the
+two it is.
 
-`function remove` deletes the record, which stops the next restart registering
-it. It does **not** give the name back in the running daemon: the name stays
-registered and answers `error`, and the listing says so, until a restart.
+`function remove` deletes the record, which stops the next restart registering it.
+For a **function** it does not give the name back in the running daemon: the name
+stays registered and answers `error`, and the listing says so, until a restart.
+For an **aggregate** it does: the registration is withdrawn, a query naming it
+fails as it would for a name nobody ever registered, and the name is free
+immediately — for an aggregate, for a function, or for the configuration.
 
 ### One name space
 
@@ -398,6 +445,12 @@ is claimed first, at start-up; a stored record asking for a name the
 configuration holds is marked bad saying so, and a reconfigure that adds a name
 the table already holds is reported rather than applied. `function list` shows
 both, with an `ORIGIN` column.
+
+**Aggregates are in it too**, although they go into a registry of their own: a
+client's parser has to decide whether `jobMean(x)` is an aggregate call before any
+request exists, so one name cannot be both. `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`
+are not available either — a parser reads those as built-in aggregates before it
+consults any registry, so a registration under one of them would be unreachable.
 
 ### What clients do with a stored function
 
@@ -425,8 +478,10 @@ configuration names and the file does not define, one whose parameter count does
 not fit the role it fills, and an `init` that does not produce an identity. Each
 message names the `def` and the role, so it says which line of the file to open.
 
-A *stored* function that does not load does not fail start-up: it is marked bad,
-answers `error`, and says so in the log, in its record and in `function list`.
+A *stored* module that does not load does not fail start-up: it is marked bad and
+says so in the log, in its record and in `function list`. A bad stored function
+answers `error`; a bad stored aggregate is not registered, so a query naming it
+fails.
 
 A function that loads but then fails a call produces `error` for that value. For
 a module the first failure of each kind is logged with the reason — a trap, the
