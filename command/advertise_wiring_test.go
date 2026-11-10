@@ -63,6 +63,22 @@ func goFiles(t *testing.T) map[string]string {
 	return out
 }
 
+// exemptAnonymousDialer is the one client with no handshake to read.
+//
+// The benchmark client dials an ANONYMOUS endpoint over a plain socket: WantSessionAttrs is a
+// field of the CEDAR security config and WithPeerSessionAttrs takes what that handshake
+// produced, so where there is no handshake there is nothing to capture and the two lines would
+// be decoration -- the "looks configured, is not" shape this file exists to prevent.
+//
+// The exemption is CONDITIONAL ON THAT STAYING TRUE. A version of this client that authenticates
+// has a handshake again, so the moment the file mentions cedar it is checked like every other.
+// Nothing here has to be remembered for that to happen.
+const exemptAnonymousDialer = "cmd/htcondordb/benchmarkclient.go"
+
+func exemptFromAdvertisement(rel, body string) bool {
+	return rel == exemptAnonymousDialer && !strings.Contains(body, "cedar")
+}
+
 // TestEveryDbrpcClientReadsWhatThePeerAdvertised: a dbrpc client built without
 // WithPeerSessionAttrs throws away the handshake's advertisement.
 func TestEveryDbrpcClientReadsWhatThePeerAdvertised(t *testing.T) {
@@ -72,6 +88,9 @@ func TestEveryDbrpcClientReadsWhatThePeerAdvertised(t *testing.T) {
 			continue
 		}
 		found++
+		if exemptFromAdvertisement(rel, body) {
+			continue
+		}
 		if !strings.Contains(body, "dbrpc.WithPeerSessionAttrs(") {
 			t.Errorf("%s builds a dbrpc client without dbrpc.WithPeerSessionAttrs, "+
 				"so it discards what the server advertised and sees every peer as unknown", rel)
@@ -93,6 +112,9 @@ func TestEveryDbSessionClientAsksForTheAdvertisement(t *testing.T) {
 			continue
 		}
 		found++
+		if exemptFromAdvertisement(rel, body) {
+			continue
+		}
 		if !strings.Contains(body, "dbrpc.ClientSessionAttrNames()") {
 			t.Errorf("%s builds a dbrpc client but never sets "+
 				"sec.WantSessionAttrs = dbrpc.ClientSessionAttrNames(), so the handshake "+
