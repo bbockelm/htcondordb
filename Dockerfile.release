@@ -1,0 +1,74 @@
+# The htcondordb daemon and CLI in a minimal runtime image, for running a
+# database -- normally a federation hub -- under Kubernetes, where there is no
+# RPM to install.
+#
+# Building by hand:
+#   docker build -f Dockerfile.release --build-arg VERSION=$(git describe --tags) .
+
+# --- Stage 1: build ---
+#
+# 1.27 is what release.yml builds with, and what the columnar SIMD engine's
+# arm64 half requires. Alpine, because the binaries are pure Go and the
+# runtime stage below is Alpine too.
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
+# Stamped into the binary. An untagged build is not a release, so the caller
+# passes a name nobody will mistake for one; `dev` is what `go build` alone
+# would leave.
+ARG VERSION=dev
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /build
+COPY . .
+
+# Mirrors release.yml's build step, and for the same reasons:
+#
+#   GOWORK=off       this is a multi-module repo and the exporter modules
+#                    must not be dragged into the daemon's module graph
+#   CGO_ENABLED=0    a static binary, so the runtime stage needs no libc
+#   GOFLAGS=-mod=mod the go.mod directives need the module-graph flags
+#   GOPRIVATE        resolve the sibling bbockelm/PelicanPlatform module tags
+#                    straight from GitHub rather than through the proxy
+#   GOEXPERIMENT     compile classad/collections/vm's SIMD engine in. Dropping
+#                    it fails nothing: it silently ships a slower daemon.
+ENV GOWORK=off \
+    CGO_ENABLED=0 \
+    GOFLAGS=-mod=mod \
+    GOPRIVATE=github.com/bbockelm,github.com/PelicanPlatform \
+    GOEXPERIMENT=simd
+
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
+        -ldflags "-s -w -X main.version=${VERSION}" \
+        -o /out/ ./cmd/htcondordb ./cmd/htcondordb-cli
+
+# --- Stage 2: runtime ---
+FROM alpine:3.21
+
+# The daemon refuses to run privileged -- it would try to drop to the condor
+# user -- so it runs as an ordinary uid instead. 1000 so a Kubernetes fsGroup
+# of 1000 makes the mounted secrets and the data volume readable, which is how
+# the rest of this stack is deployed.
+RUN apk --no-cache add ca-certificates tzdata \
+ && addgroup -g 1000 condor \
+ && adduser -D -u 1000 -G condor condor \
+ && mkdir -p /etc/htcondordb /var/lib/htcondordb /var/log/htcondordb \
+ && chown -R condor:condor /etc/htcondordb /var/lib/htcondordb /var/log/htcondordb
+
+COPY --from=builder /out/htcondordb /out/htcondordb-cli /usr/local/bin/
+
+USER condor
+WORKDIR /var/lib/htcondordb
+
+# The CEDAR command port. Everything else the daemon serves -- the change
+# feed, Arrow Flight SQL -- is off unless configured, and is published by the
+# deployment that turns it on.
+EXPOSE 9630
+
+# Configuration comes from the HTCondor configuration the daemon finds, which
+# under Kubernetes is _CONDOR_-prefixed environment variables; there is no
+# config file in the image on purpose, so nothing is half-configured by
+# default.
+ENTRYPOINT ["/usr/local/bin/htcondordb"]
