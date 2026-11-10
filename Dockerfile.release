@@ -19,7 +19,12 @@ ARG TARGETARCH
 # would leave.
 ARG VERSION=dev
 
-RUN apk --no-cache add ca-certificates
+# git is not optional here: GOPRIVATE below makes the toolchain fetch the
+# sibling bbockelm/PelicanPlatform modules straight from GitHub rather than
+# through the proxy, and it shells out to git to do it. Without it every one
+# of those imports fails with "unable to resolve git version" -- which a local
+# build never shows, because there the modules are already in the cache.
+RUN apk --no-cache add ca-certificates git
 
 WORKDIR /build
 COPY . .
