@@ -1,0 +1,100 @@
+name: Release Container
+
+# Publishes ghcr.io/bbockelm/htcondordb, for deployments that have no RPM to
+# install -- a federation hub under Kubernetes, principally. The release
+# tarballs and RPMs in release.yml are unaffected and remain how an AP
+# installs a spoke.
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  # A pull request that touches the build builds it, for one architecture and
+  # without pushing. Otherwise the first time anyone finds out the image does
+  # not build is after the change is on main.
+  pull_request:
+    paths:
+      - 'Dockerfile.release'
+      - '.dockerignore'
+      - '.github/workflows/release-container.yml'
+      - 'go.mod'
+      - 'go.sum'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build and Push Container
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Cross-building arm64 under QEMU costs several minutes and a pull
+      # request builds amd64 only, so it is skipped there.
+      - name: Set up QEMU
+        if: github.event_name != 'pull_request'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Pushes to main: a moving `devel`, plus a sortable timestamp tag
+            # so a flux ImagePolicy can pick the newest build per commit.
+            type=raw,value=devel,enable={{is_default_branch}}
+            type=raw,value=main-{{date 'YYYYMMDDHHmmss' tz='UTC'}},enable={{is_default_branch}}
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            # An untagged build is not a release; name it so nobody mistakes
+            # the image for one. `.version` in the daemon reports this.
+            echo "version=0.0.0-${GITHUB_REF_NAME}-$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile.release
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # .dockerignore excludes .git, so the toolchain finds no VCS
+          # metadata and would stamp nothing at all. Passed in from the ref
+          # being built.
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
