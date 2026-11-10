@@ -11,6 +11,16 @@ on:
       - main
     tags:
       - 'v*'
+  # A pull request that touches the build builds it, for one architecture and
+  # without pushing. Otherwise the first time anyone finds out the image does
+  # not build is after the change is on main.
+  pull_request:
+    paths:
+      - 'Dockerfile.release'
+      - '.dockerignore'
+      - '.github/workflows/release-container.yml'
+      - 'go.mod'
+      - 'go.sum'
   workflow_dispatch:
 
 env:
@@ -29,7 +39,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Cross-building arm64 under QEMU costs several minutes and a pull
+      # request builds amd64 only, so it is skipped there.
       - name: Set up QEMU
+        if: github.event_name != 'pull_request'
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: linux/amd64,linux/arm64
@@ -38,6 +51,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -73,8 +87,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile.release
-          platforms: linux/amd64,linux/arm64
-          push: true
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # .dockerignore excludes .git, so the toolchain finds no VCS
