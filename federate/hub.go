@@ -93,6 +93,7 @@ type Hub struct {
 
 	// Everything below is owned by the Run goroutine, except where noted.
 	sources       map[string]*source
+	emptyMatch    bool      // last pass found schedds but matched none of them
 	discoveryDone bool      // a discovery pass with a known match set has completed in this run
 	runStart      time.Time // when this Run started: unseen time accrues only while the hub runs
 	runCtx        context.Context
@@ -288,6 +289,39 @@ func (h *Hub) Run(ctx context.Context) error {
 	}
 }
 
+// summarizeDiscovery reports what one pass saw. Discovery is otherwise
+// silent, and a constraint matching nothing is not an error at any layer: the
+// collector answers, the matched set comes back empty, and the hub federates
+// nothing. The only outward symptom is a hub that looks entirely healthy and
+// holds no jobs, so the counts are worth a line even when nothing changed.
+func (h *Hub) summarizeDiscovery(snap Snapshot) {
+	present, matched := len(snap.Present), len(snap.Matched)
+	h.log.Debug("federate: discovery pass", "present", present, "matched", matched,
+		"spokes", len(snap.Spokes), "rejected", len(snap.Rejected))
+
+	// Schedds are advertising and the AP set is empty. A pool with schedds in
+	// it and none of them wanted is not something anyone configures on
+	// purpose, so say so -- on the transition, not every pass, or a wrong
+	// constraint becomes a warning every minute forever.
+	empty := snap.MatchKnown && snap.PresentKnown && matched == 0 && present > 0
+	if empty == h.emptyMatch {
+		return
+	}
+	h.emptyMatch = empty
+	if !empty {
+		h.log.Info("federate: the schedd constraint matches again", "matched", matched)
+		return
+	}
+	args := []any{"schedds_present", present}
+	// The constraint itself is the thing to look at, and it is worth quoting
+	// back: the usual cause is an escape the ClassAd string literal consumed
+	// before the regex engine saw it.
+	if d, ok := h.cfg.Discovery.(*Discovery); ok && d.ScheddConstraint != "" {
+		args = append(args, "constraint", d.ScheddConstraint)
+	}
+	h.log.Warn("federate: the schedd constraint matches none of the schedds advertising to the collector; the hub will federate nothing", args...)
+}
+
 // discover runs one discovery pass and applies it to the source set.
 func (h *Hub) discover(ctx context.Context) {
 	dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -299,6 +333,7 @@ func (h *Hub) discover(ctx context.Context) {
 	}
 	now := h.now()
 	snap, names := foldSnapshot(snap)
+	h.summarizeDiscovery(snap)
 	for _, r := range snap.Rejected {
 		h.metrics.RejectedSpokes.WithLabelValues(r.Reason).Inc()
 		h.log.Warn("federate: spoke rejected", "schedd", r.Schedd, "spoke", r.SpokeName,
