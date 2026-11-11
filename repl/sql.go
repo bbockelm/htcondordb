@@ -8,12 +8,13 @@
 // evaluated server-side (hash-map GROUP BY). Subqueries are unsupported and rejected with
 // a clear error.
 //
-// A JOIN reads two tables and its ON condition is a ClassAd expression, exactly as WHERE
-// is, because the row a join produces is itself a ClassAd whose members are the two sides
-// under their aliases -- so `j.ClusterId == h.ClusterId` is the ClassAd select operator
-// over a nested ad rather than new syntax, and an unmatched LEFT JOIN row simply has no
-// member for its right side, making every reference through it undefined. In a join every
-// attribute must be alias-qualified; see join.go and joinsql.go.
+// A JOIN reads two or more tables -- each JOIN after the first folds another one in -- and
+// its ON condition is a ClassAd expression, exactly as WHERE is, because the row a join
+// produces is itself a ClassAd whose members are the sides under their aliases -- so
+// `j.ClusterId == h.ClusterId` is the ClassAd select operator over a nested ad rather than
+// new syntax, and an unmatched LEFT JOIN row simply has no member for its right side,
+// making every reference through it undefined. In a join every attribute must be
+// alias-qualified; see join.go and joinsql.go.
 //
 // JOIN is not MATCH. A join is unilateral and states its own condition; matchmaking is
 // bilateral, and takes its condition from the Requirements of the ads themselves.
@@ -359,8 +360,8 @@ func (it SelectItem) Header() string {
 }
 
 // Parse parses one statement. Trailing ';' is allowed. It returns a descriptive
-// error for empty input, unsupported constructs (JOIN, GROUP BY, ...), and
-// syntax errors.
+// error for empty input, unsupported constructs (subqueries, RIGHT/FULL/NATURAL
+// JOIN, ...), and syntax errors.
 func Parse(input string) (*Statement, error) {
 	toks, err := lex(input)
 	if err != nil {
@@ -1734,19 +1735,6 @@ func (p *parser) literalToken() (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// rejectJoins produces a helpful error if a JOIN follows the table name.
-func (p *parser) rejectJoins() error {
-	for _, kw := range []string{"JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL"} {
-		if p.isKeyword(kw) {
-			return fmt.Errorf("JOINs are not supported (the store is a single ClassAd collection)")
-		}
-	}
-	if p.atPunct(",") {
-		return fmt.Errorf("multiple tables / JOINs are not supported")
-	}
-	return nil
 }
 
 func (p *parser) peekAheadPunct(n int, s string) bool {

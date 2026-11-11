@@ -1,8 +1,9 @@
 // SQL over the C API: hcdb_sql runs one statement through the same parser and executor the
 // REPL uses (package repl) and returns the result as a JSON document, so a non-Go caller
 // gets the full SQL surface -- SELECT with GROUP BY / aggregates / HAVING / ORDER BY /
-// LIMIT, AS OF time travel, INSERT / UPDATE / DELETE, DDL, views, MATCH -- without
-// reimplementing any of it. The Python DB-API driver in python/ is the primary consumer.
+// LIMIT, INNER / LEFT / CROSS JOIN, UNION [ALL], AS OF time travel, INSERT / UPDATE /
+// DELETE, DDL, views, MATCH -- without reimplementing any of it. The Python DB-API driver
+// in python/ is the primary consumer.
 //
 // JSON rather than a row cursor: repl.Exec materializes the whole result anyway, the
 // document is self-describing (so the C signature never has to grow a column-type API), and
