@@ -79,6 +79,34 @@ func TestStartProgressDistinguishesStalledFromProgressing(t *testing.T) {
 	}
 }
 
+// The overwhelmingly common case is a start that finishes in well under one beat. It must stay
+// silent: a line on every normal startup is noise, and noise is what stops people reading the ones
+// that matter.
+func TestStartProgressSilentOnAFastStart(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "log")
+	logger, err := logging.New(&logging.Config{
+		OutputPath:        logPath,
+		SkipGlobalInstall: true,
+		DefaultLevel:      logging.VerbosityInfo,
+		DestinationLevels: map[logging.Destination]logging.Verbosity{
+			logging.DestinationGeneral: logging.VerbosityInfo,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	timer := newStartupTimer(logger)
+	timer.startProgress(t.TempDir())
+	timer.recordTableOpen("table", "jobs", time.Millisecond)
+	timer.stopProgress()
+
+	b, _ := os.ReadFile(logPath)
+	if strings.Contains(string(b), "opening the catalog") {
+		t.Errorf("a start shorter than one beat still logged progress:\n%s", string(b))
+	}
+}
+
 // stopProgress on a timer that never started must not panic: the failure paths defer it.
 func TestStopProgressWithoutStart(t *testing.T) {
 	newStartupTimer(nil).stopProgress()
