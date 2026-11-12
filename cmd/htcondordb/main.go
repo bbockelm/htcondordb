@@ -284,6 +284,12 @@ func run() error {
 
 	archiveIndexBackfillBytes := archiveIndexBackfillBudget(cfg, log)
 
+	// The catalog open starts here and is the long, quiet part of a start; beat while it runs.
+	// The defer covers the failure paths between here and the listener, where the explicit stop
+	// below never runs; stopping twice is harmless.
+	boot.startProgress(dbDir)
+	defer boot.stopProgress()
+
 	svc, err := server.New(server.Config{
 		OnPhase:               boot.record,
 		OnTableOpen:           boot.recordTableOpen,
@@ -361,6 +367,9 @@ func run() error {
 		return err
 	}
 	boot.mark("listener")
+	// Listening: the daemon is about to announce itself, so the heartbeat has nothing left to
+	// report and must not interleave with that announcement.
+	boot.stopProgress()
 	defer func() { _ = ln.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())

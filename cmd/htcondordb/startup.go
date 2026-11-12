@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -44,6 +46,10 @@ const slowTableOpen = 250 * time.Millisecond
 // all would push the line past what any log reader will read, and the tail is not what anyone acts on.
 const slowestKept = 5
 
+// How often the catalog-open heartbeat reports. Short enough that a human watching a start does not
+// conclude it has hung, long enough that it is a handful of lines rather than a log of its own.
+var progressEvery = 15 * time.Second
+
 // startupTimer accumulates startup phase durations.
 //
 // Two levels. phases are the top-level spans, measured as deltas between mark calls. detail holds
@@ -68,6 +74,101 @@ type startupTimer struct {
 	// One-time seal migrations reported during those same opens; guarded by tblMu for the same reason.
 	migTables   int
 	migSegments int
+
+	// Progress heartbeat state, guarded by tblMu because it is written from the same concurrent
+	// open callbacks and read by the ticker goroutine.
+	lastDone   string
+	lastDoneAt time.Time
+	progStop   chan struct{}
+	progDone   chan struct{}
+}
+
+// countCatalogEntries returns how many tables and archives the catalog directory holds, so the
+// heartbeat below can report a denominator rather than a bare count. Best effort on purpose: a
+// catalog that does not exist yet is a new database with nothing to open, and a directory that
+// cannot be read is not worth failing a startup over -- the heartbeat just omits the total.
+func countCatalogEntries(dir string) (tables, archives int) {
+	count := func(sub string) int {
+		ents, err := os.ReadDir(filepath.Join(dir, sub))
+		if err != nil {
+			return 0
+		}
+		n := 0
+		for _, e := range ents {
+			if e.IsDir() {
+				n++
+			}
+		}
+		return n
+	}
+	return count("tables"), count("archives")
+}
+
+// startProgress logs what the catalog open is doing every progressEvery until stopProgress is
+// called.
+//
+// Opening a catalog is the longest thing this daemon does and, until now, the quietest: every
+// timing line -- "slow table open", "table open phase timing" -- is emitted when a table *finishes*,
+// so the slowest opens are exactly the ones that report nothing while they are slow. A 53GB catalog
+// recomputing zone maps went silent for over two minutes, which is indistinguishable from a wedged
+// process; an orchestrator with a liveness probe draws the obvious conclusion and kills it, and the
+// restart begins the same silent open again.
+//
+// So the useful signal is not "what is it doing" but "is it still getting anywhere": each beat
+// reports what finished since the last one. A beat that reports nothing finished is the honest
+// shape of a daemon that may be stuck, and says so.
+func (t *startupTimer) startProgress(dir string) {
+	if t == nil || t.log == nil {
+		return
+	}
+	tables, archives := countCatalogEntries(dir)
+	t.progStop, t.progDone = make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(t.progDone)
+		tick := time.NewTicker(progressEvery)
+		defer tick.Stop()
+		lastCount := 0
+		for {
+			select {
+			case <-t.progStop:
+				return
+			case <-tick.C:
+				t.tblMu.Lock()
+				done, last, lastAt := t.tblCount, t.lastDone, t.lastDoneAt
+				t.tblMu.Unlock()
+
+				fields := []any{"elapsed", time.Since(t.start).Round(time.Second).String(),
+					"opened", done, "since_last_beat", done - lastCount}
+				if total := tables + archives; total > 0 {
+					fields = append(fields, "of", total)
+				}
+				if last != "" {
+					fields = append(fields, "last", last,
+						"idle", time.Since(lastAt).Round(time.Second).String())
+				}
+				if done == lastCount {
+					// Not an error: a single large archive legitimately takes minutes. But it is
+					// the one case an operator needs named, because it is also what stuck looks like.
+					t.log.Info(logging.DestinationGeneral,
+						"still opening the catalog; nothing finished since the last report", fields...)
+				} else {
+					t.log.Info(logging.DestinationGeneral, "opening the catalog", fields...)
+				}
+				lastCount = done
+			}
+		}
+	}()
+}
+
+// stopProgress ends the heartbeat and waits for it, so no beat can be emitted after the daemon has
+// reported itself up. Safe to call on a timer whose progress was never started.
+func (t *startupTimer) stopProgress() {
+	if t == nil || t.progStop == nil {
+		return
+	}
+	close(t.progStop)
+	<-t.progDone
+	t.progStop, t.progDone = nil, nil
 }
 
 type phaseTime struct {
@@ -142,6 +243,8 @@ func (t *startupTimer) recordTableOpen(kind, name string, d time.Duration) {
 			t.tblSlow = t.tblSlow[:slowestKept]
 		}
 	}
+	t.lastDone = kind + " " + name
+	t.lastDoneAt = time.Now()
 	log := t.log
 	t.tblMu.Unlock()
 
