@@ -16,7 +16,7 @@ import (
 // The store narrows the hashed side's scan to the key values the streamed side turns out to
 // hold, instead of reading that side whole to build buckets most of which are never probed.
 // It decides from three numbers a client does not have: whether an index covers the attribute,
-// how many records the hashed side's read visits, and how many segments it spans.
+// how many records the hashed side's read visits, and how many of them the keys reach.
 //
 // This exercises it over the transport a deployment uses -- a statement through dbrpc, not a
 // direct call into the store -- because an access path that works in the store and is not
@@ -43,26 +43,46 @@ type probeFixture struct {
 	cleanup func()
 }
 
-// newProbeFixture builds a left side of leftKeys rows and a right side of rightRows, the
-// right side's key drawn from the left side's keys in turn.
-//
-// indexed is the one difference between the two arms: a value index on the join attribute is
-// what makes the probe possible, and without one the membership constraint would be a filter
-// over a scan that still reads every record, which costs more than it saves.
+// probeShape is the store the fixture builds, in the terms the probe's own decision is
+// priced in: how many keys it would narrow to, how many records the scan it replaces reads,
+// and how many of those records those keys reach.
+type probeShape struct {
+	// leftKeys is how many distinct key values the streamed side holds, which is how many
+	// the membership constraint would name.
+	leftKeys int
+	// rightRows is how many records the hashed side's scan reads. It is the denominator
+	// the probe is priced against, and is held constant across key counts for that reason.
+	rightRows int
+	// dupPerKey is how many records of the hashed side each distinct key reaches. At 1 a
+	// key reaches one record and narrowing to k keys reads k records; above it the probe
+	// reads k*dupPerKey, which is the half of the price a key count alone does not say.
+	dupPerKey int
+	// indexed is the one difference between the benchmark's two arms: a value index on the
+	// join attribute is what makes the probe possible, and without one the membership
+	// constraint would be a filter over a scan that still reads every record, which costs
+	// more than it saves.
+	indexed bool
+}
+
+// newProbeFixture builds the store that shape describes.
 //
 // Both sides are archives because that is the shape a history-to-epoch join reads, and
-// because the segment count is part of what the store's decision prices -- an `in` probe of
-// k values across s segments costs s*k lookups against the r records the scan would read.
-func newProbeFixture(t testing.TB, leftKeys, rightRows int, indexed bool) *probeFixture {
+// because the records a key reaches are what the store's decision prices: narrowing pays
+// while the lookups plus the records they reach stay under a share of the records the scan
+// would have read.
+func newProbeFixture(t testing.TB, shape probeShape) *probeFixture {
 	t.Helper()
+	leftKeys, rightRows, indexed := shape.leftKeys, shape.rightRows, shape.indexed
+	dup := max(shape.dupPerKey, 1)
+	distinct := max(rightRows/dup, 1)
 	cat, err := db.OpenCatalog(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := func(value []string) db.ArchiveConfig {
-		// Small segments on purpose: the store prices the probe against the number of
-		// segments its lookups have to visit, so a fixture of one segment would price a
-		// decision no deployment takes.
+		// Small segments on purpose: a key's records are spread across many of them, which
+		// is the shape a deployment's history is in and the shape the probe's lookups are
+		// priced for. A fixture of one segment would price a decision no deployment takes.
 		return db.ArchiveConfig{SegmentSize: 1 << 12, ValueAttrs: value}
 	}
 	left, err := cat.CreateArchiveTable("probeleft", cfg([]string{"ClusterId"}))
@@ -90,13 +110,15 @@ func newProbeFixture(t testing.TB, leftKeys, rightRows int, indexed bool) *probe
 	// from its head, so narrowing to them cannot be served by reading one end of the table.
 	var keys []int
 	for i := 0; i < leftKeys; i++ {
-		k := 1 + i*(rightRows/max(leftKeys, 1))
+		k := 1 + i*(distinct/max(leftKeys, 1))
 		keys = append(keys, k)
 		add(left, fmt.Sprintf(`[ ClusterId = %d; Owner = "alice" ]`, k))
 	}
-	for j := 1; j <= rightRows; j++ {
-		add(right, fmt.Sprintf(`[ ClusterId = %d; ExitCode = %d; Pad = "%s" ]`,
-			j, j%3, strings.Repeat("x", 32)))
+	for j := 1; j <= distinct; j++ {
+		for d := 0; d < dup; d++ {
+			add(right, fmt.Sprintf(`[ ClusterId = %d; ExitCode = %d; Pad = "%s" ]`,
+				j, (j+d)%3, strings.Repeat("x", 32)))
+		}
 	}
 
 	s := dbrpc.NewServerCatalog(cat)
@@ -140,7 +162,7 @@ func TestStoreSideIndexProbeFiresForTheJoinHTCondorDBSends(t *testing.T) {
 		indexed bool
 	}{{"indexed", true}, {"not indexed", false}} {
 		t.Run(c.name, func(t *testing.T) {
-			fix := newProbeFixture(t, 16, 8192, c.indexed)
+			fix := newProbeFixture(t, probeShape{leftKeys: 16, rightRows: 8192, indexed: c.indexed})
 			defer fix.cleanup()
 
 			// Through the transport first: the rows are the answer, and the arm is the op.
@@ -198,8 +220,8 @@ func TestStoreSideIndexProbeFiresForTheJoinHTCondorDBSends(t *testing.T) {
 func BenchmarkStoreSideIndexProbe(b *testing.B) {
 	const rightRows = 8192
 	for _, keys := range []int{16, 32, 64, 128, 256} {
-		indexed := newProbeFixture(b, keys, rightRows, true)
-		plain := newProbeFixture(b, keys, rightRows, false)
+		indexed := newProbeFixture(b, probeShape{leftKeys: keys, rightRows: rightRows, indexed: true})
+		plain := newProbeFixture(b, probeShape{leftKeys: keys, rightRows: rightRows, indexed: false})
 		// Both arms must return the same rows before either is timed: an arm that quietly
 		// returned fewer would be timed as the faster one.
 		ires, err := indexed.exec.ExecString(probeJoinSQL)
@@ -241,22 +263,30 @@ func BenchmarkStoreSideIndexProbe(b *testing.B) {
 
 // THE CROSSOVER, AND THE STORE DECLINING AT IT.
 //
-// A sealed segment carries its own index, so an `in` probe of k values across s segments
-// costs s*k lookups where the scan it replaces costs r records. That makes the decision a
-// comparison between s*k and r rather than a property of the key count alone, and it is the
-// reason the probe is a decision at all instead of an optimization that is always taken.
+// A probe looks each key up and then READS the records that key reaches, so what it costs is
+// the lookups plus those records, and what it saves is the scan of every record the hashed
+// side holds. It pays while the first stays under a share of the second. That makes the
+// decision a comparison between the records the keys reach and the records the table holds,
+// NOT a property of the key count alone -- and it is why the probe is a decision at all
+// rather than an optimization that is always taken.
 //
-// This pins both sides of it on one fixture -- 8,192 records over about 210 segments, so the
-// crossover falls between 32 keys and 64 -- and pins that the decline SAYS SO. An access path
-// that was priced and rejected reads exactly like one that was never available, unless the
-// reason is reported.
+// A key count alone cannot move it, which is why this fixture gives each key SIXTEEN records
+// rather than one. The hashed side is 8,192 records either way; what changes is how much of
+// it the keys reach. At 32 keys they reach 512 records and narrowing pays; at 128 they reach
+// 2,048, a quarter of the table, and it does not.
+//
+// This pins both sides of that and pins that the decline SAYS SO. An access path that was
+// priced and rejected reads exactly like one that was never available, unless the reason is
+// reported.
 func TestStoreSideIndexProbeDeclinesPastTheCrossover(t *testing.T) {
 	for _, c := range []struct {
 		keys     int
 		narrowed bool
-	}{{32, true}, {64, false}} {
+	}{{32, true}, {128, false}} {
 		t.Run(fmt.Sprintf("keys=%d", c.keys), func(t *testing.T) {
-			fix := newProbeFixture(t, c.keys, 8192, true)
+			fix := newProbeFixture(t, probeShape{
+				leftKeys: c.keys, rightRows: 8192, dupPerKey: 16, indexed: true,
+			})
 			defer fix.cleanup()
 			var stats db.JoinStats
 			seq, err := fix.cat.Join(probeSpec(), db.JoinLimits{}, &stats)
@@ -275,7 +305,7 @@ func TestStoreSideIndexProbeDeclinesPastTheCrossover(t *testing.T) {
 			if stats.ProbeKeys != 0 {
 				t.Errorf("past the crossover the scan was narrowed anyway: keys=%d", stats.ProbeKeys)
 			}
-			for _, want := range []string{"index lookups", "records", "costs more than it saves"} {
+			for _, want := range []string{"128 keys", "reaching about", "share of the 8192 records"} {
 				if !strings.Contains(stats.ProbeWhy, want) {
 					t.Errorf("the decline does not say %q: %q", want, stats.ProbeWhy)
 				}
