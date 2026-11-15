@@ -326,9 +326,8 @@ func (s *archiveSink) loadFloor() error {
 }
 
 // retentionDropped reports whether an archive's retention has (or may have) dropped records: it is
-// capped by segment count or bytes and is within one segment of that cap -- an append-only archive
-// that has reached its cap stays there, so being under it means rotation has dropped nothing
-// (unless the cap was raised since) -- or it is capped by age, which drops whatever ages out.
+// capped by segment count or bytes and occupies the band a rotation leaves it in, or it is capped
+// by age, which drops whatever ages out.
 func retentionDropped(a *db.ArchiveTable) bool {
 	r := a.Retention()
 	if r.MaxAge > 0 {
@@ -341,7 +340,20 @@ func retentionDropped(a *db.ArchiveTable) bool {
 	if r.MaxSegments > 0 && st.Segments >= r.MaxSegments {
 		return true
 	}
-	return r.MaxBytes > 0 && st.UsedBytes+st.UsedBytes/int64(st.Segments) > r.MaxBytes
+	if r.MaxBytes <= 0 {
+		return false
+	}
+	// A size pass is triggered by the ceiling but frees down to the low mark, so an archive that
+	// has evicted sits anywhere in [TargetBytes, MaxBytes] rather than parked against the cap.
+	// Occupancy alone therefore no longer says which side of its first eviction an archive is on,
+	// and the test has to take the whole band. That over-reports only while an archive grows
+	// through the band for the first time, and over-reporting costs at most a replayed record
+	// older than anything the hub holds for that AP being skipped rather than appended.
+	low := r.TargetBytes
+	if low <= 0 || low > r.MaxBytes {
+		low = r.MaxBytes
+	}
+	return st.UsedBytes+st.UsedBytes/int64(st.Segments) > low
 }
 
 // Flush makes the appends since the last flush durable (once, not per record) and only then

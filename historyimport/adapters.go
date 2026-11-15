@@ -136,7 +136,7 @@ type ArchiveWriter struct {
 func archiveConfig() db.ArchiveConfig {
 	return db.ArchiveConfig{
 		CategoricalAttrs: []string{"GlobalJobId", ScheddNameAttr},
-		ZoneAttrs:        []string{EnteredHistoryAttr},
+		ZoneAttrs:        []string{EnteredHistoryAttr, "CompletionDate"},
 	}
 }
 

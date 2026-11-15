@@ -24,6 +24,16 @@ const (
 	epochAdTypeAttr    = "EpochAdType"    // ATTR_EPOCH_AD_TYPE: "EPOCH", "SPAWN", ...
 )
 
+// epochEventTime is an epoch record's own time. EpochWriteDate is when the schedd wrote
+// the run-instance record, which is the epoch file's ordering key, so it is the direct
+// analogue of a completed job's entry into history.
+func epochEventTime(ad *classad.ClassAd) (int64, bool) {
+	if v, ok := ad.EvaluateAttrInt(epochWriteDateAttr); ok && v > 0 {
+		return v, true
+	}
+	return 0, false
+}
+
 // epochCursor is the durable resume state for an epoch import of one schedd.
 type epochCursor struct {
 	T    int64    `json:"t"`    // newest EpochWriteDate imported
@@ -97,7 +107,7 @@ func (im *Importer) importEpochSchedd(ctx context.Context, j Job, sd ScheddRef) 
 		if wd == prev.T && prevKeys[key] {
 			return nil
 		}
-		stamp(ad, sd.Name, im.now())
+		stamp(ad, sd.Name, epochEventTime, im.now())
 		if aerr := im.W.Append(ctx, j.Table, ad); aerr != nil {
 			if im.skipTooDeep(j, sd, key, aerr) {
 				skipped++

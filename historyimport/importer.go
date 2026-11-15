@@ -17,10 +17,23 @@ import (
 // globally unique).
 const ScheddNameAttr = "ScheddName"
 
-// EnteredHistoryAttr is stamped with the Unix time the record was imported. It
-// matches scheddsync's attribute of the same name so archive retention and the
-// zone-mapped time index work uniformly whether a record arrived by local tail or
-// remote import. Duplicated here to keep the module free of a scheddsync import.
+// EnteredHistoryAttr carries the Unix time (seconds) the record's own event happened:
+// for a completed job, its terminal-status transition (EnteredCurrentStatus), falling
+// back to CompletionDate, and only to the import clock when the record carries neither.
+// It is the record's OWN time, not when htcondordb read it, so it survives a re-import
+// and is comparable with the same attribute on records that arrived by local tail --
+// scheddsync derives it identically. Archive retention and the zone-mapped time index
+// therefore measure one clock whatever path a record took.
+//
+// It always overwrites, as scheddsync does and for the same reason: HTCondor never writes
+// this attribute and the schedd does not protect it, so any value already on a record
+// pulled from a schedd came from the user (`+EnteredHistoryTime = 0` at submit, or
+// condor_qedit) and would let a job misplace itself in every time-windowed query and break
+// the zone map's ordering. Overwriting is safe to repeat because the value is DERIVED from
+// the record: re-importing the same record stamps the same time, so the attribute does not
+// drift as records move between stores.
+//
+// Duplicated here to keep the module free of a scheddsync import.
 const EnteredHistoryAttr = "EnteredHistoryTime"
 
 // errStopScan halts a newest-first history stream once it reaches records the
@@ -216,7 +229,7 @@ func (im *Importer) importSchedd(ctx context.Context, j Job, sd ScheddRef) (impo
 				return errStopScan // reached the archived prefix
 			}
 		}
-		stamp(ad, sd.Name, im.now())
+		stamp(ad, sd.Name, historyEventTime, im.now())
 		if aerr := im.W.Append(ctx, j.Table, ad); aerr != nil {
 			if im.skipTooDeep(j, sd, id, aerr) {
 				skipped++
@@ -257,11 +270,36 @@ func (im *Importer) skipTooDeep(j Job, sd ScheddRef, record string, err error) b
 	return true
 }
 
-// stamp writes ScheddName (authoritative, from discovery) and the import time onto
-// a record before it is archived.
-func stamp(ad *classad.ClassAd, scheddName string, now time.Time) {
+// historyEventTime is a completed job's entry into history: the schedd writes a job to
+// history when it leaves the queue, i.e. at its terminal-status transition, so
+// EnteredCurrentStatus is the faithful time. It falls back to CompletionDate, which is
+// set only when a job completes normally.
+//
+// Both legs are guarded > 0 deliberately. CompletionDate is 0 on a job that was removed
+// rather than completed, and an unguarded 0 would make every removed job the oldest
+// record in the archive -- the first thing an age-ordered retention pass evicts.
+func historyEventTime(ad *classad.ClassAd) (int64, bool) {
+	if v, ok := ad.EvaluateAttrInt("EnteredCurrentStatus"); ok && v > 0 {
+		return v, true
+	}
+	if v, ok := ad.EvaluateAttrInt("CompletionDate"); ok && v > 0 {
+		return v, true
+	}
+	return 0, false
+}
+
+// stamp writes ScheddName (authoritative, from discovery) and EnteredHistoryTime derived
+// from the record itself via eventTime, overwriting whatever the schedd handed us. now
+// supplies the import clock, used only when the record carries no time of its own -- the
+// one leg that is not reproducible from the record, and so the one that can differ between
+// two stores that imported the same record.
+func stamp(ad *classad.ClassAd, scheddName string, eventTime func(*classad.ClassAd) (int64, bool), now time.Time) {
 	ad.InsertAttrString(ScheddNameAttr, scheddName)
-	ad.InsertAttr(EnteredHistoryAttr, now.Unix())
+	when, ok := eventTime(ad)
+	if !ok {
+		when = now.Unix()
+	}
+	ad.InsertAttr(EnteredHistoryAttr, when)
 }
 
 // jobKey returns "cluster.proc" for a job ad, or "" if it lacks the ids. This is
