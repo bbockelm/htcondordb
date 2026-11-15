@@ -67,7 +67,7 @@ func TestReplaySkipsWhatTheCapDropped(t *testing.T) {
 	if got := countArchive(t, hist, fmt.Sprintf(`ClusterId == %d`, n+1)); got != 1 {
 		t.Errorf("the new completion appended %d times, want 1", got)
 	}
-	if v := val(m.BelowRetention.WithLabelValues(TableHistory)); v != float64(n-held) {
+	if v := sumTable(m.BelowRetention, TableHistory); v != float64(n-held) {
 		t.Errorf("below_retention_total = %v, want %d", v, n-held)
 	}
 }

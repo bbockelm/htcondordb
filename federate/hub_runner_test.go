@@ -215,12 +215,12 @@ func TestHubOverRealWatch(t *testing.T) {
 	a.putJobs(3)
 	a.appendHistory("ap1", 3)
 	a.restart()
-	resetsBefore := val(metrics.Resets.WithLabelValues(TableJobs))
+	resetsBefore := sumTable(metrics.Resets, TableJobs)
 	hub = startHub(t, cfg)
 	waitFor(t, "reconcile after spoke restart", func() bool {
 		return sameKeys(jobKeysOf(t, cat, "ap1"), 3) && hist("ap1") == 3
 	})
-	if val(metrics.Resets.WithLabelValues(TableJobs)) <= resetsBefore {
+	if sumTable(metrics.Resets, TableJobs) <= resetsBefore {
 		t.Error("the restarted spoke's replay was not a Reset; the test did not exercise reconcile")
 	}
 	if !sameKeys(jobKeysOf(t, cat, "ap2"), 1) || hist("ap2") != 1 {
@@ -236,7 +236,7 @@ func TestHubOverRealWatch(t *testing.T) {
 	if len(before) != 3 {
 		t.Fatalf("ap2 cursors before restart: %v", before)
 	}
-	histResets := val(metrics.Resets.WithLabelValues(TableHistory))
+	histResets := sumTable(metrics.Resets, TableHistory)
 	b.restart()
 	waitFor(t, "ap2's mutable tables replayed to Synced", func() bool {
 		after := cursors(t, hub.hub, "ap2")
@@ -245,7 +245,7 @@ func TestHubOverRealWatch(t *testing.T) {
 	if after := cursors(t, hub.hub, "ap2"); after[TableHistory] != before[TableHistory] {
 		t.Errorf("ap2's history cursor changed across a clean spoke restart: the archive was replayed")
 	}
-	if n := val(metrics.Resets.WithLabelValues(TableHistory)); n != histResets {
+	if n := sumTable(metrics.Resets, TableHistory); n != histResets {
 		t.Errorf("history Resets went %v -> %v across a clean spoke restart, want no Reset", histResets, n)
 	}
 	ups, dels := wc.settle(t)

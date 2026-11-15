@@ -68,7 +68,7 @@ func TestArchiveReplayNoDuplicates(t *testing.T) {
 			t.Errorf("job %d.0 appears %d times, want 1", i, n)
 		}
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 10 {
+	if v := sumTable(m.DedupHits, TableHistory); v != 10 {
 		t.Errorf("dedup_hits = %v, want 10", v)
 	}
 	if n := countArchive(t, hist, `ScheddName == "ap1.example.org"`); n != 6 {
@@ -128,7 +128,7 @@ func TestArchiveRedeliveryAfterCrash(t *testing.T) {
 			t.Errorf("job %d.0 appears %d times, want 1", i, n)
 		}
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 3 {
+	if v := sumTable(m.DedupHits, TableHistory); v != 3 {
 		t.Errorf("dedup_hits = %v, want 3", v)
 	}
 }
@@ -150,7 +150,7 @@ func TestArchiveLiveTailAppends(t *testing.T) {
 	if n := countArchive(t, hist, `true`); n != 4 {
 		t.Fatalf("live tail appended %d, want 4", n)
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 0 {
+	if v := sumTable(m.DedupHits, TableHistory); v != 0 {
 		t.Errorf("live tail probed: dedup_hits = %v", v)
 	}
 }
@@ -170,7 +170,7 @@ func TestArchiveIdentity(t *testing.T) {
 	if n := countArchive(t, hist, `ClusterId == 99`); n != 2 {
 		t.Errorf("identity-less records appended = %d, want 2", n)
 	}
-	if v := val(m.MissingIdentity.WithLabelValues(TableHistory)); v != 2 {
+	if v := sumTable(m.MissingIdentity, TableHistory); v != 2 {
 		t.Errorf("missing_identity = %v, want 2", v)
 	}
 
@@ -240,7 +240,7 @@ func TestArchiveLargeReplayUsesIdentitySet(t *testing.T) {
 	if got := countArchive(t, ep, `true`); got != n+5 {
 		t.Fatalf("after second replay: %d records, want %d", got, n+5)
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableEpochHistory)); v != float64(n) {
+	if v := sumTable(m.DedupHits, TableEpochHistory); v != float64(n) {
 		t.Errorf("dedup_hits = %v, want %d", v, n)
 	}
 }
@@ -318,8 +318,8 @@ func TestReplayCountsRepeatedIdentity(t *testing.T) {
 				}
 				apply(t, s, append(changes, synced("c1"))...)
 				s.EndSession()
-				if val(metrics.DedupHits.WithLabelValues(TableEpochHistory)) != float64(m) {
-					t.Errorf("dedup_hits = %v, want %d", val(metrics.DedupHits.WithLabelValues(TableEpochHistory)), m)
+				if sumTable(metrics.DedupHits, TableEpochHistory) != float64(m) {
+					t.Errorf("dedup_hits = %v, want %d", sumTable(metrics.DedupHits, TableEpochHistory), m)
 				}
 				if got := countArchive(t, ep, `EpochAdType == "CHECKPOINT"`); got != n {
 					t.Fatalf("hub holds %d CHECKPOINT records after replaying %d into a hub holding %d, want %d", got, n, m, n)
@@ -352,11 +352,14 @@ func TestHistoryReplayCountsIdentity(t *testing.T) {
 	}
 }
 
-// TestResumeCatchupProbesWithoutLoadingSet: a resume's catch-up re-delivers at most the overlap
-// since the committed cursor (after a WatchResync, up to the spoke's watch buffer of ~1024 events),
-// so it is probed record by record however long it runs -- loading the AP's whole identity set is
-// for a Reset's full replay only. It still dedups exactly, repeated identities included.
-func TestResumeCatchupProbesWithoutLoadingSet(t *testing.T) {
+// TestResumeCatchupDedupsTheOverlap: a resume's catch-up dedups the re-delivered overlap exactly,
+// repeated identities included -- and goes on doing so once the overlap outruns probeBudget and the
+// sink switches from probing to the loaded identity set. The two paths have to agree: which one
+// answers is a cost decision, not a semantic one.
+//
+// The overlap here is deliberately past the budget: a resume is not bounded by the spoke's watch
+// buffer when the cursor is not advancing, and a cursor advances only at Synced.
+func TestResumeCatchupDedupsTheOverlap(t *testing.T) {
 	cat := openCatalog(t, t.TempDir())
 	t.Cleanup(func() { _ = cat.Close() })
 	ep := hubArchive(t, cat, TableEpochHistory)
@@ -385,15 +388,15 @@ func TestResumeCatchupProbesWithoutLoadingSet(t *testing.T) {
 		apply(t, s, rec(i))
 	}
 	apply(t, s, checkpointRec(t, 1), checkpointRec(t, 2), checkpointRec(t, 3), rec(n+1))
-	if s.setLoaded {
-		t.Error("a resume catch-up loaded the identity set")
+	if !s.setLoaded {
+		t.Errorf("a %d-record overlap did not reach the %d-probe budget; the set was never loaded", n, probeBudget)
 	}
 	apply(t, s, synced("s1"))
 	s.EndSession()
 	if got := countArchive(t, ep, `true`); got != n+4 {
 		t.Fatalf("hub holds %d records, want %d", got, n+4)
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableEpochHistory)); v != float64(n+1) {
+	if v := sumTable(m.DedupHits, TableEpochHistory); v != float64(n+1) {
 		t.Errorf("dedup_hits = %v, want %d", v, n+1)
 	}
 }
@@ -415,6 +418,54 @@ func TestResetReplayLoadsSet(t *testing.T) {
 	}
 	if s.probes != probeBudget {
 		t.Errorf("%d probe queries, want %d (none once the set is loaded)", s.probes, probeBudget)
+	}
+}
+
+// TestResumedCatchupLoadsSet: a catch-up that resumed from a committed cursor -- no Reset -- is
+// bounded by the same probe budget as a Reset replay.
+//
+// It was not, on the reasoning that a resume re-delivers only a short overlap. That holds only
+// while the cursor advances, and the cursor is committed at Synced: a catch-up that does not reach
+// Synced leaves the cursor where it was, so the next session resumes against a backlog one session
+// longer and probes every record of it one query at a time. A hub was found with a history cursor a
+// day stale, re-probing ~150k records on every start and never finishing.
+func TestResumedCatchupLoadsSet(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, NewMetrics())
+	s.BeginSession() // no reset(): a resume, which is what every restart does
+	if s.full {
+		t.Fatal("precondition: a resumed catch-up must not be a full replay")
+	}
+	for i := 1; i <= probeBudget+100; i++ {
+		apply(t, s, upsert("r", histRecord(t, "ap1", i)))
+	}
+	if s.setLoads != 1 || !s.setLoaded {
+		t.Errorf("identity set loaded %d times during a long resumed catch-up, want 1", s.setLoads)
+	}
+	if s.probes != probeBudget {
+		t.Errorf("%d probe queries on a resumed catch-up, want %d (none once the set is loaded)", s.probes, probeBudget)
+	}
+}
+
+// TestShortResumeNeverLoadsSet: the budget changes nothing for the case a resume was exempted for.
+// An overlap shorter than the budget is still probed per record and never pays the projected scan.
+func TestShortResumeNeverLoadsSet(t *testing.T) {
+	cat := openCatalog(t, t.TempDir())
+	t.Cleanup(func() { _ = cat.Close() })
+	hist := hubArchive(t, cat, TableHistory)
+	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, NewMetrics())
+	s.BeginSession()
+	const overlap = probeBudget - 1
+	for i := 1; i <= overlap; i++ {
+		apply(t, s, upsert("r", histRecord(t, "ap1", i)))
+	}
+	if s.setLoads != 0 || s.setLoaded {
+		t.Errorf("identity set loaded %d times for a %d-record overlap, want 0", s.setLoads, overlap)
+	}
+	if s.probes != overlap {
+		t.Errorf("%d probe queries, want %d (one per record)", s.probes, overlap)
 	}
 }
 
@@ -479,7 +530,7 @@ func TestArchiveUndecodableSkipped(t *testing.T) {
 	if n := countArchive(t, hist, `true`); n != 2 {
 		t.Errorf("hub history = %d records, want 2", n)
 	}
-	if v := val(m.Undecodable.WithLabelValues(TableHistory)); v != 1 {
+	if v := sumTable(m.Undecodable, TableHistory); v != 1 {
 		t.Errorf("undecodable_total = %v, want 1", v)
 	}
 	if got := string(s.Cursor()); got != "c1" {
@@ -539,7 +590,7 @@ func TestArchiveRedeliveryAfterReconnect(t *testing.T) {
 			t.Errorf("job %d.0 appears %d times after the reconnect, want 1", i, n)
 		}
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 3 {
+	if v := sumTable(m.DedupHits, TableHistory); v != 3 {
 		t.Errorf("dedup_hits = %v, want 3", v)
 	}
 }

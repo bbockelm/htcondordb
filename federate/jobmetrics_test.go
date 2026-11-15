@@ -159,7 +159,7 @@ func TestJobMetricsReplayNoDuplicates(t *testing.T) {
 					t.Fatalf("sample at offset %d appears %d times, want 1", 100*i, c)
 				}
 			}
-			if v := val(m.DedupHits.WithLabelValues(TableJobMetrics)); v != float64(2*n) {
+			if v := sumTable(m.DedupHits, TableJobMetrics); v != float64(2*n) {
 				t.Errorf("dedup_hits = %v, want %d", v, 2*n)
 			}
 		})
@@ -194,7 +194,7 @@ func TestJobMetricsOverlapKeepsNewSample(t *testing.T) {
 	if got := countArchive(t, jm, `LogOffset == 520`); got != 1 {
 		t.Errorf("the new sample in the catch-up appended %d times, want 1", got)
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableJobMetrics)); v != 0 {
+	if v := sumTable(m.DedupHits, TableJobMetrics); v != 0 {
 		t.Errorf("dedup_hits = %v, want 0", v)
 	}
 }
@@ -233,7 +233,7 @@ func TestJobMetricsRedeliveryAfterHubRestart(t *testing.T) {
 			t.Errorf("sample %d appears %d times after the hub restart, want 1", i, c)
 		}
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableJobMetrics)); v != 3 {
+	if v := sumTable(m.DedupHits, TableJobMetrics); v != 3 {
 		t.Errorf("dedup_hits = %v, want 3", v)
 	}
 }
@@ -355,7 +355,7 @@ func TestJobMetricsMissingIdentity(t *testing.T) {
 	if n := countArchive(t, jm, `ClusterId == 9`); n != 2 {
 		t.Errorf("identity-less samples = %d, want 2 (appended unchecked)", n)
 	}
-	if v := val(m.MissingIdentity.WithLabelValues(TableJobMetrics)); v != 2 {
+	if v := sumTable(m.MissingIdentity, TableJobMetrics); v != 2 {
 		t.Errorf("missing_identity = %v, want 2", v)
 	}
 }
@@ -384,7 +384,7 @@ func TestJobMetricsReplaySkipsWhatTheCapDropped(t *testing.T) {
 	if n := countArchive(t, jm, `true`); n != 2 {
 		t.Errorf("hub holds %d samples, want 2 (the held one and the newer one)", n)
 	}
-	if v := val(m.BelowRetention.WithLabelValues(TableJobMetrics)); v != 1 {
+	if v := sumTable(m.BelowRetention, TableJobMetrics); v != 1 {
 		t.Errorf("below_retention_total = %v, want 1", v)
 	}
 }

@@ -25,13 +25,18 @@ import (
 //     held k records of an identity, the first k replayed records of it are dropped and the rest
 //     appended. Records this catch-up appends never count as already held. The count of an
 //     identity is read when the catch-up first meets it -- before it can have appended any -- by
-//     an exact query. A Reset replay that runs past probeBudget queries then loads every identity
+//     an exact query. A catch-up that runs past probeBudget queries then loads every identity
 //     count this schedd has in the hub archive once (one projected scan of the schedd's rows) and
 //     checks the rest in memory. A query per record costs about a millisecond -- the archive's
-//     active segment is scanned, not indexed -- which is fine for a resume's overlap and hours for
-//     a replay of a million records. A resume's catch-up is always probed: it re-delivers only the
-//     overlap since the committed cursor (after a WatchResync, up to the spoke's watch buffer), and
-//     loading the AP's whole history for that would cost more than the probes;
+//     active segment is scanned, not indexed -- which is fine for a short overlap and hours for a
+//     replay of a million records. The budget applies however the catch-up began, a Reset replay
+//     and a cursor resume alike. A resume looks like it needs no budget, since it re-delivers only
+//     the overlap since the committed cursor -- but the cursor is committed at Synced, so a
+//     catch-up that does not reach Synced leaves it where it was and the next session resumes
+//     against a backlog one session longer. A hub left that way re-probes its whole backlog one
+//     query at a time on every start and never finishes, and the overlap it was sized for is the
+//     one case it never sees. Where the overlap really is short the budget is not reached and
+//     costs nothing;
 //   - during a Reset replay into a capped archive that has reached its cap, a record older than
 //     the oldest the hub still holds for this schedd (by floorAttr: EnteredHistoryTime,
 //     EpochWriteDate for epochs, SampleTime for job_metrics) is skipped: the cap already dropped it, and re-appending it would make it the newest
@@ -100,8 +105,9 @@ func newArchiveSink(arch *db.ArchiveTable, table, schedd string, store replicate
 // sync per flush instead of one per record.
 func archiveSync(arch *db.ArchiveTable) func() error { return arch.Flush }
 
-// probeBudget is how many records of a Reset replay are checked by exact query before the sink
-// loads the identity set instead.
+// probeBudget is how many records of a catch-up are checked by exact query before the sink loads
+// the identity set instead -- for any catch-up, a Reset replay or a cursor resume alike. It bounds
+// the per-record queries at a cost that is paid once.
 const probeBudget = 256
 
 // BeginSession starts from the committed cursor: a cursor a failed session left uncommitted is
@@ -147,13 +153,13 @@ func (s *archiveSink) apply(c replicate.Change) error {
 	switch c.Kind {
 	case replicate.KindUpsert:
 		if c.Ad == nil { // undecodable: nothing to append
-			s.metrics.Undecodable.WithLabelValues(s.table).Inc()
+			s.metrics.Undecodable.WithLabelValues(s.table, s.schedd).Inc()
 			break
 		}
 		c.Ad.InsertAttrString(ScheddNameAttr, s.schedd)
 		if s.full && s.floorOK {
 			if v, ok := c.Ad.EvaluateAttrNumber(floorAttr(s.table)); ok && v < s.floor {
-				s.metrics.BelowRetention.WithLabelValues(s.table).Inc()
+				s.metrics.BelowRetention.WithLabelValues(s.table, s.schedd).Inc()
 				break
 			}
 		}
@@ -163,7 +169,7 @@ func (s *archiveSink) apply(c replicate.Change) error {
 				return err
 			}
 			if held {
-				s.metrics.DedupHits.WithLabelValues(s.table).Inc()
+				s.metrics.DedupHits.WithLabelValues(s.table, s.schedd).Inc()
 				break
 			}
 		}
@@ -172,13 +178,13 @@ func (s *archiveSink) apply(c replicate.Change) error {
 			// replay, so failing the session on it would wedge this source at that record. A spoke
 			// on the same storage could not have stored it either; this guards a spoke that can.
 			if errors.Is(err, db.ErrTooDeep) {
-				s.metrics.TooDeep.WithLabelValues(s.table).Inc()
+				s.metrics.TooDeep.WithLabelValues(s.table, s.schedd).Inc()
 				break
 			}
 			return err
 		}
 		s.appended = true
-		s.metrics.EventsApplied.WithLabelValues(s.table, "upsert").Inc()
+		s.metrics.EventsApplied.WithLabelValues(s.table, s.schedd, "upsert").Inc()
 	case replicate.KindReset:
 		if err := s.flush(); err != nil {
 			return err
@@ -191,7 +197,7 @@ func (s *archiveSink) apply(c replicate.Change) error {
 		if err := s.loadFloor(); err != nil {
 			return err
 		}
-		s.metrics.Resets.WithLabelValues(s.table).Inc()
+		s.metrics.Resets.WithLabelValues(s.table, s.schedd).Inc()
 		if s.onReset != nil {
 			s.onReset()
 		}
@@ -221,7 +227,7 @@ func (s *archiveSink) ApplyUndecodable(c replicate.Change, _ error) error {
 func (s *archiveSink) held(c replicate.Change) (bool, error) {
 	id, ok := archiveIdentity(s.table, c.Ad)
 	if !ok {
-		s.metrics.MissingIdentity.WithLabelValues(s.table).Inc()
+		s.metrics.MissingIdentity.WithLabelValues(s.table, s.schedd).Inc()
 		s.log.Debug("federate: archive record has no identity; appended without dedup",
 			"table", s.table, "schedd", s.schedd, "key", c.Key)
 		return false, nil
@@ -229,7 +235,7 @@ func (s *archiveSink) held(c replicate.Change) (bool, error) {
 	d := id.digest()
 	n, known := s.remaining[d]
 	if !known && !s.setLoaded {
-		if s.full && s.probes >= probeBudget {
+		if s.probes >= probeBudget {
 			if err := s.loadIdentities(); err != nil {
 				return false, err
 			}
@@ -284,8 +290,9 @@ func (s *archiveSink) loadIdentities() error {
 	}
 	s.setLoaded = true
 	s.setLoads++
-	s.log.Info("federate: catch-up is a full replay; loaded the hub's identities for it",
-		"table", s.table, "schedd", s.schedd, "identities", len(loaded))
+	s.log.Info("federate: catch-up passed its probe budget; loaded the hub's identities for the rest",
+		"table", s.table, "schedd", s.schedd, "identities", len(loaded),
+		"probes", s.probes, "full_replay", s.full)
 	return nil
 }
 

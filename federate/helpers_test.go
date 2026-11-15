@@ -115,6 +115,34 @@ func val(m prometheus.Metric) float64 {
 	return out.Gauge.GetValue()
 }
 
+// sumTable totals a per-table counter across every schedd. The counters carry a schedd label so
+// one AP's catch-up can be told from another's on a table several APs feed; a test asserting what
+// a table saw altogether should not have to name the AP, and several of these drive two.
+func sumTable(c *prometheus.CounterVec, match ...string) float64 {
+	ch := make(chan prometheus.Metric, 1024)
+	go func() { c.Collect(ch); close(ch) }()
+	total := 0.0
+	for m := range ch {
+		var d dto.Metric
+		if err := m.Write(&d); err != nil {
+			panic(err)
+		}
+		got := map[string]string{}
+		for _, lp := range d.GetLabel() {
+			got[lp.GetName()] = lp.GetValue()
+		}
+		// match is (table) or (table, kind): schedd is the one we sum over.
+		if got["table"] != match[0] {
+			continue
+		}
+		if len(match) > 1 && got["kind"] != match[1] {
+			continue
+		}
+		total += d.Counter.GetValue()
+	}
+	return total
+}
+
 // writeCounter watches a hub table and counts the writes committed to it -- the honest measure
 // of "a replay of an unchanged source writes nothing", which final state alone cannot show.
 type writeCounter struct {
