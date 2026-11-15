@@ -153,6 +153,28 @@ func (e *Executor) placeJoin(st *Statement, p *joinPlan) joinPlacement {
 			"join opcode is sent"}
 	}
 
+	// A WINDOW IS NOT PRICED, IT IS PREFERRED.
+	//
+	// The arithmetic below is about bytes, and it reads k off the two table sizes. A band
+	// does not appear in those sizes: it is the one predicate that changes the ALGORITHM --
+	// the store sorts the folded side once and binary-searches each row's window, so the
+	// pairs examined become the matches instead of the product -- and the comment on
+	// joinExpansion already concedes that a narrowing predicate makes k an over-estimate
+	// biased towards pairing here. Letting a table-size ratio send a band to the arm that
+	// has no window would spend that estimate's error on the query it helps most.
+	//
+	// What the arm here does instead is correct and bounded, not fast: with no equality to
+	// hash on it pairs every row against every row, and maxJoinPairs refuses past about
+	// 4,500 rows a side.
+	if len(p.steps[0].band) > 0 {
+		if !e.c.SupportsNewer(dbrpc.FeatJoinBand) {
+			return joinPlacement{why: "this server does not advertise the window a BETWEEN " +
+				"declares, so no join opcode is sent and the rows are paired here"}
+		}
+		return joinPlacement{store: true, why: "the join windows a range, which the store " +
+			"answers by searching a sorted side rather than by pairing every row"}
+	}
+
 	// k is right rows per left row, which is what decides both halves of the trade: how many
 	// times the store repeats the left ad, and how much of the right side the client arm
 	// rebuilds only to discard. Both counts are the cheap kind -- an O(1) length for a

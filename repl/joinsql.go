@@ -56,6 +56,37 @@ type JoinClause struct {
 	// On is the translated ClassAd join condition, over BOTH sides' aliases. Empty for a
 	// CROSS JOIN, which has no condition by definition.
 	On string
+
+	// Bands are the ON clause's BETWEEN conjuncts, held apart from On rather than
+	// translated into it. See BandClause.
+	Bands []BandClause
+}
+
+// BandClause is one `<expr> BETWEEN <lo> AND <hi>` conjunct of a join's ON clause.
+//
+// BETWEEN IS A DECLARATION, WHICH IS WHY IT IS NOT TRANSLATED.
+//
+// Every other SQL spelling in this language becomes ClassAd text and is answered with
+// ClassAd's semantics. BETWEEN cannot be, because what it declares is an ordered WINDOW over
+// one attribute, and a window is narrower than the comparison it reads like: it is defined
+// over numbers, so a bound or an attribute that evaluates to a string, a list or undefined
+// puts the row outside the window rather than being ordered or raising an error. ClassAd's
+// own `>=` orders strings against strings.
+//
+// So `a.X BETWEEN b.Lo AND b.Hi` is NOT stored as `a.X >= b.Lo && a.X <= b.Hi`. Writing it
+// that way and recognising the window back out of the text would make the plan depend on how
+// the predicate was spelled, and would leave the two spellings meaning different things on
+// the same data. Held apart, there is one meaning and both join arms read it from here.
+//
+// It is also why there is no NOT BETWEEN: the complement of a window is not a window, so
+// there is nothing to declare.
+type BandClause struct {
+	// Attr is the windowed expression, reading the table its JOIN clause folds in.
+	Attr string
+	// Lo and Hi bound the window, reading the tables joined before that one.
+	Lo, Hi string
+	// Raw is the conjunct as written, for errors and for EXPLAIN.
+	Raw string
 }
 
 // IsJoin reports whether the statement's FROM clause names more than one table.
@@ -172,11 +203,11 @@ func (p *parser) parseJoins(st *Statement) error {
 			if !p.takeKeyword("ON") {
 				return fmt.Errorf("%s needs an ON clause", kind)
 			}
-			on, err := p.captureRawExpr(p.atJoinCondEnd)
+			on, bands, err := p.parseJoinOn()
 			if err != nil {
 				return fmt.Errorf("JOIN ON: %w", err)
 			}
-			jc.On = on
+			jc.On, jc.Bands = on, bands
 		}
 		st.Joins = append(st.Joins, jc)
 	}
@@ -217,6 +248,80 @@ func (p *parser) parseJoinKind() (JoinKind, bool, error) {
 			"happen to coincide)")
 	}
 	return 0, false, nil
+}
+
+// parseJoinOn consumes an ON condition, pulling its BETWEEN conjuncts out as they are read.
+//
+// The condition is read one top-level conjunct at a time rather than captured whole, which is
+// what makes a BETWEEN reachable at all. It cannot be handled where the other SQL spellings
+// are, in translateSQL, for the reason IN cannot: by the time the keyword is seen its left
+// operand has already been written through to the output verbatim, and a window needs that
+// operand in both of its bounds.
+//
+// Reading conjunct by conjunct also puts BETWEEN's own AND in the one place that can tell it
+// from the spine's. SQL binds BETWEEN tighter than AND, so the AND after a lower bound
+// belongs to the BETWEEN and the next one ends the conjunct, which is exactly the order this
+// reads them in.
+//
+// What comes back is the remaining conjuncts rejoined as one ClassAd expression -- the same
+// text a condition without a BETWEEN has always produced -- and the windows, separately.
+func (p *parser) parseJoinOn() (string, []BandClause, error) {
+	var conj []string
+	var bands []BandClause
+	for {
+		expr, raw, err := p.captureExpr(p.atJoinConjunctEnd, nil)
+		if err != nil {
+			return "", nil, err
+		}
+		switch {
+		case p.isKeyword("NOT") && p.peekAheadKeyword(1, "BETWEEN"):
+			return "", nil, fmt.Errorf("NOT BETWEEN is not supported in a join condition; "+
+				"the complement of a range is not a range, so write the two comparisons "+
+				"instead, e.g. `%s < <lo> OR %s > <hi>`", raw, raw)
+		case p.takeKeyword("BETWEEN"):
+			b, berr := p.parseBandBounds(raw)
+			if berr != nil {
+				return "", nil, berr
+			}
+			b.Attr = expr
+			bands = append(bands, b)
+		default:
+			conj = append(conj, expr)
+		}
+		if !p.takeKeyword("AND") {
+			break
+		}
+	}
+	return strings.Join(conj, " && "), bands, nil
+}
+
+// parseBandBounds consumes `<lo> AND <hi>` after a BETWEEN whose operand captured as raw.
+func (p *parser) parseBandBounds(raw string) (BandClause, error) {
+	lo, loRaw, err := p.captureExpr(p.atJoinConjunctEnd, nil)
+	if err != nil {
+		return BandClause{}, fmt.Errorf("BETWEEN: lower bound: %w", err)
+	}
+	if !p.takeKeyword("AND") {
+		return BandClause{}, fmt.Errorf("BETWEEN names two bounds; `%s BETWEEN %s` has no "+
+			"AND and no upper bound", raw, loRaw)
+	}
+	hi, hiRaw, err := p.captureExpr(p.atJoinConjunctEnd, nil)
+	if err != nil {
+		return BandClause{}, fmt.Errorf("BETWEEN: upper bound: %w", err)
+	}
+	return BandClause{
+		Lo:  lo,
+		Hi:  hi,
+		Raw: fmt.Sprintf("%s BETWEEN %s AND %s", raw, loRaw, hiRaw),
+	}, nil
+}
+
+// atJoinConjunctEnd reports whether the parser sits at the end of one top-level conjunct of
+// an ON condition: where the whole condition ends, or at the AND that separates it from the
+// next, or at the BETWEEN that makes it a window's operand rather than a conjunct.
+func (p *parser) atJoinConjunctEnd() bool {
+	return p.atJoinCondEnd() || p.isKeyword("AND") || p.isKeyword("BETWEEN") ||
+		(p.isKeyword("NOT") && p.peekAheadKeyword(1, "BETWEEN"))
 }
 
 // atJoinCondEnd reports whether the parser sits at the end of an ON condition: the next

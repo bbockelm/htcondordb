@@ -118,6 +118,35 @@ SELECT j.Owner, m.Name FROM jobs j JOIN machines m
   ON j.RequestMemory <= m.Memory && j.RequestCpus <= m.Cpus;
 ```
 
+**`BETWEEN` declares a range to window on**, and is the one SQL spelling here that is not
+simply ClassAd text:
+
+```sql
+-- every event that happened during each run
+SELECT r.ClusterId, e.Ts, e.Kind
+  FROM runs r JOIN events e ON e.Ts BETWEEN r.Start AND r.End;
+```
+
+Written this way the store sorts the folded side once and searches each row's window,
+instead of comparing every row with every row — which is what a join with no equality to
+hash on otherwise does, and what the pair guard rail below stops at a few thousand rows a
+side.
+
+A window is **over numbers**, and that is narrower than the two comparisons it reads like:
+if the attribute or either bound evaluates to a string, a list or `undefined`, the row
+falls outside the window rather than being ordered or raising an error. ClassAd's own `>=`
+orders strings against strings, so write the comparisons when that is the question:
+
+```sql
+-- ClassAd's ordering, compared pair by pair
+... ON e.Ts >= r.Start && e.Ts <= r.End;
+```
+
+Both ends are inclusive. The left side names one attribute of the table its `JOIN` folds
+in; the bounds may read any table above it, or be constants. `BETWEEN` is written as a
+whole conjunct of `ON` — not nested inside a larger expression, and not in `WHERE` — and
+there is no `NOT BETWEEN`, because the complement of a range is not a range.
+
 Three things follow from the row being a ClassAd:
 
 - **An unmatched `LEFT JOIN` row has no member for the right side**, so every `h.X`
@@ -132,12 +161,16 @@ Three things follow from the row being a ClassAd:
 `SELECT *` returns every attribute of both sides, alias-qualified so like-named
 attributes stay distinct; `SELECT h.*` returns one side's.
 
-**Where the work happens.** A join runs in the client, over query operations that predate
-it, so it works against any server. What makes it affordable is that the `&&` spine of
-`ON` and `WHERE` is split: conjuncts naming one table become server-side constraints on
+**Where the work happens.** The rows are paired either in the store or here, decided per
+statement and reported by `EXPLAIN`. Pairing here uses only query operations that predate
+joins, so it works against any server; what makes it affordable is that the `&&` spine of
+`ON` and `WHERE` is split — conjuncts naming one table become server-side constraints on
 that table's scan, each side fetches only the attributes the statement reads from it, and
 an equality on a bare attribute lets the right-hand scan be narrowed to the key values the
-left side actually has. `EXPLAIN` reports all of it.
+left side actually has. Pairing in the store ships only the joined rows and holds one side
+rather than both, which is the better trade unless the join expands enough that repeating
+the left side costs more than the link can spare. `EXPLAIN` prints the arithmetic either
+way.
 
 Outer joins push asymmetrically, which is worth knowing because it is the usual source of
 wrong join results: for a `LEFT JOIN`, `ON` conjuncts push only to the right (inner) side,

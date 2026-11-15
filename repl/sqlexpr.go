@@ -145,6 +145,17 @@ func (p *parser) translateSQL(lift *[]AggCall) (out string, matched bool, err er
 		return "", false, fmt.Errorf("%s is not supported; ClassAd spells membership as a "+
 			"function, so write %s", form, want)
 
+	// BETWEEN is a join's window and is read where a join's ON clause is read, so one
+	// reaching here is one written somewhere a window has no meaning -- a WHERE, a
+	// projection, or nested inside a larger expression in an ON. Refused rather than
+	// translated, because the range it declares is narrower than the two comparisons it
+	// reads like (see BandClause) and quietly answering the wider question would be a
+	// different query.
+	case p.isKeyword("BETWEEN"), p.isKeyword("NOT") && p.peekKeywordAt(1, "BETWEEN"):
+		return "", false, fmt.Errorf("BETWEEN declares the range a JOIN windows on, so it " +
+			"is written as a whole conjunct of ON and nowhere else; elsewhere write the " +
+			"comparisons, e.g. `x >= a AND x <= b`")
+
 	case p.isKeyword("AND"):
 		p.pos++
 		return "&&", true, nil

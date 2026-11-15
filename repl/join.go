@@ -38,8 +38,10 @@ package repl
 // the && spine only and treats a || node as one opaque conjunct, never looking inside it.
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"reflect"
 	"sort"
@@ -153,6 +155,17 @@ type joinStep struct {
 	// is what key batching builds a membership constraint on.
 	batchAttr string
 
+	// band are this step's BETWEEN conjuncts: an ordered window over one attribute of the
+	// table it folds in. Unlike equi they do not merely narrow -- a band IS the predicate
+	// its BETWEEN declared, and nothing in cond repeats it, so a pair the band excludes is
+	// excluded by the band alone. See BandClause for why that is a window and not the two
+	// comparisons it reads like.
+	band []bandPred
+
+	// bandSrc is the same windows in the form the wire carries. Built from the same parsed
+	// halves as band, so the arm that runs cannot change which rows match.
+	bandSrc []db.JoinBand
+
 	// The same predicates as text, for a server-side join: the wire carries ClassAd
 	// expressions, not compiled ones. They are the text the compiled forms were BUILT from
 	// (mustCompile parses e.String()), so they cannot disagree with them -- sending them is
@@ -185,6 +198,70 @@ type equiText struct {
 // so it is stripped down to a bare attribute path.
 type equiPair struct {
 	acc, side *classad.Expr
+}
+
+// bandPred is one window compiled for the pairing that happens HERE.
+//
+// All three halves read the composite row, because that is the ad a candidate pair is
+// evaluated against -- the same scope cond is compiled in. The store's spelling of the same
+// window splits them, since it evaluates the attribute against its own table's ad; both come
+// from the one BandClause, which is what keeps them the same window.
+type bandPred struct {
+	attr, lo, hi *classad.Expr
+	raw          string
+}
+
+// holds reports whether a candidate pair falls inside the window.
+//
+// The rule is the store's, deliberately and exactly: the window is over NUMBERS, so an end
+// or an attribute that is not one puts the row outside rather than being ordered as ClassAd
+// would order it, or raising an error. A band that answered ClassAd's question here and the
+// window's question in the store would make the same statement mean two things.
+func (b *bandPred) holds(row *classad.ClassAd) bool {
+	v, ok := bandNumber(b.attr.Eval(row))
+	if !ok {
+		return false
+	}
+	lo, ok := bandNumber(b.lo.Eval(row))
+	if !ok || v < lo {
+		return false
+	}
+	hi, ok := bandNumber(b.hi.Eval(row))
+	return ok && v <= hi
+}
+
+// bandNumber folds a value into the one numeric space a window orders, and reports false for
+// everything else -- undefined, a string, a list, an error, and NaN, whose every comparison
+// is false and which would otherwise read as a window that admits nothing at one end and
+// everything at the other.
+//
+// A bool is numeric here, below every positive number and ordered false < true, because it
+// is numeric in the store.
+func bandNumber(v classad.Value) (float64, bool) {
+	switch {
+	case v.IsBool():
+		b, err := v.BoolValue()
+		if err != nil {
+			return 0, false
+		}
+		if b {
+			return 1, true
+		}
+		return 0, true
+	case v.IsInteger():
+		n, err := v.IntValue()
+		if err != nil {
+			return 0, false
+		}
+		return float64(n), true
+	case v.IsReal():
+		f, err := v.RealValue()
+		if err != nil || math.IsNaN(f) {
+			return 0, false
+		}
+		return f, true
+	}
+	return 0, false
 }
 
 // twoTable reports whether this is the two-table shape every path handled before n-way
@@ -227,7 +304,7 @@ func planJoin(st *Statement) (*joinPlan, error) {
 	}
 
 	for i := range p.steps {
-		if err := p.planStep(i, st.Joins[i].On, aliases); err != nil {
+		if err := p.planStep(i, st.Joins[i], aliases); err != nil {
 			return nil, err
 		}
 	}
@@ -251,8 +328,9 @@ func planJoin(st *Statement) (*joinPlan, error) {
 // A forward reference -- this step's ON naming a table a later step folds in -- is refused
 // rather than quietly deferred. SQL does not allow it, and a reader who writes it means
 // something this would not do.
-func (p *joinPlan) planStep(i int, on string, aliases map[string]int) error {
+func (p *joinPlan) planStep(i int, jc JoinClause, aliases map[string]int) error {
 	st := &p.steps[i]
+	on := jc.On
 	parts, err := conjunctsOf(on)
 	if err != nil {
 		return fmt.Errorf("%s %s ON: %w", st.kind, p.sides[st.side].ref.Alias, err)
@@ -279,7 +357,75 @@ func (p *joinPlan) planStep(i int, on string, aliases map[string]int) error {
 		}
 	}
 	st.extractEqui(p, on, aliases)
+	return st.planBands(p, jc.Bands, aliases)
+}
+
+// planBands compiles this step's BETWEEN conjuncts into the two forms the two join arms
+// need, and refuses the ones that are not windows.
+//
+// The refusals are shapes a window cannot express, and each is refused rather than answered
+// some other way. A statement that quietly fell back to the comparisons would mean something
+// different from the one next to it that did not, on data neither author looked at.
+func (st *joinStep) planBands(p *joinPlan, bands []BandClause, aliases map[string]int) error {
+	alias := p.sides[st.side].ref.Alias
+	for _, b := range bands {
+		attr, err := parseBandExpr("", b.Raw, b.Attr)
+		if err != nil {
+			return err
+		}
+		// The window is over an ATTRIBUTE of the table this step folds in: the store
+		// searches that side sorted on it, which a computed value has no order in.
+		ref, isRef := unwrapParens(attr).(*ast.SelectExpr)
+		side, name, ok := 0, "", false
+		if isRef {
+			side, name, ok = qualifiedRef(ref, aliases)
+		}
+		if !ok || side != st.side {
+			return fmt.Errorf("%s %s ON: `%s` windows %s, but BETWEEN windows one "+
+				"attribute of %s -- the table the JOIN folds in -- so its left side is "+
+				"written `%s.<attribute>`", st.kind, alias, b.Raw, b.Attr, alias, alias)
+		}
+		lo, err := parseBandExpr("lower bound", b.Raw, b.Lo)
+		if err != nil {
+			return err
+		}
+		hi, err := parseBandExpr("upper bound", b.Raw, b.Hi)
+		if err != nil {
+			return err
+		}
+		// Both bounds read the row as it stands BEFORE this step. One reading this step's
+		// own table would be a window whose ends move with the row being placed in it, and
+		// the store, which fixes the ends once per accumulated row, could not mean that.
+		for _, half := range []struct {
+			what string
+			ex   ast.Expr
+		}{{"lower bound", lo}, {"upper bound", hi}} {
+			if bad := sidesOf(half.ex, aliases) &^ visibleAt(st.side-1); bad != 0 {
+				return fmt.Errorf("%s %s ON: the %s of `%s` reads %s; a window's ends are "+
+					"fixed before %s is reached, so they may only read the tables above it",
+					st.kind, alias, half.what, b.Raw, p.aliasesIn(bad), alias)
+			}
+		}
+		st.band = append(st.band, bandPred{
+			attr: mustCompile(attr), lo: mustCompile(lo), hi: mustCompile(hi), raw: b.Raw,
+		})
+		st.bandSrc = append(st.bandSrc, db.JoinBand{Attr: name, Lo: b.Lo, Hi: b.Hi})
+	}
 	return nil
+}
+
+// parseBandExpr parses one half of a window, naming which half it was when it will not
+// parse. what is "" for the windowed expression itself.
+func parseBandExpr(what, raw, src string) (ast.Expr, error) {
+	parts, err := conjunctsOf(src)
+	if err != nil || len(parts) != 1 {
+		if what != "" {
+			what = " " + what
+		}
+		return nil, fmt.Errorf("BETWEEN:%s `%s` in `%s`: %w", what, src, raw,
+			cmp.Or(err, errors.New("is not a single expression")))
+	}
+	return parts[0], nil
 }
 
 // planWhere splits the WHERE clause. It is the mirror image of planStep: a conjunct on a
@@ -466,6 +612,15 @@ func (p *joinPlan) planProjection(st *Statement, aliases map[string]int) {
 	scan(st.Where)
 	for _, j := range st.Joins {
 		scan(j.On)
+		// A window's halves are held apart from the ON text, so scanning that text alone
+		// would fetch neither the attribute windowed nor the ends it is windowed between.
+		// Each side would then arrive without the attributes its own predicate reads, and
+		// a window over an attribute that was never fetched admits nothing.
+		for _, b := range j.Bands {
+			scan(b.Attr)
+			scan(b.Lo)
+			scan(b.Hi)
+		}
 	}
 	for _, t := range st.OrderBy {
 		if t.Item.Expr != "" {
@@ -795,6 +950,16 @@ func validateJoinClauses(st *Statement, aliases map[string]int, refs []TableRef)
 	for _, j := range st.Joins {
 		if err := check("JOIN ON", j.On); err != nil {
 			return err
+		}
+		// A window's halves left the ON text when they were read, so they are checked
+		// here rather than inside it. Skipping them would exempt exactly the attributes a
+		// BETWEEN names from the rule that a join qualifies every one of them.
+		for _, b := range j.Bands {
+			for _, half := range []string{b.Attr, b.Lo, b.Hi} {
+				if err := check("JOIN ON", half); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	if err := check("WHERE", st.Where); err != nil {
@@ -1179,6 +1344,11 @@ func (p *joinPlan) keep(t joinTuple, side int, r, row *classad.ClassAd, last boo
 
 // condHolds evaluates this step's join condition over a candidate row.
 func (step *joinStep) condHolds(row *classad.ClassAd) bool {
+	for i := range step.band {
+		if !step.band[i].holds(row) {
+			return false
+		}
+	}
 	return allTrue(step.cond, row)
 }
 
@@ -1613,14 +1783,25 @@ func (e *Executor) describeJoinPlan(st *Statement) []string {
 		step := &p.steps[i]
 		s := p.sides[step.side]
 		strategy := "nested loop (no equality to hash on)"
-		if len(step.equi) > 0 {
+		switch {
+		case len(step.equi) > 0:
 			strategy = fmt.Sprintf("hash join on %d equality term(s), build side %s",
 				len(step.equi), s.ref.Alias)
+		case len(step.band) > 0:
+			// A window is searched only where there is no equality to hash on: with one,
+			// the hash decides the candidates and the window is checked against them. So
+			// the strategy named here is the one that follows from the terms, and a step
+			// with both says hash, above.
+			strategy = fmt.Sprintf("windowed on %s, searched rather than scanned", s.ref.Alias)
 		}
 		out = append(out,
 			fmt.Sprintf("%s %s %s: %s", step.kind, s.ref.Table, s.ref.Alias, strategy),
 			side(s),
 			fmt.Sprintf("  checked per pair: %d condition term(s)", len(step.cond)))
+		for i := range step.band {
+			out = append(out, fmt.Sprintf("  window: %s, over numbers; a bound or an "+
+				"attribute that is not one places the row outside it", step.band[i].raw))
+		}
 		if step.batchAttr != "" {
 			// The decision needs the keys the rows so far actually hold, which EXPLAIN
 			// without ANALYZE has not read, so this reports what is available to batch on
@@ -1830,6 +2011,7 @@ func (e *Executor) joinServerSide(st *Statement, p *joinPlan) ([]*classad.ClassA
 		Right: db.JoinSide{Table: right.ref.Table, Alias: right.ref.Alias, Constraint: right.where, Project: right.project},
 		Cond:  step.condSrc,
 		Post:  p.postSrc,
+		Band:  step.bandSrc,
 	}}
 	for _, eq := range step.equiSrc {
 		req.Spec.Equi = append(req.Spec.Equi, db.JoinEqui{Left: eq.accStripped, Right: eq.side})
@@ -1883,6 +2065,9 @@ func (e *Executor) joinWireRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool
 	if errors.Is(err, dbrpc.ErrJoinWireUnsupported) {
 		return nil, false, nil // take the text reply
 	}
+	if errors.Is(err, dbrpc.ErrJoinBandUnsupported) {
+		return nil, false, nil // no window on this peer: pair here, where there is one
+	}
 	if decodeErr != nil {
 		return nil, false, decodeErr
 	}
@@ -1911,7 +2096,7 @@ func (e *Executor) joinTextRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool
 		rows = append(rows, ad)
 		return true
 	}, e.joinStatsReport())
-	if errors.Is(err, dbrpc.ErrJoinUnsupported) {
+	if errors.Is(err, dbrpc.ErrJoinUnsupported) || errors.Is(err, dbrpc.ErrJoinBandUnsupported) {
 		return nil, false, nil // join it here, as before
 	}
 	if parseErr != nil {
