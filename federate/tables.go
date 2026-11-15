@@ -54,10 +54,14 @@ type ArchiveOptions struct {
 	ExtraValue []string
 	// SegmentSize applies only when an archive is created.
 	SegmentSize int
-	// MaxBytes caps each archive's on-disk size (0 = no cap), keyed by table name. The daemon's
-	// periodic archive maintenance drops the oldest whole segments past it. Hub archives grow with
-	// the sum of every AP's completions, so a production hub should set this.
+	// MaxBytes caps each archive's on-disk size (0 = no cap), keyed by table name. Past it the
+	// archive frees down to TargetBytes, dropping the segments holding the oldest floorAttr.
+	// Hub archives grow with the sum of every AP's completions, so a production hub should set this.
 	MaxBytes map[string]int64
+	// TargetBytes is the low mark a size pass frees DOWN to, keyed by table name. Zero
+	// takes a quarter of MaxBytes as headroom. The gap is what stops an archive sitting on
+	// its ceiling and evicting on nearly every seal.
+	TargetBytes map[string]int64
 	// MaxAge caps an archive by age, in seconds against its floorAttr (SampleTime for
 	// job_metrics), keyed by table name; 0 = no age cap. A table absent from the map keeps
 	// whatever age cap it has.
@@ -153,11 +157,23 @@ func ensureTables(cat *db.Catalog, tables []string, opts ArchiveOptions, log *sl
 					"note", "the next maintenance pass adopts the re-derived schema; sealed segments are "+
 						"then rewritten onto it a budgeted number per pass")
 			}
-			if maxBytes := opts.MaxBytes[t]; a.Retention().MaxBytes != maxBytes {
-				r := a.Retention()
-				r.MaxBytes = maxBytes
+			// The size ceiling, and -- crucially for a hub -- the axis it evicts along.
+			// Without EvictByAttr a size pass drops the OLDEST SEGMENT, which is oldest by
+			// arrival, not by data: a spoke replaying a year of backfill appends records far
+			// older than the ones already in the oldest segment, so the pass evicts recent
+			// history and keeps the backfill. Pointing it at the same floorAttr the age cap
+			// uses makes it evict by what the records say about themselves.
+			maxBytes := opts.MaxBytes[t]
+			target := opts.TargetBytes[t]
+			if target <= 0 && maxBytes > 0 {
+				target = maxBytes - maxBytes/4 // a quarter of headroom, as the merge policy takes
+			}
+			attr := floorAttr(t)
+			if r := a.Retention(); r.MaxBytes != maxBytes || r.TargetBytes != target || r.EvictByAttr != attr {
+				r.MaxBytes, r.TargetBytes, r.EvictByAttr = maxBytes, target, attr
 				if err := a.SetRetention(r); err != nil {
-					log.Error("federate: setting archive size limit", "archive", t, "max_bytes", maxBytes, "err", err)
+					log.Error("federate: setting archive size limit", "archive", t,
+						"max_bytes", maxBytes, "target_bytes", target, "evict_by", attr, "err", err)
 				}
 			}
 			if maxAge, ok := opts.MaxAge[t]; ok {

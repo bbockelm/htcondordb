@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/db"
+	"github.com/bbockelm/htcondordb/scheddsync"
 )
 
 // TestArchiveSizeLimitConfig pins how the space-limit knobs resolve: a shared default applied to
@@ -79,9 +80,21 @@ func TestApplyArchiveMaxBytesEnforced(t *testing.T) {
 	m := &scheddSyncManager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 
 	// Apply a tiny cap and confirm it lands on the archive's retention.
-	m.applyArchiveMaxBytes(hist, "history", 64<<10) // 64 KiB
-	if got := hist.Retention().MaxBytes; got != 64<<10 {
-		t.Fatalf("after apply MaxBytes = %d, want %d", got, 64<<10)
+	m.applyArchiveMaxBytes(hist, "history", 64<<10, scheddsync.EnteredHistoryAttr) // 64 KiB
+	r := hist.Retention()
+	if r.MaxBytes != 64<<10 {
+		t.Fatalf("after apply MaxBytes = %d, want %d", r.MaxBytes, 64<<10)
+	}
+	// The axis matters as much as the ceiling: without it a size pass drops the oldest
+	// SEGMENT, which on a store fed by replay is not the oldest data.
+	if r.EvictByAttr != scheddsync.EnteredHistoryAttr {
+		t.Errorf("EvictByAttr = %q, want %q: the cap would evict by arrival order",
+			r.EvictByAttr, scheddsync.EnteredHistoryAttr)
+	}
+	// And a low mark below the ceiling, so the archive does not sit on the cap evicting
+	// at nearly every seal.
+	if r.TargetBytes <= 0 || r.TargetBytes >= r.MaxBytes {
+		t.Errorf("TargetBytes = %d, want a low mark under MaxBytes %d", r.TargetBytes, r.MaxBytes)
 	}
 
 	// The ordinary rotation pass now enforces it: oldest whole segments drop until under the cap.
@@ -97,8 +110,9 @@ func TestApplyArchiveMaxBytesEnforced(t *testing.T) {
 	}
 
 	// Removing the knob (0) lifts the ceiling rather than leaving a stale one.
-	m.applyArchiveMaxBytes(hist, "history", 0)
-	if got := hist.Retention().MaxBytes; got != 0 {
-		t.Errorf("MaxBytes = %d after clearing, want 0 (no limit)", got)
+	m.applyArchiveMaxBytes(hist, "history", 0, scheddsync.EnteredHistoryAttr)
+	if cleared := hist.Retention(); cleared.MaxBytes != 0 || cleared.TargetBytes != 0 {
+		t.Errorf("after clearing: MaxBytes=%d TargetBytes=%d, want 0/0 (no limit)",
+			cleared.MaxBytes, cleared.TargetBytes)
 	}
 }

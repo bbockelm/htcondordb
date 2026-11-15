@@ -16,12 +16,12 @@ go 1.26.0
 toolchain go1.27.0
 
 require (
-	github.com/PelicanPlatform/classad v0.39.0
-	github.com/PelicanPlatform/classad/changefeed v0.39.0
-	github.com/PelicanPlatform/classad/collections v0.39.0
-	github.com/PelicanPlatform/classad/db v0.39.0
-	github.com/PelicanPlatform/classad/dbrpc v0.39.0
-	github.com/PelicanPlatform/classad/wasmudf v0.39.0
+	github.com/PelicanPlatform/classad v0.40.1
+	github.com/PelicanPlatform/classad/changefeed v0.40.1
+	github.com/PelicanPlatform/classad/collections v0.40.1
+	github.com/PelicanPlatform/classad/db v0.40.1
+	github.com/PelicanPlatform/classad/dbrpc v0.40.1
+	github.com/PelicanPlatform/classad/wasmudf v0.40.1
 	github.com/apache/arrow-go/v18 v18.8.0
 	github.com/bbockelm/cedar v0.7.14
 	github.com/bbockelm/golang-htcondor v0.22.1

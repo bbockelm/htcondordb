@@ -740,30 +740,40 @@ func (m *scheddSyncManager) applySchemaRequire(name string, want []string, set f
 			"rewritten onto it a budgeted number per pass")
 }
 
-// applyArchiveMaxBytes puts the configured on-disk size cap onto an archive's retention. The
-// periodic archive-maintenance pass (RunPeriodicArchiveMaintenanceEvery -> Rotate) then drops the
-// oldest whole segments whenever the table exceeds the cap. Retention is a runtime setting (not
-// persisted), so this is re-asserted on every start and reconfig, which is exactly how a
-// puppet-managed fleet drives it -- change the HTCondor config, condor_reconfig, done.
+// applyArchiveMaxBytes puts the configured on-disk size cap onto an archive's retention, along with
+// the low mark a size pass frees down to and the axis it evicts along. The periodic
+// archive-maintenance pass (RunPeriodicArchiveMaintenanceEvery -> Rotate) then drops segments
+// whenever the table exceeds the cap. Retention is a runtime setting (not persisted), so this is
+// re-asserted on every start and reconfig, which is exactly how a puppet-managed fleet drives it --
+// change the HTCondor config, condor_reconfig, done.
+//
+// evictBy is what makes the pass drop the oldest DATA rather than the oldest segment. The two
+// differ as soon as records do not arrive in the order their timestamps imply -- a replayed
+// backlog, or anything imported from another store -- and when they differ, evicting by
+// position takes the recent history and leaves the backfill.
 //
 // maxBytes 0 means "no limit"; it is still applied (clearing a previously-set cap), so removing the
 // knob and reconfiguring lifts the ceiling rather than leaving a stale one in force. A no-op when the
-// archive already carries this cap, so a steady reconfigure does no work.
-func (m *scheddSyncManager) applyArchiveMaxBytes(t *db.ArchiveTable, name string, maxBytes int64) {
+// archive already carries this configuration, so a steady reconfigure does no work.
+func (m *scheddSyncManager) applyArchiveMaxBytes(t *db.ArchiveTable, name string, maxBytes int64, evictBy string) {
 	r := t.Retention()
-	if r.MaxBytes == maxBytes {
+	target := int64(0)
+	if maxBytes > 0 {
+		target = maxBytes - maxBytes/4 // a quarter of headroom, as the merge policy takes
+	}
+	if r.MaxBytes == maxBytes && r.TargetBytes == target && r.EvictByAttr == evictBy {
 		return
 	}
 	was := r.MaxBytes
-	r.MaxBytes = maxBytes
+	r.MaxBytes, r.TargetBytes, r.EvictByAttr = maxBytes, target, evictBy
 	if err := t.SetRetention(r); err != nil {
 		m.logger.Error("schedd-sync: setting archive size limit", "archive", name,
 			"max_bytes", maxBytes, "err", err)
 		return
 	}
 	m.logger.Info("schedd-sync: archive size limit set", "archive", name,
-		"max_bytes", maxBytes, "was", was,
-		"note", "oldest whole segments are dropped past the cap on the archive-maintenance pass")
+		"max_bytes", maxBytes, "target_bytes", target, "evict_by", evictBy, "was", was,
+		"note", "segments holding the oldest "+evictBy+" are dropped past the cap, at a seal and on the maintenance pass")
 }
 
 // groupSchemaCount maps the boolean knob onto the library's tri-state: 0 is "use the default"
@@ -1101,7 +1111,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			// It now costs a backfill, in the background, exactly as for history.
 			m.reconcileArchiveIndexes(ctx, jm, scheddsync.DefaultJobMetricsTable, jmCat, jmVal, &wg)
 			m.applyArchiveRowGroupBytes(jm, scheddsync.DefaultJobMetricsTable, s)
-			m.applyArchiveMaxBytes(jm, scheddsync.DefaultJobMetricsTable, s.metricsMaxBytes)
+			m.applyArchiveMaxBytes(jm, scheddsync.DefaultJobMetricsTable, s.metricsMaxBytes, "SampleTime")
 			m.applyArchiveMaxAge(jm, scheddsync.DefaultJobMetricsTable, s.metricsMaxAge)
 			metricsCfg.Archive = jm
 			m.logger.Info("schedd-sync: sampling job resource usage",
@@ -1131,9 +1141,12 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			RowGroupBytes:    s.archiveRowGroupBytes,
 			CategoricalAttrs: histCat,
 			ValueAttrs:       histVal,
-			// Zone-map both the job's completion time and htcondordb's ingest time
-			// (EnteredHistoryTime, stamped per record), so range queries on either prune whole
-			// segments instead of scanning -- e.g. "jobs that entered history in the last 24h".
+			// Zone-map both the job's completion time and its entry into history
+			// (EnteredHistoryTime, stamped per record from the record's OWN terminal-status
+			// transition -- not when htcondordb read it), so range queries on either prune
+			// whole segments instead of scanning -- e.g. "jobs that entered history in the
+			// last 24h". EnteredHistoryTime is the one to measure age against: CompletionDate
+			// is 0 on a job removed rather than completed.
 			ZoneAttrs:          []string{"CompletionDate", scheddsync.EnteredHistoryAttr},
 			SchemaRequireAttrs: splitAttrList(s.historySchemaRequireAttrs),
 		})
@@ -1150,7 +1163,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		m.reconcileArchiveIndexes(ctx, hist, "history", histCat, histVal, &wg)
 		m.applyArchiveRowGroupBytes(hist, "history", s)
 		m.applySchemaRequire("history", splitAttrList(s.historySchemaRequireAttrs), hist.SetSchemaRequireAttrs)
-		m.applyArchiveMaxBytes(hist, "history", s.historyMaxBytes)
+		m.applyArchiveMaxBytes(hist, "history", s.historyMaxBytes, scheddsync.EnteredHistoryAttr)
 		hs := scheddsync.NewHistorySync(hist, scheddsync.HistorySyncConfig{
 			Filename:        s.histFile,
 			PollInterval:    s.pollInterval,
@@ -1177,8 +1190,9 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 			RowGroupBytes:    s.archiveRowGroupBytes,
 			CategoricalAttrs: epCat,
 			ValueAttrs:       epVal,
-			// Zone-map the epoch write time and htcondordb's ingest time so range
-			// queries on either prune whole segments. Epoch records carry no
+			// Zone-map the epoch write time and the record's entry into history
+			// (EnteredHistoryTime, derived from EpochWriteDate -- not when htcondordb read
+			// it) so range queries on either prune whole segments. Epoch records carry no
 			// CompletionDate (a run instance is not a completed job).
 			ZoneAttrs:          []string{scheddsync.EpochWriteDateAttr, scheddsync.EnteredHistoryAttr},
 			SchemaRequireAttrs: splitAttrList(s.epochSchemaRequireAttrs),
@@ -1189,7 +1203,7 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 		m.reconcileArchiveIndexes(ctx, ep, "epoch_history", epCat, epVal, &wg)
 		m.applyArchiveRowGroupBytes(ep, "epoch_history", s)
 		m.applySchemaRequire("epoch_history", splitAttrList(s.epochSchemaRequireAttrs), ep.SetSchemaRequireAttrs)
-		m.applyArchiveMaxBytes(ep, "epoch_history", s.epochMaxBytes)
+		m.applyArchiveMaxBytes(ep, "epoch_history", s.epochMaxBytes, scheddsync.EpochWriteDateAttr)
 		es := scheddsync.NewJobEpochSync(ep, scheddsync.HistorySyncConfig{
 			Filename:        s.epochFile,
 			PollInterval:    s.pollInterval,
