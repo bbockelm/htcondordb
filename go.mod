@@ -23,7 +23,7 @@ require (
 	github.com/PelicanPlatform/classad/dbrpc v0.39.0
 	github.com/PelicanPlatform/classad/wasmudf v0.39.0
 	github.com/apache/arrow-go/v18 v18.8.0
-	github.com/bbockelm/cedar v0.7.12
+	github.com/bbockelm/cedar v0.7.14
 	github.com/bbockelm/golang-htcondor v0.22.1
 	github.com/chzyer/readline v1.5.1
 	github.com/dustin/go-humanize v1.1.0
@@ -32,7 +32,7 @@ require (
 	github.com/hashicorp/raft-boltdb/v2 v2.4.2
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 	google.golang.org/grpc v1.85.0
 )
 

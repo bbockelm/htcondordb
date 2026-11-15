@@ -9,16 +9,16 @@ go 1.26.0
 toolchain go1.27.0
 
 require (
-	github.com/PelicanPlatform/classad v0.37.0
-	github.com/PelicanPlatform/classad/db v0.37.0
-	github.com/PelicanPlatform/classad/dbrpc v0.37.0
-	github.com/bbockelm/cedar v0.7.12
-	github.com/bbockelm/golang-htcondor v0.20.2
+	github.com/PelicanPlatform/classad v0.38.2
+	github.com/PelicanPlatform/classad/db v0.38.2
+	github.com/PelicanPlatform/classad/dbrpc v0.38.2
+	github.com/bbockelm/cedar v0.7.14
+	github.com/bbockelm/golang-htcondor v0.22.1
 	github.com/opensearch-project/opensearch-go/v4 v4.8.1
 )
 
 require (
-	github.com/PelicanPlatform/classad/collections v0.37.0 // indirect
+	github.com/PelicanPlatform/classad/collections v0.38.2 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.29.0 // indirect
 	github.com/bbockelm/gosssd v0.0.4 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
@@ -39,6 +39,6 @@ require (
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
