@@ -493,6 +493,11 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 	if err := e.applyDialect(st); err != nil {
 		return nil, err
 	}
+	// Before anything is read: a lifted subquery predicate that nothing applies would run
+	// the statement with a filter missing and answer with too many rows.
+	if err := refuseUnrunnableSubqueries(st); err != nil {
+		return nil, err
+	}
 	switch st.Kind {
 	case StmtSelect:
 		if st.IsSetOp() {
