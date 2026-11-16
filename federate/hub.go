@@ -127,6 +127,10 @@ type source struct {
 	runners           map[string]*runnerHandle
 	lastStable        *classad.ClassAd // the last written row without its volatile fields
 	lastWrite         time.Time        // when it was written (hub clock)
+	// The state and reason last reported for this source, so a change is logged once rather than
+	// every pass. loggedState is "" until the first pass, which is what makes a start name every
+	// source it knows.
+	loggedState, loggedReason string
 }
 
 type runnerHandle struct {
@@ -837,6 +841,7 @@ func (h *Hub) refreshState() {
 			statuses[t] = rh.runner.Status()
 		}
 		state, reason := h.stateOf(s, statuses, stale, staleKnown, fresh)
+		h.logSourceState(s, state, reason)
 		byState[state]++
 		sum.Total++
 		switch state {
@@ -877,6 +882,38 @@ type pendingRow struct {
 	state, reason string
 	stale         int64
 	staleKnown    bool
+}
+
+// logSourceState reports a source's state and WHY, once per change.
+//
+// The reason is computed on every pass and persisted to the source's federation_sources row, and
+// that was the only place it went: an operator reading the hub saw sources{state="absent"} = 7 and
+// had no way to learn whether those APs had left the pool, were refusing the hub, or simply had no
+// htcondordb to federate from -- three very different problems that the row distinguishes and the
+// metric does not. The row needs a read of the hub to see, which is exactly what is hard to do
+// about a hub you are already unsure of.
+//
+// Logged on change rather than per pass, so a steady federation is silent, and on the first pass
+// for every source, so a start says what it found.
+func (h *Hub) logSourceState(s *source, state, reason string) {
+	if s.loggedState == state && s.loggedReason == reason {
+		return
+	}
+	was := s.loggedState
+	s.loggedState, s.loggedReason = state, reason
+	fields := []any{"schedd", s.schedd, "state", state}
+	if was != "" {
+		fields = append(fields, "was", was)
+	}
+	if reason != "" {
+		fields = append(fields, "reason", reason)
+	}
+	// Fresh is the state nothing is wrong with; everything else is worth an operator's eye.
+	if state == StateFresh {
+		h.log.Info("federate: source state", fields...)
+		return
+	}
+	h.log.Warn("federate: source state", fields...)
 }
 
 func (h *Hub) logRetire(schedd, why string) error {
