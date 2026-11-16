@@ -1450,7 +1450,17 @@ func (e *Executor) describePlan(st *Statement) []string {
 	case aggregate:
 		out = append(out, "  path: server-side aggregate")
 	case hasWindow(st):
-		out = append(out, "  path: window function (whole ads fetched; ranking computed client-side)")
+		// The ranking is client-side, but the rows are still projected: queryAdsForClientScan
+		// asks scanAttrs for exactly the attributes the items, the PARTITION BY and the
+		// window's own ORDER BY name, so saying "whole ads" would overstate what crosses the
+		// wire by however wide the ads are.
+		if proj := e.scanAttrs(st); proj != nil {
+			out = append(out, fmt.Sprintf(
+				"  path: window function (projected row scan; ranking computed client-side); attrs=[%s]",
+				strings.Join(proj, ", ")))
+		} else {
+			out = append(out, "  path: window function (whole ads fetched; ranking computed client-side)")
+		}
 	default:
 		if proj := e.projectionAttrs(st); proj != nil {
 			transport := "old-ClassAd text projection"
@@ -1463,13 +1473,20 @@ func (e *Executor) describePlan(st *Statement) []string {
 		}
 	}
 	if st.Limit > 0 {
-		if len(st.OrderBy) == 0 && !st.Distinct && !aggregate {
+		if len(st.OrderBy) == 0 && !st.Distinct && !aggregate && !hasWindow(st) {
 			out = append(out, fmt.Sprintf("  limit: %d pushed to the server", st.Limit))
 		} else {
 			blocker := "ORDER BY"
-			if st.Distinct {
+			switch {
+			case hasWindow(st):
+				// Named first because it is the one case where pushing the limit would change
+				// the ANSWER rather than only the amount fetched: a server-side cap truncates
+				// before the ranking, so the rows returned would be a ranking of an arbitrary
+				// prefix. execSelectWindow deliberately does not push it.
+				blocker = "the window function"
+			case st.Distinct:
 				blocker = "DISTINCT"
-			} else if aggregate {
+			case aggregate:
 				blocker = "aggregation"
 			}
 			out = append(out, fmt.Sprintf("  limit: %d applied client-side (after %s; not pushed down)", st.Limit, blocker))
