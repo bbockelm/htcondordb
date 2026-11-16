@@ -190,10 +190,14 @@ SELECT h.Owner, COUNT(*) AS attempts,
   ORDER BY attempts DESC;
 ```
 
-The grouping runs **client-side** over the joined rows — the server's aggregate is
-single-table and has no notion of a composite row — and `EXPLAIN` says so. Over a single
-table an aggregate still takes a bare attribute name, since there is no second table for a
-qualified one to refer to.
+The grouping runs **in the store**, which joins and reduces in one request so that one row
+per group crosses the wire rather than one row per pair. That is ahead of any question about
+where the rows get paired: a reduction ships no copy of either side, so the link capacity the
+unreduced join is placed on does not come into it. A server that cannot reduce a join, a
+`*` beside an aggregate, a `time_bucket` group, or a session that has forced the pairing here
+all fall back to folding the joined rows in this process, and `EXPLAIN` says which ran and
+why. Over a single table an aggregate still takes a bare attribute name, since there is no
+second table for a qualified one to refer to.
 
 Each `JOIN` after the first folds in another table, up to eight in one statement; beyond
 that the statement is refused, because the join order is the order the tables are written
@@ -308,11 +312,17 @@ spelling to use instead.
 
 `EXPLAIN` names the arm. The predicate is normally sent to the store as a semi or anti join,
 where neither table's rows cross the wire. When the store cannot take it — an older server,
-`AS OF`, a read inside a transaction, or an aggregate query — the subquery's key column is
-read and inlined into the outer constraint instead, up to a cap
-(`HTCONDORDB_MAX_IN_LIST`-equivalent `MaxInListValues`, default 1000), which is about where
-the two stop being worth swapping. Past the cap the query is refused rather than quietly
-degrading to a full scan carrying a very large constraint. Both arms return the same rows.
+`AS OF`, or a read inside a transaction — the subquery's key column is read and inlined into
+the outer constraint instead, up to a cap (`HTCONDORDB_MAX_IN_LIST`-equivalent
+`MaxInListValues`, default 1000), which is about where the two stop being worth swapping.
+Past the cap the query is refused rather than quietly degrading to a full scan carrying a
+very large constraint. Both arms return the same rows.
+
+A **grouped** query goes to the store as the same semi join plus its reduction, so one row
+per group comes back and the cap never applies: the key set is not shipped at all. That needs
+every group column and aggregate argument to be a plain attribute, since the store evaluates
+them against the joined row; an expression, or a `FILTER (WHERE ...)` on an aggregate, falls
+back to the inlined constraint and the single-table aggregate, which is capped as above.
 
 ## UNION — stacking two results
 

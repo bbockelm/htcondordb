@@ -70,6 +70,29 @@ func (e *Executor) trySubqueryStoreArm(st *Statement, allowText bool) (*Result, 
 		return nil, false, nil
 	}
 	req := e.subqueryJoinRequest(st, plans)
+	// A GROUPED statement is reduced in the store rather than streamed back and folded here.
+	// It is not an optimisation of the row path but the only way this arm answers one at all:
+	// the membership arm's single-table aggregate already reduces server-side, so without
+	// this the predicate's key set would have to be inlined, and a set past the cap has no
+	// other answer than an error.
+	if statementReduces(st) {
+		cols, aggs := subqueryAggShape(st, req.Spec.Left.Alias)
+		res, ok, aerr := e.reduceInStore(st, req.Spec, cols, aggs)
+		if aerr != nil {
+			return nil, false, aerr
+		}
+		if !ok {
+			if e.explain != nil {
+				e.explain.subqueryArm = "membership (the store does not reduce a join)"
+			}
+			return nil, false, nil
+		}
+		if e.explain != nil {
+			e.explain.subqueryArm = "store-side " + chainName(plans) + ", reduced in the store"
+		}
+		st.Subqueries = nil
+		return res, true, nil
+	}
 	rows, ok, err := e.semiJoinWireRows(req)
 	if !ok && err == nil && allowText {
 		rows, ok, err = e.semiJoinTextRows(req)
@@ -152,13 +175,25 @@ func chainKeysQualifiable(plans []*subPlan) bool {
 
 // isBareAttr reports whether src is a single unqualified attribute reference, which is the
 // one shape an alias can be prefixed onto without rewriting the expression.
-func isBareAttr(src string) bool {
+func isBareAttr(src string) bool { return bareAttrOf(src) != "" }
+
+// bareAttrOf returns the attribute src names when it is nothing but an unqualified reference
+// to one, and "" otherwise.
+//
+// The name comes from the parsed reference rather than from the text, so the caller qualifies
+// what the expression MEANS and not how it was spelled. CurrentTime is excluded: it is the
+// clock rather than an attribute of any side, and prefixing an alias onto it would turn a
+// working expression into an undefined member read.
+func bareAttrOf(src string) string {
 	q, err := vm.Parse(src)
 	if err != nil {
-		return false
+		return ""
 	}
 	ref, ok := unwrapParens(q.Expr()).(*ast.AttributeReference)
-	return ok && ref.Scope == ast.NoScope
+	if !ok || ref.Scope != ast.NoScope || classad.IsCurrentTimeName(ref.Name) {
+		return ""
+	}
+	return ref.Name
 }
 
 // unsendableSubqueryWhy says why these predicates cannot go to the store, and "" when they
@@ -184,8 +219,14 @@ func (e *Executor) unsendableSubqueryWhy(st *Statement, plans []*subPlan) string
 			"attribute, which cannot be qualified against the joined row"
 	case st.AsOf != "":
 		return "AS OF reads both sides at one instant, which the join opcode cannot ask for"
-	case len(effectiveGroupBy(st)) > 0 || hasAggregate(st):
-		return "the statement aggregates, which the single-table aggregate answers server-side"
+	case st.Distinct && len(effectiveGroupBy(st)) > 0:
+		// DISTINCT over named columns is a grouping, and the membership arm's single-table
+		// aggregate answers it. The store arm would have to dedupe whole ADS, which is a
+		// different answer whenever the SELECT names fewer attributes than the row has.
+		return "DISTINCT over named columns groups them, which the single-table aggregate " +
+			"answers server-side"
+	case statementReduces(st) && e.unsendableSubqueryAggWhy(st) != "":
+		return e.unsendableSubqueryAggWhy(st)
 	case hasWindow(st):
 		return "the statement ranks rows with a window function"
 	case st.IsJoin():
@@ -208,10 +249,7 @@ func (e *Executor) unsendableSubqueryWhy(st *Statement, plans []*subPlan) string
 // Several is the chain spelling -- one step each -- which dbrpc routes to its own opcode when
 // Spec.Steps is set. Both are the same plan; db compiles the first into the second.
 func (e *Executor) subqueryJoinRequest(st *Statement, plans []*subPlan) dbrpc.JoinRequest {
-	outerAlias := st.Table
-	if len(st.From) > 0 {
-		outerAlias = st.From[0].Alias
-	}
+	outerAlias := outerAliasOf(st)
 	outerWhere := st.Where
 	for _, sp := range plans {
 		outerWhere = andText(outerWhere, sp.outerWhere)
@@ -254,10 +292,85 @@ func (e *Executor) subqueryJoinRequest(st *Statement, plans []*subPlan) dbrpc.Jo
 		}
 	}
 	// The LIMIT only pushes down when nothing here reorders or removes rows afterwards.
-	if st.Limit > 0 && len(st.OrderBy) == 0 && !st.Distinct {
+	// Grouping is one of those: a limit on a reduction truncates its INPUT, which is a
+	// different answer rather than a shorter one (see db.JoinAggSpec.Join).
+	if st.Limit > 0 && len(st.OrderBy) == 0 && !st.Distinct && !statementReduces(st) {
 		req.Spec.Limit = st.Limit
 	}
 	return req
+}
+
+// unsendableSubqueryAggWhy says why this statement's grouping cannot ride the semi join, and
+// "" when it can.
+//
+// Everything the reduction evaluates is an expression over the COMPOSITE row, where the outer
+// table sits under its alias -- so a group column or an aggregate argument has to be written
+// against that row rather than against the table. Prefixing an alias is sound for a bare
+// attribute name and for nothing else: any other expression would need every reference inside
+// it rewritten, which is work the membership arm does not need at all. The same rule, and the
+// same reason, as chainKeysQualifiable.
+func (e *Executor) unsendableSubqueryAggWhy(st *Statement) string {
+	if why := unsendableJoinAggWhy(e, st); why != "" {
+		return why
+	}
+	if e.projectionAttrs(st) != nil {
+		// An aggregate statement has no column projection -- projectionAttrs declines the
+		// moment an item is one -- and the reduction relies on that: the attributes it reads
+		// are the group columns and the aggregate arguments, which nothing here scans into a
+		// projection. A side narrowed to the SELECT's columns would reduce over rows missing
+		// what the aggregates read, and answer successfully and wrongly.
+		return "the outer side carries a column projection, which the reduction does not scan"
+	}
+	for _, it := range st.Items {
+		if !it.GroupLevel() && bareAttrOf(groupSourceOf(it)) == "" {
+			return "a selected column groups by an expression rather than an attribute, " +
+				"which cannot be qualified against the joined row"
+		}
+	}
+	for _, a := range aggCallOrder(st) {
+		if a.Filter != "" {
+			return "a conditional aggregate's FILTER reads the row as an expression, which " +
+				"cannot be qualified against the joined row"
+		}
+		if a.Arg != "*" && a.Arg != "" && bareAttrOf(a.Arg) == "" {
+			return "an aggregate reads an expression rather than an attribute, which cannot " +
+				"be qualified against the joined row"
+		}
+	}
+	return ""
+}
+
+// subqueryAggShape renders the statement's grouping against the joined row: every group column
+// and aggregate argument qualified with the outer table's alias, since that is the member the
+// semi join's row carries.
+//
+// It must be called only where unsendableSubqueryAggWhy returned "", which is what makes every
+// qualification below a bare name rather than a guess.
+func subqueryAggShape(st *Statement, alias string) ([]db.GroupCol, []db.AggSpec) {
+	var cols []db.GroupCol
+	for _, it := range st.Items {
+		if it.GroupLevel() {
+			continue
+		}
+		cols = append(cols, db.GroupCol{Attr: alias + "." + bareAttrOf(groupSourceOf(it))})
+	}
+	aggs := aggSpecsFor(st)
+	for i := range aggs {
+		if aggs[i].Arg == "*" || aggs[i].Arg == "" {
+			continue // COUNT(*) counts rows and reads no attribute
+		}
+		aggs[i].Arg = alias + "." + bareAttrOf(aggs[i].Arg)
+	}
+	return cols, aggs
+}
+
+// outerAliasOf is the name the outer table's member carries in the joined row: the FROM
+// clause's alias where there is one, and the table's own name otherwise.
+func outerAliasOf(st *Statement) string {
+	if len(st.From) > 0 {
+		return st.From[0].Alias
+	}
+	return st.Table
 }
 
 // serverSubqueryKind is the join one predicate becomes.
@@ -420,6 +533,12 @@ func (e *Executor) subqueryPlanLines(st *Statement) (lines []string, whole bool)
 		out = append(out, fmt.Sprintf("  path: store-side %s (neither side's rows cross the "+
 			"wire; a semi join never expands, so no link capacity makes pairing here "+
 			"cheaper)", chainName(plans)))
+		if statementReduces(st) {
+			cols, aggs := subqueryAggShape(st, outerAliasOf(st))
+			out = append(out, fmt.Sprintf("  grouping: in the store, one row per group "+
+				"(%d group column(s), %d aggregate(s)); the joined rows never cross the wire",
+				len(cols), len(aggs)))
+		}
 		if proj := e.projectionAttrs(st); proj != nil {
 			out = append(out, "  attrs: ["+strings.Join(proj, ", ")+"]")
 		}

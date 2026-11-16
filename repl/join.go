@@ -1112,6 +1112,20 @@ func (e *Executor) execJoin(st *Statement) (*Result, error) {
 	e.rowCounts = map[string]int{}
 	defer func() { e.rowCounts = nil }()
 
+	// A GROUPED join is reduced in the store when it can be sent there, ahead of any
+	// question about where the rows get paired: the reduction answers both at once, and its
+	// reply is one row per group rather than one per pair. See joinagg.go for why that
+	// decision needs no arithmetic.
+	if hasAggregate(st) || len(st.GroupBy) > 0 {
+		if e.placeJoinAgg(st, p).store {
+			if res, ok, aerr := e.joinAggregateServerSide(st, joinSpecOf(p)); aerr != nil {
+				return nil, aerr
+			} else if ok {
+				return res, nil
+			}
+		}
+	}
+
 	// Ask the store to join, when that is the cheaper arm (see joinplace.go: it turns on how
 	// much the join expands and how fast the link is). Only the joined rows then cross the
 	// wire, where joining here ships both sides whole first. Everything after the pairing is
@@ -1369,9 +1383,9 @@ func allTrue(exprs []*classad.Expr, row *classad.ClassAd) bool {
 // composite ads either way -- which is what makes the server-side join a change of where the
 // pairing happens and not a second implementation of the statement.
 func (e *Executor) finishJoin(st *Statement, p *joinPlan, rows []*classad.ClassAd) (*Result, error) {
-	// Aggregation happens over the joined rows, which only exist here -- the server's
-	// aggregate is single-table and has no notion of a composite row. So a grouped join is
-	// reduced client-side, and EXPLAIN says so.
+	// Reaching here with an aggregate means the store did not reduce it -- an older server,
+	// a shape unsendableJoinAggWhy declined, or a session that forced the pairing here. The
+	// joined rows are in hand, so they are folded here, and EXPLAIN says which it was.
 	if hasAggregate(st) || len(st.GroupBy) > 0 {
 		return e.aggregateJoinRows(st, rows)
 	}
@@ -1819,10 +1833,12 @@ func (e *Executor) describeJoinPlan(st *Statement) []string {
 		}
 	}
 	out = append(out, fmt.Sprintf("after the last join: %d post-filter term(s)", len(p.post)))
-	if hasAggregate(st) || len(st.GroupBy) > 0 {
-		out = append(out, fmt.Sprintf("  grouping: client-side over the joined rows "+
-			"(%d group term(s), %d aggregate(s)); the server aggregate is single-table",
-			len(st.GroupBy), len(aggCallOrder(st))))
+	if statementReduces(st) {
+		lines, reduced := e.joinAggPlanLines(st, p)
+		out = append(out, lines...)
+		if reduced {
+			return out // the reduction answers the whole statement; see joinAggPlanLines
+		}
 	}
 	// Which arm will run, and on what arithmetic. The decision is re-taken here rather than
 	// described, so EXPLAIN reports what the statement would actually do: an arm that was
@@ -1993,6 +2009,29 @@ func joinExprRefs(src string) []string {
 	return out
 }
 
+// joinSpecOf renders the plan as the spec the join opcodes carry: each side's pushed-down
+// constraint and projection, the residual condition and filter as ClassAd expression text, and
+// the equality halves that drive the hash.
+//
+// It carries no Limit. A limit means something different to each caller -- it truncates the
+// rows for a row-streaming join and the reduction's INPUT for a grouped one -- so each decides
+// for itself whether this statement's limit may be pushed at all.
+func joinSpecOf(p *joinPlan) db.JoinSpec {
+	left, right, step := p.sides[0], p.sides[1], &p.steps[0]
+	spec := db.JoinSpec{
+		Kind:  serverJoinKind(step.kind),
+		Left:  db.JoinSide{Table: left.ref.Table, Alias: left.ref.Alias, Constraint: left.where, Project: left.project},
+		Right: db.JoinSide{Table: right.ref.Table, Alias: right.ref.Alias, Constraint: right.where, Project: right.project},
+		Cond:  step.condSrc,
+		Post:  p.postSrc,
+		Band:  step.bandSrc,
+	}
+	for _, eq := range step.equiSrc {
+		spec.Equi = append(spec.Equi, db.JoinEqui{Left: eq.accStripped, Right: eq.side})
+	}
+	return spec
+}
+
 // joinServerSide asks the store to do the pairing, returning the joined rows.
 //
 // ok is false when the join has to happen here instead, which is not a failure: an older
@@ -2004,18 +2043,7 @@ func joinExprRefs(src string) []string {
 // equality halves that drive the hash -- so the server executes a decision this package
 // made rather than making its own.
 func (e *Executor) joinServerSide(st *Statement, p *joinPlan) ([]*classad.ClassAd, bool, error) {
-	left, right, step := p.sides[0], p.sides[1], &p.steps[0]
-	req := dbrpc.JoinRequest{Spec: db.JoinSpec{
-		Kind:  serverJoinKind(step.kind),
-		Left:  db.JoinSide{Table: left.ref.Table, Alias: left.ref.Alias, Constraint: left.where, Project: left.project},
-		Right: db.JoinSide{Table: right.ref.Table, Alias: right.ref.Alias, Constraint: right.where, Project: right.project},
-		Cond:  step.condSrc,
-		Post:  p.postSrc,
-		Band:  step.bandSrc,
-	}}
-	for _, eq := range step.equiSrc {
-		req.Spec.Equi = append(req.Spec.Equi, db.JoinEqui{Left: eq.accStripped, Right: eq.side})
-	}
+	req := dbrpc.JoinRequest{Spec: joinSpecOf(p)}
 	// The LIMIT only pushes down when nothing here reorders or removes rows afterwards.
 	// Sorting, DISTINCT and grouping all decide WHICH rows the limit keeps, so a limit
 	// applied before them would keep the wrong ones.
