@@ -10,24 +10,74 @@ import (
 	"github.com/bbockelm/golang-htcondor/logging"
 )
 
-func TestCountCatalogEntries(t *testing.T) {
+func TestScanCatalogEntries(t *testing.T) {
 	dir := t.TempDir()
 	for _, d := range []string{"tables/jobs", "tables/ads", "tables/federation_sources", "archives/history"} {
 		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// A stray file is not a table; only directories count.
-	if err := os.WriteFile(filepath.Join(dir, "tables", "NOTES"), []byte("x"), 0o600); err != nil {
+	// Segment files, including one in a shard subdirectory: the walk has to reach it, because an
+	// archive's segments live under its shards and that is the whole size signal.
+	if err := os.MkdirAll(filepath.Join(dir, "archives", "history", "d0"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if tables, archives := countCatalogEntries(dir); tables != 3 || archives != 1 {
-		t.Fatalf("countCatalogEntries = %d tables, %d archives; want 3, 1", tables, archives)
+	for _, f := range []string{"archives/history/seg-1.dat", "archives/history/d0/seg-2.dat", "tables/jobs/seg-1.dat"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A stray file is not a table, and a non-.dat file is not a segment.
+	for _, f := range []string{"tables/NOTES", "archives/history/archiveconfig.json"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := scanCatalogEntries(dir)
+	segs := map[string]int{}
+	for _, e := range got {
+		segs[e.label()] = e.segs
+	}
+	if len(got) != 4 {
+		t.Fatalf("scanCatalogEntries returned %d entries (%v), want 4", len(got), segs)
+	}
+	if n := segs["archive history"]; n != 2 {
+		t.Errorf("archive history = %d segments, want 2 (one of them under a shard directory)", n)
+	}
+	if n := segs["table jobs"]; n != 1 {
+		t.Errorf("table jobs = %d segments, want 1", n)
+	}
+	if n, ok := segs["table ads"]; !ok || n != 0 {
+		t.Errorf("table ads = %d segments (present=%v), want 0 and present", n, ok)
 	}
 
 	// A catalog that does not exist yet is a new database, not an error.
-	if tables, archives := countCatalogEntries(filepath.Join(dir, "nope")); tables != 0 || archives != 0 {
-		t.Errorf("missing catalog = %d, %d; want 0, 0", tables, archives)
+	if got := scanCatalogEntries(filepath.Join(dir, "nope")); len(got) != 0 {
+		t.Errorf("missing catalog returned %d entries, want 0", len(got))
+	}
+}
+
+// TestEstimateOpenScalesWithSegments: the estimate is the segment count over the rate, so an
+// operator reading it can check it against the counts and the rate printed beside it.
+func TestEstimateOpenScalesWithSegments(t *testing.T) {
+	if got := estimateOpen(0, seedSegmentsPerSecond); got != 0 {
+		t.Errorf("estimateOpen(0) = %v, want 0", got)
+	}
+	if got, want := estimateOpen(600, 10), time.Minute; got != want {
+		t.Errorf("estimateOpen(600 segs, 10/s) = %v, want %v", got, want)
+	}
+	if estimateOpen(7007, 10) <= estimateOpen(5278, 10) {
+		t.Error("a larger archive must not estimate shorter")
+	}
+	// The whole point of measuring the rate: the same work on a machine twice as fast must
+	// estimate half as long, rather than reporting the seeded figure whatever the machine does.
+	if got, want := estimateOpen(600, 20), 30*time.Second; got != want {
+		t.Errorf("estimateOpen(600 segs, 20/s) = %v, want %v", got, want)
+	}
+	// A rate nothing has established yet cannot produce a number; it must not produce a
+	// divide-by-zero one either.
+	if got := estimateOpen(600, 0); got != 0 {
+		t.Errorf("estimateOpen with no rate = %v, want 0", got)
 	}
 }
 

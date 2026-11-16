@@ -19,8 +19,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
-	"net/http/pprof"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -289,6 +287,19 @@ func run() error {
 	// below never runs; stopping twice is harmless.
 	boot.startProgress(dbDir)
 	defer boot.stopProgress()
+	// Let the heartbeat see inside a single table's open. Every other signal this daemon has
+	// about the catalog open fires when a table FINISHES, so the one archive that takes eleven
+	// minutes is the one that reports nothing for eleven minutes. This hook is the storage
+	// layer's in-flight report -- phase, and segments done out of that phase's total -- which is
+	// both what the beat counts down and what the throughput estimate is measured from. Set once,
+	// before the open, as the hook's contract requires; the timer drops reports that arrive after
+	// the start is over.
+	collections.OpenProgressHook = boot.onOpenProgress
+
+	// Bound before the open, not after it: see obsserver.go. pprof and /startupz answer for the
+	// whole of the open; /metrics joins them once there is a catalog to read.
+	obs := startObservability(cfg, log, boot.statusLine)
+	defer obs.Close()
 
 	svc, err := server.New(server.Config{
 		OnPhase:               boot.record,
@@ -611,34 +622,7 @@ func run() error {
 		defer stopFlight()
 	}
 
-	if addr := getStr(cfg, "HTCONDORDB_METRICS_ADDRESS"); addr != "" {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", metrics.Handler(ctx, svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, fedMgr.Metrics()))
-		// pprof (opt-in via HTCONDORDB_ENABLE_PPROF): profiling endpoints on the same
-		// trusted listener, so a memory/CPU anomaly in a live daemon is one
-		// `go tool pprof http://.../debug/pprof/heap` away instead of a blind restart.
-		// Off by default: profiles expose internals (symbol names, allocation sites)
-		// beyond the storage-size counters /metrics carries.
-		if configBool(cfg, "HTCONDORDB_ENABLE_PPROF") {
-			mux.HandleFunc("/debug/pprof/", pprof.Index)
-			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-			log.Info(logging.DestinationGeneral, "pprof profiling endpoints enabled (HTCONDORDB_ENABLE_PPROF)")
-		}
-		metricsSrv := &http.Server{Addr: addr, Handler: mux}
-		go func() {
-			<-ctx.Done()
-			_ = metricsSrv.Close()
-		}()
-		go func() {
-			log.Info(logging.DestinationGeneral, "serving Prometheus metrics", "address", addr)
-			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Error(logging.DestinationGeneral, "metrics endpoint failed", "err", err.Error())
-			}
-		}()
-	}
+	obs.SetMetrics(metrics.Handler(ctx, svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, fedMgr.Metrics()))
 
 	// Everything a client finds this daemon through is published HERE, with every manager
 	// started and the accept loop next: the address file, and the ClassAd the collector hands
