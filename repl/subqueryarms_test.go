@@ -95,7 +95,26 @@ var subqueryArmQueries = []string{
 // whole answer rather than one column of it.
 func subqueryRowsOf(t *testing.T, e *Executor, query string) []string {
 	t.Helper()
-	r, err := e.ExecString(query)
+	rows, _ := subqueryRowsAndArm(t, e, query)
+	return rows
+}
+
+// subqueryRowsAndArm also reports which arm ANSWERED the query.
+//
+// Which arm ran is read from the execution trace rather than from the ops the server logged,
+// because a join the server REFUSED is logged exactly like one it served -- and a refused
+// join falls back to the membership arm, which is how the first version of
+// TestSubqueryArmsAgree came to pass while comparing that arm with itself.
+func subqueryRowsAndArm(t *testing.T, e *Executor, query string) ([]string, string) {
+	t.Helper()
+	st, err := Parse(query)
+	if err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	tr := &explainTrace{}
+	e.explain = tr
+	defer func() { e.explain = nil }()
+	r, err := e.Exec(st)
 	if err != nil {
 		t.Fatalf("%s: %v", query, err)
 	}
@@ -103,7 +122,7 @@ func subqueryRowsOf(t *testing.T, e *Executor, query string) []string {
 	for _, row := range r.Rows {
 		out = append(out, strings.Join(row, "\x1f"))
 	}
-	return out
+	return out, tr.subqueryArm
 }
 
 func TestSubqueryArmsAgree(t *testing.T) {
@@ -113,10 +132,14 @@ func TestSubqueryArmsAgree(t *testing.T) {
 	for _, q := range subqueryArmQueries {
 		t.Run(q, func(t *testing.T) {
 			storeOps.reset()
-			got, want := subqueryRowsOf(t, store, q), subqueryRowsOf(t, member, q)
+			got, storeArm := subqueryRowsAndArm(t, store, q)
+			want, memberArm := subqueryRowsAndArm(t, member, q)
 			// The agreement is worth nothing if both runs took the same arm.
-			if !sawAnyJoinOp(storeOps) {
-				t.Fatalf("the store arm was not taken; ops were %v", storeOps.all())
+			if !strings.HasPrefix(storeArm, "store-side") {
+				t.Fatalf("the store arm was not taken: %q (ops %v)", storeArm, storeOps.all())
+			}
+			if !strings.HasPrefix(memberArm, "membership") {
+				t.Fatalf("the membership arm was not taken: %q", memberArm)
 			}
 			// ORDER BY fixes the order; without one neither arm promises any.
 			if !strings.Contains(strings.ToUpper(q), "ORDER BY") {
@@ -128,16 +151,6 @@ func TestSubqueryArmsAgree(t *testing.T) {
 			}
 		})
 	}
-}
-
-// sawAnyJoinOp reports whether the server was asked to run a join at all.
-func sawAnyJoinOp(ops *opRecorder) bool {
-	for _, op := range ops.all() {
-		if strings.Contains(strings.ToLower(op), "join") {
-			return true
-		}
-	}
-	return false
 }
 
 // The shapes the store arm declines are declined for a stated reason, and the membership arm
@@ -176,21 +189,21 @@ func TestSubqueryStoreArmDeclinesWithAReason(t *testing.T) {
 	}
 }
 
-// AN UNDEFINED CORRELATION KEY IS IN NEITHER HALF, and that is worth pinning because it is
-// the one answer a reader will not predict: EXISTS and NOT EXISTS do NOT partition the table.
+// EXISTS AND NOT EXISTS PARTITION THE TABLE, including the rows whose own correlation key is
+// undefined, and that is worth pinning because getting it wrong is invisible.
 //
-// A ClassAd equality against undefined does not hold, so a row whose own key is undefined
-// matches nothing -- which drops it from EXISTS, as expected -- and the membership constraint
-// `!member(undefined, {...})` is itself undefined, so it drops the row from NOT EXISTS too.
-// The two arms reach it by different routes and agree.
-//
-// The practical consequence: `NOT EXISTS` is "has a key, and nothing matches it", not "does
-// not appear". A job with no ClusterId is not reported as a job that never ran.
-func TestAnUndefinedCorrelationKeyIsInNeitherHalf(t *testing.T) {
+// A row with no key matches nothing, so NOT EXISTS keeps it: "nothing matched" is true of it.
+// The membership arm reaches that by testing the membership against true rather than negating
+// it -- `!member(undefined, {...})` is undefined, and an undefined constraint keeps no row, so
+// the obvious spelling would silently drop exactly the rows a NOT EXISTS is usually asked
+// about. The store's anti join keeps them. This test is what holds the two together; its
+// first version asserted the opposite, because at the time the store arm was never taken and
+// both runs were the arm with the bug.
+func TestExistsAndNotExistsPartitionTheTable(t *testing.T) {
 	store, member, _, cleanup := newSubqueryPair(t)
 	defer cleanup()
 
-	// Job 5 has no ClusterId; jobs 1-3 have epochs, 4 and 6 do not.
+	// Job 5 has no ClusterId (shown as -1); jobs 1-3 have epochs, 4 and 6 do not.
 	const col = `SELECT ifThenElse(ClusterId is undefined, -1, ClusterId) FROM jobs `
 	for _, e := range []*Executor{store, member} {
 		yes := subqueryRowsOf(t, e, col+`WHERE EXISTS (SELECT 1 FROM epochs x WHERE x.ClusterId == jobs.ClusterId)`)
@@ -200,23 +213,25 @@ func TestAnUndefinedCorrelationKeyIsInNeitherHalf(t *testing.T) {
 		if strings.Join(yes, ",") != "1,2,3" {
 			t.Errorf("EXISTS = %v, want [1 2 3]", yes)
 		}
-		if strings.Join(no, ",") != "4,6" {
-			t.Errorf("NOT EXISTS = %v, want [4 6] -- the keyless job must be in neither half", no)
+		if strings.Join(no, ",") != "-1,4,6" {
+			t.Errorf("NOT EXISTS = %v, want [-1 4 6] -- the keyless job matched nothing, "+
+				"so nothing is what it matched", no)
 		}
-		// Six jobs, and the two halves account for five of them.
-		if len(yes)+len(no) != 5 {
-			t.Errorf("the halves cover %d of 6 rows; the keyless one should be in neither",
+		if len(yes)+len(no) != 6 {
+			t.Errorf("the halves cover %d of 6 rows; they must partition the table",
 				len(yes)+len(no))
 		}
 	}
 
-	// On the INNER side an undefined key simply contributes nothing to the set, so
-	// `NOT IN` keeps the rows that are not in what remains -- where SQL's three-valued
-	// logic would return no rows at all because the set contains a NULL.
+	// On the INNER side an undefined contributes nothing to the set, so `NOT IN` keeps the
+	// rows that are not in what remains -- where SQL's three-valued logic would return no
+	// rows at all, because the set contains a NULL. Job 6 has no Owner and is kept for the
+	// outer-side reason above; job 4 is carol, who is not a user.
 	for _, e := range []*Executor{store, member} {
 		got := subqueryRowsOf(t, e, col+`WHERE Owner NOT IN (SELECT Owner FROM users)`)
-		if strings.Join(got, ",") != "4" {
-			t.Errorf("NOT IN over a set containing an undefined = %v, want [4]", got)
+		sort.Strings(got)
+		if strings.Join(got, ",") != "4,6" {
+			t.Errorf("NOT IN over a set containing an undefined = %v, want [4 6]", got)
 		}
 	}
 }

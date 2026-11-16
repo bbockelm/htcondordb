@@ -1355,6 +1355,9 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 				lines = append(lines, "  "+l)
 			}
 		}
+		if tr.subqueryArm != "" {
+			lines = append(lines, "subquery arm taken: "+tr.subqueryArm)
+		}
 		// The store-side counterpart of the key-batching block above: the same decision,
 		// taken where no EXPLAIN here can watch it. The two never both appear, because a
 		// join either ran in the store or ran through the pipeline.
@@ -1451,6 +1454,13 @@ func (e *Executor) describePlan(st *Statement) []string {
 	out := []string{fmt.Sprintf("SELECT on %s %q", kind, st.Table)}
 	if st.Where != "" {
 		out = append(out, "  filter: "+st.Where)
+	}
+	// A statement the store arm will take does not run the single-table read path at all,
+	// so it is described as the join it becomes rather than as a scan with extra lines.
+	if lines, whole := e.subqueryPlanLines(st); whole {
+		return append(out, lines...)
+	} else {
+		out = append(out, lines...)
 	}
 	groupBy := effectiveGroupBy(st)
 	aggregate := len(groupBy) > 0 || hasAggregate(st)

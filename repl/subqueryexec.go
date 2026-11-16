@@ -312,11 +312,29 @@ func (e *Executor) subqueryTerm(sp *subPlan) (string, error) {
 		}
 		return "false", nil
 	}
-	term := fmt.Sprintf("member(%s, {%s})", sp.outerKey, strings.Join(lits, ", "))
-	if sp.sub.Kind.negated() {
-		term = "!" + term
+	member := fmt.Sprintf("member(%s, {%s})", sp.outerKey, strings.Join(lits, ", "))
+	if !sp.sub.Kind.negated() {
+		// `member` is already exactly the semi join's rule -- true when the key is in the
+		// set, undefined when the key is undefined, and an undefined constraint keeps no
+		// row. Left bare so the store still folds it to one "in" index probe.
+		return member, nil
 	}
-	return term, nil
+	// THE NEGATED FORM IS NOT `!member(...)`, and the difference is the whole row.
+	//
+	// An anti join keeps a left row when NO right row matched it, and a row whose own key
+	// is undefined matched nothing -- so it is kept. `!member(undefined, {...})` is
+	// `!undefined`, which is undefined, and an undefined constraint keeps no row: the two
+	// arms would disagree about exactly the rows a NOT EXISTS is usually asked about.
+	//
+	// Testing the membership against true rather than negating it says "the membership is
+	// not definitely true", which is what "nothing matched" means, and gives the same answer
+	// for a key that is undefined, an error, or a value with no literal at all. Nothing is
+	// lost by it: a negated membership is not an index probe either way.
+	//
+	// It also means EXISTS and NOT EXISTS PARTITION the table, which is what a reader of
+	// "jobs that never ran" expects, and what SQL says: NOT EXISTS is true when the
+	// subquery returns no rows, whatever is or is not null in them.
+	return "!(" + member + " =?= true)", nil
 }
 
 // uncorrelatedTerm answers a predicate that does not depend on the outer row at all. It is a

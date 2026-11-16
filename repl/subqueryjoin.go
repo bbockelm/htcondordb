@@ -59,7 +59,10 @@ func (e *Executor) trySubqueryStoreArm(st *Statement) (*Result, bool, error) {
 		return nil, false, nil
 	}
 	req := e.subqueryJoinRequest(st, plans[0])
-	rows, ok, err := e.semiJoinWireRows(req, st)
+	rows, ok, err := e.semiJoinWireRows(req)
+	if !ok && err == nil {
+		rows, ok, err = e.semiJoinTextRows(req)
+	}
 	if err != nil {
 		return nil, false, err
 	}
@@ -174,7 +177,7 @@ func (e *Executor) subqueryJoinRequest(st *Statement, sp *subPlan) dbrpc.JoinReq
 //
 // ok is false with a nil error when the store declined the request before sending anything,
 // which is the signal to answer the predicate the other way.
-func (e *Executor) semiJoinWireRows(req dbrpc.JoinRequest, st *Statement) ([]*classad.ClassAd, bool, error) {
+func (e *Executor) semiJoinWireRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool, error) {
 	alias := req.Spec.Left.Alias
 	var rows []*classad.ClassAd
 	var rowErr error
@@ -209,6 +212,56 @@ func (e *Executor) semiJoinWireRows(req dbrpc.JoinRequest, st *Statement) ([]*cl
 	return rows, true, nil
 }
 
+// semiJoinTextRows is the reply form for a store that cannot produce wire rows for this
+// request: one rendered old-ClassAd row per frame, parsed here.
+//
+// IT IS NOT A RARE PATH, and that is worth saying where someone will read it. db.JoinWire
+// refuses a REDACTED wire-form join unless every side carries a projection, and a semi or
+// anti join's tested side must carry none -- db refuses a spec that projects from a side
+// contributing no member. A connection is redacted unless it is privileged, which for the
+// daemon means DAEMON level, so every ordinary user's semi join lands here. The two
+// requirements are each sound on their own and contradict only together; removing the
+// contradiction is a change to db.JoinWire, which has nothing to withhold from a side that
+// contributes no member.
+func (e *Executor) semiJoinTextRows(req dbrpc.JoinRequest) ([]*classad.ClassAd, bool, error) {
+	alias := req.Spec.Left.Alias
+	var rows []*classad.ClassAd
+	var rowErr error
+	err := e.c.JoinStats(e.opCtx(), req, func(row string) bool {
+		ad, perr := classad.Parse(row)
+		if perr != nil {
+			rowErr = fmt.Errorf("joined row did not parse: %w", perr)
+			return false
+		}
+		side, serr := unwrapSemiAd(ad, alias)
+		if serr != nil {
+			rowErr = serr
+			return false
+		}
+		rows = append(rows, side)
+		return true
+	}, e.joinStatsReport())
+	switch {
+	case errors.Is(err, dbrpc.ErrJoinUnsupported):
+		return nil, false, nil
+	case rowErr != nil:
+		return nil, false, rowErr
+	case err != nil:
+		return nil, false, err
+	}
+	return rows, true, nil
+}
+
+// unwrapSemiAd is unwrapSemiRow for a row that arrived as a parsed ad rather than as wire
+// bytes. Same rule: the composite carries exactly one member, and that member is the row.
+func unwrapSemiAd(row *classad.ClassAd, alias string) (*classad.ClassAd, error) {
+	if inner, verr := row.EvaluateAttr(alias).ClassAdValue(); verr == nil {
+		return inner, nil
+	}
+	return nil, fmt.Errorf("the joined row carries no %q member; a semi join's row should "+
+		"carry exactly the side it kept", alias)
+}
+
 // unwrapSemiRow takes the one side a semi or anti join's row carries out of the composite.
 //
 // The row is `[ <alias> = [ ... ] ]`: the tested side contributes no member, so there is
@@ -229,4 +282,56 @@ func unwrapSemiRow(row *ast.ClassAd, alias string) (*ast.ClassAd, error) {
 	}
 	return nil, fmt.Errorf("the joined row carries no %q member; a semi join's row should "+
 		"carry exactly the side it kept", alias)
+}
+
+// subqueryPlanLines reports, for EXPLAIN, what each subquery predicate will do and which arm
+// will do it.
+//
+// It is reported because the two arms have wildly different costs and the reader's only other
+// signal is the clock: the store arm sends the predicate and neither side's rows cross the
+// wire, while the membership arm reads the subquery's key column here and inlines it. An arm
+// that was not taken for a reason also reads exactly like an arm that was never available,
+// unless the reason is printed.
+//
+// It plans without running, so it says which arm WILL run. EXPLAIN ANALYZE additionally
+// reports the arm that did, from the trace.
+// whole is true when the lines describe the WHOLE read -- the store arm replaces the
+// single-table scan rather than adding to it, so the caller must not go on to describe a scan
+// that will not happen.
+func (e *Executor) subqueryPlanLines(st *Statement) (lines []string, whole bool) {
+	if len(st.Subqueries) == 0 {
+		return nil, false
+	}
+	plans, err := planSubqueries(st)
+	if err != nil {
+		return []string{"  subquery: " + err.Error()}, false
+	}
+	why := e.unsendableSubqueryWhy(st, plans)
+	out := make([]string, 0, len(plans)+1)
+	for _, sp := range plans {
+		switch {
+		case !sp.correlated():
+			out = append(out, fmt.Sprintf("  subquery: %s over %q is uncorrelated; one row "+
+				"of it settles the predicate for every row", sp.sub.Kind, sp.innerTable))
+		default:
+			out = append(out, fmt.Sprintf("  subquery: %s over %q on %s == %s",
+				sp.sub.Kind, sp.innerTable, sp.outerKey, sp.innerKey))
+		}
+		if sp.innerWhere != "" {
+			out = append(out, "    subquery filter: "+sp.innerWhere)
+		}
+	}
+	if why == "" {
+		out = append(out, fmt.Sprintf("  path: store-side %s against %q (neither side's rows "+
+			"cross the wire; a semi join never expands, so no link capacity makes pairing "+
+			"here cheaper)", joinKindName(plans[0]), plans[0].innerTable))
+		if proj := e.projectionAttrs(st); proj != nil {
+			out = append(out, "  attrs: ["+strings.Join(proj, ", ")+"]")
+		}
+		return out, true
+	}
+	out = append(out, fmt.Sprintf("    arm: membership constraint, because %s", why),
+		fmt.Sprintf("    (the subquery's key column is read here and inlined, up to %d "+
+			"distinct values)", e.maxInListValues()))
+	return out, false
 }

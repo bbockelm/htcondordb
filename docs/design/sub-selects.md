@@ -85,19 +85,27 @@ The two arms must agree, and neither can produce SQL's answer: `literalOf` has n
 undefined, so such an inner row contributes nothing to the key set; on the join arm a ClassAd
 equality against undefined does not hold, so such a row matches nothing.
 
-Two consequences, both measured and pinned by
-`TestAnUndefinedCorrelationKeyIsInNeitherHalf`:
+Two consequences, both pinned by `TestExistsAndNotExistsPartitionTheTable`:
 
 - **On the inner side**, an undefined value contributes nothing to the set, so `NOT IN` keeps
   the rows that are not in what remains — where SQL would return no rows at all, because the
   set contains a NULL.
-- **On the outer side**, a row whose own correlation key is undefined matches nothing, which
-  drops it from `EXISTS` as expected *and* from `NOT EXISTS`, where the membership constraint
-  `!member(undefined, {...})` is itself undefined. **`EXISTS` and `NOT EXISTS` therefore do
-  not partition the table.** `NOT EXISTS` reads as "has a key, and nothing matches it", not
-  "does not appear" — a job with no `ClusterId` is not reported as a job that never ran. The
-  two arms reach this by different routes and agree, which is the only reason it can be
-  stated as a rule rather than as an artifact of one implementation.
+- **On the outer side**, a row whose own correlation key is undefined matches nothing, so
+  `EXISTS` drops it and `NOT EXISTS` keeps it. **The two partition the table**, and a job with
+  no `ClusterId` *is* reported as a job that never ran.
+
+The second one is where the arms had to be made to agree rather than found to agree. The
+store's anti join keeps a row that matched nothing, as it should; the obvious membership
+spelling `!member(k, {...})` does not, because `!undefined` is undefined and an undefined
+constraint keeps no row — so it silently dropped exactly the rows a `NOT EXISTS` is usually
+asked about. The membership arm therefore tests `!(member(k, {...}) =?= true)`, which says
+"the membership is not definitely true" and gives the same answer for a key that is
+undefined, an error, or a value with no literal. Nothing is lost: a negated membership is not
+an index probe either way.
+
+**This was found by the differential test, and only after the store arm was made to actually
+run** — its first version passed while both arms were the membership arm, and the semantics
+originally written into this document were the buggy arm's.
 
 **Duplicates do not multiply.** A semi join emits each outer row once however many inner rows
 match. This is the property that makes the construct safe: no statement can grow its own

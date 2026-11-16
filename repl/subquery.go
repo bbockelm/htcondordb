@@ -446,10 +446,13 @@ func walkStatements(st *Statement, visit func(*Statement) error) error {
 	if err := visit(st); err != nil {
 		return err
 	}
-	for _, next := range []*Statement{st.Inner, st.ViewSelect} {
-		if err := walkStatements(next, visit); err != nil {
-			return err
-		}
+	// NOT st.Inner, which is EXPLAIN's wrapped statement. Resolving a predicate is running
+	// the subquery, and EXPLAIN must describe the plan BEFORE anything is answered -- a
+	// predicate resolved first would leave EXPLAIN reporting the membership arm's constraint
+	// for a statement the store arm was about to run. EXPLAIN ANALYZE reaches the inner
+	// statement through Exec, which resolves it there.
+	if err := walkStatements(st.ViewSelect, visit); err != nil {
+		return err
 	}
 	for i := range st.SetBranches {
 		if err := walkStatements(st.SetBranches[i].Stmt, visit); err != nil {

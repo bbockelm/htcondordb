@@ -42,14 +42,11 @@
 // e.GlobalJobId == jobs.GlobalJobId)`. Inside the subquery a bare attribute name is the
 // SUBQUERY's; a reference to the outer row is qualified.
 //
-// UNDEFINED FOLLOWS CLASSAD, not SQL's three-valued logic, and the consequence is worth
-// knowing before writing one: a ClassAd equality against undefined does not hold, so a row
-// whose own correlation key is undefined matches nothing and is dropped by EXISTS AND by NOT
-// EXISTS alike. The two do not partition the table. NOT EXISTS reads as "has a key, and
-// nothing matches it", not "does not appear" -- a job with no ClusterId is not reported as a
-// job that never ran. On the other side, an undefined value in the subquery's column simply
-// contributes nothing to the set, so NOT IN keeps the rows that are not in what remains
-// rather than returning nothing at all as SQL would.
+// UNDEFINED FOLLOWS CLASSAD, not SQL's three-valued logic. A row whose own correlation key is
+// undefined matches nothing, so EXISTS drops it and NOT EXISTS keeps it: the two partition
+// the table, and a job with no ClusterId is reported as a job that never ran. An undefined
+// value in the SUBQUERY's column simply contributes nothing to the set, so NOT IN keeps the
+// rows that are not in what remains, rather than returning nothing at all as SQL would.
 //
 // `x IN (a, b, c)` and `x NOT IN (...)` lower to ClassAd's membership function,
 // member(x, {a, b, c}) and its negation. They are read as a whole conjunct of a WHERE
