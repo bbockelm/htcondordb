@@ -231,3 +231,32 @@ func TestWindowParse(t *testing.T) {
 		t.Errorf("plain SELECT looks windowed: %+v", st.Items)
 	}
 }
+
+// TestExplainWindowPlan locks what the plan says about a windowed query, because both lines
+// used to say the opposite of what execSelectWindow does.
+//
+// The `limit` line matters most: pushing a LIMIT under a window would not merely fetch fewer
+// rows, it would rank an arbitrary prefix and return the wrong ones. A plan that claims the
+// push happened is the one way a reader would conclude the ranking is unsound.
+func TestExplainWindowPlan(t *testing.T) {
+	e, cleanup := windowExec(t)
+	defer cleanup()
+
+	plan := explainText(t, e, `EXPLAIN SELECT Owner, ClusterId, `+
+		`ROW_NUMBER() OVER (PARTITION BY Owner ORDER BY QDate DESC) AS n `+
+		`FROM jobs QUALIFY n <= 2 LIMIT 3`)
+
+	// The rows are projected to what the items, PARTITION BY and the window's ORDER BY name --
+	// QDate among them, though it is never selected.
+	mustContain(t, plan, "path: window function (projected row scan; ranking computed client-side)")
+	for _, attr := range []string{"Owner", "ClusterId", "QDate"} {
+		mustContain(t, plan, attr)
+	}
+
+	// No statement-level ORDER BY here, which is exactly the shape that used to report the
+	// limit as pushed down.
+	mustContain(t, plan, "limit: 3 applied client-side (after the window function; not pushed down)")
+	if strings.Contains(plan, "pushed to the server") {
+		t.Errorf("plan claims the limit pushed down under a window:\n%s", plan)
+	}
+}
