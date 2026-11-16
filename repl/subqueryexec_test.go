@@ -264,3 +264,36 @@ func TestScalarSubqueryRefusals(t *testing.T) {
 		}
 	}
 }
+
+// A conjunct of the subquery's WHERE that reads only the OUTER row filters the outer scan --
+// but only for a predicate that keeps the rows that matched.
+//
+// `EXISTS (... AND o.P)` returns something only when o.P holds AND an inner row matches, so
+// o.P is a necessary conjunct of the answer. `NOT EXISTS (... AND o.P)` is true when `!o.P`
+// OR nothing matched, which is a disjunction no filter can express -- hoisting it anyway
+// answered the opposite question on every row where o.P does not hold, and returned no rows
+// at all for the query below.
+func TestAnOuterConjunctInsideANegatedSubqueryIsRefused(t *testing.T) {
+	e, cleanup := subqueryFixture(t)
+	defer cleanup()
+
+	// Positive: alice's jobs that have an epoch -> 1 and 3.
+	const pos = `SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs x WHERE x.ClusterId == jobs.ClusterId AND jobs.Owner == 'alice')`
+	if got := clusters(t, e, pos); got != "1,3" {
+		t.Errorf("EXISTS with an outer conjunct = %q, want %q", got, "1,3")
+	}
+
+	for _, q := range []string{
+		`SELECT ClusterId FROM jobs WHERE NOT EXISTS (SELECT 1 FROM epochs x WHERE x.ClusterId == jobs.ClusterId AND jobs.Owner == 'alice')`,
+		`SELECT ClusterId FROM jobs WHERE Owner NOT IN (SELECT Owner FROM users WHERE jobs.JobStatus == 5)`,
+	} {
+		_, err := e.ExecString(q)
+		if err == nil {
+			t.Errorf("accepted %s -- the hoist answers the opposite question", q)
+			continue
+		}
+		if !strings.Contains(err.Error(), "disjunction") {
+			t.Errorf("%s:\n  error %q\n  does not explain why it cannot be hoisted", q, err)
+		}
+	}
+}

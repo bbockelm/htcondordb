@@ -134,7 +134,23 @@ func planSubquery(st *Statement, sub Subquery) (*subPlan, error) {
 	for _, c := range conj {
 		switch mask := sidesOf(c, aliases); mask {
 		case sideBit(0):
-			// Reads only the outer row: it filters the outer scan, not the inner one.
+			// Reads only the outer row, so it does not depend on the subquery's table at
+			// all and can filter the outer scan instead -- but ONLY for a predicate that
+			// keeps the rows that matched.
+			//
+			// `EXISTS (... AND o.P)` returns something only when o.P holds AND an inner
+			// row matches, so o.P is a necessary conjunct of the answer and hoisting it
+			// is sound. `NOT EXISTS (... AND o.P)` is true when `!o.P` OR nothing
+			// matched, which is a DISJUNCTION: neither a conjunct of the outer filter nor
+			// a step of a join can express it, and hoisting it anyway answers the
+			// opposite question on every row where o.P does not hold.
+			if sub.Kind.negated() {
+				return nil, fmt.Errorf("%s: the subquery's condition `%s` reads only the "+
+					"outer row, which inside a negated subquery means `NOT (%s AND <the "+
+					"subquery matched>)` -- a disjunction that no filter can express. "+
+					"Write it outside the subquery, where it says what it looks like",
+					sub.Kind, c, c)
+			}
 			s := stripSide(c, aliases, 0)
 			if s == "" {
 				return nil, refuseSubqueryTerm(sub, c, "it reads the outer row in a way "+
@@ -298,13 +314,16 @@ func (e *Executor) resolveSubqueries(st *Statement) error {
 		if err != nil {
 			return err
 		}
-		if term == "" {
-			continue // the predicate holds for every row; it adds no constraint
-		}
-		terms = append(terms, term)
+		// The hoisted conjunct is part of the predicate's meaning, so it is appended
+		// whether or not the predicate itself contributed a constraint -- dropping it
+		// alongside an empty term would widen the answer.
 		if sp.outerWhere != "" {
 			terms = append(terms, sp.outerWhere)
 		}
+		if term == "" {
+			continue // the predicate holds for every row; it adds no constraint of its own
+		}
+		terms = append(terms, term)
 	}
 	st.Where = strings.Join(terms, " && ")
 	st.Subqueries = nil
