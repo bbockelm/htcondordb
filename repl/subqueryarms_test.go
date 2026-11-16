@@ -99,6 +99,18 @@ var subqueryArmQueries = []string{
 	`SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) AND Owner IN (SELECT Owner FROM users WHERE Priority > 100)`,
 	`SELECT ClusterId FROM jobs WHERE NOT EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId AND e.Restarts > 0) AND Owner IN (SELECT Owner FROM users)`,
 	`SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) AND Owner NOT IN (SELECT Owner FROM users WHERE Priority > 100) AND JobStatus == 2`,
+	// GROUPED, which the store arm answers by reducing the semi join rather than by
+	// streaming its rows. The membership arm answers the same statement with its
+	// single-table aggregate, so these compare two server-side reductions over two
+	// different plans.
+	`SELECT COUNT(*) FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId)`,
+	`SELECT Owner, COUNT(*) FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) GROUP BY Owner ORDER BY Owner`,
+	`SELECT Owner, COUNT(*) FROM jobs WHERE NOT EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) GROUP BY Owner ORDER BY Owner`,
+	`SELECT Owner, MIN(ClusterId), MAX(ClusterId), SUM(ClusterId) FROM jobs WHERE Owner IN (SELECT Owner FROM users) GROUP BY Owner ORDER BY Owner`,
+	`SELECT Owner, COUNT(*) FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) GROUP BY Owner HAVING COUNT(*) > 1 ORDER BY Owner`,
+	`SELECT JobStatus, COUNT(*) FROM jobs WHERE Owner NOT IN (SELECT Owner FROM users WHERE Priority > 100) GROUP BY JobStatus ORDER BY JobStatus`,
+	// A grouped statement with several predicates, which folds a chain and then reduces it.
+	`SELECT Owner, COUNT(*) FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) AND Owner IN (SELECT Owner FROM users) GROUP BY Owner ORDER BY Owner`,
 }
 
 // subqueryRowsOf runs a query and returns every cell, row by row, so a comparison sees the
@@ -170,10 +182,15 @@ func TestSubqueryStoreArmDeclinesWithAReason(t *testing.T) {
 	defer cleanup()
 
 	for _, tc := range []struct{ query, why string }{
-		{`SELECT COUNT(*) FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId)`,
-			"aggregates"},
-		{`SELECT Owner, COUNT(*) FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) GROUP BY Owner`,
-			"aggregates"},
+		// A grouped statement rides the semi join as a reduction, but only where every
+		// group column and aggregate argument is an attribute that can be qualified
+		// against the joined row.
+		{`SELECT ClusterId + 1, COUNT(*) FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) GROUP BY ClusterId + 1`,
+			"groups by an expression"},
+		{`SELECT Owner, COUNT(*) FILTER (WHERE JobStatus == 5) FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) GROUP BY Owner`,
+			"FILTER reads the row as an expression"},
+		{`SELECT DISTINCT Owner FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId)`,
+			"DISTINCT over named columns"},
 		{`SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.Restarts > 0)`,
 			"does not depend on the outer row"},
 		{`SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) AND Owner IN (SELECT Owner FROM users) AND EXISTS (SELECT 1 FROM epochs f WHERE f.ClusterId == jobs.ClusterId + 1)`,
@@ -300,6 +317,36 @@ func TestAKeySetPastTheCapWithNoStoreArmReportsTheCap(t *testing.T) {
 		t.Fatal("accepted a key set over the cap with no store arm to fall back to")
 	}
 	if !strings.Contains(err.Error(), "more than 1 distinct Owner values") {
+		t.Errorf("error %q does not name the cap and the column", err)
+	}
+}
+
+// A GROUPED statement whose key set is past the inlining cap is answered by the reduction,
+// where before it had no answer at all.
+//
+// That is the whole reason the reduction reaches the subquery arm. The membership arm already
+// reduces server-side, so the two agree on every statement small enough to inline; what it
+// changes is the statement that is NOT -- which the store arm used to decline for aggregating
+// and the membership arm then refused for the cap, leaving an error where both arms could
+// have answered.
+func TestAGroupedStatementPastTheCapIsStillAnswered(t *testing.T) {
+	store, member, _, cleanup := newSubqueryPair(t)
+	defer cleanup()
+	store.maxInList, member.maxInList = 1, 1
+
+	const q = `SELECT Owner, COUNT(*) FROM jobs WHERE Owner IN (SELECT Owner FROM users) GROUP BY Owner ORDER BY Owner`
+	got, arm := subqueryRowsAndArm(t, store, q)
+	if !strings.HasPrefix(arm, "store-side") || !strings.Contains(arm, "reduced in the store") {
+		t.Fatalf("the reduction did not answer it: arm = %q", arm)
+	}
+	if len(got) == 0 {
+		t.Fatalf("the reduction answered nothing")
+	}
+	// And the arm that cannot reduce still reports the cap rather than a wrong answer, which
+	// is what makes the line above a change in what is answerable and not in what is right.
+	if _, err := member.ExecString(q); err == nil {
+		t.Error("the membership arm accepted a key set over the cap")
+	} else if !strings.Contains(err.Error(), "more than 1 distinct Owner values") {
 		t.Errorf("error %q does not name the cap and the column", err)
 	}
 }

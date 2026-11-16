@@ -115,18 +115,21 @@ func benchExecutor(b *testing.B, s *dbrpc.Server, attrs map[string]string) *Exec
 func BenchmarkSubqueryArms(b *testing.B) {
 	const outerRows = 20000
 	query := `SELECT ClusterId, Owner FROM jobs WHERE Owner IN (SELECT Owner FROM users)`
-	for _, keys := range []int{16, 64, 256, 1024, 4096, 16384} {
+	for i, keys := range []int{16, 64, 256, 1024, 4096, 16384} {
 		if keys > outerRows {
 			continue
 		}
 		store, member, cleanup := benchSubqueryPair(b, outerRows, keys)
 		// The arms are run in BOTH orders across the sweep, because a benchmark that
 		// always runs one first charges it with whatever the other warmed.
+		//
+		// On the SWEEP INDEX, not on the key count: every key count here is even, so a
+		// flip keyed on the count flips at every step and therefore never flips at all.
 		arms := []struct {
 			name string
 			e    *Executor
 		}{{"store", store}, {"membership", member}}
-		if keys%2 == 0 {
+		if i%2 == 0 {
 			arms[0], arms[1] = arms[1], arms[0]
 		}
 		for _, arm := range arms {
@@ -177,4 +180,65 @@ func subqueryRowsAndArmB(b *testing.B, e *Executor, query string) (int, string) 
 		b.Fatal(err)
 	}
 	return len(r.Rows), tr.subqueryArm
+}
+
+// THE SAME SWEEP, GROUPED, which is the one the reduction changed the routing of.
+//
+// The membership arm does not stream rows for a grouped statement either: it inlines the key
+// set and then runs the SINGLE-TABLE server aggregate, so both arms already reduce in the
+// store and both reply with one row per group. What differs is everything before that -- the
+// store arm sends a semi join and ships no key set at all, where the membership arm reads the
+// key column, carries it back, and gives the outer scan a constraint that grows with it.
+//
+// So this sweep is the measurement standing behind preferring the reduction. It is NOT the
+// one in BenchmarkSubqueryArms: there the membership arm's advantage was that it avoided
+// shipping joined rows, and here there are no joined rows to ship on either arm.
+//
+// MEASURED, 20,000 outer rows, 20 iterations, Apple M2 Pro, in-process pipe, each arm run
+// both first and second (the two columns are the two orders):
+//
+//	keys     membership        store (reduced)   store faster by
+//	    16      10.5 / 10.5 ms     8.2 / 7.9 ms       1.28-1.32x
+//	   256      11.9 / 11.9 ms     9.5 / 8.9 ms       1.25-1.34x
+//	  4096      29.4 / 31.3 ms    16.5 / 16.6 ms      1.78-1.89x
+//	 16384      83.2 / 86.7 ms    34.9 / 40.2 ms      2.16-2.38x
+//
+// The store arm wins at every size and in both orders, which is why the reduction is
+// preferred outright and not gated on the key set the way the row path is. It is also why
+// this had to be run at a real iteration count: at -benchtime 5x the smallest case reads as
+// a 1.8x LOSS for the store arm, which is warm-up and not a crossover.
+//
+// Run: go test ./repl/ -run XXX -bench BenchmarkGroupedSubqueryArms -benchtime 20x
+func BenchmarkGroupedSubqueryArms(b *testing.B) {
+	const outerRows = 20000
+	query := `SELECT Owner, COUNT(*) FROM jobs WHERE Owner IN (SELECT Owner FROM users) GROUP BY Owner`
+	for i, keys := range []int{16, 256, 4096, 16384} {
+		store, member, cleanup := benchSubqueryPair(b, outerRows, keys)
+		arms := []struct {
+			name string
+			e    *Executor
+		}{{"store", store}, {"membership", member}}
+		if i%2 == 0 {
+			arms[0], arms[1] = arms[1], arms[0]
+		}
+		for _, arm := range arms {
+			b.Run(fmt.Sprintf("keys=%d/%s", keys, arm.name), func(b *testing.B) {
+				_, got := subqueryRowsAndArmB(b, arm.e, query)
+				if want := arm.name; !hasArmPrefix(got, want) {
+					b.Fatalf("arm %q ran as %q", want, got)
+				}
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					st, perr := Parse(query)
+					if perr != nil {
+						b.Fatal(perr)
+					}
+					if _, eerr := arm.e.Exec(st); eerr != nil {
+						b.Fatal(eerr)
+					}
+				}
+			})
+		}
+		cleanup()
+	}
 }
