@@ -104,6 +104,11 @@ type ExecConfig struct {
 	// which is faster but ships more whenever a join expands; the reasoning, and what each
 	// capacity was measured to do, is in joinplace.go.
 	LinkCapacityMbps int
+
+	// MaxInListValues bounds the distinct values a subquery predicate will inline into the
+	// outer query's constraint before refusing. Zero means defaultMaxInListValues. See
+	// subqueryexec.go for what the cap is protecting against.
+	MaxInListValues int
 }
 
 // WriteKind identifies a mutation in a write batch.
@@ -135,6 +140,8 @@ type Executor struct {
 	resync     func(target string) error
 	syncCtl    func(action, target string, args []string) (string, error)
 	retire     func(schedd string) error
+	// maxInList caps the values a subquery predicate inlines (see ExecConfig.MaxInListValues).
+	maxInList int
 	// serverJoin forces a join into the store (see ExecConfig.ServerSideJoin), placement
 	// overrides the per-statement decision (ExecConfig.JoinPlacement), and linkMbps is the
 	// capacity that decision prices the extra bytes against (ExecConfig.LinkCapacityMbps).
@@ -255,7 +262,7 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps, attrNDV: cfg.AttrNDV}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps, attrNDV: cfg.AttrNDV, maxInList: cfg.MaxInListValues}
 }
 
 // SyncControl sends one DBSyncControl request to the daemon (see ExecConfig.SyncControl).
@@ -493,9 +500,10 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 	if err := e.applyDialect(st); err != nil {
 		return nil, err
 	}
-	// Before anything is read: a lifted subquery predicate that nothing applies would run
-	// the statement with a filter missing and answer with too many rows.
-	if err := refuseUnrunnableSubqueries(st); err != nil {
+	// Subquery predicates are answered and folded into the WHERE clause before anything
+	// else reads it, so every path below -- the scan, the aggregate, EXPLAIN, a set
+	// operation's branch -- sees one constraint and need not know a subquery was there.
+	if err := e.resolveAllSubqueries(st); err != nil {
 		return nil, err
 	}
 	switch st.Kind {

@@ -464,18 +464,13 @@ func walkStatements(st *Statement, visit func(*Statement) error) error {
 	return nil
 }
 
-// refuseUnrunnableSubqueries rejects a statement carrying a subquery predicate this executor
-// cannot run, BEFORE anything is read.
+// resolveAllSubqueries answers the subquery predicates of a statement and of every statement
+// nested inside it, BEFORE anything is read.
 //
-// A subquery that is parsed and not executed is the one outcome worse than one that is
-// refused: the predicate is lifted out of the WHERE clause, so the statement would run with
-// a filter silently missing and return MORE rows than it asked for, which reads as a
-// successful answer.
-func refuseUnrunnableSubqueries(st *Statement) error {
-	return walkStatements(st, func(s *Statement) error {
-		if len(s.Subqueries) == 0 {
-			return nil
-		}
-		return fmt.Errorf("%s (SELECT ...) is not supported yet", s.Subqueries[0].Kind)
-	})
+// It walks rather than reading the outermost statement alone because a predicate that is
+// parsed and not answered is the one outcome worse than one that is refused: the predicate is
+// lifted out of its WHERE clause, so the statement would run with a filter silently missing
+// and return MORE rows than it asked for, which reads as a successful answer.
+func (e *Executor) resolveAllSubqueries(st *Statement) error {
+	return walkStatements(st, e.resolveSubqueries)
 }

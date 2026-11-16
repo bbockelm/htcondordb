@@ -1,6 +1,7 @@
 package repl
 
 import (
+	"sort"
 	"strings"
 	"testing"
 )
@@ -162,31 +163,42 @@ func TestSubqueryEndsAtItsParenthesis(t *testing.T) {
 }
 
 // A predicate that is parsed and then not applied would run the statement with a filter
-// missing and answer with MORE rows than it asked for, which reads as success. Until the
-// executor runs them, every shape is refused -- including one nested inside a view
-// definition or a UNION branch, which a guard reading only the outermost statement would
-// let through.
-func TestUnrunnableSubqueriesAreRefusedBeforeAnythingIsRead(t *testing.T) {
-	e, cleanup := newCatalogExec(t)
+// missing and answer with MORE rows than it asked for, which reads as success. That is why
+// the resolution walks the whole statement tree rather than reading the outermost statement:
+// a subquery in a UNION branch or under an EXPLAIN is as much a subquery as one in a bare
+// SELECT, and each of these queries returns strictly more rows if its predicate is dropped.
+func TestSubqueriesNestedInOtherStatementsAreResolved(t *testing.T) {
+	e, cleanup := subqueryFixture(t)
 	defer cleanup()
-	mustExec(t, e, "CREATE TABLE jobs")
-	mustExec(t, e, "CREATE TABLE users")
-	mustExec(t, e, "INSERT INTO jobs (Key, Owner) VALUES ('1.0', 'alice')")
 
-	for _, q := range []string{
-		`SELECT * FROM jobs WHERE EXISTS (SELECT 1 FROM users WHERE users.Owner == jobs.Owner)`,
-		`SELECT * FROM jobs WHERE Owner IN (SELECT Owner FROM users)`,
-		`EXPLAIN SELECT * FROM jobs WHERE Owner IN (SELECT Owner FROM users)`,
-		`SELECT Owner FROM jobs WHERE Owner IN (SELECT Owner FROM users) UNION SELECT Owner FROM users`,
-		`SELECT Owner FROM users UNION SELECT Owner FROM jobs WHERE Owner IN (SELECT Owner FROM users)`,
+	// Branch two is empty, so every row of the answer comes through the predicate. Drop
+	// the predicate and bob and carol appear.
+	const inAlice = `SELECT Owner FROM jobs WHERE Owner IN (SELECT Owner FROM users WHERE Priority > 100)`
+	for _, tc := range []struct{ name, query string }{
+		{"subquery in the first branch",
+			inAlice + ` UNION SELECT Owner FROM users WHERE Priority < 0`},
+		{"subquery in the second branch",
+			`SELECT Owner FROM users WHERE Priority < 0 UNION ` + inAlice},
 	} {
-		st, err := Parse(q)
-		if err != nil {
-			t.Errorf("%s: parse: %v", q, err)
-			continue
-		}
-		if _, err := e.Exec(st); err == nil {
-			t.Errorf("%s: ran a statement whose subquery nothing applies", q)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := e.ExecString(tc.query)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.query, err)
+			}
+			var got []string
+			for _, row := range r.Rows {
+				got = append(got, row[0])
+			}
+			sort.Strings(got)
+			if strings.Join(got, ",") != "alice" {
+				t.Errorf("%s:\n  got %v, want [alice]", tc.query, got)
+			}
+		})
+	}
+
+	// EXPLAIN reports a plan for the constraint the statement will actually run, which
+	// means resolving the predicate first.
+	if _, err := e.ExecString(`EXPLAIN ` + inAlice); err != nil {
+		t.Errorf("EXPLAIN over a subquery: %v", err)
 	}
 }
