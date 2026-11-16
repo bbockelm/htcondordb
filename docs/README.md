@@ -30,3 +30,4 @@ Draft design sketches (not user documentation):
 
 - [Time-series over history](design/time-series.md)
 - [Continuous aggregates](design/continuous-aggregates.md)
+- [Continuous archive backup](design/archive-continuous-backup.md)

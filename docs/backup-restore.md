@@ -204,6 +204,13 @@ consumer, with at-least-once delivery and a durable resume cursor. This is a goo
 feed into an external long-term store, but it is not a restore path: nothing in
 htcondordb re-ingests those tarballs.
 
+That makes it, today, the one archive copy that cannot be stranded by damage to
+the store's internal structure — each record is an independent ClassAd in text,
+with every attribute inline and no reference to a shared compression dictionary —
+and also the one you cannot restore from. Closing that gap, and the stream
+hardening it implies, is designed in
+[Continuous archive backup](design/archive-continuous-backup.md).
+
 **Rebuilding from source.** For the `history` archive specifically, the records
 originate in a schedd's own history file. If that file is intact, a lost archive
 can often be rebuilt — either by letting schedd-sync re-read the configured
@@ -454,6 +461,9 @@ who assumes the snapshot mechanism is a database backup:
 - **Escrowed backup keys are per-table and unreachable from the shipped tools**,
   and the catalog restore path ignores them. Pool keys are what you must retain.
 - **No offline archive checker or repair tool** is exposed.
+- **The dropbox exporter has no restore path.** It is the most damage-resistant
+  archive copy available and nothing shipped re-ingests it. See
+  [Continuous archive backup](design/archive-continuous-backup.md).
 - **Retention prunes by filename.** Any file matching `htcondordb-*.cadb` in the
   snapshot directory is eligible for deletion; `HTCONDORDB_SNAPSHOT_KEEP` has no
   "unlimited" setting.
