@@ -1,0 +1,470 @@
+# Backup and restore
+
+htcondordb has two kinds of table and only one of them has a built-in backup
+mechanism. Read [What is covered](#what-is-covered) before designing a backup
+regime: a snapshot that looks like a whole-database backup is not one.
+
+## What is covered
+
+The daemon's snapshot mechanism writes a single `.cadb` file holding the ads of
+every **mutable table** — the `jobs` table and its schedd-sync siblings, and any
+table you created yourself.
+
+| | In a `.cadb` snapshot | How to back it up |
+|---|---|---|
+| Mutable table ads (incl. private attributes) | **yes** | snapshot |
+| Internal sync idempotency markers | **yes** | snapshot |
+| **Archive tables** (`history`, `epoch_history`, any append-only table) | **no** | file-level copy — see [Backing up archives](#backing-up-archives) |
+| Per-table index config, hot set, encrypted-attribute policy, time-travel and delta settings | no | file-level copy of the database directory |
+| Materialized view definitions | no | file-level copy (view *data* is rebuilt from the base table at startup, so it never needs backing up) |
+| Exporter definitions and their resume cursors | no | file-level copy |
+| Schedd-sync, CEDAR-sync and history-import cursors | no | file-level copy |
+| Raft log and membership (`consistent` mode) | no | file-level copy, or rebuild by rejoining the cluster |
+| The pool signing keys that decrypt an encrypted backup | no | back up `SEC_PASSWORD_DIRECTORY` — see [Keys and escrow](#keys-and-escrow) |
+
+### The archive gap
+
+**Archive tables are not in a snapshot at all.** The catalog's snapshot walks the
+mutable tables only; archives are a separate registry and are skipped silently —
+no warning, no error, no empty section in the file. A `.cadb` taken from a
+schedd-sync deployment therefore contains the live queue and *none* of the
+completed-job history, which on a typical deployment is the overwhelming majority
+of the data and the part that cannot be regenerated.
+
+The same applies to the raft snapshots taken in `consistent` mode: they are built
+from the same catalog snapshot, so a node that joins a raft cluster and restores
+from a leader snapshot comes up with the mutable tables and an empty history. In
+every replicated mode, archive data is node-local and is never replicated.
+
+Archives need their own procedure. See [Backing up archives](#backing-up-archives).
+
+## Configuration
+
+Periodic snapshots are **off by default**. Nothing is backed up until you set
+`HTCONDORDB_SNAPSHOT_DIR` and `HTCONDORDB_SNAPSHOT_INTERVAL`.
+
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `HTCONDORDB_SNAPSHOT_DIR` | — | Directory for periodic snapshots. Unset disables them. Created at startup (mode `0750`) if absent. |
+| `HTCONDORDB_SNAPSHOT_INTERVAL` | — | Seconds between snapshots. Unset or `0` disables them, even with a directory set. |
+| `HTCONDORDB_SNAPSHOT_KEEP` | `7` | How many of the most recent snapshot files to keep in that directory. `0` or negative is treated as the default; there is no "keep everything" setting. |
+| `HTCONDORDB_RESTORE_FILE` | — | One-shot restore trigger, read at startup. See [Restoring](#restoring). |
+| `HTCONDORDB_ENCRYPT_AT_REST` | `false` | Encrypt the store, and with it every snapshot, under the pool signing keys. |
+| `HTCONDORDB_ENCRYPT_ATTRS` | — | Extra attributes to encrypt beyond the always-encrypted private ones. |
+
+A minimal regime:
+
+```
+HTCONDORDB_SNAPSHOT_DIR      = $(SPOOL)/htcondordb-backups
+HTCONDORDB_SNAPSHOT_INTERVAL = 3600
+HTCONDORDB_SNAPSHOT_KEEP     = 24
+```
+
+Snapshots are written as `htcondordb-<UTC timestamp>.cadb`, for example
+`htcondordb-20260411T030000Z.cadb`. The stamp is the file's only ordering key:
+pruning sorts the names lexically and deletes all but the newest
+`HTCONDORDB_SNAPSHOT_KEEP`. **Anything else you leave in that directory matching
+`htcondordb-*.cadb` is a pruning candidate**, so keep your long-term copies
+somewhere else — the snapshot directory is working space, not an archive.
+
+Each file is written to `<name>.cadb.tmp` and renamed into place, so a reader
+never sees a partial file and a crashed snapshot leaves no `.cadb` behind. The
+`.tmp` file is removed on failure.
+
+In a replicated deployment every node snapshots its own copy independently; the
+setting is node-local, and a follower's snapshot is sealed under that node's own
+keys.
+
+## Taking a backup
+
+### Live tables
+
+Set the knobs above and the daemon does it. There is **no command to take a
+snapshot on demand** — no CLI subcommand, no REPL dot-command, no signal, and no
+administrative RPC that covers the whole catalog. If you need an ad-hoc backup,
+your options are:
+
+- Wait for the next periodic snapshot, or temporarily lower
+  `HTCONDORDB_SNAPSHOT_INTERVAL` and `condor_reconfig`.
+- Stop the daemon and copy the database directory (see below). This is the only
+  way to get a genuinely point-in-time copy, and the only way to capture archives
+  and per-table configuration at the same moment.
+
+**A snapshot is not a point-in-time image.** It is taken online, and that is
+deliberate: it does not block writers, so an hourly backup of a busy queue costs
+nothing in availability. The price is that it is not consistent against the
+writers either. Within a single table, each internal shard is captured
+consistently but the shards are not captured together; across tables, each table
+is a separate capture taken as the writer reaches it. A relationship written
+across two tables while the snapshot runs can come back half-present, and a
+single table can mix pre- and post-write state across shards. Treat a `.cadb` as
+a crash-consistent image of a moving database — the same class of guarantee you
+get from restoring after a power loss — not as a transactional one. If you need
+a true point-in-time copy, stop the daemon or take a filesystem snapshot.
+
+Copy finished snapshots off the machine as part of the same job that would copy
+any other spool data. A snapshot sitting next to the database it came from
+protects you against nothing except operator error.
+
+### Backing up archives
+
+Archives are backed up by copying their directories. They live under the
+database directory (`HTCONDORDB_DIR`, by default `$(SPOOL)/htcondordb`):
+
+```
+$(SPOOL)/htcondordb/
+├── tables/<name>/            mutable tables (also covered by snapshots)
+├── archives/<name>/          archive tables — NOT covered by snapshots
+├── views/                    materialized view definitions
+├── exporters/                exporter definitions and resume state
+├── scheddsync/, cedarsync/   sync cursors
+├── replica_cursors/          leader-follower replication cursors
+└── raft/                     raft log and membership (consistent mode)
+```
+
+Each archive directory is self-contained: its segment data files, their sidecar
+indexes, the compression dictionaries, the persisted archive configuration, and
+its own wrapped master key. The only thing it needs from outside is the pool
+signing keys that unwrap that master key.
+
+**Cold copy (recommended).** Stop the daemon, copy, restart:
+
+```
+condor_off -daemon HTCONDORDB
+# wait for the process to exit; the daemon logs "store closed" when it is done
+tar -C $(SPOOL)/htcondordb -cf - archives/ | ...
+condor_on -daemon HTCONDORDB
+```
+
+Shutdown waits for any in-flight maintenance pass to reach a safe boundary. On a
+large archive this is not instantaneous — wait for `store closed` in the daemon
+log rather than for the command to return, and do not start copying until the
+process is gone.
+
+A cold copy is point-in-time, internally consistent, and restores by being put
+back. It is the only archive backup with that guarantee.
+
+**Filesystem snapshot (the hot-copy answer).** If the database directory sits on
+LVM, ZFS, btrfs or anything else that can take an atomic point-in-time snapshot,
+take one and copy the archive directories out of it. That gives you a crash-
+consistent image for free and sidesteps everything below. The daemon recovers
+from such an image exactly as it recovers from a crash.
+
+**Plain copy of a live directory.** Without a filesystem snapshot, a copy taken
+while the daemon runs is still usable, with caveats you need to understand.
+Segment data files are immutable once sealed, so the overwhelming majority of an
+archive does not change under a copying process. Three things do move:
+
+- *The active segment* is being appended to. A copy catches a partial record at
+  its end. Recovery handles this: the tail walk stops at the first record that
+  does not verify, so the restored archive ends shortly before the copy did.
+  This is the ordinary shape of the loss and it is bounded by one segment.
+- *Retention* unlinks whole sealed segments once they fall outside the archive's
+  age or size bounds. A copy that misses a segment being dropped is fine — the
+  data was going away anyway.
+- *Merging* replaces a run of adjacent sealed segments with one larger file, then
+  unlinks the sources. This is the only maintenance that rewrites archive data,
+  and it is the one that can damage a plain hot copy: between the merged file
+  being renamed into place and the sources being unlinked, both exist, and a copy
+  that captures both restores an archive with **duplicated records**. The merge
+  leaves an intent marker on disk that recovery uses to finish the job, so a copy
+  that includes the marker resolves correctly — but whether your copy tool catches
+  the marker is luck, not a guarantee.
+
+**There is no configuration that quiesces archive maintenance.** Setting
+`HTCONDORDB_ARCHIVE_ROTATE_INTERVAL = 0` stops the dedicated retention sweep but
+not the general background maintenance pass, which rotates and merges on its own
+cadence and has no knob. Stopping the daemon is the only way to guarantee nothing
+moves.
+
+What makes a plain hot copy acceptable in practice is that merging does not start
+until an archive holds roughly ten thousand sealed segments. Below that watermark
+a merge pass is a segment count and a comparison, and nothing is rewritten — so
+the only moving part is the active segment's tail. Check before you rely on it:
+
+```
+# interactive shell
+.stats history          # look at the "segments:" line
+
+# or from the Prometheus endpoint (HTCONDORDB_METRICS_ADDRESS)
+htcondordb_segments{table="history"}
+```
+
+A few thousand segments: a plain hot copy is sound. Approaching or past ten
+thousand: use a filesystem snapshot or stop the daemon.
+
+A plain hot copy guarantees: every record sealed before the copy started, minus a
+possibly truncated final segment, provided no merge ran during it. It does not
+guarantee a copy consistent with the mutable tables taken at the same time.
+
+**Logical export.** For a continuous, out-of-band copy of archive records as they
+arrive, configure a dropbox exporter on the archive. It writes completed-job
+records as `.tar.gz` batches of ClassAd files into a directory for an external
+consumer, with at-least-once delivery and a durable resume cursor. This is a good
+feed into an external long-term store, but it is not a restore path: nothing in
+htcondordb re-ingests those tarballs.
+
+**Rebuilding from source.** For the `history` archive specifically, the records
+originate in a schedd's own history file. If that file is intact, a lost archive
+can often be rebuilt — either by letting schedd-sync re-read the configured
+history file, or by running a history import job against the pool's schedds.
+Both are bounded by what the schedds still retain, so neither is a substitute for
+a backup of an archive older than the schedds' own retention.
+
+### Everything else
+
+The per-table index configuration, hot sets, encrypted-attribute policy,
+retention bounds, view and exporter definitions, and sync cursors are files in
+the database directory and are in no snapshot. If you only ever restore into a
+*running* catalog whose tables already exist, this does not matter — a restore
+replaces ads and leaves table configuration alone. If you are rebuilding a host
+from nothing, a snapshot alone gives you the data with default indexes, default
+hot sets, no views, no exporters, and sync cursors reset. Back up the database
+directory as well as the snapshots, or be prepared to re-apply that configuration
+by hand.
+
+## Keys and escrow
+
+With `HTCONDORDB_ENCRYPT_AT_REST` off, snapshots are written in the clear.
+Protect them with filesystem permissions: a snapshot carries private attributes
+— claim ids, capabilities, transfer keys — that a READ-level client never sees.
+
+With it on, every snapshot is encrypted and there is a key hierarchy between you
+and your data:
+
+1. **Pool keys** — the HTCondor pool signing keys in `SEC_PASSWORD_DIRECTORY`,
+   the same keys used for token signing. Any one of them opens the database.
+2. **A per-table master key**, stored wrapped by the pool keys inside each
+   table's or archive's own directory.
+3. **A per-table backup key**, derived from that master. It unwraps a snapshot's
+   key and cannot read the live store.
+4. **A per-snapshot key**, minted fresh for each backup, which seals that
+   backup's body and nothing else.
+
+Each snapshot embeds the master-key envelope and the wrapped per-snapshot key, so
+a backup can be restored by any node holding a pool key — including a different
+host, with no access to the original database.
+
+**The operational rule: back up `SEC_PASSWORD_DIRECTORY`, separately from the
+snapshots, and keep it.** It is small and it changes rarely. Losing it while your
+only copy of the data is an encrypted snapshot means the data is gone; there is
+no recovery path and no override. Rotating a pool key in is safe — the new key is
+added to each table's envelope at the next daemon start and old backups stay
+readable under the keys that were present when they were taken — but *removing*
+every key a backup was sealed under makes that backup unrecoverable.
+
+### What escrow buys you
+
+A per-table backup key can be exported in hex and escrowed separately, so a
+backup can be decrypted without the pool keys at all. That capability is in the
+protocol but **not exposed by any shipped command**: there is no CLI or REPL
+command to export it. Reaching it requires a program written against the Go
+client library, holding a DAEMON-authorized session.
+
+Two further limits are worth knowing before you design a recovery model around
+escrow:
+
+- The key is **per table**. A catalog-wide `.cadb` holds a section per table,
+  each sealed under that table's own key, so escrowing one key does not open the
+  file.
+- The **catalog restore path accepts no escrowed key at all.** It opens every
+  section with the restoring daemon's own pool keys. Escrowed backup keys apply
+  only to a single-table restore driven through the client library.
+
+In practice, for a deployment administered through configuration and the shipped
+tools, **the pool keys are the only key that matters.** Treat
+`SEC_PASSWORD_DIRECTORY` as the thing that must survive.
+
+See [Authorization & security](authorization.md) for how DAEMON authorization is
+granted.
+
+## Restoring
+
+### Live tables
+
+Restore is a startup operation. Point `HTCONDORDB_RESTORE_FILE` at a snapshot and
+restart the daemon:
+
+```
+condor_off -daemon HTCONDORDB
+cp /backups/htcondordb-20260411T030000Z.cadb $(SPOOL)/htcondordb-restore.cadb
+# add to the config: HTCONDORDB_RESTORE_FILE = $(SPOOL)/htcondordb-restore.cadb
+condor_on -daemon HTCONDORDB
+```
+
+The restore runs before the daemon serves any client. Afterwards the trigger file
+is renamed to `<path>.restored-<timestamp>`, so the next restart serves live data
+rather than reverting to the snapshot again. A missing file is a silent no-op,
+which means the knob is safe to leave in the configuration permanently; it also
+means a typo in the path restores nothing and says nothing beyond the absence of
+a "restored database from snapshot" log line. Check for that line.
+
+What a restore does, precisely:
+
+- For each table named in the snapshot, it creates the table if absent, then
+  **empties it and reloads it**. Writers are blocked for the duration; the empty
+  intermediate state is never visible to a client.
+- **Tables present in the database but absent from the snapshot are left
+  untouched.** A restore is not a revert to the snapshot's state — it is an
+  overwrite of the tables the snapshot happens to contain. If you need the
+  database to match the backup exactly, drop the extra tables yourself.
+- **Archives are not touched.** Whatever history the host has stays exactly as it
+  is, neither replaced nor removed.
+- **A restore is not atomic across tables.** Tables are restored one at a time.
+  A failure part-way through leaves the already-restored tables restored, the
+  failing table emptied and partially loaded, and the remaining tables at their
+  pre-restore contents. There is no rollback. The daemon fails to start, which at
+  least prevents clients from seeing the mixed state — fix the cause and restart,
+  since restoring the same file again is idempotent.
+- Ads are re-encrypted under the **target's** policy, not the source's. Restoring
+  an encrypted backup into a daemon with `HTCONDORDB_ENCRYPT_AT_REST` off writes
+  that data unencrypted at rest.
+- Every watcher of a restored table — changefeed consumers, exporters,
+  replication followers — is told to resync and replays from a full snapshot of
+  the new state. Expect a burst of downstream re-ingest after a restore.
+- If the snapshot names a table that exists on the target as an *archive*, the
+  restore of that section fails.
+
+### Restoring archives
+
+Put the directory back:
+
+```
+condor_off -daemon HTCONDORDB
+# wait for "store closed"
+rm -rf $(SPOOL)/htcondordb/archives/history
+tar -C $(SPOOL)/htcondordb -xf archives-backup.tar archives/history
+chown -R condor:condor $(SPOOL)/htcondordb/archives/history
+condor_on -daemon HTCONDORDB
+```
+
+The catalog discovers archives by enumerating the `archives/` directory at
+startup, so a restored directory is picked up with no further configuration. The
+directory carries its own persisted configuration — indexes, zone maps, retention
+bounds — which is authoritative on reopen, so the archive comes back configured
+as it was rather than as the current config file describes.
+
+An archive restored onto a host whose pool keys differ from the ones it was
+sealed under will not open. This is the failure that `SEC_PASSWORD_DIRECTORY`
+backups exist to prevent.
+
+### Replicated deployments
+
+In `leader-follower` and `consistent` modes, restore the **leader** and let
+replication re-propagate. Restoring a snapshot onto a single follower or raft
+peer puts that node's mutable tables out of agreement with the rest of the
+cluster, and nothing detects or repairs the divergence.
+
+Archives are node-local in every mode. Restoring the leader's archive directory
+does not give the followers one — each node needs its own archive backup and its
+own restore.
+
+See [High availability](ha.md) for the replication modes.
+
+## Verifying
+
+**There is no command that validates a `.cadb` file without restoring it**, and no
+checksum or manifest alongside it. The file is a compressed, usually encrypted,
+streaming format; `file`, `gzip -t` and friends tell you nothing. A backup you
+have not restored is a backup you have not tested.
+
+Test restores against a scratch daemon, not production:
+
+```
+# a throwaway daemon on its own directory and port, with the SAME SEC_PASSWORD_DIRECTORY
+HTCONDORDB_DIR          = /var/tmp/htcondordb-verify
+HTCONDORDB_RESTORE_FILE = /var/tmp/htcondordb-verify-restore.cadb
+```
+
+Start it, confirm the `restored database from snapshot` log line, then count the
+restored rows and compare against the source:
+
+```
+htcondordb-cli -addr <scratch-host>:<port> -e 'SELECT COUNT(*) FROM jobs'
+```
+
+Doing this on a schedule is the only way to know that your snapshots, your pool
+keys and your off-host copies all still work together.
+
+For a restored **archive**, open an interactive shell against the scratch daemon
+and use `.tables` to confirm it was discovered and `.stats <archive>` to read back
+its ad count, segment count and byte totals; compare those to the source. (These
+are interactive meta-commands — `-e` runs SQL only.) Record contents are checksum-
+verified as they are read, so a query that actually scans records surfaces
+corruption rather than returning bad data silently; a bare `COUNT(*)` may be
+answered from metadata and prove less than it appears to. There is **no offline
+archive checker exposed by any shipped command**: the ability to inspect a damaged
+archive's files without opening it, and to repair one, exists in the storage
+library but has no CLI.
+
+### What you can monitor
+
+There are **no metrics for backups** — nothing reports the age of the last
+successful snapshot, and nothing counts failures. The only signal is the daemon
+log:
+
+| Log line | Level | Meaning |
+|---|---|---|
+| `periodic snapshots enabled` | Info | Confirms the schedule is actually on, with directory, interval and keep count. Its absence at startup means no backups are being taken. |
+| `wrote periodic snapshot` | Info | One snapshot succeeded, with the file name. |
+| `periodic snapshot failed` | Warning | One snapshot failed. The schedule continues; the previous files are untouched. |
+| `periodic snapshots disabled: cannot create directory` | Warning | The directory could not be created. **No backups will be taken at all.** |
+| `could not prune old snapshot` | Warning | Retention could not delete an old file; the directory will grow. |
+| `restored database from snapshot` | Info | A restore-on-startup ran. |
+
+Until there is a metric, alert on the backup directory from outside the daemon —
+the age of the newest `htcondordb-*.cadb` is a direct proxy for the thing you
+care about:
+
+```
+find $(SPOOL)/htcondordb-backups -name 'htcondordb-*.cadb' -mmin -120 | grep -q . \
+  || echo "htcondordb: no snapshot in the last 2 hours"
+```
+
+For sizing backups and watching archive growth, the daemon's Prometheus endpoint
+(opt-in via `HTCONDORDB_METRICS_ADDRESS`) exports `htcondordb_used_bytes`,
+`htcondordb_live_bytes` and `htcondordb_segments`, labelled by table, for archives
+as well as mutable tables. `htcondordb_store_corrupt_chain_links_total` is a
+store-integrity counter; it is zero on a healthy store and any increase is worth
+alerting on.
+
+## Limitations and known gaps
+
+Collected in one place, because several of these will surprise an administrator
+who assumes the snapshot mechanism is a database backup:
+
+- **Archives are not in snapshots.** On a schedd-sync deployment this is most of
+  the data. Back up `archives/` separately, by directory copy.
+- **No scheduled backups by default.** Snapshots happen only if you configure
+  them.
+- **No on-demand backup command.** No CLI, REPL command, signal or
+  catalog-level RPC.
+- **No verify command, no checksums, no manifest.** A test restore is the only
+  verification.
+- **No backup metrics.** Monitor the directory from outside.
+- **A snapshot is not point-in-time.** It is taken while writers proceed — it
+  does not block them and is not consistent against them. Within a single table
+  it is consistent per internal shard, not across the table; across tables it is
+  a sequence of independently-taken captures, so a cross-table relationship
+  written during the snapshot can appear half-present. The file is a crash-
+  consistent image of a moving database, not a transactional one. For a true
+  point-in-time copy, stop the daemon and copy the directory.
+- **Restore is not atomic across tables** and has no rollback.
+- **Restore does not remove tables** absent from the snapshot.
+- **Escrowed backup keys are per-table and unreachable from the shipped tools**,
+  and the catalog restore path ignores them. Pool keys are what you must retain.
+- **No offline archive checker or repair tool** is exposed.
+- **Retention prunes by filename.** Any file matching `htcondordb-*.cadb` in the
+  snapshot directory is eligible for deletion; `HTCONDORDB_SNAPSHOT_KEEP` has no
+  "unlimited" setting.
+- **Archive maintenance cannot be paused from configuration.** There is no knob
+  that stops the background pass from rotating or merging, so a hot copy of an
+  archive directory cannot be made race-free without a filesystem snapshot or a
+  daemon stop.
+- In `consistent` mode, the raft snapshot that brings a joining node up to date is
+  held whole in memory while it is captured, unlike the file-based snapshot, which
+  streams.
+
+See also [Configuration](configuration.md),
+[Authorization & security](authorization.md) and
+[High availability](ha.md).
