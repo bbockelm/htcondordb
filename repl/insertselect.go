@@ -2,8 +2,10 @@ package repl
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
+	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
 )
 
@@ -192,4 +194,73 @@ func validAttrName(name string) bool {
 		}
 	}
 	return true
+}
+
+// execAlterTable answers ALTER TABLE ... ADD/DROP PRIMARY KEY.
+//
+// The declaration governs writes from here on; it does NOT rekey what is already stored.
+// That is the storage model rather than a shortcut -- a row's key is its address, so
+// changing the rule cannot move rows that were written under the old one, and doing it
+// implicitly would be a whole-table rewrite hiding inside a DDL statement.
+//
+// The consequence is the thing worth saying out loud, because it is silent otherwise: a
+// table that already holds rows keeps them under their existing keys, and a roll-up run
+// afterwards derives NEW keys and writes beside the old rows rather than replacing them.
+// So when the table is not empty, the result says so and says how many rows it means.
+func (e *Executor) execAlterTable(st *Statement) (*Result, error) {
+	if !e.tableExists(st.Table) {
+		return nil, fmt.Errorf("no such table: %s", st.Table)
+	}
+	existing, err := e.c.PrimaryKey(e.opCtx(), st.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	switch st.AlterAction {
+	case "drop-primary-key":
+		if len(existing) == 0 {
+			return nil, fmt.Errorf("table %s declares no primary key", st.Table)
+		}
+		if err := e.c.SetPrimaryKey(e.opCtx(), st.Table, nil); err != nil {
+			return nil, err
+		}
+		return &Result{Note: fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY (was %s)",
+			st.Table, strings.Join(existing, ", "))}, nil
+
+	case "add-primary-key":
+		// ADD refuses to overwrite, as SQL's does: changing a key is DROP then ADD, so the
+		// change is two deliberate statements rather than one that looks like a correction.
+		if len(existing) > 0 {
+			if samePrimaryKey(existing, st.PrimaryKey) {
+				return &Result{Note: fmt.Sprintf("ALTER TABLE %s: PRIMARY KEY (%s) already declared",
+					st.Table, strings.Join(existing, ", "))}, nil
+			}
+			return nil, fmt.Errorf(
+				"table %s already declares PRIMARY KEY (%s); DROP PRIMARY KEY first if you "+
+					"mean to change it to (%s)",
+				st.Table, strings.Join(existing, ", "), strings.Join(st.PrimaryKey, ", "))
+		}
+		if err := e.c.SetPrimaryKey(e.opCtx(), st.Table, st.PrimaryKey); err != nil {
+			return nil, err
+		}
+		note := fmt.Sprintf("ALTER TABLE %s ADD PRIMARY KEY (%s)", st.Table, strings.Join(st.PrimaryKey, ", "))
+		if n, err := e.rowCount(st.Table); err == nil && n > 0 {
+			note += fmt.Sprintf("; %d existing row(s) keep the keys they were written under, "+
+				"so a roll-up will write beside them rather than replace them", n)
+		}
+		return &Result{Note: note}, nil
+	}
+	return nil, fmt.Errorf("unsupported ALTER TABLE action %q", st.AlterAction)
+}
+
+// rowCount is COUNT(*) over the whole table, which the store answers from its own tally
+// rather than by scanning.
+func (e *Executor) rowCount(table string) (int, error) {
+	rows, err := e.c.AggregateTable(e.opCtx(), table, "true", nil,
+		[]dbrpc.AggSpec{{Func: db.AggCount, Arg: "*"}})
+	if err != nil || len(rows) == 0 || len(rows[0].Values) == 0 {
+		return 0, err
+	}
+	n, convErr := strconv.Atoi(rows[0].Values[0])
+	return n, convErr
 }

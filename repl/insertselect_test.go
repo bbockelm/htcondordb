@@ -231,3 +231,143 @@ func TestInsertSelectFromArchiveBucketed(t *testing.T) {
 		t.Fatalf("after a second run the summary holds %s rows, want %d", again.Rows[0][0], len(want))
 	}
 }
+
+func TestAlterTableAddPrimaryKeyEnablesRollup(t *testing.T) {
+	e, cleanup := newCatalogExec(t)
+	defer cleanup()
+	seedHistory(t, e)
+	mustExec(t, e, "CREATE TABLE summaries") // created without a key
+
+	// Without a declaration the roll-up is refused...
+	st, err := Parse(`INSERT INTO summaries SELECT Owner, COUNT(*) AS Jobs FROM history GROUP BY Owner`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Exec(st); err == nil {
+		t.Fatal("roll-up succeeded with no declared key, want a refusal")
+	}
+
+	// ...and declaring one afterwards is what ALTER TABLE is for.
+	mustExec(t, e, "ALTER TABLE summaries ADD PRIMARY KEY (Owner)")
+	r, err := e.Exec(st)
+	if err != nil {
+		t.Fatalf("roll-up after ALTER TABLE failed: %v", err)
+	}
+	if r.Affected != 2 {
+		t.Fatalf("wrote %d rows, want 2", r.Affected)
+	}
+}
+
+func TestAlterTableDropPrimaryKey(t *testing.T) {
+	e, cleanup := newCatalogExec(t)
+	defer cleanup()
+	mustExec(t, e, "CREATE TABLE summaries PRIMARY KEY (Owner)")
+	r := mustExec(t, e, "ALTER TABLE summaries DROP PRIMARY KEY")
+	if !strings.Contains(r.Note, "was Owner") {
+		t.Fatalf("note %q should say what was dropped", r.Note)
+	}
+	// Dropping twice is an error, not a silent no-op.
+	st, _ := Parse("ALTER TABLE summaries DROP PRIMARY KEY")
+	if _, err := e.Exec(st); err == nil {
+		t.Fatal("dropping an absent key succeeded, want a refusal")
+	}
+}
+
+// ADD refuses to overwrite; changing a key is DROP then ADD.
+func TestAlterTableAddRefusesToOverwrite(t *testing.T) {
+	e, cleanup := newCatalogExec(t)
+	defer cleanup()
+	mustExec(t, e, "CREATE TABLE summaries PRIMARY KEY (Day, Owner)")
+
+	st, _ := Parse("ALTER TABLE summaries ADD PRIMARY KEY (Owner)")
+	_, err := e.Exec(st)
+	if err == nil {
+		t.Fatal("ADD over an existing key succeeded, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "DROP PRIMARY KEY first") {
+		t.Fatalf("error %v should point at DROP PRIMARY KEY", err)
+	}
+
+	// Re-declaring the SAME key is accepted, so a setup script is re-runnable.
+	same := mustExec(t, e, "ALTER TABLE summaries ADD PRIMARY KEY (day, owner)")
+	if !strings.Contains(same.Note, "already declared") {
+		t.Fatalf("note %q should say it was already declared", same.Note)
+	}
+
+	// DROP then ADD is the way through.
+	mustExec(t, e, "ALTER TABLE summaries DROP PRIMARY KEY")
+	mustExec(t, e, "ALTER TABLE summaries ADD PRIMARY KEY (Owner)")
+}
+
+// Declaring a key on a POPULATED table cannot rekey what is stored, and the result says so
+// -- otherwise the next roll-up writes beside the old rows with nothing reporting it.
+func TestAlterTableAddWarnsOnPopulatedTable(t *testing.T) {
+	e, cleanup := newCatalogExec(t)
+	defer cleanup()
+	mustExec(t, e, "CREATE TABLE summaries")
+	mustExec(t, e, "INSERT INTO summaries (Key, Owner, Jobs) VALUES ('old-1', 'alice', 1)")
+	mustExec(t, e, "INSERT INTO summaries (Key, Owner, Jobs) VALUES ('old-2', 'bob', 2)")
+
+	r := mustExec(t, e, "ALTER TABLE summaries ADD PRIMARY KEY (Owner)")
+	if !strings.Contains(r.Note, "2 existing row(s)") {
+		t.Fatalf("note %q should name how many rows predate the declaration", r.Note)
+	}
+	if !strings.Contains(r.Note, "write beside them") {
+		t.Fatalf("note %q should say a roll-up writes beside them", r.Note)
+	}
+}
+
+// CREATE TABLE is idempotent, so it reaches existing tables -- but it must not silently
+// CHANGE a declaration that is already there.
+func TestCreateTableRefusesToChangeExistingPrimaryKey(t *testing.T) {
+	e, cleanup := newCatalogExec(t)
+	defer cleanup()
+	mustExec(t, e, "CREATE TABLE summaries PRIMARY KEY (Day, Owner)")
+
+	// Re-running the same setup is fine.
+	mustExec(t, e, "CREATE TABLE summaries PRIMARY KEY (Day, Owner)")
+
+	// A different key is refused, pointing at the statement that makes it deliberate.
+	st, _ := Parse("CREATE TABLE summaries PRIMARY KEY (Owner)")
+	_, err := e.Exec(st)
+	if err == nil {
+		t.Fatal("CREATE TABLE silently changed the key, want a refusal")
+	}
+	for _, want := range []string{"already declares", "ALTER TABLE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %v should mention %q", err, want)
+		}
+	}
+}
+
+func TestAlterTableParsing(t *testing.T) {
+	add, err := Parse("ALTER TABLE t ADD PRIMARY KEY (Day, Owner)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if add.Kind != StmtAlterTable || add.AlterAction != "add-primary-key" ||
+		strings.Join(add.PrimaryKey, ",") != "Day,Owner" {
+		t.Fatalf("parsed ADD as %+v", add)
+	}
+	drop, err := Parse("ALTER TABLE t DROP PRIMARY KEY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drop.Kind != StmtAlterTable || drop.AlterAction != "drop-primary-key" {
+		t.Fatalf("parsed DROP as %+v", drop)
+	}
+	for _, bad := range []string{"ALTER t ADD PRIMARY KEY (a)", "ALTER TABLE t ADD KEY (a)", "ALTER TABLE t RENAME TO u"} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%q parsed, want a refusal", bad)
+		}
+	}
+}
+
+func TestAlterTableUnknownTable(t *testing.T) {
+	e, cleanup := newCatalogExec(t)
+	defer cleanup()
+	st, _ := Parse("ALTER TABLE nosuch ADD PRIMARY KEY (Owner)")
+	if _, err := e.Exec(st); err == nil {
+		t.Fatal("ALTER on a missing table succeeded, want a refusal")
+	}
+}

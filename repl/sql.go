@@ -137,6 +137,7 @@ const (
 	StmtUpdate
 	StmtDelete
 	StmtCreateTable
+	StmtAlterTable
 	StmtDropTable
 	StmtCreateIndex
 	StmtDropIndex
@@ -228,10 +229,13 @@ type Statement struct {
 	// optional column list -- is parsed identically.
 	Source *Statement
 
-	// PrimaryKey is the attribute list of CREATE TABLE ... PRIMARY KEY (a, b): the columns
-	// whose values derive each row's storage key. Empty declares none, which is the
-	// behaviour every existing table has.
+	// PrimaryKey is the attribute list of CREATE TABLE ... PRIMARY KEY (a, b) and of
+	// ALTER TABLE ... ADD PRIMARY KEY (a, b): the columns whose values derive each row's
+	// storage key. Empty declares none, which is the behaviour every existing table has.
 	PrimaryKey []string
+
+	// AlterAction is what an ALTER TABLE does: "add-primary-key" or "drop-primary-key".
+	AlterAction string
 
 	// Update fields.
 	Assignments []Assignment
@@ -642,6 +646,8 @@ func (p *parser) parseStatement() (*Statement, error) {
 		return p.parseDelete()
 	case p.takeKeyword("CREATE"):
 		return p.parseCreate()
+	case p.takeKeyword("ALTER"):
+		return p.parseAlter()
 	case p.takeKeyword("DROP"):
 		return p.parseDrop()
 	case p.takeKeyword("MATCH"):
@@ -655,7 +661,7 @@ func (p *parser) parseStatement() (*Statement, error) {
 	case p.takeKeyword("ROLLBACK"), p.takeKeyword("ABORT"):
 		return p.parseTransaction(StmtRollback)
 	default:
-		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, MATCH, WATCH, BEGIN, COMMIT, or ROLLBACK)", p.peek().text)
+		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, MATCH, WATCH, BEGIN, COMMIT, or ROLLBACK)", p.peek().text)
 	}
 }
 
@@ -887,6 +893,61 @@ func (p *parser) parseViewOptions() (grace, retention int64, err error) {
 }
 
 // parseDrop parses DROP TABLE <name> or DROP INDEX ON <table> (<attr>, ...).
+// parseAlter parses ALTER TABLE <t> ADD PRIMARY KEY (a, b) and
+// ALTER TABLE <t> DROP PRIMARY KEY.
+//
+// ADD and DROP rather than a single "SET", because that is how SQL spells it and because
+// the asymmetry is useful here: ADD refuses to overwrite a declaration that already exists,
+// so changing one is DROP then ADD -- two statements, which is the point. A table's key
+// decides which writes are the same row, and replacing it in one step is the kind of change
+// that should not be a typo away from a declaration that was already right.
+func (p *parser) parseAlter() (*Statement, error) {
+	if err := p.expectKeyword("TABLE"); err != nil {
+		return nil, fmt.Errorf("expected TABLE after ALTER")
+	}
+	name, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	st := &Statement{Kind: StmtAlterTable, Table: name}
+	switch {
+	case p.takeKeyword("ADD"):
+		if err := p.expectPrimaryKey(); err != nil {
+			return nil, err
+		}
+		if err := p.expectPunct("("); err != nil {
+			return nil, fmt.Errorf("ADD PRIMARY KEY requires a column list: %w", err)
+		}
+		cols, err := p.parseIdentList()
+		if err != nil {
+			return nil, err
+		}
+		if len(cols) == 0 {
+			return nil, fmt.Errorf("ADD PRIMARY KEY requires at least one column")
+		}
+		st.AlterAction, st.PrimaryKey = "add-primary-key", cols
+		return st, nil
+	case p.takeKeyword("DROP"):
+		if err := p.expectPrimaryKey(); err != nil {
+			return nil, err
+		}
+		st.AlterAction = "drop-primary-key"
+		return st, nil
+	}
+	return nil, fmt.Errorf("ALTER TABLE supports ADD PRIMARY KEY (...) and DROP PRIMARY KEY")
+}
+
+// expectPrimaryKey consumes the two words PRIMARY KEY.
+func (p *parser) expectPrimaryKey() error {
+	if !p.takeKeyword("PRIMARY") {
+		return fmt.Errorf("expected PRIMARY KEY")
+	}
+	if err := p.expectKeyword("KEY"); err != nil {
+		return fmt.Errorf("expected KEY after PRIMARY")
+	}
+	return nil
+}
+
 func (p *parser) parseDrop() (*Statement, error) {
 	if p.takeKeyword("MATERIALIZED") {
 		if err := p.expectKeyword("VIEW"); err != nil {

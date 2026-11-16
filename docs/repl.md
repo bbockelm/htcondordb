@@ -84,9 +84,22 @@ DELETE FROM jobs WHERE JobStatus == 4;
 - **`PRIMARY KEY`**: `CREATE TABLE t PRIMARY KEY (a, b)` declares the attributes whose
   values derive each row's storage key. It is optional and no existing table has one;
   without it nothing changes, and `INSERT … VALUES` keeps generating keys as before.
-  Declaring one is what gives `INSERT … SELECT` a key to write rows under. It governs
-  later writes only — it does not rewrite or rekey rows already stored. A private
+  Declaring one is what gives `INSERT … SELECT` a key to write rows under. A private
   attribute is refused, because storage keys are not private data.
+
+  An existing table gains one with `ALTER TABLE t ADD PRIMARY KEY (a, b)`, and
+  `ALTER TABLE t DROP PRIMARY KEY` removes it. `ADD` refuses to overwrite a declaration
+  that is already there (re-declaring the *same* one is accepted, so setup scripts stay
+  re-runnable), so changing a key is `DROP` then `ADD` — two deliberate statements, because
+  the key decides which writes are the same row. `CREATE TABLE` likewise refuses to change
+  the key of a table that already exists, and points here.
+
+  **A declaration governs later writes only — it never rekeys what is already stored.** A
+  row's key is its address, so the rule cannot move rows written under the old one. On a
+  populated table that matters: the stored rows keep their existing keys, and a roll-up run
+  afterwards derives new keys and writes *beside* them rather than replacing them.
+  `ALTER TABLE … ADD PRIMARY KEY` says how many rows it is leaving behind when the table is
+  not empty.
 - **`INSERT … SELECT`** runs a **roll-up entirely on the server**: the scan, the
   grouping and the write all happen where the data is, and only a row count comes back.
   The target must declare a `PRIMARY KEY` whose columns the SELECT produces.

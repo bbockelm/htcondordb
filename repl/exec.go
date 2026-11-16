@@ -558,6 +558,8 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 		return e.execDelete(st)
 	case StmtCreateTable:
 		return e.execCreateTable(st)
+	case StmtAlterTable:
+		return e.execAlterTable(st)
 	case StmtDropTable:
 		return e.execDropTable(st)
 	case StmtCreateIndex:
@@ -604,17 +606,52 @@ func (e *Executor) execCreateTable(st *Statement) (*Result, error) {
 	return &Result{Note: "CREATE TABLE " + st.Table + primaryKeyNote(st)}, nil
 }
 
-// applyPrimaryKey declares the table's key, if the statement named one.
+// applyPrimaryKey declares the table's key for a CREATE TABLE that named one.
 //
-// It runs as a second call after the table exists rather than riding CREATE TABLE, because
-// the declaration is a property a table can also gain later -- and because CREATE TABLE
-// returns the existing table when one is already there, so folding the two together would
-// make "create if absent" quietly re-declare the key of a table someone else set up.
+// CREATE TABLE is idempotent -- it returns the existing table when the name is taken -- so
+// this statement reaches tables that already exist, and re-running a setup script is a
+// normal thing to do. What it must NOT do is silently change a declaration that is already
+// there: the key decides which writes are the same row, so replacing it on a populated
+// table leaves the stored rows under keys the new rule would never derive, and the next
+// roll-up writes beside them instead of replacing them. Nothing reports that afterwards.
+//
+// So: declare it when there is none, accept a re-run that says the same thing, and refuse a
+// different one with the statement that exists to make the change deliberate.
 func (e *Executor) applyPrimaryKey(st *Statement) error {
 	if len(st.PrimaryKey) == 0 {
 		return nil
 	}
-	return e.c.SetPrimaryKey(e.opCtx(), st.Table, st.PrimaryKey)
+	existing, err := e.c.PrimaryKey(e.opCtx(), st.Table)
+	if err != nil {
+		return err
+	}
+	switch {
+	case len(existing) == 0:
+		return e.c.SetPrimaryKey(e.opCtx(), st.Table, st.PrimaryKey)
+	case samePrimaryKey(existing, st.PrimaryKey):
+		return nil // a re-run saying what the table already says
+	default:
+		return fmt.Errorf(
+			"table %s already declares PRIMARY KEY (%s); CREATE TABLE will not change it to "+
+				"(%s). Use ALTER TABLE %s DROP PRIMARY KEY then ADD PRIMARY KEY (...), and note "+
+				"that rows already stored keep the keys they were written under",
+			st.Table, strings.Join(existing, ", "), strings.Join(st.PrimaryKey, ", "), st.Table)
+	}
+}
+
+// samePrimaryKey compares two declarations. Order matters -- (Day, Owner) and (Owner, Day)
+// derive different keys -- but case does not, since ClassAd attribute names are
+// case-insensitive and the two spellings name one attribute.
+func samePrimaryKey(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !strings.EqualFold(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func primaryKeyNote(st *Statement) string {
