@@ -38,12 +38,20 @@ import (
 
 // defaultMaxInListValues bounds the key set the membership arm will inline.
 //
-// It is a guard, not a tuned crossover: past it the constraint stops being worth building,
-// because `member(k, {...})` folds to a single index probe whose candidate estimate runs over
-// as the set grows -- on the archive measured in the store's batchlookup_test.go, 1024 keys
-// are estimated at the whole collection where the truth is 8.5% -- and the read degrades to a
-// full scan carrying a very large constraint. The store's semi join is what answers a set
-// this size; until this cap is measured against it, it is deliberately low.
+// It is where the two arms cross, measured: see BenchmarkSubqueryArms. Below about a thousand
+// distinct keys the arms are indistinguishable, because both pay for the same outer read and
+// the set is too small to matter. Above it the membership arm degrades with the set while the
+// store arm stays nearly flat, so the store answers a set this size better -- which is what
+// this cap hands it over to.
+//
+// What degrades is the constraint: `member(k, {...})` folds to a single index probe whose
+// candidate estimate runs over as the set grows -- on the archive measured in the store's
+// batchlookup_test.go, 1024 keys are estimated at the whole collection where the truth is
+// 8.5% -- and the read falls back to a full scan carrying a very large constraint.
+//
+// A statement the store arm cannot take is REFUSED past this cap rather than run anyway,
+// because there is nothing better to fall back to and a silent full scan over a
+// multi-megabyte constraint is the kind of slow that reads as a hang.
 var defaultMaxInListValues = 1024
 
 // subPlan is one subquery predicate reduced to the shape both arms run.

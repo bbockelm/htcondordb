@@ -156,9 +156,25 @@ measures 1024 keys estimated at the whole collection where the truth is 8.5% —
 size the outer read degrades to a full scan carrying a very large constraint. Hence a cap
 (`ExecConfig.MaxInListValues`, default 1024), past which the predicate refuses.
 
-**The cap is a placeholder, not a crossover.** It is deliberately a guard rail until there is
-a store arm to measure it against; the number to ship is the one where the two arms cross,
-and that measurement is unmade.
+**The cap is now measured** (`BenchmarkSubqueryArms`, 20,000 outer rows, every row matching,
+in-process pipe):
+
+| distinct keys | membership | store (wire) | store (text) |
+|---|---|---|---|
+| 16 | 17.1 ms | 17.2 ms | 52.6 ms |
+| 256 | 17.2 ms | 17.2 ms | 50.1 ms |
+| 1024 | 18.9 ms | 18.4 ms | 57.6 ms |
+| 4096 | 21.9 ms | 19.3 ms | 53.1 ms |
+| 16384 | 35.9 ms | 21.5 ms | 55.7 ms |
+
+The crossover is around a thousand keys, which is where the cap already sat. Below it the
+arms are indistinguishable — both pay for the same outer read. Above it the membership arm
+degrades with the set (2.1× from 16 to 16,384 keys) while the store arm is nearly flat
+(1.25×), so the store wins by 1.67× at the top of the sweep and by more past it.
+
+Both of the sweep's biases favour the membership arm — an in-process pipe charges nothing for
+bytes, and every outer row matches, which is the most the store arm can ever ship — so the
+crossover on a real link is at or below this.
 
 ### 6.2 The store arm
 
@@ -180,7 +196,13 @@ So: a subquery predicate goes to the store whenever the store can take it, and t
 arm is the fallback — for an older server, a read inside a transaction, an `AS OF` statement,
 and as the fast path for a small key set.
 
-**It needs a `classad` release to use the WIRE reply.** `db.JoinWire` refuses a redacted
+**It needs a `classad` release to be worth taking at all.** The third column above is this
+same store arm on the text reply, which is what a server without the fix below serves: 2.4× to
+3.1× *slower* than the membership arm at every size, because every joined row is rendered at
+one end and parsed at the other — about 35 ms for 20,000 rows, more than the whole query. On
+the text path the store arm is a pessimization.
+
+ `db.JoinWire` refuses a redacted
 wire-form join unless every side carries a projection, and a semi join's tested side must
 carry none — `refuseSemiSideRefs` rejects a spec that projects from a side contributing no
 member. The two rules are each sound alone and contradict together, so every redacted semi
@@ -188,8 +210,9 @@ join fell back to the text row stream, which is the render-and-reparse path the 
 exists to avoid. A connection is redacted unless privileged, which for the daemon means
 DAEMON level, so that is every ordinary user. The one-line fix is prepared on `classad`'s
 `semi-wire-redact` branch (skip a side that contributes no member); with it in place the
-store arm sends `JoinWire` and no row is rendered or parsed. Until it is released, the store
-arm still runs — on the text reply.
+store arm sends `JoinWire`, no row is rendered or parsed, and the numbers above are the wire
+column. **Until it is released, the store arm runs on the text reply and is slower than the
+membership arm** — which is an argument for releasing it, not for preferring the text path.
 
 Several predicates in one statement go as the **chain** spelling, one step each, which
 `dbrpc` routes to its own opcode when `Spec.Steps` is set. Past the first step the equality's
