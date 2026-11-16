@@ -260,6 +260,52 @@ One difference the test cannot cover, which is therefore documented instead: the
 arm issues **two reads**, so a concurrent write can land between them, where the store arm is
 one operation over one view. `FOR SYSTEM_TIME AS OF` pins both when it matters.
 
+### 6.4 The reduced arm, for a grouped statement
+
+A grouped statement does not stream rows on either arm, so the comparison of §6.1 does not
+apply to it and had to be made separately.
+
+The membership arm already reduces server-side: it inlines the key set, and the outer
+statement is then an ordinary single-table aggregate, whose reply is one row per group. What
+the store arm changes is everything before that — it sends the semi join and its reduction as
+one `opJoinAgg` request, so the key set is never read, never shipped, and never becomes a
+constraint the outer scan evaluates per row.
+
+Measured over the same fixture as §6.1 — 20,000 outer rows, 20 iterations, each arm run both
+first and second, the two numbers being the two orders:
+
+| keys | membership | store (reduced) | store faster by |
+|---|---|---|---|
+| 16 | 10.5 / 10.5 ms | 8.2 / 7.9 ms | 1.28–1.32x |
+| 256 | 11.9 / 11.9 ms | 9.5 / 8.9 ms | 1.25–1.34x |
+| 4096 | 29.4 / 31.3 ms | 16.5 / 16.6 ms | 1.78–1.89x |
+| 16384 | 83.2 / 86.7 ms | 34.9 / 40.2 ms | 2.16–2.38x |
+
+So the reduction is preferred outright rather than gated on the key set the way the row path
+is, and **the cap does not apply to a grouped statement at all** — which is the case this
+closes rather than merely speeds up. Before it, a grouped statement whose key set was past the
+cap had no answer: the store arm declined it for aggregating and the membership arm then
+refused it for the cap.
+
+Two things it cost to get that number right. The sweep had to be run at a real iteration
+count: at five iterations the smallest case reads as a 1.8x LOSS for the store arm, which is
+warm-up. And the arm-order flip in the existing benchmark never flipped — every key count in
+the sweep is even and the flip was keyed on the count — so both tables above are the first
+measurements of either arm running second.
+
+**What the store evaluates, and the one restriction that follows.** The group columns and the
+aggregate arguments are expressions over the COMPOSITE row, where the outer table sits under
+its alias. Prefixing that alias is sound for a bare attribute name and for nothing else, so a
+group column that is an expression, or an aggregate with a `FILTER (WHERE ...)`, falls back to
+the membership arm — the same rule, for the same reason, as the chain's qualified keys in
+§6.2. `DISTINCT` over named columns likewise: the store arm would dedupe whole ads, which is a
+different answer whenever the SELECT names fewer attributes than the row has.
+
+The same lowering serves an ordinary `JOIN`, where there is nothing to qualify because the
+items are already written against the composite row. That arm has no placement arithmetic
+either: `joinplace.go`'s whole model prices the (k-1) extra copies of the left side that a
+row-streaming join ships, and a reduction ships none.
+
 ## 7. Authorization
 
 htcondordb authorizes per connection, not per table (`server.Level` is READ / WRITE /
@@ -325,15 +371,15 @@ And a derived table that *is* the answer ships to a Flight client with no conver
 4. Scalar uncorrelated subqueries (`> (SELECT AVG(...))`). **Done.**
 5. Measure the cap against the store arm and set it to the crossover. **Done** — §6.1; the
    cap was already at it.
-6. `JoinAggregate` for `GROUP BY` over a predicate, so the aggregate stays on the store arm
-   instead of falling back to the membership arm's client-side grouping. This would be
-   `repl`'s first use of `opJoinAgg` for any join, ordinary ones included.
+6. `JoinAggregate` for `GROUP BY` over a predicate. **Done** — and for an ordinary `JOIN`
+   with it, since the two differ only in how the group columns are written. See §6.4.
 
 ### Still open
 
 - **Land the `classad` fix** (§6.2) — `PelicanPlatform/classad#692`, open. Until it is released
   the store arm cannot serve wire rows for a semi join, so the membership arm answers nearly
-  everything and the cap is the real ceiling.
+  every UNGROUPED statement and the cap is the real ceiling. A grouped one is unaffected: its
+  reply is groups rather than rows, so it never asks for the wire form (§6.4).
 - A set operation's branches take the membership arm only.
 - Derived tables and CTEs, and correlated scalar subqueries — each a separate design. §9 is
   the standing constraint on the first of them.
