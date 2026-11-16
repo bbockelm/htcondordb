@@ -117,6 +117,19 @@ scoping are concerned — `IsJoin()` is false, references stay unqualified, `SEL
 job rows. When the store arm lands it will return a composite `[ jobs = [...] ]` carrying one
 member, and the executor must unwrap it rather than let it reach the projection.
 
+**Hoisting an outer-only conjunct is sound only for a positive predicate.** A conjunct of the
+subquery's `WHERE` that reads only the outer row does not depend on the subquery's table, so
+it can filter the outer scan instead — but only for `EXISTS`, which returns something *only*
+when the conjunct holds and an inner row matches, making the conjunct necessary.
+`NOT EXISTS (... AND o.P)` is true when `!o.P` **or** nothing matched: a disjunction that
+neither a conjunct of the outer filter nor a step of a join can express. Hoisting it anyway
+answered the opposite question on every row where `o.P` does not hold — it returned *no rows
+at all* for the obvious test case.
+
+Both arms had that fault, so the differential test could not see it. It was found by
+re-deriving what the predicate means, which is the only thing that finds a fault two
+implementations share.
+
 ## 5. Where a subquery may appear
 
 Only as a **top-level conjunct of `WHERE`**. This is not a parser limitation; it is what
@@ -132,6 +145,7 @@ clause that lifts anything must be a pure AND-spine, and one that is not is refu
 | `WHERE EXISTS (...) OR x == 1` | refused | not a conjunct |
 | correlated on a non-equality (`e.Ts > j.QDate`) | refused | a nested loop bounded only by the pair budget, which returns a partial answer when it hits it |
 | correlated on more than one equality | refused | a composite key; the store arm will take it |
+| an outer-only conjunct inside a **negated** subquery | refused | see §4 |
 | aggregate / `LIMIT` / `ORDER BY` inside the subquery | refused | each changes *which* rows the predicate is drawn from |
 | scalar `WHERE x > (SELECT AVG(...))` | done | constant folding: run once, written into the predicate as a literal. It is an operand rather than a postfix keyword, so it needs nothing already written through and is accepted anywhere in a `WHERE`, including inside an `OR` |
 | correlated scalar | refused | a different value per row is a per-row aggregate, not a constant |

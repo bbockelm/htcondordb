@@ -296,7 +296,10 @@ These follow ClassAd's reading, not SQL's three-valued logic, and the difference
 ### What is not supported
 
 An aggregate, `LIMIT` or `ORDER BY` inside an `EXISTS`/`IN` subquery; a correlation on
-anything but one equality; a correlated scalar subquery; a subquery in a projection or in an
+anything but one equality; a condition inside a negated subquery that reads only the outer
+row (`NOT EXISTS (... AND jobs.Owner == 'alice')` means "`Owner` is not alice **or** nothing
+matched", so write it outside the subquery where it says what it looks like); a correlated
+scalar subquery; a subquery in a projection or in an
 `UPDATE`/`DELETE`; an `EXISTS`/`IN` as one arm of an `OR`;
 `FROM (SELECT ...)` and `WITH`. Each is refused with the reason and, where there is one, the
 spelling to use instead.
