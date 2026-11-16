@@ -33,6 +33,28 @@
 // GROUP BY time_bucket(QDate, '1h'). This grouping is computed client-side (the
 // server aggregate groups by raw attribute value only).
 //
+// EXISTS (SELECT ...) and NOT EXISTS (...), and `x IN (SELECT ...)` / `x NOT IN (...)`,
+// filter the rows a SELECT reads by what another table holds. They contribute no column, so
+// the result is shaped exactly like the same query without them and nothing else in the
+// statement has to change; a row is kept once however many rows the subquery matches. Each
+// is read as a whole conjunct of WHERE and nowhere else, and the subquery correlates to the
+// outer row through one equality -- `EXISTS (SELECT 1 FROM epoch_history e WHERE
+// e.GlobalJobId == jobs.GlobalJobId)`. Inside the subquery a bare attribute name is the
+// SUBQUERY's; a reference to the outer row is qualified.
+//
+// UNDEFINED FOLLOWS CLASSAD, not SQL's three-valued logic. A row whose own correlation key is
+// undefined matches nothing, so EXISTS drops it and NOT EXISTS keeps it: the two partition
+// the table, and a job with no ClusterId is reported as a job that never ran. An undefined
+// value in the SUBQUERY's column simply contributes nothing to the set, so NOT IN keeps the
+// rows that are not in what remains, rather than returning nothing at all as SQL would.
+//
+// `x IN (a, b, c)` and `x NOT IN (...)` lower to ClassAd's membership function,
+// member(x, {a, b, c}) and its negation. They are read as a whole conjunct of a WHERE
+// clause and nowhere else: ClassAd spells membership as a call that takes the left operand
+// as an ARGUMENT, so the operand has to still be in hand when the keyword is reached, which
+// it is only at a conjunct boundary. Elsewhere -- in a projection, inside parentheses, as
+// one arm of an OR -- IN is refused with the member() spelling to write instead.
+//
 // CASE WHEN <cond> THEN <v> [WHEN ...] [ELSE <v>] END (and the CASE <expr> WHEN <value>
 // form) is accepted anywhere an expression is: it becomes the equivalent ClassAd ?: chain,
 // with a missing ELSE yielding undefined (SQL's NULL).
@@ -204,6 +226,12 @@ type Statement struct {
 	// Where is the translated ClassAd constraint ("" = match all). Used by
 	// SELECT, UPDATE, DELETE.
 	Where string
+
+	// Subqueries are the subquery predicates lifted out of the WHERE clause, in source
+	// order. Each filters the rows the statement reads without contributing a column, so
+	// Where holds what is left of the clause and the statement stays single-table as far
+	// as projection and scoping are concerned. See subquery.go.
+	Subqueries []Subquery
 
 	// WhereRaw and TargetWhereRaw are the same clauses as the user TYPED them, before the
 	// SQL-spelling translation that produced Where. They exist for the ANSI dialect, whose
@@ -516,6 +544,22 @@ type parser struct {
 	// inOrderBy marks that the SELECT-item grammar is being reused for an ORDER BY term,
 	// where DESC/ASC/LIMIT terminate the term (see atSelectItemEnd).
 	inOrderBy bool
+	// inSubquery counts the parenthesized subqueries being parsed around the current
+	// position. It is what tells every clause terminator that this statement ends at a
+	// `)` rather than at the end of the input; see atSubqueryClose.
+	inSubquery int
+	// inWhere counts the WHERE clauses being captured around the current position. A
+	// scalar subquery is recognised only inside one; elsewhere it is refused.
+	inWhere int
+	// scalarSubs collects the scalar subqueries found while capturing the clause, in
+	// source order. parseWhereClause drains it after every conjunct, so it never outlives
+	// one clause.
+	scalarSubs []Subquery
+	// scalarSeq names the next scalar subquery's placeholder. It is a counter of its own
+	// rather than len(scalarSubs), which is reset by each conjunct's drain -- two scalars
+	// in one clause would then both be called __sub_0, and the first value substituted
+	// would answer for both.
+	scalarSeq int
 }
 
 func (p *parser) atEnd() bool { return p.pos >= len(p.toks) }
@@ -999,12 +1043,16 @@ func (p *parser) parseSelect() (*Statement, error) {
 		return nil, err
 	}
 	if p.takeKeyword("WHERE") {
-		where, raw, err := p.parseWhere()
-		if err != nil {
-			return nil, err
+		w, werr := p.parseWhereClause(p.whereEnd())
+		if werr != nil {
+			return nil, werr
 		}
-		st.Where = where
-		st.WhereRaw = raw
+		st.Where = w.expr()
+		// The dialect lowering is handed only the conjuncts that STAYED: a lifted
+		// subquery is not part of the predicate any more, and asking a dialect to lower
+		// text that is no longer in the clause would lower it twice.
+		st.WhereRaw = w.rawExpr()
+		st.Subqueries = w.subs
 	}
 	if p.takeKeyword("GROUP") {
 		if err := p.expectKeyword("BY"); err != nil {
@@ -1065,6 +1113,24 @@ func (p *parser) parseSelect() (*Statement, error) {
 }
 
 func (p *parser) parseSelectItem() (SelectItem, error) {
+	it, err := p.parseSelectItemInner()
+	if err != nil {
+		return it, err
+	}
+	// A projected item is captured as a whole expression, so by the time an IN after it is
+	// reached its left operand has been written through verbatim and can no longer be moved
+	// inside a call -- the reason translateSQL refuses IN everywhere but a WHERE conjunct.
+	// Caught here so the error names the spelling that works, rather than surfacing as
+	// "expected FROM" and pointing at the wrong thing.
+	if p.isKeyword("IN") || (p.isKeyword("NOT") && p.peekAheadKeyword(1, "IN")) {
+		return it, fmt.Errorf("IN is only supported as a whole conjunct of a WHERE clause; " +
+			"in a projection write ClassAd's membership function, e.g. " +
+			"`member(x, {a, b})`")
+	}
+	return it, nil
+}
+
+func (p *parser) parseSelectItemInner() (SelectItem, error) {
 	// "*"
 	if t := p.peek(); t.kind == tOp && t.text == "*" {
 		p.pos++
@@ -1173,7 +1239,8 @@ func (p *parser) atSelectItemEnd() bool {
 	if p.inOrderBy && (p.isKeyword("DESC") || p.isKeyword("ASC") || p.isKeyword("LIMIT")) {
 		return true
 	}
-	return (pk.kind == tPunct && pk.text == ",") || p.isKeyword("FROM") || p.isKeyword("AS")
+	return (pk.kind == tPunct && pk.text == ",") || p.isKeyword("FROM") || p.isKeyword("AS") ||
+		p.atSubqueryClose()
 }
 
 // captureSelectExpr captures a SELECT expression and lifts every aggregate call out of it,
@@ -1561,13 +1628,27 @@ func (p *parser) parseDelete() (*Statement, error) {
 // dialect needs that: its whole job is to translate the predicate differently, so it has to
 // see what the user typed rather than the ClassAd expression this already produced.
 func (p *parser) parseWhere() (string, string, error) {
-	stop := func() bool {
+	w, err := p.parseWhereClause(p.whereEnd())
+	if err != nil {
+		return "", "", err
+	}
+	if len(w.subs) > 0 {
+		return "", "", fmt.Errorf("%s is only supported in a SELECT; this statement's WHERE "+
+			"cannot contain a subquery", w.subs[0].Kind)
+	}
+	return w.expr(), w.rawAll, nil
+}
+
+// whereEnd reports where a WHERE clause stops: at the next clause keyword, at a set
+// operator, at the end of the statement, or at the parenthesis closing an enclosing
+// subquery. SINCE is a WATCH-only terminator; the other statements never use it, so listing
+// it here is harmless for them.
+func (p *parser) whereEnd() func() bool {
+	return func() bool {
 		return p.atEnd() || p.isKeyword("GROUP") || p.isKeyword("HAVING") ||
 			p.isKeyword("QUALIFY") || p.isKeyword("ORDER") || p.isKeyword("LIMIT") ||
-			p.isKeyword("SINCE") || p.atSetOp()
+			p.isKeyword("SINCE") || p.atSetOp() || p.atSubqueryClose()
 	}
-	expr, raw, err := p.captureExpr(stop, nil)
-	return expr, raw, err
 }
 
 // captureRawExpr captures an expression that is NOT a SELECT item -- a WHERE clause, an

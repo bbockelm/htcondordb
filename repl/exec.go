@@ -104,6 +104,11 @@ type ExecConfig struct {
 	// which is faster but ships more whenever a join expands; the reasoning, and what each
 	// capacity was measured to do, is in joinplace.go.
 	LinkCapacityMbps int
+
+	// MaxInListValues bounds the distinct values a subquery predicate will inline into the
+	// outer query's constraint before refusing. Zero means defaultMaxInListValues. See
+	// subqueryexec.go for what the cap is protecting against.
+	MaxInListValues int
 }
 
 // WriteKind identifies a mutation in a write batch.
@@ -135,6 +140,17 @@ type Executor struct {
 	resync     func(target string) error
 	syncCtl    func(action, target string, args []string) (string, error)
 	retire     func(schedd string) error
+	// maxInList caps the values a subquery predicate inlines (see ExecConfig.MaxInListValues).
+	maxInList int
+	// storeArmTakesRenderedReply lets the store arm take the RENDERED joined-row reply on
+	// its first attempt, which the measurement otherwise rules out (see
+	// BenchmarkSubqueryArms and trySubqueryStoreArm's allowText).
+	//
+	// It exists for the differential test. Against a store that cannot serve wire rows for
+	// a semi join the store arm is never taken at all, so the test that holds the two arms
+	// to the same rows would compare the membership arm with itself -- which is exactly
+	// what its first version did.
+	storeArmTakesRenderedReply bool
 	// serverJoin forces a join into the store (see ExecConfig.ServerSideJoin), placement
 	// overrides the per-statement decision (ExecConfig.JoinPlacement), and linkMbps is the
 	// capacity that decision prices the extra bytes against (ExecConfig.LinkCapacityMbps).
@@ -255,7 +271,7 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps, attrNDV: cfg.AttrNDV}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps, attrNDV: cfg.AttrNDV, maxInList: cfg.MaxInListValues}
 }
 
 // SyncControl sends one DBSyncControl request to the daemon (see ExecConfig.SyncControl).
@@ -491,6 +507,41 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 	// DELETE's selector -- works from one constraint. Lowering at each use would let the
 	// plan EXPLAIN shows differ from the one that ran.
 	if err := e.applyDialect(st); err != nil {
+		return nil, err
+	}
+	// Subquery predicates are answered first, so every path below -- the scan, the
+	// aggregate, EXPLAIN, a set operation's branch -- sees one constraint and need not know
+	// a subquery was there. The store arm answers the predicate by pairing the two tables
+	// and returns the rows directly; the membership arm folds it into the WHERE clause.
+	if st.Kind == StmtSelect && !st.IsSetOp() && len(st.Subqueries) > 0 {
+		res, ok, err := e.trySubqueryStoreArm(st, e.storeArmTakesRenderedReply)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return res, nil
+		}
+		// The membership arm is tried next, and it is the one that can refuse: a key set
+		// past the inlining cap. The store arm's RENDERED reply can still answer that, so
+		// it is retried with the reply it was not allowed before -- slower than inlining,
+		// and faster than not answering. The statement is restored first, because
+		// resolving mutates its predicate as it goes.
+		where, subs := st.Where, st.Subqueries
+		if rerr := e.resolveAllSubqueries(st); rerr != nil {
+			if !errors.Is(rerr, errSubqueryKeySetTooLarge) {
+				return nil, rerr
+			}
+			st.Where, st.Subqueries = where, subs
+			res, ok, terr := e.trySubqueryStoreArm(st, true)
+			if terr != nil {
+				return nil, terr
+			}
+			if !ok {
+				return nil, rerr // neither arm can answer it; the cap's message is the useful one
+			}
+			return res, nil
+		}
+	} else if err := e.resolveAllSubqueries(st); err != nil {
 		return nil, err
 	}
 	switch st.Kind {
@@ -1253,6 +1304,11 @@ func parseProjectedAds(texts []string) ([]*classad.ClassAd, error) {
 // explainTrace collects EXPLAIN ANALYZE execution stats for a row-scan SELECT: how long the
 // server fetch and the client-side sort took, and how many rows were fetched vs returned.
 type explainTrace struct {
+	// subqueryArm names which arm answered a subquery predicate -- the store's semi or anti
+	// join, or the membership constraint -- and, when it was the membership arm, why the
+	// store did not take it. An arm that was not taken for a reason reads exactly like an
+	// arm that was never available, unless the reason is printed.
+	subqueryArm  string
 	fetchDur     time.Duration
 	sortDur      time.Duration
 	rowsFetched  int
@@ -1326,6 +1382,9 @@ func (e *Executor) execExplain(st *Statement) (*Result, error) {
 			for _, l := range tr.keyBatch {
 				lines = append(lines, "  "+l)
 			}
+		}
+		if tr.subqueryArm != "" {
+			lines = append(lines, "subquery arm taken: "+tr.subqueryArm)
 		}
 		// The store-side counterpart of the key-batching block above: the same decision,
 		// taken where no EXPLAIN here can watch it. The two never both appear, because a
@@ -1423,6 +1482,13 @@ func (e *Executor) describePlan(st *Statement) []string {
 	out := []string{fmt.Sprintf("SELECT on %s %q", kind, st.Table)}
 	if st.Where != "" {
 		out = append(out, "  filter: "+st.Where)
+	}
+	// A statement the store arm will take does not run the single-table read path at all,
+	// so it is described as the join it becomes rather than as a scan with extra lines.
+	if lines, whole := e.subqueryPlanLines(st); whole {
+		return append(out, lines...)
+	} else {
+		out = append(out, lines...)
 	}
 	groupBy := effectiveGroupBy(st)
 	aggregate := len(groupBy) > 0 || hasAggregate(st)

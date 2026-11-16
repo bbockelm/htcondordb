@@ -279,6 +279,11 @@ func (p *parser) parseJoinOn() (string, []BandClause, error) {
 				"the complement of a range is not a range, so write the two comparisons "+
 				"instead, e.g. `%s < <lo> OR %s > <hi>`", raw, raw)
 		case p.takeKeyword("BETWEEN"):
+			// The capture ran to the end of a conjunct, which reaches further left than
+			// BETWEEN binds; see refuseLooseOperand.
+			if lerr := refuseLooseOperand("BETWEEN", raw, expr); lerr != nil {
+				return "", nil, lerr
+			}
 			b, berr := p.parseBandBounds(raw)
 			if berr != nil {
 				return "", nil, berr

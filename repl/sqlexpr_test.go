@@ -177,27 +177,86 @@ func TestCaseErrors(t *testing.T) {
 	}
 }
 
-// IN is refused with the member() spelling rather than mistranslated. NOT IN mattered most:
-// NOT translated to `!` on its own, so `Owner NOT IN ('alice')` became `Owner ! IN (...)`
-// and surfaced as a ClassAd syntax error pointing at the `!`.
-func TestInIsRefusedWithTheClassAdSpelling(t *testing.T) {
+// IN now lowers to ClassAd's member() rather than being refused, but only where the left
+// operand is still in hand: as a whole conjunct of a WHERE clause. Everywhere else the old
+// refusal stands, and it still has to name the spelling that works.
+//
+// NOT IN is the case that mattered most: NOT used to translate to `!` on its own, so
+// `Owner NOT IN ('alice')` became `Owner ! IN (...)` and surfaced as a ClassAd syntax error
+// pointing at the `!`.
+func TestInLowersToMemberInAConjunct(t *testing.T) {
 	for _, tc := range []struct{ query, want string }{
-		{`SELECT Owner FROM ads WHERE Owner IN ('alice', 'bob')`, `member(x, {a, b})`},
-		{`SELECT Owner FROM ads WHERE ClusterId IN (1, 2)`, `member(x, {a, b})`},
-		{`SELECT Owner FROM ads WHERE Owner NOT IN ('alice')`, `!member(x, {a, b})`},
-		{`SELECT Owner FROM ads WHERE Owner IN (SELECT Owner FROM other)`, `member(x, {a, b})`},
+		{`SELECT Owner FROM ads WHERE Owner IN ('alice', 'bob')`,
+			`member(Owner, {"alice", "bob"})`},
+		{`SELECT Owner FROM ads WHERE ClusterId IN (1, 2)`, `member(ClusterId, {1, 2})`},
+		{`SELECT Owner FROM ads WHERE Owner NOT IN ('alice')`, `!member(Owner, {"alice"})`},
+		// The left operand may be any expression, not just an attribute.
+		{`SELECT Owner FROM ads WHERE strcat(a, b) IN ('ab')`,
+			`member(strcat(a, b), {"ab"})`},
+		// It is one conjunct among others, in its own position.
+		{`SELECT Owner FROM ads WHERE JobStatus == 5 AND Owner IN ('a') AND Cpus > 1`,
+			`JobStatus == 5 && member(Owner, {"a"}) && Cpus > 1`},
+	} {
+		st, err := Parse(tc.query)
+		if err != nil {
+			t.Errorf("%s: %v", tc.query, err)
+			continue
+		}
+		if st.Where != tc.want {
+			t.Errorf("%s:\n  Where = %q\n  want    %q", tc.query, st.Where, tc.want)
+		}
+	}
+	// The member() spelling the refusal used to point at still works unchanged.
+	if _, err := Parse(`SELECT Owner FROM ads WHERE member(Owner, {"alice", "bob"})`); err != nil {
+		t.Errorf("member() spelling: %v", err)
+	}
+}
+
+// Outside a WHERE conjunct the left operand has already been written through to the output
+// verbatim and cannot be moved inside a call, so IN is still refused -- with the spelling
+// that works, as before.
+func TestInIsStillRefusedWhereTheOperandIsGone(t *testing.T) {
+	for _, q := range []string{
+		`SELECT Owner IN ('a') FROM ads`,
+		`SELECT Owner FROM ads WHERE (Owner IN ('a'))`,
+	} {
+		_, err := Parse(q)
+		if err == nil {
+			t.Errorf("accepted %s", q)
+			continue
+		}
+		if !strings.Contains(err.Error(), "member(") {
+			t.Errorf("%s:\n  error %q\n  does not name the member() spelling", q, err)
+		}
+	}
+}
+
+// IN binds tighter than every comparison and than OR, but the capture that produces its left
+// operand runs to the end of a top-level conjunct. An operand that reached too far left used
+// to be built into the call -- `member(a == 1 || Owner, {"a"})` -- answering a different
+// question with no symptom. BETWEEN is read the same way and had the same hole.
+func TestPostfixKeywordRefusesAnOperandThatReachesTooFar(t *testing.T) {
+	for _, tc := range []struct{ query, kw string }{
+		{`SELECT Owner FROM ads WHERE a == 1 OR Owner IN ('a')`, "IN"},
+		{`SELECT Owner FROM ads WHERE a > 1 AND b == 2 OR Owner NOT IN ('a')`, "IN"},
+		{`SELECT * FROM a JOIN b ON a.k == b.k AND a.x == 1 OR b.t BETWEEN 1 AND 2`, "BETWEEN"},
 	} {
 		_, err := Parse(tc.query)
 		if err == nil {
 			t.Errorf("accepted %s", tc.query)
 			continue
 		}
-		if !strings.Contains(err.Error(), tc.want) {
-			t.Errorf("%s:\n  error %q\n  does not suggest %q", tc.query, err, tc.want)
+		if !strings.Contains(err.Error(), tc.kw+" binds tighter than") {
+			t.Errorf("%s:\n  error %q\n  does not explain the precedence", tc.query, err)
 		}
 	}
-	// The spelling it points at has to work.
-	if _, err := Parse(`SELECT Owner FROM ads WHERE member(Owner, {"alice", "bob"})`); err != nil {
-		t.Errorf("the suggested member() form does not parse: %v", err)
+	// The operand a parenthesis really does delimit is still accepted.
+	for _, q := range []string{
+		`SELECT Owner FROM ads WHERE (a == 1) AND Owner IN ('a')`,
+		`SELECT * FROM a JOIN b ON a.k == b.k AND b.t BETWEEN 1 AND 2`,
+	} {
+		if _, err := Parse(q); err != nil {
+			t.Errorf("%s: %v", q, err)
+		}
 	}
 }
