@@ -179,13 +179,25 @@ So: a subquery predicate goes to the store whenever the store can take it, and t
 arm is the fallback — for an older server, a read inside a transaction, an `AS OF` statement,
 and as the fast path for a small key set.
 
-What it needs:
+**It needs a `classad` release to use the WIRE reply.** `db.JoinWire` refuses a redacted
+wire-form join unless every side carries a projection, and a semi join's tested side must
+carry none — `refuseSemiSideRefs` rejects a spec that projects from a side contributing no
+member. The two rules are each sound alone and contradict together, so every redacted semi
+join fell back to the text row stream, which is the render-and-reparse path the wire op
+exists to avoid. A connection is redacted unless privileged, which for the daemon means
+DAEMON level, so that is every ordinary user. The one-line fix is prepared on `classad`'s
+`semi-wire-redact` branch (skip a side that contributes no member); with it in place the
+store arm sends `JoinWire` and no row is rendered or parsed. Until it is released, the store
+arm still runs — on the text reply.
 
-- `JoinSemi` / `JoinAnti` in `repl`'s `JoinKind`, and in `serverJoinKind`.
-- The chain spelling in `joinServerSide` for a statement with more than one predicate
-  (`unsendableJoinWhy` refuses a chain today; `dbrpc` picks the chain opcode itself when
-  `Spec.Steps` is set).
-- Unwrapping the single-member composite from the wire row, without rebuilding the ad.
+What it still needs:
+
+- The chain spelling, for a statement with more than one predicate. `dbrpc` picks the chain
+  opcode itself when `Spec.Steps` is set; today a second predicate falls to the membership
+  arm.
+- `JoinAggregate` for `GROUP BY` over a predicate, which today also falls to the membership
+  arm (where the single-table aggregate still runs server-side, so this is a smaller gap
+  than it looks).
 
 ### 6.3 The arms must be held to the same answer
 

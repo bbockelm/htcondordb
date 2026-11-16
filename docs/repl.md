@@ -229,6 +229,72 @@ SELECT h.ClusterId, e.RunInstanceId, e.ExitCode
 `JOIN` is not `MATCH`. A join is unilateral and says its own condition; matchmaking is
 bilateral and takes the condition from the ads themselves. Both are below.
 
+## EXISTS and IN — filtering by what another table holds
+
+```sql
+SELECT <items> FROM <table> [<alias>]
+ WHERE [NOT] EXISTS (SELECT 1 FROM <table> <alias> WHERE <alias>.<attr> == <outer>.<attr> [AND ...])
+SELECT <items> FROM <table> WHERE <expr> [NOT] IN (SELECT <attr> FROM <table> [WHERE ...])
+SELECT <items> FROM <table> WHERE <expr> [NOT] IN (<value>, <value>, ...)
+```
+
+A join **pairs** rows and brings the other table's columns along. `EXISTS` and `IN` only
+**ask a question** about the other table: they filter the rows, contribute no column, and
+keep each row once however many rows the subquery matches. So the result is shaped exactly
+like the same query without them, and nothing else in the statement has to change.
+
+```sql
+-- Held jobs that never actually ran.
+SELECT ClusterId, ProcId, HoldReason FROM jobs
+ WHERE JobStatus == 5
+   AND NOT EXISTS (SELECT 1 FROM epoch_history e WHERE e.GlobalJobId == jobs.GlobalJobId);
+
+-- Jobs belonging to users who are over their priority.
+SELECT ClusterId, Owner FROM jobs
+ WHERE Owner IN (SELECT Owner FROM users WHERE Priority > 100);
+
+-- Machines running a job of alice's.
+SELECT Name FROM machines m
+ WHERE EXISTS (SELECT 1 FROM jobs j WHERE j.GlobalJobId == m.JobId AND j.Owner == "alice");
+```
+
+Inside the subquery a bare attribute name is the **subquery's**; a reference to the outer row
+is written with the outer table's alias, which defaults to its own name (`jobs.GlobalJobId`
+above). SQL would resolve an unmatched bare name outward; this does not, because ClassAd rows
+are heterogeneous and a typo would silently become a correlation.
+
+`IN` also takes a plain list — `WHERE JobStatus IN (1, 5)` — which is ClassAd's
+`member(JobStatus, {1, 5})` written the SQL way. Both forms are read as a whole conjunct of
+`WHERE`, joined to the rest with `AND`; inside parentheses, in a projection or as one arm of
+an `OR`, write `member(...)` yourself.
+
+### Undefined
+
+These follow ClassAd's reading, not SQL's three-valued logic, and the difference is visible:
+
+- A row whose own correlation key is **undefined** matches nothing, so `EXISTS` drops it and
+  `NOT EXISTS` keeps it. **The two partition the table** — a job with no `ClusterId` *is*
+  reported by a `NOT EXISTS` as a job that never ran.
+- An undefined value in the **subquery's** column contributes nothing to the set, so `NOT IN`
+  keeps the rows that are not in what remains. SQL would return no rows at all, because the
+  set contains a `NULL`.
+
+### What is not supported
+
+An aggregate, `LIMIT` or `ORDER BY` inside the subquery; a correlation on anything but one
+equality; a subquery in a projection, in an `UPDATE`/`DELETE`, or as one arm of an `OR`;
+`FROM (SELECT ...)` and `WITH`. Each is refused with the reason and, where there is one, the
+spelling to use instead.
+
+### Where it runs
+
+`EXPLAIN` names the arm. The predicate is normally sent to the store as a semi or anti join,
+where neither table's rows cross the wire. When the store cannot take it — an older server,
+`AS OF`, a read inside a transaction, an aggregate query, or more than one predicate in the
+statement — the subquery's key column is read and inlined into the outer constraint instead,
+up to a cap (over it, the query is refused rather than quietly degrading to a full scan).
+Both arms return the same rows.
+
 ## UNION — stacking two results
 
 ```sql
