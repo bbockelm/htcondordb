@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"sync"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/db/replicate"
 
@@ -25,13 +27,20 @@ import (
 //     held k records of an identity, the first k replayed records of it are dropped and the rest
 //     appended. Records this catch-up appends never count as already held. The count of an
 //     identity is read when the catch-up first meets it -- before it can have appended any -- by
-//     an exact query. A Reset replay that runs past probeBudget queries then loads every identity
-//     count this schedd has in the hub archive once (one projected scan of the schedd's rows) and
-//     checks the rest in memory. A query per record costs about a millisecond -- the archive's
-//     active segment is scanned, not indexed -- which is fine for a resume's overlap and hours for
-//     a replay of a million records. A resume's catch-up is always probed: it re-delivers only the
-//     overlap since the committed cursor (after a WatchResync, up to the spoke's watch buffer), and
-//     loading the AP's whole history for that would cost more than the probes;
+//     an exact query. A query per record costs about a millisecond -- the archive's active segment
+//     is scanned, not indexed;
+//   - a Reset replay runs that check per record until probeBudget queries are spent and then loads
+//     every identity count this schedd has in the hub archive once (one projected scan of the
+//     schedd's rows, bounded by maxLoadedIdentities) and checks the rest in memory. Nothing about
+//     a full replay is a prefix of what the hub holds -- the hub may hold a middle of it, having
+//     been added to the federation late or having evicted the oldest -- so there is no boundary to
+//     find and every record has to be checked;
+//   - a resume's catch-up skips by batch instead (see drainBatch): it re-delivers the records
+//     since the committed cursor in append order, so the ones the hub already holds are a PREFIX of
+//     it, and only the boundary has to be found. Records are buffered up to catchupBatchBytes and
+//     the LAST of each batch is probed: if the hub holds it the whole batch is prefix and is
+//     dropped unprobed, and once a batch's last record is missing, that batch is checked record by
+//     record and everything after the first miss is new;
 //   - during a Reset replay into a capped archive that has reached its cap, a record older than
 //     the oldest the hub still holds for this schedd (by floorAttr: EnteredHistoryTime,
 //     EpochWriteDate for epochs, SampleTime for job_metrics) is skipped: the cap already dropped it, and re-appending it would make it the newest
@@ -70,7 +79,21 @@ type archiveSink struct {
 	// looked up yet -- unless setLoaded, when it was loaded and the hub held none.
 	remaining map[[16]byte]int
 	setLoaded bool // remaining holds every identity of this schedd (a long catch-up)
+	setGaveUp bool // the identity set did not fit its budget; this catch-up probes instead
 	setLoads  int  // identity-set loads since the sink was made (for tests)
+	// skipAhead is on while a resume's catch-up is buffering batches to skip the prefix the hub
+	// already holds; batch holds that buffer and batchBytes approximates its memory.
+	skipAhead   bool
+	batch       []replicate.Change
+	batchBytes  int
+	batchProbes int // batch-tail probes made this catch-up (for tests)
+	// batchLimit and identityLimit are catchupBatchBytes and maxLoadedIdentities. Seams: the tests
+	// that show the two bounds hold drive them at a size a test can fill.
+	batchLimit    int
+	identityLimit int
+	// pastBoundary is set once a resume's catch-up has met a record the hub does not hold. Every
+	// record after it is new, and is appended without a probe -- see drainBatch.
+	pastBoundary bool
 	// floor is the oldest floorAttr value the hub holds for this schedd, read when a Reset begins;
 	// floorOK only when the archive is capped and at its cap (see retentionDropped).
 	floor   float64
@@ -88,7 +111,7 @@ func newArchiveSink(arch *db.ArchiveTable, table, schedd string, store replicate
 		return nil, err
 	}
 	s := &archiveSink{arch: arch, table: table, schedd: schedd, store: store, metrics: m, log: log, onReset: onReset,
-		syncData: archiveSync(arch), cur: cur}
+		syncData: archiveSync(arch), cur: cur, batchLimit: catchupBatchBytes, identityLimit: maxLoadedIdentities}
 	s.startCatchup() // a sink starts in catch-up, as after BeginSession
 	return s, nil
 }
@@ -103,6 +126,36 @@ func archiveSync(arch *db.ArchiveTable) func() error { return arch.Flush }
 // probeBudget is how many records of a Reset replay are checked by exact query before the sink
 // loads the identity set instead.
 const probeBudget = 256
+
+// catchupBatchBytes is how much memory a resume's catch-up may hold in its skip-ahead buffer, per
+// (schedd, table) sink.
+//
+// The bound is bytes, not records: 256 buffered history ads and 256 buffered job_metrics samples
+// are very different amounts of memory, and memory is what has to stay bounded. A history ad of
+// ~110 attributes costs about 15 KiB decoded and a job_metrics sample under 2 KiB, so 4 MiB is a
+// batch of roughly 270 of the former or 2000 of the latter: an overlap of 150k history records
+// costs about 550 probes, well under a second, where a probe per record costs 150k queries at
+// about a millisecond each -- two and a half minutes, repeated on every hub restart for an AP
+// whose cursor is stuck. Raising it buys less and less, and the memory is held by every sink
+// catching up at once (three archive tables per AP).
+//
+// The buffered ads are not copies. The stream allocated them to deliver them and the archive would
+// have taken them a moment later; buffering holds them past the point where they would otherwise
+// be collected. approxAdBytes measures them (approximately, and deliberately on the high side).
+const catchupBatchBytes = 4 << 20
+
+// bytesPerIdentity is what one entry of the identity set costs, measured by
+// BenchmarkJobMetricsIdentitySet: 73 MiB at a million entries and 276 MiB at five million, i.e.
+// 58-77 bytes per entry for the map alone.
+const bytesPerIdentity = 80
+
+// maxLoadedIdentities bounds loadIdentities. A hub holding 14.7M history rows and 31.6M epoch rows
+// across its APs cannot materialise one AP's share of that per sink: at bytesPerIdentity the set
+// is hundreds of MiB to more than a gigabyte, against a 16 GiB GOMEMLIMIT, for every (schedd,
+// table) sink that is replaying at once. 64 MiB is about 840k identities; past them the load is
+// abandoned and the replay goes back to one query per record, because running out of memory kills
+// the daemon while probing only makes it slow.
+const maxLoadedIdentities = (64 << 20) / bytesPerIdentity
 
 // BeginSession starts from the committed cursor: a cursor a failed session left uncommitted is
 // discarded, since the session re-delivers what it covers. (appended is kept: those appends still
@@ -123,14 +176,23 @@ func (s *archiveSink) fail(err error) error {
 	return err
 }
 
+// startCatchup arms the catch-up checks. It starts in skip-ahead: a session begins by resuming
+// from the committed cursor, and only a Reset that arrives afterwards turns it into a full replay.
 func (s *archiveSink) startCatchup() {
 	s.catchup, s.full, s.probes, s.remaining, s.setLoaded = true, false, 0, map[[16]byte]int{}, false
-	s.floorOK = false
+	s.setGaveUp, s.floorOK = false, false
+	s.skipAhead, s.pastBoundary = true, false
+	s.batch, s.batchBytes, s.batchProbes = nil, 0, 0
 }
 
+// endCatchup drops the catch-up state. Any records still buffered are dropped with it, so every
+// caller drains the batch first (the drain is what appends them, and no cursor covering them is
+// committed until it has: see flush).
 func (s *archiveSink) endCatchup() {
 	s.catchup, s.full, s.probes, s.remaining, s.setLoaded = false, false, 0, nil, false
-	s.floorOK = false
+	s.setGaveUp, s.floorOK = false, false
+	s.skipAhead, s.pastBoundary = false, false
+	s.batch, s.batchBytes = nil, 0
 }
 
 func (s *archiveSink) Apply(c replicate.Change) error {
@@ -147,38 +209,38 @@ func (s *archiveSink) apply(c replicate.Change) error {
 	switch c.Kind {
 	case replicate.KindUpsert:
 		if c.Ad == nil { // undecodable: nothing to append
-			s.metrics.Undecodable.WithLabelValues(s.table).Inc()
+			s.metrics.Undecodable.WithLabelValues(s.table, s.schedd).Inc()
 			break
 		}
 		c.Ad.InsertAttrString(ScheddNameAttr, s.schedd)
 		if s.full && s.floorOK {
 			if v, ok := c.Ad.EvaluateAttrNumber(floorAttr(s.table)); ok && v < s.floor {
-				s.metrics.BelowRetention.WithLabelValues(s.table).Inc()
+				s.metrics.BelowRetention.WithLabelValues(s.table, s.schedd).Inc()
 				break
 			}
 		}
-		if s.catchup {
-			held, err := s.held(c)
+		if s.skipAhead {
+			s.buffer(c)
+			if s.batchBytes >= s.batchLimit {
+				if err := s.drainBatch(); err != nil {
+					return err
+				}
+			}
+			break
+		}
+		if s.catchup && !s.pastBoundary {
+			held, _, err := s.held(c)
 			if err != nil {
 				return err
 			}
 			if held {
-				s.metrics.DedupHits.WithLabelValues(s.table).Inc()
+				s.metrics.DedupHits.WithLabelValues(s.table, s.schedd).Inc()
 				break
 			}
 		}
-		if err := s.arch.AppendDeferred(c.Ad); err != nil {
-			// A record nested deeper than the archive can hold is refused the same way on every
-			// replay, so failing the session on it would wedge this source at that record. A spoke
-			// on the same storage could not have stored it either; this guards a spoke that can.
-			if errors.Is(err, db.ErrTooDeep) {
-				s.metrics.TooDeep.WithLabelValues(s.table).Inc()
-				break
-			}
+		if err := s.appendRecord(c.Ad); err != nil {
 			return err
 		}
-		s.appended = true
-		s.metrics.EventsApplied.WithLabelValues(s.table, "upsert").Inc()
 	case replicate.KindReset:
 		if err := s.flush(); err != nil {
 			return err
@@ -188,14 +250,20 @@ func (s *archiveSink) apply(c replicate.Change) error {
 		}
 		s.startCatchup() // a replay of everything retained: all of it may already be here
 		s.full = true
+		// A full replay is not a prefix of what the hub holds, so there is no boundary to skip to
+		// and every record is checked (by probe, then by the identity set).
+		s.skipAhead = false
 		if err := s.loadFloor(); err != nil {
 			return err
 		}
-		s.metrics.Resets.WithLabelValues(s.table).Inc()
+		s.metrics.Resets.WithLabelValues(s.table, s.schedd).Inc()
 		if s.onReset != nil {
 			s.onReset()
 		}
 	case replicate.KindSynced:
+		if err := s.drainBatch(); err != nil { // before endCatchup drops what is buffered
+			return err
+		}
 		s.endCatchup()
 	case replicate.KindDelete, replicate.KindGap:
 		// append-only: nothing to remove
@@ -217,42 +285,221 @@ func (s *archiveSink) ApplyUndecodable(c replicate.Change, _ error) error {
 }
 
 // held reports whether c's record matches one the hub held before this catch-up that no earlier
-// record of the catch-up matched, and consumes that match.
-func (s *archiveSink) held(c replicate.Change) (bool, error) {
+// record of the catch-up matched, and consumes that match. decided is false for a record with no
+// identity: nothing can be said about it, so it is appended, and it says nothing about where a
+// resume's boundary is either.
+func (s *archiveSink) held(c replicate.Change) (held, decided bool, err error) {
 	id, ok := archiveIdentity(s.table, c.Ad)
 	if !ok {
-		s.metrics.MissingIdentity.WithLabelValues(s.table).Inc()
+		s.metrics.MissingIdentity.WithLabelValues(s.table, s.schedd).Inc()
 		s.log.Debug("federate: archive record has no identity; appended without dedup",
 			"table", s.table, "schedd", s.schedd, "key", c.Key)
-		return false, nil
+		return false, false, nil
 	}
 	d := id.digest()
 	n, known := s.remaining[d]
 	if !known && !s.setLoaded {
-		if s.full && s.probes >= probeBudget {
+		if s.full && s.probes >= probeBudget && !s.setGaveUp {
 			if err := s.loadIdentities(); err != nil {
-				return false, err
+				return false, true, err
 			}
+		}
+		if s.setLoaded {
 			n = s.remaining[d]
 		} else {
 			s.probes++
-			var err error
 			if n, err = s.countHeld(id); err != nil {
-				return false, err
+				return false, true, err
 			}
 		}
 	}
 	if n == 0 {
 		s.remaining[d] = 0
-		return false, nil
+		return false, true, nil
 	}
 	s.remaining[d] = n - 1
-	return true, nil
+	return true, true, nil
+}
+
+// appendRecord appends one record and counts it.
+func (s *archiveSink) appendRecord(ad *classad.ClassAd) error {
+	if err := s.arch.AppendDeferred(ad); err != nil {
+		// A record nested deeper than the archive can hold is refused the same way on every
+		// replay, so failing the session on it would wedge this source at that record. A spoke
+		// on the same storage could not have stored it either; this guards a spoke that can.
+		if errors.Is(err, db.ErrTooDeep) {
+			s.metrics.TooDeep.WithLabelValues(s.table, s.schedd).Inc()
+			return nil
+		}
+		return err
+	}
+	s.appended = true
+	s.metrics.EventsApplied.WithLabelValues(s.table, s.schedd, "upsert").Inc()
+	return nil
+}
+
+// buffer holds c for the skip-ahead batch.
+func (s *archiveSink) buffer(c replicate.Change) {
+	s.batch = append(s.batch, c)
+	s.batchBytes += changeOverheadBytes + len(c.Key) + len(c.Cursor) + approxAdBytes(c.Ad)
+}
+
+// changeOverheadBytes is what one buffered replicate.Change costs beyond its ad: the struct in the
+// slice and the headers of the key and cursor it carries.
+const changeOverheadBytes = 160
+
+// drainBatch decides what to do with the records a resume's catch-up has buffered, and is where
+// the skip-ahead happens.
+//
+// What makes one probe stand for a whole batch: an archive is append-only, which forces it into a
+// SINGLE shard (collections/retention.go, collections/watch.go and collections/parallel_ordered.go
+// in the classad module all take that as given), so a catch-up streams its records in append order
+// with no interleaving between shards, and the spoke's planCatchup resets the session with
+// WatchResetRetention when the cursor has fallen below the spoke's append floor rather than
+// silently skipping the gap. The records the hub already holds are therefore a PREFIX of what the
+// resume delivers, and finding the boundary is the whole job: if the hub holds the LAST record of
+// a batch it holds everything before it too, and the batch can be dropped without a probe for any
+// other record of it. (The spoke's own history tailer recovers on the same argument: "once a
+// record is NOT present every later record is new" -- see scheddsync.HistorySync.)
+//
+// The holes in that prefix are holes that have to stay holes. A record the hub refused as too
+// deeply nested, or could not decode, is skipped permanently and would be refused again. A record
+// the hub's retention evicted must not be re-appended -- re-appending it would make the oldest
+// data the newest and evict other APs at the next rotation, which is exactly what the Reset path's
+// BelowRetention floor prevents. A transient append error cannot leave a hole: it returns, fails
+// the session, and the uncommitted cursor has the whole range re-delivered.
+//
+// Repeated identities: an identity is not unique, and a dropped batch's records are never counted
+// against the hub's copies of them. That is right for the dropped records themselves -- the whole
+// batch is prefix, so all of them are held, and counting them could only have dropped them -- but
+// it means a LATER record of an identity whose earlier occurrences were dropped would be matched
+// against copies the prefix already accounts for. That is why nothing after the boundary is probed
+// at all: by the prefix property every record after it is new, so probing there would be not
+// merely wasteful but wrong. Up to the boundary the exact per-record path runs as always, and the
+// one case it can still get wrong is a record at the boundary itself whose identity also occurs
+// among the dropped records (a CHECKPOINT or COMMON epoch record of a run instance that straddles
+// it): its count is spent on occurrences the prefix already covered, and it is dropped. That costs
+// that record, not the batch -- the first record whose identity the hub holds nothing of ends the
+// probing for good.
+func (s *archiveSink) drainBatch() error {
+	buf := s.batch
+	s.batch, s.batchBytes = nil, 0
+	if len(buf) == 0 {
+		return nil
+	}
+	// The probe point is the last buffered record that can be probed exactly (holdsTail). It is
+	// normally the last record of the batch; a trailing record that cannot be probed leaves the
+	// few records after the probe point to the exact path rather than giving up the skip.
+	probe := len(buf) - 1
+	for probe >= 0 && !probeable(s.table, buf[probe].Ad) {
+		probe--
+	}
+	exactFrom := 0
+	if probe >= 0 {
+		s.batchProbes++
+		held, err := s.holdsTail(buf[probe])
+		if err != nil {
+			return err
+		}
+		if held {
+			s.metrics.DedupHits.WithLabelValues(s.table, s.schedd).Add(float64(probe + 1))
+			exactFrom = probe + 1
+		} else {
+			// The hub does not hold the probe point, so the boundary is at or before it and
+			// nothing later in this catch-up is held either.
+			s.skipAhead = false
+		}
+	}
+	for _, c := range buf[exactFrom:] {
+		if !s.pastBoundary {
+			held, decided, err := s.held(c)
+			if err != nil {
+				return err
+			}
+			if held {
+				s.metrics.DedupHits.WithLabelValues(s.table, s.schedd).Inc()
+				continue
+			}
+			// A record with no identity says nothing about where the boundary is: append it, but
+			// keep checking the ones that follow.
+			if decided {
+				s.pastBoundary, s.skipAhead = true, false
+			}
+		}
+		if err := s.appendRecord(c.Ad); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// holdsTail reports whether the hub already holds the record at the probe point of a skip-ahead
+// batch -- the one probe that condemns or spares every record before it.
+//
+// It may only be wrong in one direction. Saying "not held" of a record the hub holds costs the
+// batch its skip: its records go through the exact per-record path, which is what they would have
+// got anyway. Saying "held" of a record the hub does NOT hold drops every record before it,
+// including new ones past the boundary, and nothing re-delivers them. So the probe asks for more
+// than the identity: narrowed by the record's retention timestamp, a false "held" needs a held
+// record matching on identity AND timestamp -- a record indistinguishable from this one, not
+// merely a sibling of it. Two CHECKPOINT records of one run instance share an identity but not the
+// second they were written in.
+func (s *archiveSink) holdsTail(c replicate.Change) (bool, error) {
+	id, ok := archiveIdentity(s.table, c.Ad)
+	if !ok {
+		return false, nil
+	}
+	term, ok := retentionTerm(s.table, c.Ad)
+	if !ok {
+		return false, nil
+	}
+	n, err := s.countMatching(id.constraint(s.schedd) + term)
+	return n > 0, err
+}
+
+// probeable reports whether a record can be probed exactly enough to skip a batch on: it needs an
+// identity and the retention timestamp that narrows the probe. A spoke old enough to write epoch
+// records without EpochWriteDate has none, and its records are checked one at a time as before.
+func probeable(table string, ad *classad.ClassAd) bool {
+	if ad == nil {
+		return false
+	}
+	if _, ok := archiveIdentity(table, ad); !ok {
+		return false
+	}
+	_, ok := retentionTerm(table, ad)
+	return ok
+}
+
+// retentionTerm is the constraint term pinning a record's floorAttr value (EnteredHistoryTime,
+// EpochWriteDate for epochs, SampleTime for samples), for the narrowed batch-tail probe. A record
+// without that attribute has no term, and does not get skipped by batch.
+func retentionTerm(table string, ad *classad.ClassAd) (string, bool) {
+	attr := floorAttr(table)
+	v, ok := ad.EvaluateAttrNumber(attr)
+	if !ok {
+		return "", false
+	}
+	return " && " + attr + " == " + numberLit(v), true
+}
+
+// numberLit writes v as a ClassAd literal, as an integer when it is one: the attribute is a
+// timestamp, the hub stores it as the spoke wrote it, and an integer literal compares equal to it
+// either way (ClassAd == promotes). A value that is not exactly an integer keeps full precision.
+func numberLit(v float64) string {
+	if v == math.Trunc(v) && math.Abs(v) < 1<<53 {
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return strconv.FormatFloat(v, 'g', -1, 64)
 }
 
 // countHeld counts the hub's records of id for this schedd.
 func (s *archiveSink) countHeld(id recordIdentity) (int, error) {
-	seq, err := s.arch.Query(id.constraint(s.schedd))
+	return s.countMatching(id.constraint(s.schedd))
+}
+
+func (s *archiveSink) countMatching(constraint string) (int, error) {
+	seq, err := s.arch.Query(constraint)
 	if err != nil {
 		return 0, err
 	}
@@ -266,21 +513,39 @@ func (s *archiveSink) countHeld(id recordIdentity) (int, error) {
 // loadIdentities counts every identity this schedd has in the hub archive, for the identities
 // this catch-up has not met yet. One it has met keeps its running count: the scan would also see
 // the records the catch-up appended, and those are not "held before".
+//
+// The scan counts straight into s.remaining and the identities already met are set aside first.
+// There are at most probeBudget of those (the replay probes one record at a time until the budget
+// is spent), so setting them aside is cheap, and the sink never holds a second copy of the whole
+// set to copy out of.
+//
+// The load is bounded by maxLoadedIdentities. Past it the set is abandoned -- s.remaining goes
+// back to what it was and the replay returns to one query per record, for this catch-up -- rather
+// than grown until the daemon is killed.
 func (s *archiveSink) loadIdentities() error {
 	seq, err := s.arch.QueryProject(scheddConstraint(s.schedd), identityAttrs(s.table))
 	if err != nil {
 		return err
 	}
-	loaded := map[[16]byte]int{}
+	met := s.remaining
+	loaded := make(map[[16]byte]int, len(met))
+	s.remaining = loaded
 	for vals := range seq {
-		if id, ok := identityFromValues(s.table, vals); ok {
-			loaded[id.digest()]++
+		id, ok := identityFromValues(s.table, vals)
+		if !ok {
+			continue
+		}
+		loaded[id.digest()]++
+		if len(loaded) > s.identityLimit {
+			s.remaining, s.setGaveUp = met, true
+			s.log.Warn("federate: too many identities held for this AP to check a full replay in memory; probing instead",
+				"table", s.table, "schedd", s.schedd, "limit", s.identityLimit,
+				"approx_bytes_per_identity", bytesPerIdentity)
+			return nil
 		}
 	}
-	for d, n := range loaded {
-		if _, met := s.remaining[d]; !met {
-			s.remaining[d] = n
-		}
+	for d, n := range met {
+		loaded[d] = n
 	}
 	s.setLoaded = true
 	s.setLoads++
@@ -370,6 +635,12 @@ func (s *archiveSink) Flush() error {
 }
 
 func (s *archiveSink) flush() error {
+	// Drain first: a cursor must never be committed over records that are still only buffered.
+	// It costs one probe, not one per buffered record, so a flush interval that fires in the
+	// middle of a long overlap does not put the catch-up back on the per-record path.
+	if err := s.drainBatch(); err != nil {
+		return err
+	}
 	if s.appended {
 		if err := s.syncData(); err != nil {
 			return fmt.Errorf("federate: syncing %s appends from %s: %w", s.table, s.schedd, err)

@@ -68,7 +68,7 @@ func TestArchiveReplayNoDuplicates(t *testing.T) {
 			t.Errorf("job %d.0 appears %d times, want 1", i, n)
 		}
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 10 {
+	if v := tableTotal(m.DedupHits, TableHistory); v != 10 {
 		t.Errorf("dedup_hits = %v, want 10", v)
 	}
 	if n := countArchive(t, hist, `ScheddName == "ap1.example.org"`); n != 6 {
@@ -128,7 +128,7 @@ func TestArchiveRedeliveryAfterCrash(t *testing.T) {
 			t.Errorf("job %d.0 appears %d times, want 1", i, n)
 		}
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 3 {
+	if v := tableTotal(m.DedupHits, TableHistory); v != 3 {
 		t.Errorf("dedup_hits = %v, want 3", v)
 	}
 }
@@ -150,7 +150,7 @@ func TestArchiveLiveTailAppends(t *testing.T) {
 	if n := countArchive(t, hist, `true`); n != 4 {
 		t.Fatalf("live tail appended %d, want 4", n)
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 0 {
+	if v := tableTotal(m.DedupHits, TableHistory); v != 0 {
 		t.Errorf("live tail probed: dedup_hits = %v", v)
 	}
 }
@@ -170,7 +170,7 @@ func TestArchiveIdentity(t *testing.T) {
 	if n := countArchive(t, hist, `ClusterId == 99`); n != 2 {
 		t.Errorf("identity-less records appended = %d, want 2", n)
 	}
-	if v := val(m.MissingIdentity.WithLabelValues(TableHistory)); v != 2 {
+	if v := tableTotal(m.MissingIdentity, TableHistory); v != 2 {
 		t.Errorf("missing_identity = %v, want 2", v)
 	}
 
@@ -240,7 +240,7 @@ func TestArchiveLargeReplayUsesIdentitySet(t *testing.T) {
 	if got := countArchive(t, ep, `true`); got != n+5 {
 		t.Fatalf("after second replay: %d records, want %d", got, n+5)
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableEpochHistory)); v != float64(n) {
+	if v := tableTotal(m.DedupHits, TableEpochHistory); v != float64(n) {
 		t.Errorf("dedup_hits = %v, want %d", v, n)
 	}
 }
@@ -318,8 +318,8 @@ func TestReplayCountsRepeatedIdentity(t *testing.T) {
 				}
 				apply(t, s, append(changes, synced("c1"))...)
 				s.EndSession()
-				if val(metrics.DedupHits.WithLabelValues(TableEpochHistory)) != float64(m) {
-					t.Errorf("dedup_hits = %v, want %d", val(metrics.DedupHits.WithLabelValues(TableEpochHistory)), m)
+				if tableTotal(metrics.DedupHits, TableEpochHistory) != float64(m) {
+					t.Errorf("dedup_hits = %v, want %d", tableTotal(metrics.DedupHits, TableEpochHistory), m)
 				}
 				if got := countArchive(t, ep, `EpochAdType == "CHECKPOINT"`); got != n {
 					t.Fatalf("hub holds %d CHECKPOINT records after replaying %d into a hub holding %d, want %d", got, n, m, n)
@@ -393,7 +393,7 @@ func TestResumeCatchupProbesWithoutLoadingSet(t *testing.T) {
 	if got := countArchive(t, ep, `true`); got != n+4 {
 		t.Fatalf("hub holds %d records, want %d", got, n+4)
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableEpochHistory)); v != float64(n+1) {
+	if v := tableTotal(m.DedupHits, TableEpochHistory); v != float64(n+1) {
 		t.Errorf("dedup_hits = %v, want %d", v, n+1)
 	}
 }
@@ -479,7 +479,7 @@ func TestArchiveUndecodableSkipped(t *testing.T) {
 	if n := countArchive(t, hist, `true`); n != 2 {
 		t.Errorf("hub history = %d records, want 2", n)
 	}
-	if v := val(m.Undecodable.WithLabelValues(TableHistory)); v != 1 {
+	if v := tableTotal(m.Undecodable, TableHistory); v != 1 {
 		t.Errorf("undecodable_total = %v, want 1", v)
 	}
 	if got := string(s.Cursor()); got != "c1" {
@@ -539,7 +539,7 @@ func TestArchiveRedeliveryAfterReconnect(t *testing.T) {
 			t.Errorf("job %d.0 appears %d times after the reconnect, want 1", i, n)
 		}
 	}
-	if v := val(m.DedupHits.WithLabelValues(TableHistory)); v != 3 {
+	if v := tableTotal(m.DedupHits, TableHistory); v != 3 {
 		t.Errorf("dedup_hits = %v, want 3", v)
 	}
 }

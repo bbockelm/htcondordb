@@ -37,7 +37,7 @@ func TestArchiveSkipsTooDeepRecord(t *testing.T) {
 	if n := countArchive(t, hist, `true`); n != 2 {
 		t.Fatalf("hub history holds %d records, want 2 (1.0 and 3.0)", n)
 	}
-	if v := val(m.TooDeep.WithLabelValues(TableHistory)); v != 1 {
+	if v := tableTotal(m.TooDeep, TableHistory); v != 1 {
 		t.Errorf("too_deep_total = %v, want 1", v)
 	}
 }

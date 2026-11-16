@@ -204,3 +204,31 @@ func (wc *writeCounter) settle(t *testing.T) (upserts, deletes int) {
 	}
 	return wc.upserts, wc.deletes
 }
+
+// tableTotal sums a per-table counter over every schedd it carries (and, for EventsApplied, over
+// one kind). The counters are labelled by source AP as well as by table, and several tests drive
+// two APs into one table: what they assert is what the TABLE saw, so they must not name one AP's
+// series and miss the other's.
+func tableTotal(vec *prometheus.CounterVec, table string, kind ...string) float64 {
+	ch := make(chan prometheus.Metric)
+	go func() { vec.Collect(ch); close(ch) }()
+	total := 0.0
+	for m := range ch {
+		var out dto.Metric
+		if err := m.Write(&out); err != nil {
+			panic(err)
+		}
+		labels := map[string]string{}
+		for _, p := range out.Label {
+			labels[p.GetName()] = p.GetValue()
+		}
+		if labels["table"] != table {
+			continue
+		}
+		if len(kind) > 0 && labels["kind"] != kind[0] {
+			continue
+		}
+		total += out.Counter.GetValue()
+	}
+	return total
+}
