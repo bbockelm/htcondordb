@@ -274,7 +274,48 @@ those have very different costs and the user's only other signal is the clock. N
 resolving a predicate means *running* the subquery, so `EXPLAIN` over one does read the inner
 table; that is what decides the plan it is reporting.
 
-## 9. Staging
+## 9. If a derived table is ever materialized
+
+Every construct in this design pushes its inner statement somewhere: a predicate lowers to a
+filter the store evaluates, or to a key set shipped as literals. A derived table or a CTE is
+the first one that cannot. It is a *relation* the outer statement reads, so when the server
+cannot be asked for it whole, its rows land in this process and something has to hold them.
+
+**That something must not be a `[]*classad.ClassAd`.** The measurement the join was rewritten
+around still holds: on the shape this is wanted for — a handful of attributes out of eighty —
+reading both sides wire-form costs 15.5 ms and ten thousand allocations, and decoding those
+same rows into ads costs 20.3 ms and two hundred thousand (`classad/db/joinrow.go`). A slice
+of ads is the worse end of that twice over, because it pays the decode for every attribute of
+every row *before* a predicate has rejected one.
+
+**The shape to hold them in already exists.** `arrowtype` derives a column set from a batch and
+appends one tail column, `_ad`, carrying every attribute no typed column covers
+(`arrowtype/derive.go`, `TailColumnName`). That is the rule this section would otherwise have
+to invent: an item with a name and a settled evaluated kind becomes a column; everything else
+rides in the tail and is completed per row when something asks for it. The store applies the
+same split per segment — `collections/adschema.go` puts type-stable fields in a fixed typed
+prefix and every non-schema attribute, plus every escaped field, in a cold tail — so a derived
+table and a stored segment would have one shape between them, and one fallback.
+
+**One thing has to change in it.** `arrowtype`'s tail holds ClassAd *text*, because its reader
+is an Arrow client outside this process. A derived table's reader is the evaluator inside it,
+so its tail must hold wire bytes with a lazy decode, exactly as `db.joinRow` does: answer an
+attribute from the bytes, and decode the ad only for what the bytes cannot answer — an
+attribute holding an expression, a sealed value, a list. A text tail would reintroduce the
+render-and-reparse that the wire opcodes exist to remove, on the rows that survive.
+
+**Which items columnarize** is then decided by the SELECT list rather than by sampling. A
+derived table is one finite, closed batch, so its kinds are *measured from the batch in hand*;
+it needs none of the agreement machinery a live table's schema needs (`flightsvc/columntypes.go`
+moves a column's type only once successive derivations agree, because the table under it is
+still being written to). An item whose evaluated kind is not stable across the batch simply
+does not get a column.
+
+Two things follow that are worth having for their own sake. A predicate over a named column is
+a vector pass, which is the shape the columnar accelerator already takes rather than a new one.
+And a derived table that *is* the answer ships to a Flight client with no conversion at all.
+
+## 10. Staging
 
 1. `IN` value lists, the subquery parser, the predicate lifted out of `WHERE`. **Done.**
 2. The membership arm: correlated `EXISTS` / `NOT EXISTS` / `IN` / `NOT IN`, uncorrelated
@@ -284,13 +325,15 @@ table; that is what decides the plan it is reporting.
 4. Scalar uncorrelated subqueries (`> (SELECT AVG(...))`). **Done.**
 5. Measure the cap against the store arm and set it to the crossover. **Done** — §6.1; the
    cap was already at it.
+6. `JoinAggregate` for `GROUP BY` over a predicate, so the aggregate stays on the store arm
+   instead of falling back to the membership arm's client-side grouping. This would be
+   `repl`'s first use of `opJoinAgg` for any join, ordinary ones included.
 
 ### Still open
 
-- **Release the `classad` fix** (§6.2). Until then the store arm cannot serve wire rows for a
-  semi join, so the membership arm answers nearly everything and the cap is the real ceiling.
-- `JoinAggregate` for `GROUP BY` over a predicate. `repl` does not use it for ordinary joins
-  either, so this would be its first use; the single-table aggregate still runs server-side
-  on the membership arm, which makes the gap narrower than it looks.
+- **Land the `classad` fix** (§6.2) — `PelicanPlatform/classad#692`, open. Until it is released
+  the store arm cannot serve wire rows for a semi join, so the membership arm answers nearly
+  everything and the cap is the real ceiling.
 - A set operation's branches take the membership arm only.
-- Derived tables and CTEs, and correlated scalar subqueries — each a separate design.
+- Derived tables and CTEs, and correlated scalar subqueries — each a separate design. §9 is
+  the standing constraint on the first of them.
