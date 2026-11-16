@@ -161,6 +161,28 @@ type Config struct {
 	// OnPhase the handler must be safe for concurrent use and must not block. Every open is reported, so
 	// per-table attribution holds under parallelism; only the SUM stops matching the wall clock.
 	OnTableOpen func(kind, name string, d time.Duration)
+	// OnClosePhase, when set, is called with the duration of each step of Close: stopping the
+	// transaction reaper, draining the RPC server, and closing the catalog.
+	//
+	// Close is the mirror of New and had the opposite problem: it was one opaque call that logs
+	// "closing store" and then nothing. The steps inside it are not comparable in cost -- draining
+	// the RPC server waits for an in-flight maintenance pass to reach a safe boundary, measured in
+	// minutes on a large archive, while closing the catalog of an append-only table is a few
+	// hundred kilobytes of snapshot -- so attributing a slow shutdown needs the split. Without it
+	// an operator sizing a termination grace period has to infer it from the OPEN timings, which
+	// measure different work.
+	//
+	// OnClosePhaseStart, when set, is called with each step's name as it BEGINS. A completion-only
+	// hook cannot report an in-flight step, and the in-flight step is the whole question during a
+	// shutdown that is taking too long: "drain-rpc finished in 190s" arrives 190 seconds after the
+	// moment someone wanted to know what was happening.
+	//
+	// Called from the goroutine that calls Close, in order, never concurrently, and always paired
+	// with the OnClosePhase for the same name unless the process dies in between -- which is the
+	// case it exists to make visible.
+	OnClosePhaseStart func(name string)
+	// Called from the goroutine that calls Close, in order, never concurrently.
+	OnClosePhase func(name string, d time.Duration)
 	// OnSealMigration, when set, is called for each table whose open rewrote segments to encrypt
 	// private attributes written before they were always encrypted, with how many it rewrote.
 	//
@@ -211,9 +233,11 @@ type Service struct {
 	logQueries   bool
 	// maintainOpts is the resolved maintenance configuration the background loop was
 	// started with (zero when maintenance is disabled).
-	maintainOpts db.MaintainOptions
-	log          *slog.Logger
-	stopReaper   func() // stops the idle-transaction reaper; set in New
+	maintainOpts      db.MaintainOptions
+	log               *slog.Logger
+	stopReaper        func()                             // stops the idle-transaction reaper; set in New
+	onClosePhaseStart func(name string)                  // Config.OnClosePhaseStart
+	onClosePhase      func(name string, d time.Duration) // Config.OnClosePhase
 
 	// owners holds the tables an in-process writer owns; every client connection's
 	// TableWritable consults it, so those tables are read-only to remote peers.
@@ -279,14 +303,16 @@ func New(cfg Config) (*Service, error) {
 	step("ensure-tables")
 
 	svc := &Service{
-		cat:          cat,
-		rpc:          dbrpc.NewServerCatalog(cat),
-		defaultTable: defaultTable,
-		authorize:    cfg.Authorize,
-		forceReadOn:  cfg.ForceReadOnly,
-		logQueries:   cfg.LogQueries,
-		log:          log,
-		owners:       NewTableOwners(),
+		cat:               cat,
+		rpc:               dbrpc.NewServerCatalog(cat),
+		defaultTable:      defaultTable,
+		authorize:         cfg.Authorize,
+		forceReadOn:       cfg.ForceReadOnly,
+		logQueries:        cfg.LogQueries,
+		log:               log,
+		owners:            NewTableOwners(),
+		onClosePhaseStart: cfg.OnClosePhaseStart,
+		onClosePhase:      cfg.OnClosePhase,
 	}
 	// A read that panics is failed alone and reported through the server's logger; without this
 	// it goes to the process default, which only the daemon's main points at our log.
@@ -568,11 +594,34 @@ func (s *Service) levelWithin(addr, user string, inBound func(perm string) bool)
 
 // Close stops background work and closes the database.
 func (s *Service) Close() error {
-	if s.stopReaper != nil {
-		s.stopReaper()
+	begin := func(name string) time.Time {
+		if s.onClosePhaseStart != nil {
+			s.onClosePhaseStart(name)
+		}
+		return time.Now()
 	}
+	phase := func(name string, start time.Time) {
+		if s.onClosePhase != nil {
+			s.onClosePhase(name, time.Since(start))
+		}
+	}
+	if s.stopReaper != nil {
+		t := begin("stop-reaper")
+		s.stopReaper()
+		phase("stop-reaper", t)
+	}
+	// The long one. rpc.Close asks every maintenance pass to stop at its next safe boundary and
+	// then waits for it, because the catalog close below unmaps the segments those passes are
+	// reading. The wait is therefore not something that can be cut short and skipped past -- see
+	// the comment on bgWG.Wait in dbrpc -- which is exactly why it is worth timing.
+	t := begin("drain-rpc")
 	s.rpc.Close()
-	return s.cat.Close()
+	phase("drain-rpc", t)
+
+	t = begin("close-catalog")
+	err := s.cat.Close()
+	phase("close-catalog", t)
+	return err
 }
 
 // peerUser is the authenticated fully-qualified user, or "" for an
