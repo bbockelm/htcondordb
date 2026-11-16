@@ -271,12 +271,35 @@ func (m *federationManager) forget(hub *federate.Hub) {
 	}
 }
 
+// hubStopNag is how long the hub may take to wind down before the wait says so. Short, because the
+// point is not to flag a problem -- a hub with several spokes legitimately takes a moment -- but to
+// stop the wait being invisible: it runs on the shutdown path, inside the termination grace period,
+// and anything there that cannot be seen cannot be budgeted for.
+const hubStopNag = 2 * time.Second
+
 // stopLocked stops the running hub and waits for it: the hub writes this catalog in process, so it
 // must be gone before the catalog closes. Ownership is left to the caller.
+//
+// The wait has no deadline, and must not get one that gives up and proceeds. What follows a stop on
+// the shutdown path is the catalog close, which unmaps the segments the hub's sinks write through;
+// returning early would hand those sinks a freed mapping. A bounded wait here would convert a slow
+// shutdown -- which costs time and nothing else -- into a use-after-unmap, which costs the database.
+// What it gets instead is a voice: how long it waited, and a line while it waits.
 func (m *federationManager) stopLocked() {
 	if m.cancel != nil {
+		start := time.Now()
 		m.cancel()
-		<-m.done
+		select {
+		case <-m.done:
+		case <-time.After(hubStopNag):
+			m.logger.Info("federate: waiting for the hub to wind down before the store closes",
+				"waited", time.Since(start).Round(time.Millisecond).String())
+			<-m.done
+		}
+		if waited := time.Since(start); waited > hubStopNag {
+			m.logger.Info("federate: hub stopped",
+				"seconds", waited.Round(time.Millisecond).Seconds())
+		}
 	}
 	m.hub, m.cancel, m.done, m.sig = nil, nil, nil, ""
 }

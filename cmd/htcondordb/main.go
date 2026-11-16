@@ -282,6 +282,10 @@ func run() error {
 			"archive index auto-tune disabled (HTCONDORDB_ARCHIVE_INDEX_MIN_DEMAND < 0)")
 	}
 
+	// Set when the close begins; the OnClosePhase hooks below report into it. Atomic because the
+	// hooks are installed now and the timer is created on the shutdown path.
+	var closer atomic.Pointer[closeTimer]
+
 	archiveIndexBackfillBytes := archiveIndexBackfillBudget(cfg, log)
 
 	// The catalog open starts here and is the long, quiet part of a start; beat while it runs.
@@ -291,9 +295,22 @@ func run() error {
 	defer boot.stopProgress()
 
 	svc, err := server.New(server.Config{
-		OnPhase:               boot.record,
-		OnTableOpen:           boot.recordTableOpen,
-		OnSealMigration:       boot.recordSealMigration,
+		OnPhase:         boot.record,
+		OnTableOpen:     boot.recordTableOpen,
+		OnSealMigration: boot.recordSealMigration,
+		// The close timer does not exist yet -- it starts when the close does, which is after
+		// Serve returns. The hooks read it through the pointer so Close can report into a timer
+		// created long after the service was built.
+		OnClosePhaseStart: func(name string) {
+			if t := closer.Load(); t != nil {
+				t.begin(name)
+			}
+		},
+		OnClosePhase: func(name string, d time.Duration) {
+			if t := closer.Load(); t != nil {
+				t.record(name, d)
+			}
+		},
 		Dir:                   dbDir,
 		Authorize:             authorize,
 		ForceReadOnly:         ha.forceReadOnly,
@@ -318,11 +335,11 @@ func run() error {
 	// the log says the daemon stopped and the process then sits there, so a shutdown killed
 	// during the gap leaves a log showing a clean exit that never happened.
 	defer func() {
-		start := time.Now()
+		t := newCloseTimer(log)
+		closer.Store(t)
 		log.Info(logging.DestinationGeneral, "closing store")
 		_ = svc.Close()
-		log.Info(logging.DestinationGeneral, "store closed",
-			"seconds", time.Since(start).Round(time.Millisecond).Seconds())
+		log.Info(logging.DestinationGeneral, "store closed", t.finish()...)
 	}()
 	if logQueries {
 		log.Info(logging.DestinationGeneral, "per-query logging enabled (HTCONDORDB_LOG_QUERIES)")
