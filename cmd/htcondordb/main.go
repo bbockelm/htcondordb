@@ -287,6 +287,14 @@ func run() error {
 	// below never runs; stopping twice is harmless.
 	boot.startProgress(dbDir)
 	defer boot.stopProgress()
+	// Let the heartbeat see inside a single table's open. Every other signal this daemon has
+	// about the catalog open fires when a table FINISHES, so the one archive that takes eleven
+	// minutes is the one that reports nothing for eleven minutes. This hook is the storage
+	// layer's in-flight report -- phase, and segments done out of that phase's total -- which is
+	// both what the beat counts down and what the throughput estimate is measured from. Set once,
+	// before the open, as the hook's contract requires; the timer drops reports that arrive after
+	// the start is over.
+	collections.OpenProgressHook = boot.onOpenProgress
 
 	// Bound before the open, not after it: see obsserver.go. pprof and /startupz answer for the
 	// whole of the open; /metrics joins them once there is a catalog to read.

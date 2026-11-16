@@ -57,17 +57,27 @@ func TestScanCatalogEntries(t *testing.T) {
 	}
 }
 
-// TestEstimateOpenScalesWithSegments: the estimate is the segment count over the rate constant, so
-// an operator reading it can check it against the counts printed beside it.
+// TestEstimateOpenScalesWithSegments: the estimate is the segment count over the rate, so an
+// operator reading it can check it against the counts and the rate printed beside it.
 func TestEstimateOpenScalesWithSegments(t *testing.T) {
-	if got := estimateOpen(0); got != 0 {
+	if got := estimateOpen(0, seedSegmentsPerSecond); got != 0 {
 		t.Errorf("estimateOpen(0) = %v, want 0", got)
 	}
-	if got, want := estimateOpen(openSegmentsPerSecond*60), time.Minute; got != want {
-		t.Errorf("estimateOpen(%d) = %v, want %v", openSegmentsPerSecond*60, got, want)
+	if got, want := estimateOpen(600, 10), time.Minute; got != want {
+		t.Errorf("estimateOpen(600 segs, 10/s) = %v, want %v", got, want)
 	}
-	if estimateOpen(7007) <= estimateOpen(5278) {
+	if estimateOpen(7007, 10) <= estimateOpen(5278, 10) {
 		t.Error("a larger archive must not estimate shorter")
+	}
+	// The whole point of measuring the rate: the same work on a machine twice as fast must
+	// estimate half as long, rather than reporting the seeded figure whatever the machine does.
+	if got, want := estimateOpen(600, 20), 30*time.Second; got != want {
+		t.Errorf("estimateOpen(600 segs, 20/s) = %v, want %v", got, want)
+	}
+	// A rate nothing has established yet cannot produce a number; it must not produce a
+	// divide-by-zero one either.
+	if got := estimateOpen(600, 0); got != 0 {
+		t.Errorf("estimateOpen with no rate = %v, want 0", got)
 	}
 }
 
