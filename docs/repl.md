@@ -263,6 +263,20 @@ is written with the outer table's alias, which defaults to its own name (`jobs.G
 above). SQL would resolve an unmatched bare name outward; this does not, because ClassAd rows
 are heterogeneous and a typo would silently become a correlation.
 
+A subquery that names **one value** is written where that value goes, and is folded into the
+predicate before the outer read happens — so the scan sees an ordinary constraint:
+
+```sql
+-- Jobs asking for more memory than the average completed job used.
+SELECT ClusterId, RequestMemory FROM jobs
+ WHERE RequestMemory > (SELECT AVG(MemoryUsage) FROM history);
+```
+
+It has to be an aggregate (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), which yields exactly one row
+whatever the table holds, and it may not read the outer row — that would name a different
+value per row, which is a per-row aggregate rather than a constant. An aggregate over nothing
+is `undefined`, and a comparison against it holds for no row.
+
 `IN` also takes a plain list — `WHERE JobStatus IN (1, 5)` — which is ClassAd's
 `member(JobStatus, {1, 5})` written the SQL way. Both forms are read as a whole conjunct of
 `WHERE`, joined to the rest with `AND`; inside parentheses, in a projection or as one arm of
@@ -281,8 +295,9 @@ These follow ClassAd's reading, not SQL's three-valued logic, and the difference
 
 ### What is not supported
 
-An aggregate, `LIMIT` or `ORDER BY` inside the subquery; a correlation on anything but one
-equality; a subquery in a projection, in an `UPDATE`/`DELETE`, or as one arm of an `OR`;
+An aggregate, `LIMIT` or `ORDER BY` inside an `EXISTS`/`IN` subquery; a correlation on
+anything but one equality; a correlated scalar subquery; a subquery in a projection or in an
+`UPDATE`/`DELETE`; an `EXISTS`/`IN` as one arm of an `OR`;
 `FROM (SELECT ...)` and `WITH`. Each is refused with the reason and, where there is one, the
 spelling to use instead.
 

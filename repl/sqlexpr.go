@@ -106,6 +106,28 @@ func (p *parser) translateSQL(lift *[]AggCall) (out string, matched bool, err er
 		*lift = append(*lift, call)
 		return out, true, nil
 
+	// A parenthesized SELECT used as a VALUE: `RequestMemory > (SELECT AVG(RequestMemory)
+	// FROM history)`. Unlike IN, a scalar subquery IS an operand, so it needs nothing that
+	// has already been written through -- it is replaced where it stands by a placeholder
+	// attribute, and the value is folded in once the subquery has run.
+	case p.inWhere > 0 && p.atPunct("(") && p.peekAheadKeyword(1, "SELECT"):
+		inner, serr := p.parseSubquerySelect("a scalar subquery")
+		if serr != nil {
+			return "", false, serr
+		}
+		name := fmt.Sprintf("%s%d", scalarPlaceholderPrefix, p.scalarSeq)
+		p.scalarSeq++
+		p.scalarSubs = append(p.scalarSubs, Subquery{
+			Kind: SubqueryScalar, Inner: inner, Placeholder: name,
+			Raw: "(SELECT ...)",
+		})
+		return name, true, nil
+
+	// Anywhere else a parenthesized SELECT is not a value this can stand behind.
+	case p.atPunct("(") && p.peekAheadKeyword(1, "SELECT"):
+		return "", false, fmt.Errorf("a subquery is only supported in a WHERE clause; " +
+			"compute the value with a separate SELECT and write it in")
+
 	case p.isKeyword("CASE"):
 		s, cerr := p.parseCaseExpr(lift)
 		if cerr != nil {

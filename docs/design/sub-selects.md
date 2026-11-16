@@ -133,7 +133,8 @@ clause that lifts anything must be a pure AND-spine, and one that is not is refu
 | correlated on a non-equality (`e.Ts > j.QDate`) | refused | a nested loop bounded only by the pair budget, which returns a partial answer when it hits it |
 | correlated on more than one equality | refused | a composite key; the store arm will take it |
 | aggregate / `LIMIT` / `ORDER BY` inside the subquery | refused | each changes *which* rows the predicate is drawn from |
-| scalar `WHERE x > (SELECT AVG(...))` | not yet | folds to a literal; no engine question, just unwritten |
+| scalar `WHERE x > (SELECT AVG(...))` | done | constant folding: run once, written into the predicate as a literal. It is an operand rather than a postfix keyword, so it needs nothing already written through and is accepted anywhere in a `WHERE`, including inside an `OR` |
+| correlated scalar | refused | a different value per row is a per-row aggregate, not a constant |
 | `FROM (SELECT ...)`, `WITH` | not planned here | derived tables cost the outer query its pushdown; separate design |
 
 ## 6. The two arms
@@ -235,5 +236,5 @@ table; that is what decides the plan it is reporting.
 2. The membership arm: correlated `EXISTS` / `NOT EXISTS` / `IN` / `NOT IN`, uncorrelated
    `EXISTS`, the cap. **Done.**
 3. The store arm, with the differential test of §6.3 standing between them.
-4. Scalar uncorrelated subqueries (`> (SELECT AVG(...))`).
+4. Scalar uncorrelated subqueries (`> (SELECT AVG(...))`). **Done.**
 5. Measure the cap against the store arm and set it to the crossover.

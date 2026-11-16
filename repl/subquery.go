@@ -46,6 +46,10 @@ const (
 	SubqueryIn
 	// SubqueryNotIn is `<expr> NOT IN (SELECT ...)`, the anti join of the same.
 	SubqueryNotIn
+	// SubqueryScalar is `(SELECT <agg> FROM ...)` used as a VALUE -- one row, one column.
+	// It is not a join at all: the subquery is run once and its result folded into the
+	// predicate as a literal, so the outer read sees an ordinary constraint.
+	SubqueryScalar
 )
 
 func (k SubqueryKind) String() string {
@@ -56,6 +60,8 @@ func (k SubqueryKind) String() string {
 		return "IN"
 	case SubqueryNotIn:
 		return "NOT IN"
+	case SubqueryScalar:
+		return "a scalar subquery"
 	default:
 		return "EXISTS"
 	}
@@ -79,7 +85,16 @@ type Subquery struct {
 
 	// Inner is the subquery's own SELECT.
 	Inner *Statement
+
+	// Placeholder is the attribute name a SubqueryScalar stands behind in the predicate
+	// until its value is known: `__sub_0`, `__sub_1`, ... in source order. Double-
+	// underscored so it cannot collide with an ad's own attributes, exactly as the
+	// aggregate placeholders are. Empty for every other kind.
+	Placeholder string
 }
+
+// scalarPlaceholderPrefix names the attribute a scalar subquery is bound to until it is run.
+const scalarPlaceholderPrefix = "__sub_"
 
 // atSubqueryClose reports whether the parser sits at the `)` that closes the subquery being
 // parsed. It is folded into the stop predicates of every clause an inner SELECT can contain,
@@ -104,9 +119,18 @@ func (p *parser) parseSubquerySelect(what string) (*Statement, error) {
 	if !p.takeKeyword("SELECT") {
 		return nil, fmt.Errorf("%s takes a SELECT, and this parenthesis does not open one", what)
 	}
+	// A nested statement collects its own scalar subqueries; the outer clause's must not
+	// be drained by it, nor its own left behind for the outer clause to adopt.
+	saved, savedSeq := p.scalarSubs, p.scalarSeq
+	p.scalarSubs, p.scalarSeq = nil, 0
+	savedWhere := p.inWhere
+	p.inWhere = 0
 	p.inSubquery++
 	inner, err := p.parseSelect()
 	p.inSubquery--
+	p.inWhere = savedWhere
+	inner.Subqueries = append(inner.Subqueries, p.scalarSubs...)
+	p.scalarSubs, p.scalarSeq = saved, savedSeq
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", what, err)
 	}
@@ -188,6 +212,7 @@ func (p *parser) atWhereConjunctEnd(end func() bool) func() bool {
 // statement, a set operator, or the parenthesis closing an enclosing subquery).
 func (p *parser) parseWhereClause(end func() bool) (*whereClause, error) {
 	w := &whereClause{}
+	p.scalarSeq = 0
 	start := p.peek().pos
 	last := start
 	stop := p.atWhereConjunctEnd(end)
@@ -196,6 +221,10 @@ func (p *parser) parseWhereClause(end func() bool) (*whereClause, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Scalar subqueries found while capturing this conjunct come first: they are
+		// folded into the predicate as values, and the conjunct that names them is kept.
+		w.subs = append(w.subs, p.scalarSubs...)
+		p.scalarSubs = nil
 		if piece.sub != nil {
 			w.subs = append(w.subs, *piece.sub)
 		} else {
@@ -211,15 +240,26 @@ func (p *parser) parseWhereClause(end func() bool) (*whereClause, error) {
 		}
 	}
 	w.rawAll = strings.TrimSpace(p.src[start:last])
-	if len(w.subs) > 0 && p.isKeyword("OR") {
-		w.hadOr = true
+	for _, sub := range w.subs {
+		if sub.Kind != SubqueryScalar && p.isKeyword("OR") {
+			w.hadOr = true
+			break
+		}
 	}
 	// Lifting a conjunct out of a clause that is not a pure AND-spine would answer a
 	// different query; see the file comment.
-	if len(w.subs) > 0 && w.hadOr {
-		return nil, fmt.Errorf("%s inside an OR is not supported: it filters rows, so it has "+
-			"to be a whole conjunct of WHERE. Rewrite the clause so the subquery is joined "+
-			"to the rest with AND", w.subs[0].Kind)
+	// A LIFTED predicate must be a real conjunct of the whole clause (see the file comment).
+	// A scalar subquery is not lifted -- it stays where it was written, as a value -- so an
+	// OR around it changes nothing.
+	if w.hadOr {
+		for _, sub := range w.subs {
+			if sub.Kind == SubqueryScalar {
+				continue
+			}
+			return nil, fmt.Errorf("%s inside an OR is not supported: it filters rows, so "+
+				"it has to be a whole conjunct of WHERE. Rewrite the clause so the "+
+				"subquery is joined to the rest with AND", sub.Kind)
+		}
 	}
 	return w, nil
 }
@@ -261,7 +301,9 @@ func (p *parser) parseWhereConjunct(stop func() bool) (wherePiece, error) {
 	}
 	p.pos = save
 
+	p.inWhere++
 	expr, raw, err := p.captureExpr(stop, nil)
+	p.inWhere--
 	if err != nil {
 		return wherePiece{}, err
 	}

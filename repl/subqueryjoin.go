@@ -49,6 +49,11 @@ import (
 // decision the statement has already made, never a performance judgement -- see the file
 // comment for why there is no judgement to make.
 func (e *Executor) trySubqueryStoreArm(st *Statement) (*Result, bool, error) {
+	// A scalar subquery is folded into the predicate first, whichever arm runs: it is a
+	// value in the constraint, not a side of the join.
+	if err := e.foldScalarSubqueries(st); err != nil {
+		return nil, false, err
+	}
 	plans, err := planSubqueries(st)
 	if err != nil {
 		return nil, false, err

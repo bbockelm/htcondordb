@@ -210,3 +210,57 @@ func TestSubqueryRefusesAnOversizeKeySet(t *testing.T) {
 		t.Errorf("under the cap: got %q, want %q", got, "1,2,3")
 	}
 }
+
+// A scalar subquery is constant folding: it is run once, its value is written into the
+// predicate, and the outer read is an ordinary constrained scan.
+func TestScalarSubqueryFoldsIntoThePredicate(t *testing.T) {
+	e, cleanup := subqueryFixture(t)
+	defer cleanup()
+
+	// epochs holds Restarts 0, 3, 1, 0 -- so AVG is 1 and MAX is 3.
+	for _, tc := range []struct{ name, query, want string }{
+		{"greater than an average", `SELECT ClusterId FROM jobs WHERE JobStatus > (SELECT AVG(Restarts) FROM epochs)`, "1,2,3,4"},
+		{"against a MAX", `SELECT ClusterId FROM jobs WHERE JobStatus == (SELECT MAX(Restarts) FROM epochs)`, ""},
+		{"against a COUNT", `SELECT ClusterId FROM jobs WHERE ClusterId == (SELECT COUNT(*) FROM epochs)`, "4"},
+		{"the subquery's own filter counts", `SELECT ClusterId FROM jobs WHERE ClusterId == (SELECT COUNT(*) FROM epochs WHERE Restarts == 0)`, "2"},
+		{"beside another conjunct", `SELECT ClusterId FROM jobs WHERE JobStatus == 5 AND ClusterId > (SELECT MAX(Restarts) FROM epochs)`, "4"},
+		// A value, not a lifted conjunct, so an OR around it changes nothing.
+		{"inside an OR", `SELECT ClusterId FROM jobs WHERE ClusterId == 1 OR ClusterId == (SELECT MAX(Restarts) FROM epochs)`, "1,3"},
+		// More than one in a clause, each folded where it stands.
+		{"two in one clause", `SELECT ClusterId FROM jobs WHERE ClusterId > (SELECT MIN(Restarts) FROM epochs) AND ClusterId <= (SELECT MAX(Restarts) FROM epochs)`, "1,2,3"},
+		// An aggregate over nothing is undefined, and a comparison against it holds for
+		// no row -- the right answer, not an error.
+		{"over an empty set", `SELECT ClusterId FROM jobs WHERE JobStatus > (SELECT MAX(Restarts) FROM epochs WHERE Restarts > 99)`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clusters(t, e, tc.query); got != tc.want {
+				t.Errorf("query: %s\n  got  %q\n  want %q", tc.query, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestScalarSubqueryRefusals(t *testing.T) {
+	e, cleanup := subqueryFixture(t)
+	defer cleanup()
+
+	for _, tc := range []struct{ query, want string }{
+		{`SELECT ClusterId FROM jobs WHERE ClusterId == (SELECT Restarts FROM epochs)`,
+			"has to be an aggregate"},
+		{`SELECT ClusterId FROM jobs WHERE ClusterId == (SELECT COUNT(*) FROM epochs GROUP BY Restarts)`,
+			"cannot GROUP BY"},
+		{`SELECT ClusterId FROM jobs WHERE ClusterId == (SELECT COUNT(*), MAX(Restarts) FROM epochs)`,
+			"and this one selects 2"},
+		{`SELECT ClusterId FROM jobs WHERE ClusterId == (SELECT COUNT(*) FROM epochs WHERE Restarts == jobs.ClusterId)`,
+			"reads the outer row"},
+		// Outside a WHERE clause there is no value for it to stand behind.
+		{`SELECT (SELECT COUNT(*) FROM epochs) FROM jobs`,
+			"only supported in a WHERE"},
+	} {
+		if _, err := e.ExecString(tc.query); err == nil {
+			t.Errorf("accepted %s", tc.query)
+		} else if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s:\n  error %q\n  want it to mention %q", tc.query, err, tc.want)
+		}
+	}
+}

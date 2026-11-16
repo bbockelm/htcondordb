@@ -548,6 +548,18 @@ type parser struct {
 	// position. It is what tells every clause terminator that this statement ends at a
 	// `)` rather than at the end of the input; see atSubqueryClose.
 	inSubquery int
+	// inWhere counts the WHERE clauses being captured around the current position. A
+	// scalar subquery is recognised only inside one; elsewhere it is refused.
+	inWhere int
+	// scalarSubs collects the scalar subqueries found while capturing the clause, in
+	// source order. parseWhereClause drains it after every conjunct, so it never outlives
+	// one clause.
+	scalarSubs []Subquery
+	// scalarSeq names the next scalar subquery's placeholder. It is a counter of its own
+	// rather than len(scalarSubs), which is reset by each conjunct's drain -- two scalars
+	// in one clause would then both be called __sub_0, and the first value substituted
+	// would answer for both.
+	scalarSeq int
 }
 
 func (p *parser) atEnd() bool { return p.pos >= len(p.toks) }

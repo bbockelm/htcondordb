@@ -75,6 +75,9 @@ func (sp *subPlan) correlated() bool { return sp.innerKey != "" }
 func planSubqueries(st *Statement) ([]*subPlan, error) {
 	plans := make([]*subPlan, 0, len(st.Subqueries))
 	for _, sub := range st.Subqueries {
+		if sub.Kind == SubqueryScalar {
+			continue // folded into the predicate, not planned as a join
+		}
 		sp, err := planSubquery(st, sub)
 		if err != nil {
 			return nil, err
@@ -267,9 +270,15 @@ func (e *Executor) resolveSubqueries(st *Statement) error {
 	if len(st.Subqueries) == 0 {
 		return nil
 	}
+	if err := e.foldScalarSubqueries(st); err != nil {
+		return err
+	}
 	plans, err := planSubqueries(st)
 	if err != nil {
 		return err
+	}
+	if len(plans) == 0 {
+		return nil
 	}
 	terms := make([]string, 0, len(plans)+1)
 	if st.Where != "" {
@@ -397,4 +406,109 @@ func (e *Executor) maxInListValues() int {
 		return e.maxInList
 	}
 	return defaultMaxInListValues
+}
+
+// A SCALAR SUBQUERY IS CONSTANT FOLDING, not a join.
+//
+// `RequestMemory > (SELECT AVG(RequestMemory) FROM history)` names one value. It is run once,
+// its result is written into the predicate as a ClassAd literal, and what is left is an
+// ordinary constraint the store reads exactly as it reads any other -- index probes, zone
+// maps and all. Nothing about the outer read changes, which is why this is the one subquery
+// form with no second arm and no cap.
+//
+// It must be UNCORRELATED for that to be true. A subquery reading the outer row is a
+// different value per row, which is a per-row aggregate rather than a constant, and is
+// refused rather than evaluated against one row and reused for the rest.
+
+// foldScalarSubqueries runs each scalar subquery of a statement and writes its value into the
+// predicate, removing it from the statement. The other kinds are left alone.
+func (e *Executor) foldScalarSubqueries(st *Statement) error {
+	if len(st.Subqueries) == 0 {
+		return nil
+	}
+	// Last to first, so that `__sub_1` is not substituted into the name `__sub_10`.
+	for i := len(st.Subqueries) - 1; i >= 0; i-- {
+		sub := st.Subqueries[i]
+		if sub.Kind != SubqueryScalar {
+			continue
+		}
+		lit, err := e.scalarLiteral(st, sub)
+		if err != nil {
+			return err
+		}
+		st.Where = strings.ReplaceAll(st.Where, sub.Placeholder, lit)
+		st.Subqueries = append(st.Subqueries[:i], st.Subqueries[i+1:]...)
+	}
+	return nil
+}
+
+// scalarLiteral runs one scalar subquery and renders its single value as the ClassAd literal
+// naming it.
+func (e *Executor) scalarLiteral(st *Statement, sub Subquery) (string, error) {
+	if err := refuseUnscalarInner(st, sub); err != nil {
+		return "", err
+	}
+	res, err := e.Exec(sub.Inner)
+	if err != nil {
+		return "", fmt.Errorf("a scalar subquery over %s: %w", sub.Inner.Table, err)
+	}
+	switch {
+	case len(res.Rows) == 0:
+		// An aggregate over no rows still yields one row, so this is a shape that got
+		// past the checks rather than an empty table.
+		return "undefined", nil
+	case len(res.Rows) > 1:
+		return "", fmt.Errorf("a scalar subquery must name ONE value and this one returned "+
+			"%d rows", len(res.Rows))
+	case len(res.Projected) != 1 || len(res.Columns) != 1:
+		return "", fmt.Errorf("a scalar subquery must name ONE value and this one returned "+
+			"%d columns", len(res.Columns))
+	}
+	v := res.Projected[0].EvaluateAttr(res.Columns[0])
+	lit, ok := literalOf(v)
+	if !ok {
+		// Undefined is a value here, not a failure: an aggregate over nothing is
+		// undefined, and a comparison against it holds for no row -- which is the right
+		// answer and not an error.
+		return "undefined", nil
+	}
+	return lit, nil
+}
+
+// refuseUnscalarInner rejects a subquery used as a value that cannot be one.
+func refuseUnscalarInner(st *Statement, sub Subquery) error {
+	in := sub.Inner
+	switch {
+	case in.IsSetOp():
+		return fmt.Errorf("a scalar subquery combining SELECTs with UNION is not supported")
+	case len(in.GroupBy) > 0:
+		return fmt.Errorf("a scalar subquery names one value, so it cannot GROUP BY: " +
+			"grouping yields one row per group")
+	case len(in.Items) != 1:
+		return fmt.Errorf("a scalar subquery names one value, and this one selects %d",
+			len(in.Items))
+	case !in.Items[0].GroupLevel():
+		return fmt.Errorf("a scalar subquery names one value, so it has to be an aggregate " +
+			"-- COUNT, SUM, AVG, MIN or MAX -- which yields exactly one row whatever the " +
+			"table holds; a plain column yields one per row")
+	}
+	// Correlation would make it a different value per row, which is a per-row aggregate
+	// rather than a constant.
+	outerAlias := st.Table
+	if len(st.From) > 0 {
+		outerAlias = st.From[0].Alias
+	}
+	aliases := map[string]int{strings.ToLower(outerAlias): 0}
+	conj, err := conjunctsOf(in.Where)
+	if err != nil {
+		return fmt.Errorf("a scalar subquery's WHERE clause did not parse: %w", err)
+	}
+	for _, c := range conj {
+		if sidesOf(c, aliases)&sideBit(0) != 0 {
+			return fmt.Errorf("a scalar subquery that reads the outer row (`%s`) is not "+
+				"supported: it would name a different value for every row, which is a "+
+				"per-row aggregate rather than a constant", c)
+		}
+	}
+	return nil
 }
