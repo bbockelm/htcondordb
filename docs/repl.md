@@ -85,6 +85,9 @@ DELETE FROM jobs WHERE JobStatus == 4;
   numeric values sort numerically, applied before `LIMIT`.
 - **`JOIN`** reads two or more tables; see [JOIN](#join--several-tables-one-row).
   Subqueries are still rejected with a clear error.
+- **Window functions**: `ROW_NUMBER`, `RANK` and `DENSE_RANK` `OVER (PARTITION BY … ORDER
+  BY …)`, filtered with `QUALIFY` — the "top N per group" query. See
+  [window functions](#window-functions--ranking-rows-within-a-partition).
 - **`time_bucket(attr, 'width')`** groups rows by a floored unix-epoch timestamp
   attribute for time-series output. See the [time-series design](design/time-series.md).
 
@@ -267,6 +270,63 @@ The literal column is the SQL idiom for saying which branch a row came from.
 - Each branch is an ordinary `SELECT` with its own pushdowns, and may itself be a `JOIN`.
 
 `INTERSECT` and `EXCEPT` are not supported.
+
+## Window functions — ranking rows within a partition
+
+```sql
+SELECT <items>, <FUNC>() OVER ([PARTITION BY <cols>] ORDER BY <terms>) [[AS] alias]
+FROM <table> [WHERE ...]
+[QUALIFY <expression>]
+[ORDER BY ...] [LIMIT n]
+```
+
+"The five most recent jobs for every owner" has no other spelling here. `GROUP BY` collapses
+each owner to a single row, and `LIMIT` cuts the result as a whole rather than per owner — so
+without a window the query becomes one `SELECT` per owner. A ranking window numbers the rows
+**within** each partition and leaves them as rows; `QUALIFY` then keeps the first few of every
+one, in a single pass:
+
+```sql
+SELECT Owner, ClusterId, QDate,
+       ROW_NUMBER() OVER (PARTITION BY Owner ORDER BY QDate DESC) AS n
+FROM jobs
+QUALIFY n <= 5
+ORDER BY Owner, n;
+```
+
+- **Three functions**, taking no arguments and differing only on ties:
+
+  | function | a four-row partition whose 2nd and 3rd rows tie | |
+  |---|---|---|
+  | `ROW_NUMBER()` | 1, 2, 3, 4 | always distinct |
+  | `RANK()` | 1, 2, 2, 4 | ties share a number, and skip the ones they consumed |
+  | `DENSE_RANK()` | 1, 2, 2, 3 | ties share a number, and the next is the next integer |
+
+- **`ORDER BY` inside `OVER` is required.** SQL permits leaving it out, but then the numbering
+  follows whatever order the rows arrived in, and the same query over the same data can answer
+  differently each time. Its terms are columns or expressions, each `ASC` (default) or `DESC`,
+  and need not be selected — `ORDER BY QDate DESC` ranks by a `QDate` the output never shows.
+- **`PARTITION BY` is optional**; without it the whole result is one partition, which is how to
+  ask for the overall top N by a computed order. Its columns need not be selected either.
+- **`QUALIFY` filters on the window column**, and only on window columns — it is to a window
+  what `HAVING` is to an aggregate. `WHERE n <= 5` is what everyone reaches for first and is
+  not legal SQL (`WHERE` chooses rows before the numbering exists); here it would also be
+  evaluated by the store, which knows no attribute `n`, so the query would quietly return
+  nothing. It is refused with a pointer to `QUALIFY` instead. A condition on the rows
+  themselves still belongs in `WHERE`, where the store applies it before the rows are fetched.
+- **The ranking is computed client-side, and `LIMIT` is not pushed to the server.** A
+  server-side cap would truncate the rows *before* they were ranked, making the answer a
+  ranking of an arbitrary prefix. So every row matching `WHERE` crosses the wire (projected to
+  the attributes the query names — `.explain` shows which). Narrow a windowed query with
+  `WHERE`, not with `LIMIT`.
+- **The statement's own `ORDER BY` and `LIMIT` apply last**, after the numbering and after
+  `QUALIFY`, so `ORDER BY n` sorts by the window column. In a windowed query they may only
+  name selected columns.
+- **Not combinable** with aggregates or `GROUP BY` (a window is per row; an aggregate collapses
+  rows), with `SELECT *` (project explicit columns), or with `JOIN`.
+- **No frame clause and no aggregate or offset windows** — `SUM(x) OVER (...)`, `LAG`, `LEAD`
+  and `NTILE` are not supported. A running total is better expressed as a continuous-aggregate
+  view or a Grafana transform.
 
 ## MATCH — matchmaking between two tables
 
