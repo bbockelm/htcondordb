@@ -279,6 +279,18 @@ table; that is what decides the plan it is reporting.
 1. `IN` value lists, the subquery parser, the predicate lifted out of `WHERE`. **Done.**
 2. The membership arm: correlated `EXISTS` / `NOT EXISTS` / `IN` / `NOT IN`, uncorrelated
    `EXISTS`, the cap. **Done.**
-3. The store arm, with the differential test of §6.3 standing between them.
+3. The store arm, with the differential test of §6.3 standing between them, and the chain
+   spelling for several predicates. **Done.**
 4. Scalar uncorrelated subqueries (`> (SELECT AVG(...))`). **Done.**
-5. Measure the cap against the store arm and set it to the crossover.
+5. Measure the cap against the store arm and set it to the crossover. **Done** — §6.1; the
+   cap was already at it.
+
+### Still open
+
+- **Release the `classad` fix** (§6.2). Until then the store arm cannot serve wire rows for a
+  semi join, so the membership arm answers nearly everything and the cap is the real ceiling.
+- `JoinAggregate` for `GROUP BY` over a predicate. `repl` does not use it for ordinary joins
+  either, so this would be its first use; the single-table aggregate still runs server-side
+  on the membership arm, which makes the gap narrower than it looks.
+- A set operation's branches take the membership arm only.
+- Derived tables and CTEs, and correlated scalar subqueries — each a separate design.
