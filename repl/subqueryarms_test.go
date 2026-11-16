@@ -89,6 +89,10 @@ var subqueryArmQueries = []string{
 	`SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) ORDER BY ClusterId LIMIT 2`,
 	`SELECT ClusterId, Owner FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId)`,
 	`SELECT * FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId)`,
+	// Several predicates at once: one chain step each, semi and anti together.
+	`SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) AND Owner IN (SELECT Owner FROM users WHERE Priority > 100)`,
+	`SELECT ClusterId FROM jobs WHERE NOT EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId AND e.Restarts > 0) AND Owner IN (SELECT Owner FROM users)`,
+	`SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) AND Owner NOT IN (SELECT Owner FROM users WHERE Priority > 100) AND JobStatus == 2`,
 }
 
 // subqueryRowsOf runs a query and returns every cell, row by row, so a comparison sees the
@@ -166,8 +170,8 @@ func TestSubqueryStoreArmDeclinesWithAReason(t *testing.T) {
 			"aggregates"},
 		{`SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.Restarts > 0)`,
 			"does not depend on the outer row"},
-		{`SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) AND Owner IN (SELECT Owner FROM users)`,
-			"carries two tables"},
+		{`SELECT ClusterId FROM jobs WHERE EXISTS (SELECT 1 FROM epochs e WHERE e.ClusterId == jobs.ClusterId) AND Owner IN (SELECT Owner FROM users) AND EXISTS (SELECT 1 FROM epochs f WHERE f.ClusterId == jobs.ClusterId + 1)`,
+			"cannot be qualified"},
 	} {
 		st, err := Parse(tc.query)
 		if err != nil {

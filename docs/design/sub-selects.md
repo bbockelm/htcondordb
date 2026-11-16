@@ -190,14 +190,19 @@ DAEMON level, so that is every ordinary user. The one-line fix is prepared on `c
 store arm sends `JoinWire` and no row is rendered or parsed. Until it is released, the store
 arm still runs — on the text reply.
 
+Several predicates in one statement go as the **chain** spelling, one step each, which
+`dbrpc` routes to its own opcode when `Spec.Steps` is set. Past the first step the equality's
+outer half reads the *accumulated* row rather than the left table, so it has to name the
+member it reads — and because every step here is a semi or anti join, folding in no member,
+that row still holds exactly the left side. Prefixing its alias is sound for a bare attribute
+name; a predicate past the first that correlates on an expression falls to the membership arm
+rather than having every reference in it rewritten.
+
 What it still needs:
 
-- The chain spelling, for a statement with more than one predicate. `dbrpc` picks the chain
-  opcode itself when `Spec.Steps` is set; today a second predicate falls to the membership
-  arm.
-- `JoinAggregate` for `GROUP BY` over a predicate, which today also falls to the membership
-  arm (where the single-table aggregate still runs server-side, so this is a smaller gap
-  than it looks).
+- `JoinAggregate` for `GROUP BY` over a predicate, which today falls to the membership arm
+  (where the single-table aggregate still runs server-side, so this is a smaller gap than it
+  looks).
 
 ### 6.3 The arms must be held to the same answer
 

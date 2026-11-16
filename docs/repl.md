@@ -290,8 +290,8 @@ spelling to use instead.
 
 `EXPLAIN` names the arm. The predicate is normally sent to the store as a semi or anti join,
 where neither table's rows cross the wire. When the store cannot take it — an older server,
-`AS OF`, a read inside a transaction, an aggregate query, or more than one predicate in the
-statement — the subquery's key column is read and inlined into the outer constraint instead,
+`AS OF`, a read inside a transaction, or an aggregate query — the subquery's key column is
+read and inlined into the outer constraint instead,
 up to a cap (over it, the query is refused rather than quietly degrading to a full scan).
 Both arms return the same rows.
 

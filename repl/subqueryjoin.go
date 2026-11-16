@@ -35,6 +35,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/dbrpc"
@@ -58,7 +59,7 @@ func (e *Executor) trySubqueryStoreArm(st *Statement) (*Result, bool, error) {
 		}
 		return nil, false, nil
 	}
-	req := e.subqueryJoinRequest(st, plans[0])
+	req := e.subqueryJoinRequest(st, plans)
 	rows, ok, err := e.semiJoinWireRows(req)
 	if !ok && err == nil {
 		rows, ok, err = e.semiJoinTextRows(req)
@@ -73,8 +74,7 @@ func (e *Executor) trySubqueryStoreArm(st *Statement) (*Result, bool, error) {
 		return nil, false, nil
 	}
 	if e.explain != nil {
-		e.explain.subqueryArm = fmt.Sprintf("store-side %s on %q",
-			joinKindName(plans[0]), plans[0].innerTable)
+		e.explain.subqueryArm = "store-side " + chainName(plans)
 		e.explain.rowsFetched = len(rows)
 	}
 	// The predicates are answered; nothing downstream should try to answer them again.
@@ -104,6 +104,49 @@ func joinKindName(sp *subPlan) string {
 	return "semi join"
 }
 
+// chainName names the whole chain for EXPLAIN: one predicate reads as itself, several read as
+// the sequence they fold in.
+func chainName(plans []*subPlan) string {
+	parts := make([]string, len(plans))
+	for i, sp := range plans {
+		parts[i] = fmt.Sprintf("%s on %q", joinKindName(sp), sp.innerTable)
+	}
+	return strings.Join(parts, " then ")
+}
+
+// allCorrelated reports whether every predicate depends on the outer row. One that does not
+// is a constant, which the membership arm settles with a single row rather than a join.
+func allCorrelated(plans []*subPlan) bool {
+	for _, sp := range plans {
+		if !sp.correlated() {
+			return false
+		}
+	}
+	return true
+}
+
+// chainKeysQualifiable reports whether every predicate past the first correlates on something
+// that can be written against the accumulated row.
+func chainKeysQualifiable(plans []*subPlan) bool {
+	for _, sp := range plans[1:] {
+		if !isBareAttr(sp.outerKey) {
+			return false
+		}
+	}
+	return true
+}
+
+// isBareAttr reports whether src is a single unqualified attribute reference, which is the
+// one shape an alias can be prefixed onto without rewriting the expression.
+func isBareAttr(src string) bool {
+	q, err := vm.Parse(src)
+	if err != nil {
+		return false
+	}
+	ref, ok := unwrapParens(q.Expr()).(*ast.AttributeReference)
+	return ok && ref.Scope == ast.NoScope
+}
+
 // unsendableSubqueryWhy says why these predicates cannot go to the store, and "" when they
 // can. Each is a shape the opcode does not carry or a decision already taken, so each is
 // answered before any round trip.
@@ -111,11 +154,20 @@ func (e *Executor) unsendableSubqueryWhy(st *Statement, plans []*subPlan) string
 	switch {
 	case e.placement == JoinPlacementClient:
 		return "the session forces the pairing to happen here"
-	case len(plans) != 1:
-		return fmt.Sprintf("the join opcode carries two tables and this statement has %d "+
-			"subquery predicates", len(plans))
-	case !plans[0].correlated():
-		return "the predicate does not depend on the outer row, so one row settles it"
+	case len(plans) == 0:
+		return "the statement has no subquery predicate"
+	case !allCorrelated(plans):
+		return "a predicate does not depend on the outer row, so one row settles it"
+	case len(plans) > 1 && !e.c.SupportsNewer(dbrpc.FeatJoinChain) && !e.serverJoin:
+		return "this server does not advertise a join over more than two tables"
+	case len(plans) > 1 && !chainKeysQualifiable(plans):
+		// Past the first step the equality's outer half reads the ACCUMULATED row rather
+		// than the left table, so it has to name the member it reads -- see db.JoinEqui.
+		// Prefixing an alias is only sound for a bare attribute name; an expression would
+		// need every reference in it rewritten, which is work the membership arm does not
+		// need at all.
+		return "a predicate past the first correlates on an expression rather than an " +
+			"attribute, which cannot be qualified against the joined row"
 	case st.AsOf != "":
 		return "AS OF reads both sides at one instant, which the join opcode cannot ask for"
 	case len(effectiveGroupBy(st)) > 0 || hasAggregate(st):
@@ -136,41 +188,70 @@ func (e *Executor) unsendableSubqueryWhy(st *Statement, plans []*subPlan) string
 	return ""
 }
 
-// subqueryJoinRequest renders one predicate as the join the store will run.
-func (e *Executor) subqueryJoinRequest(st *Statement, sp *subPlan) dbrpc.JoinRequest {
-	kind := db.JoinSemi
-	if sp.sub.Kind.negated() {
-		kind = db.JoinAnti
-	}
+// subqueryJoinRequest renders the predicates as the join the store will run.
+//
+// One predicate is the two-table spelling, which every server that joins at all can take.
+// Several is the chain spelling -- one step each -- which dbrpc routes to its own opcode when
+// Spec.Steps is set. Both are the same plan; db compiles the first into the second.
+func (e *Executor) subqueryJoinRequest(st *Statement, plans []*subPlan) dbrpc.JoinRequest {
 	outerAlias := st.Table
 	if len(st.From) > 0 {
 		outerAlias = st.From[0].Alias
 	}
+	outerWhere := st.Where
+	for _, sp := range plans {
+		outerWhere = andText(outerWhere, sp.outerWhere)
+	}
 	req := dbrpc.JoinRequest{Spec: db.JoinSpec{
-		Kind: kind,
 		Left: db.JoinSide{
 			Table:      st.Table,
 			Alias:      outerAlias,
-			Constraint: andText(st.Where, sp.outerWhere),
+			Constraint: outerWhere,
 			Project:    e.projectionAttrs(st),
 		},
-		// The side a semi or anti join tests contributes no member to the row, so it has
-		// no output projection to name: db refuses a spec that gives one.
-		Right: db.JoinSide{
-			Table:      sp.innerTable,
-			Alias:      sp.innerAlias,
-			Constraint: sp.innerWhere,
-		},
+	}}
+	// The side a semi or anti join tests contributes no member to the row, so it has no
+	// output projection to name: db refuses a spec that gives one.
+	side := func(sp *subPlan) db.JoinSide {
+		return db.JoinSide{Table: sp.innerTable, Alias: sp.innerAlias, Constraint: sp.innerWhere}
+	}
+	if len(plans) == 1 {
+		sp := plans[0]
+		req.Spec.Kind = serverSubqueryKind(sp)
+		req.Spec.Right = side(sp)
 		// Left is written bare because this is the two-table spelling, where the row holds
 		// one side and an unqualified path is unambiguous; Right reads the folded table and
 		// is bare for the same reason it always is. See db.JoinEqui.
-		Equi: []db.JoinEqui{{Left: sp.outerKey, Right: sp.innerKey}},
-	}}
+		req.Spec.Equi = []db.JoinEqui{{Left: sp.outerKey, Right: sp.innerKey}}
+	} else {
+		for i, sp := range plans {
+			left := sp.outerKey
+			if i > 0 {
+				// Past the first step the outer half reads the ACCUMULATED row. Every
+				// step here is a semi or anti join, which folds in no member, so that
+				// row still holds exactly the left side -- and naming it is enough.
+				left = outerAlias + "." + left
+			}
+			req.Spec.Steps = append(req.Spec.Steps, db.JoinStep{
+				Kind: serverSubqueryKind(sp),
+				Side: side(sp),
+				Equi: []db.JoinEqui{{Left: left, Right: sp.innerKey}},
+			})
+		}
+	}
 	// The LIMIT only pushes down when nothing here reorders or removes rows afterwards.
 	if st.Limit > 0 && len(st.OrderBy) == 0 && !st.Distinct {
 		req.Spec.Limit = st.Limit
 	}
 	return req
+}
+
+// serverSubqueryKind is the join one predicate becomes.
+func serverSubqueryKind(sp *subPlan) db.JoinKind {
+	if sp.sub.Kind.negated() {
+		return db.JoinAnti
+	}
+	return db.JoinSemi
 }
 
 // semiJoinWireRows runs the join and unwraps each row to the side it kept.
@@ -322,9 +403,9 @@ func (e *Executor) subqueryPlanLines(st *Statement) (lines []string, whole bool)
 		}
 	}
 	if why == "" {
-		out = append(out, fmt.Sprintf("  path: store-side %s against %q (neither side's rows "+
-			"cross the wire; a semi join never expands, so no link capacity makes pairing "+
-			"here cheaper)", joinKindName(plans[0]), plans[0].innerTable))
+		out = append(out, fmt.Sprintf("  path: store-side %s (neither side's rows cross the "+
+			"wire; a semi join never expands, so no link capacity makes pairing here "+
+			"cheaper)", chainName(plans)))
 		if proj := e.projectionAttrs(st); proj != nil {
 			out = append(out, "  attrs: ["+strings.Join(proj, ", ")+"]")
 		}
