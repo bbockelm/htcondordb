@@ -63,6 +63,12 @@ func newSubqueryPair(t *testing.T) (store, member *Executor, storeOps *opRecorde
 	s := dbrpc.NewServerCatalog(cat)
 	storeOps = &opRecorder{}
 	store = joinExecutor(t, s, s.SessionAttrs(), true, storeOps)
+	// A redacted wire-form semi join needs a projection on every side, and a semi join's
+	// tested side may not have one, so this server serves the store arm only its RENDERED
+	// reply. Taking it is what keeps this a comparison of two implementations rather than
+	// of one with itself; the ordering that normally rules it out is tested separately, by
+	// TestARenderedStoreReplyLosesToInlining.
+	store.storeArmTakesRenderedReply = true
 	member = joinExecutor(t, s, nil, true, &opRecorder{})
 	return store, member, storeOps, func() { s.Close(); cat.Close() }
 }
@@ -237,5 +243,63 @@ func TestExistsAndNotExistsPartitionTheTable(t *testing.T) {
 		if strings.Join(got, ",") != "4,6" {
 			t.Errorf("NOT IN over a set containing an undefined = %v, want [4 6]", got)
 		}
+	}
+}
+
+// THE ARMS ARE ORDERED BY THE MEASUREMENT, not by preference for the store.
+//
+// BenchmarkSubqueryArms says the store arm on the RENDERED reply is the worst of the three
+// paths -- 2.4x to 3.1x slower than inlining the keys, because every joined row is rendered
+// at one end and parsed at the other. So a store that cannot serve WIRE rows does not get the
+// predicate; the membership arm does.
+//
+// The one case the rendered reply still answers is the one the membership arm cannot: a key
+// set past the inlining cap. There, slow beats refusing.
+//
+// `SELECT *` is what makes this test say the same thing whatever version of the store is
+// linked. A redacted wire-form join needs a projection on the side it carries, and `*` names
+// none -- so the wire reply is refused here for a reason that has nothing to do with semi
+// joins, and will go on being refused after the semi-join refusal is fixed.
+func TestARenderedStoreReplyLosesToInlining(t *testing.T) {
+	store, _, _, cleanup := newSubqueryPair(t)
+	defer cleanup()
+	store.storeArmTakesRenderedReply = false // the default ordering is what is under test
+	const q = `SELECT * FROM jobs WHERE Owner IN (SELECT Owner FROM users)`
+
+	want, arm := subqueryRowsAndArm(t, store, q)
+	if !strings.HasPrefix(arm, "membership") {
+		t.Fatalf("arm = %q, want the membership arm: the rendered reply costs more", arm)
+	}
+	if len(want) == 0 {
+		t.Fatal("the query matched nothing, so the comparison below proves nothing")
+	}
+
+	// Past the cap the membership arm cannot answer, and the rendered reply is taken
+	// rather than the query refused.
+	store.maxInList = 1
+	got, arm := subqueryRowsAndArm(t, store, q)
+	if !strings.HasPrefix(arm, "store-side") {
+		t.Fatalf("arm = %q, want the store arm: past the cap it is the only one left", arm)
+	}
+	// And it is the same answer.
+	sort.Strings(got)
+	sort.Strings(want)
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("the retry answered differently\n  got  %v\n  want %v", got, want)
+	}
+}
+
+// Neither arm can answer it: the membership arm is past its cap and the store cannot join at
+// all. The cap's message is the one that says what to do about it.
+func TestAKeySetPastTheCapWithNoStoreArmReportsTheCap(t *testing.T) {
+	_, member, _, cleanup := newSubqueryPair(t)
+	defer cleanup()
+	member.maxInList = 1
+	_, err := member.ExecString(`SELECT ClusterId FROM jobs WHERE Owner IN (SELECT Owner FROM users)`)
+	if err == nil {
+		t.Fatal("accepted a key set over the cap with no store arm to fall back to")
+	}
+	if !strings.Contains(err.Error(), "more than 1 distinct Owner values") {
+		t.Errorf("error %q does not name the cap and the column", err)
 	}
 }

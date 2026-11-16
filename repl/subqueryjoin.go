@@ -48,7 +48,12 @@ import (
 // the predicate the other way. Every such case is a shape the opcode does not carry or a
 // decision the statement has already made, never a performance judgement -- see the file
 // comment for why there is no judgement to make.
-func (e *Executor) trySubqueryStoreArm(st *Statement) (*Result, bool, error) {
+// allowText says whether the store arm may fall back to the RENDERED reply when the store
+// cannot serve wire rows. It is normally false, because the measurement says that reply is
+// the worst of the three paths -- see BenchmarkSubqueryArms -- so the membership arm is
+// preferred to it. It is set only on the retry below, where the membership arm has already
+// refused the key set as too large and a slow answer beats no answer.
+func (e *Executor) trySubqueryStoreArm(st *Statement, allowText bool) (*Result, bool, error) {
 	// A scalar subquery is folded into the predicate first, whichever arm runs: it is a
 	// value in the constraint, not a side of the join.
 	if err := e.foldScalarSubqueries(st); err != nil {
@@ -66,7 +71,7 @@ func (e *Executor) trySubqueryStoreArm(st *Statement) (*Result, bool, error) {
 	}
 	req := e.subqueryJoinRequest(st, plans)
 	rows, ok, err := e.semiJoinWireRows(req)
-	if !ok && err == nil {
+	if !ok && err == nil && allowText {
 		rows, ok, err = e.semiJoinTextRows(req)
 	}
 	if err != nil {
@@ -74,12 +79,16 @@ func (e *Executor) trySubqueryStoreArm(st *Statement) (*Result, bool, error) {
 	}
 	if !ok {
 		if e.explain != nil {
-			e.explain.subqueryArm = "membership (the store did not serve the join)"
+			e.explain.subqueryArm = "membership (the store did not serve wire-form " +
+				"joined rows, and the rendered reply costs more than inlining the keys)"
 		}
 		return nil, false, nil
 	}
 	if e.explain != nil {
 		e.explain.subqueryArm = "store-side " + chainName(plans)
+		if allowText {
+			e.explain.subqueryArm += " (rendered reply: the key set is past the inlining cap)"
+		}
 		e.explain.rowsFetched = len(rows)
 	}
 	// The predicates are answered; nothing downstream should try to answer them again.

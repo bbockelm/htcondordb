@@ -28,6 +28,7 @@ package repl
 // the two arms can both produce.
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -401,12 +402,18 @@ func (e *Executor) innerKeyLiterals(sp *subPlan) ([]string, error) {
 		return nil, fmt.Errorf("%s over %s: %w", sp.sub.Kind, sp.innerTable, err)
 	}
 	if over {
-		return nil, fmt.Errorf("%s over %s matches more than %d distinct %s values, which is "+
-			"too many to answer by inlining them into the outer query's constraint; narrow "+
-			"the subquery's WHERE clause", sp.sub.Kind, sp.innerTable, max, sp.innerKey)
+		return nil, fmt.Errorf("%w: %s over %s matches more than %d distinct %s values, which "+
+			"is too many to inline into the outer query's constraint; narrow the subquery's "+
+			"WHERE clause, or point this session at a store that serves wire-form joined rows",
+			errSubqueryKeySetTooLarge, sp.sub.Kind, sp.innerTable, max, sp.innerKey)
 	}
 	return lits, nil
 }
+
+// errSubqueryKeySetTooLarge marks the one failure of the membership arm that another arm can
+// still answer: the key set is past the inlining cap. Exec catches it and retries the store
+// arm on the rendered reply, which is slower than inlining but faster than not answering.
+var errSubqueryKeySetTooLarge = errors.New("the subquery's key set is too large to inline")
 
 // maxInListValues is the cap this session inlines up to.
 func (e *Executor) maxInListValues() int {

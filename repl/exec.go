@@ -142,6 +142,15 @@ type Executor struct {
 	retire     func(schedd string) error
 	// maxInList caps the values a subquery predicate inlines (see ExecConfig.MaxInListValues).
 	maxInList int
+	// storeArmTakesRenderedReply lets the store arm take the RENDERED joined-row reply on
+	// its first attempt, which the measurement otherwise rules out (see
+	// BenchmarkSubqueryArms and trySubqueryStoreArm's allowText).
+	//
+	// It exists for the differential test. Against a store that cannot serve wire rows for
+	// a semi join the store arm is never taken at all, so the test that holds the two arms
+	// to the same rows would compare the membership arm with itself -- which is exactly
+	// what its first version did.
+	storeArmTakesRenderedReply bool
 	// serverJoin forces a join into the store (see ExecConfig.ServerSideJoin), placement
 	// overrides the per-statement decision (ExecConfig.JoinPlacement), and linkMbps is the
 	// capacity that decision prices the extra bytes against (ExecConfig.LinkCapacityMbps).
@@ -505,15 +514,34 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 	// a subquery was there. The store arm answers the predicate by pairing the two tables
 	// and returns the rows directly; the membership arm folds it into the WHERE clause.
 	if st.Kind == StmtSelect && !st.IsSetOp() && len(st.Subqueries) > 0 {
-		res, ok, err := e.trySubqueryStoreArm(st)
+		res, ok, err := e.trySubqueryStoreArm(st, e.storeArmTakesRenderedReply)
 		if err != nil {
 			return nil, err
 		}
 		if ok {
 			return res, nil
 		}
-	}
-	if err := e.resolveAllSubqueries(st); err != nil {
+		// The membership arm is tried next, and it is the one that can refuse: a key set
+		// past the inlining cap. The store arm's RENDERED reply can still answer that, so
+		// it is retried with the reply it was not allowed before -- slower than inlining,
+		// and faster than not answering. The statement is restored first, because
+		// resolving mutates its predicate as it goes.
+		where, subs := st.Where, st.Subqueries
+		if rerr := e.resolveAllSubqueries(st); rerr != nil {
+			if !errors.Is(rerr, errSubqueryKeySetTooLarge) {
+				return nil, rerr
+			}
+			st.Where, st.Subqueries = where, subs
+			res, ok, terr := e.trySubqueryStoreArm(st, true)
+			if terr != nil {
+				return nil, terr
+			}
+			if !ok {
+				return nil, rerr // neither arm can answer it; the cap's message is the useful one
+			}
+			return res, nil
+		}
+	} else if err := e.resolveAllSubqueries(st); err != nil {
 		return nil, err
 	}
 	switch st.Kind {

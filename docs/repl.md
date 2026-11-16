@@ -306,9 +306,10 @@ spelling to use instead.
 `EXPLAIN` names the arm. The predicate is normally sent to the store as a semi or anti join,
 where neither table's rows cross the wire. When the store cannot take it — an older server,
 `AS OF`, a read inside a transaction, or an aggregate query — the subquery's key column is
-read and inlined into the outer constraint instead,
-up to a cap (over it, the query is refused rather than quietly degrading to a full scan).
-Both arms return the same rows.
+read and inlined into the outer constraint instead, up to a cap
+(`HTCONDORDB_MAX_IN_LIST`-equivalent `MaxInListValues`, default 1000), which is about where
+the two stop being worth swapping. Past the cap the query is refused rather than quietly
+degrading to a full scan carrying a very large constraint. Both arms return the same rows.
 
 ## UNION — stacking two results
 

@@ -192,9 +192,16 @@ and the store arm ships fewer bytes *and* spends less CPU at every link capacity
 `placeJoin`'s own words for that case: "the store ships no more than this would at any link
 capacity."
 
-So: a subquery predicate goes to the store whenever the store can take it, and the membership
-arm is the fallback — for an older server, a read inside a transaction, an `AS OF` statement,
-and as the fast path for a small key set.
+So: a subquery predicate goes to the store whenever the store can serve **wire** rows for it,
+and the membership arm is what runs otherwise — for an older server, a read inside a
+transaction, an `AS OF` statement, an aggregate query, and as the fast path for a small key
+set.
+
+**The arms are ordered by the measurement, not by preference for the store.** A store that
+cannot serve wire rows does not get the predicate, because its rendered reply is the slowest
+of the three paths. The one case that reply still answers is the one the membership arm
+cannot — a key set past the inlining cap — and there it is retried, because slow beats
+refusing.
 
 **It needs a `classad` release to be worth taking at all.** The third column above is this
 same store arm on the text reply, which is what a server without the fix below serves: 2.4× to
