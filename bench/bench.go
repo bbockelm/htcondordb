@@ -219,7 +219,11 @@ type Readiness struct {
 
 // Probe reads the store's state for the table and constraint a sweep will use.
 func Probe(ctx context.Context, c *dbrpc.Client, table, constraint string, projection []string) (Readiness, error) {
-	d, err := c.DiagnosticsTable(ctx, table)
+	// The basic read: this probe uses the record count, the index names, the accelerator state
+	// and the encryption flag, and none of the sampled or per-sidecar measurements -- which are
+	// most of what a full read costs, and which a sweep would be paying for in its setup before
+	// measuring anything.
+	d, err := c.DiagnosticsBasicTable(ctx, table)
 	if err != nil {
 		return Readiness{}, fmt.Errorf("diagnostics for %q: %w", table, err)
 	}

@@ -830,9 +830,18 @@ func (e *Executor) ExecString(s string) (*Result, error) {
 }
 
 // Diagnostics returns a table's storage stats, hot set, indexes, and tuning
-// suggestions (the .stats/.indexes/.hot commands).
+// suggestions (the .indexes/.suggest commands).
 func (e *Executor) Diagnostics(table string) (*dbrpc.Diagnostics, error) {
 	return e.c.DiagnosticsTable(e.opCtx(), table)
+}
+
+// DiagnosticsBasic returns the same report WITHOUT the index suggestions, the per-attribute
+// index sizes and the sidecar structural breakdown, for the commands that print none of them.
+// Those three are measured, between them, by decoding a sample of records and reading scattered
+// header words out of every sealed sidecar -- on a large archive with a cold page cache, more
+// than the rest of the report costs put together.
+func (e *Executor) DiagnosticsBasic(table string) (*dbrpc.Diagnostics, error) {
+	return e.c.DiagnosticsBasicTable(e.opCtx(), table)
 }
 
 // QueryStats returns the daemon's aggregated query report: every query it has served

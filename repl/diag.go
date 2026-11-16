@@ -27,7 +27,7 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 	case ".stats":
 		// Archives now report the same rich diagnostics as mutable tables (opDiag is
 		// archive-aware), so both render through showStats (which adapts for an archive).
-		s.withDiag(console, s.tableArg(arg), s.showStats)
+		s.withBasicDiag(console, s.tableArg(arg), s.showStats)
 	case ".indexes", ".index":
 		// Archives report their index set over the wire like any other table; only the
 		// rendering differs (zone maps and sealed-segment reach instead of a hot set and
@@ -41,9 +41,9 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.schemaCmd(console, arg)
 	case ".hot":
 		if t := s.tableArg(arg); s.exec.isArchive(t) {
-			s.withDiag(console, t, s.showArchiveHot)
+			s.withBasicDiag(console, t, s.showArchiveHot)
 		} else {
-			s.withDiag(console, t, s.showHot)
+			s.withBasicDiag(console, t, s.showHot)
 		}
 	case ".slow":
 		// Deliberately NOT scoped to the current table by default: the question is about
@@ -211,9 +211,28 @@ func (s *session) useTable(console io.Writer, arg string) {
 	fmt.Fprintf(console, "using table: %s\n", s.table)
 }
 
-// withDiag fetches a table's diagnostics and hands them to fn (reporting errors).
+// withDiag fetches a table's FULL diagnostics and hands them to fn (reporting errors). For a
+// view that prints the index suggestions or the per-attribute index sizes.
 func (s *session) withDiag(console io.Writer, table string, fn func(io.Writer, *dbrpc.Diagnostics)) {
 	d, err := s.exec.Diagnostics(table)
+	if err != nil {
+		fmt.Fprintf(console, "error: %v\n", err)
+		return
+	}
+	fn(console, d)
+}
+
+// withBasicDiag is withDiag for a view that prints none of the sampled or per-sidecar
+// measurements -- which is most of them. Those cost more than everything else in the report put
+// together, and paying for them to print a storage summary is what made .stats on a large
+// archive take tens of seconds.
+//
+// Use it only where fn reads no field Diagnostics.Detail gates: Suggestions, DropSuggestions,
+// IndexSizes, or SidecarSizes.MPHBytes/BloomBytes. Those come back zero here, which is not the
+// same as measured-and-zero, so a view that grew a line printing one would quietly report
+// nothing rather than fail.
+func (s *session) withBasicDiag(console io.Writer, table string, fn func(io.Writer, *dbrpc.Diagnostics)) {
+	d, err := s.exec.DiagnosticsBasic(table)
 	if err != nil {
 		fmt.Fprintf(console, "error: %v\n", err)
 		return
@@ -231,7 +250,7 @@ func (s *session) withDiag(console io.Writer, table string, fn func(io.Writer, *
 func (s *session) retention(console io.Writer, arg string) {
 	table, rest := s.peelTable(strings.Fields(arg))
 	if len(rest) == 0 {
-		d, err := s.exec.Diagnostics(table)
+		d, err := s.exec.DiagnosticsBasic(table)
 		if err != nil {
 			fmt.Fprintf(console, "error: %v\n", err)
 			return

@@ -46,7 +46,7 @@ func (s *session) schemaCmd(console io.Writer, arg string) {
 	case len(fields) > 0 && strings.EqualFold(fields[0], "rebuild"):
 		s.schemaRebuild(console, fields[1:])
 	default:
-		s.withDiag(console, s.tableArg(arg), s.showSchema)
+		s.withBasicDiag(console, s.tableArg(arg), s.showSchema)
 	}
 }
 
@@ -61,7 +61,7 @@ func (s *session) schemaGroups(console io.Writer, args []string) {
 		return
 	}
 	table, _ := s.tableAndArgs(args)
-	s.withDiag(console, table, s.showGroups)
+	s.withBasicDiag(console, table, s.showGroups)
 }
 
 // schemaGroupsSample runs the DAEMON candidate-group derivation from a fresh sample. The admin
@@ -321,7 +321,7 @@ func (s *session) schemaRequire(console io.Writer, args []string) {
 		fmt.Fprintln(console, "usage: .schema require [table] | .schema require add|drop <attr>...")
 		return
 	}
-	s.withDiag(console, table, s.showRequire)
+	s.withBasicDiag(console, table, s.showRequire)
 }
 
 // showRequire renders the required set and whatever the last derivation refused.
