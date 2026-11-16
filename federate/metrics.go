@@ -10,15 +10,15 @@ import (
 // /metrics alongside the store's own) and are also read directly by tests, which count writes,
 // dedup hits and phantom deletes rather than only inspecting final state.
 type Metrics struct {
-	EventsApplied    *prometheus.CounterVec // labels: table, kind (upsert|delete)
-	IdenticalSkips   *prometheus.CounterVec // labels: table -- catch-up upserts equal to the stored row
-	Resets           *prometheus.CounterVec // labels: table
-	DedupHits        *prometheus.CounterVec // labels: table -- archive records already present
-	MissingIdentity  *prometheus.CounterVec // labels: table -- archive records with no dedup identity
-	PhantomDeletes   *prometheus.CounterVec // labels: table -- rows a Reset replay did not re-send
-	Undecodable      *prometheus.CounterVec // labels: table -- changes whose ad could not be decoded
-	BelowRetention   *prometheus.CounterVec // labels: table -- replayed records the hub's cap already dropped
-	TooDeep          *prometheus.CounterVec // labels: table -- archive records nested too deeply to store
+	EventsApplied    *prometheus.CounterVec // labels: table, schedd, kind (upsert|delete)
+	IdenticalSkips   *prometheus.CounterVec // labels: table, schedd -- catch-up upserts equal to the stored row
+	Resets           *prometheus.CounterVec // labels: table, schedd
+	DedupHits        *prometheus.CounterVec // labels: table, schedd -- archive records already present
+	MissingIdentity  *prometheus.CounterVec // labels: table, schedd -- archive records with no dedup identity
+	PhantomDeletes   *prometheus.CounterVec // labels: table, schedd -- rows a Reset replay did not re-send
+	Undecodable      *prometheus.CounterVec // labels: table, schedd -- changes whose ad could not be decoded
+	BelowRetention   *prometheus.CounterVec // labels: table, schedd -- replayed records the hub's cap already dropped
+	TooDeep          *prometheus.CounterVec // labels: table, schedd -- archive records nested too deeply to store
 	RejectedSpokes   *prometheus.CounterVec // labels: reason
 	Retired          prometheus.Counter
 	SourceStaleness  *prometheus.GaugeVec // labels: schedd
@@ -35,23 +35,23 @@ func NewMetrics() *Metrics {
 	}
 	return &Metrics{
 		EventsApplied: cv("events_applied_total",
-			"Replicated changes written to the hub, by table and kind (upsert or delete).", "table", "kind"),
+			"Replicated changes written to the hub, by table, source AP and kind (upsert or delete).", "table", "schedd", "kind"),
 		IdenticalSkips: cv("identical_skips_total",
-			"Catch-up upserts not written because the hub already held an identical row, by table.", "table"),
+			"Catch-up upserts not written because the hub already held an identical row, by table and source AP.", "table", "schedd"),
 		Resets: cv("resets_total",
-			"Full replays (Reset) received from spokes, by table. Every spoke restart causes one per mutable table; an archive only after an unclean one.", "table"),
+			"Full replays (Reset) received from spokes, by table and source AP. Every spoke restart causes one per mutable table; an archive only after an unclean one.", "table", "schedd"),
 		DedupHits: cv("dedup_hits_total",
-			"Archive records dropped during catch-up because the hub already held one with the same identity, by table.", "table"),
+			"Archive records dropped during catch-up because the hub already held one with the same identity, by table and source AP.", "table", "schedd"),
 		MissingIdentity: cv("missing_identity_total",
-			"Archive records appended without a dedup check because they lack GlobalJobId (or, for epochs, RunInstanceID), by table.", "table"),
+			"Archive records appended without a dedup check because they lack GlobalJobId (or, for epochs, RunInstanceID), by table and source AP.", "table", "schedd"),
 		PhantomDeletes: cv("phantom_deletes_total",
-			"Hub rows deleted at the end of a Reset replay because the spoke no longer has them, by table.", "table"),
+			"Hub rows deleted at the end of a Reset replay because the spoke no longer has them, by table and source AP.", "table", "schedd"),
 		Undecodable: cv("undecodable_total",
-			"Replicated upserts whose ad could not be decoded, by table. A mutable table keeps the row it holds for the key; an archive skips the record.", "table"),
+			"Replicated upserts whose ad could not be decoded, by table and source AP. A mutable table keeps the row it holds for the key; an archive skips the record.", "table", "schedd"),
 		BelowRetention: cv("below_retention_total",
-			"Archive records of a Reset replay not appended because they are older than anything the hub's capped archive still holds for that AP (the cap already dropped them), by table.", "table"),
+			"Archive records of a Reset replay not appended because they are older than anything the hub's capped archive still holds for that AP (the cap already dropped them), by table and source AP.", "table", "schedd"),
 		TooDeep: cv("too_deep_total",
-			"Archive records not appended because a value in them nests deeper than the hub can store, by table. The refusal is permanent, so the record is skipped rather than failing the session.", "table"),
+			"Archive records not appended because a value in them nests deeper than the hub can store, by table and source AP. The refusal is permanent, so the record is skipped rather than failing the session.", "table", "schedd"),
 		RejectedSpokes: cv("rejected_spokes_total",
 			"Spoke ads not paired with a schedd, by reason (host_mismatch, ha_tie); counted per discovery pass.", "reason"),
 		Retired: prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Subsystem: sub, Name: "retired_total",

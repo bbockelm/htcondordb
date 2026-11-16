@@ -131,7 +131,7 @@ func (s *tableSink) apply(c replicate.Change) error {
 		if tx.Has(hk) {
 			tx.DestroyClassAd(hk)
 			s.pending++
-			s.metrics.EventsApplied.WithLabelValues(s.table, "delete").Inc()
+			s.metrics.EventsApplied.WithLabelValues(s.table, s.schedd, "delete").Inc()
 		}
 	case replicate.KindReset:
 		if err := s.flush(); err != nil {
@@ -141,7 +141,7 @@ func (s *tableSink) apply(c replicate.Change) error {
 			return err
 		}
 		s.resetting, s.touched, s.catchup = true, map[string]struct{}{}, true
-		s.metrics.Resets.WithLabelValues(s.table).Inc()
+		s.metrics.Resets.WithLabelValues(s.table, s.schedd).Inc()
 		if s.onReset != nil {
 			s.onReset()
 		}
@@ -182,7 +182,7 @@ func (s *tableSink) undecodable(key string) {
 	if s.resetting {
 		s.touched[HubKey(s.schedd, key)] = struct{}{}
 	}
-	s.metrics.Undecodable.WithLabelValues(s.table).Inc()
+	s.metrics.Undecodable.WithLabelValues(s.table, s.schedd).Inc()
 }
 
 func (s *tableSink) upsert(key string, ad *classad.ClassAd) error {
@@ -201,13 +201,13 @@ func (s *tableSink) upsert(key string, ad *classad.ClassAd) error {
 		// downstream and a dead version in the store. (A redelivered heartbeat keeps its receipt
 		// stamp, so it compares identical too.)
 		if stored, ok := tx.LookupClassAd(hk); ok && stored.Equal(ad) {
-			s.metrics.IdenticalSkips.WithLabelValues(s.table).Inc()
+			s.metrics.IdenticalSkips.WithLabelValues(s.table, s.schedd).Inc()
 			return nil
 		}
 	}
 	tx.NewClassAd(hk, ad)
 	s.pending++
-	s.metrics.EventsApplied.WithLabelValues(s.table, "upsert").Inc()
+	s.metrics.EventsApplied.WithLabelValues(s.table, s.schedd, "upsert").Inc()
 	return nil
 }
 
@@ -261,7 +261,7 @@ func (s *tableSink) sweep() error {
 			return fmt.Errorf("federate: sweeping %s rows of %s: %w", s.table, s.schedd, err)
 		}
 	}
-	s.metrics.PhantomDeletes.WithLabelValues(s.table).Add(float64(len(stale)))
+	s.metrics.PhantomDeletes.WithLabelValues(s.table, s.schedd).Add(float64(len(stale)))
 	return nil
 }
 

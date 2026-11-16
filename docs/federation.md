@@ -185,10 +185,17 @@ attribute is carried through unchanged and is unique only within its AP.
   most once. Job, run, `SampleTime` and trigger alone are not unique (ingest-clock samples of one
   job read in one pass share a `SampleTime`), and in a resume's overlap a new sample matching a held
   one on them would be dropped; they are in the identity for samples from a spoke that predates
-  `LogOffset`, which are deduplicated by them alone. A resume's overlap is checked record by
-  record; a Reset replay past 256 records loads the AP's identity counts once and checks in
-  memory. Live records
-  are appended without a check. A record with no `GlobalJobId` (or, for epochs, no
+  `LogOffset`, which are deduplicated by them alone. A Reset replay checks record by record and,
+  past 256 records, loads the AP's identity counts once (bounded; past the bound it goes back to
+  checking record by record rather than growing the set until the daemon dies) and checks in
+  memory. A resume's overlap is skipped by batch instead: an archive is append-only and single
+  shard, so the overlap arrives in append order and what the hub already holds is a prefix of it.
+  The hub buffers a few MiB of it at a time and probes only the LAST record of each batch -- if it
+  holds that one it holds the whole batch and drops it unprobed -- until a batch's last record is
+  missing. That batch is the boundary: it is checked record by record, and everything after the
+  first miss is new and is appended without a check. An AP whose cursor has not advanced in a day
+  therefore costs the hub hundreds of queries on reconnect instead of hundreds of thousands. Live
+  records are appended without a check. A record with no `GlobalJobId` (or, for epochs, no
   `RunInstanceID`; for samples, no `Key`, `RunInstanceID` or `SampleTime`) is appended unchecked
   and counted in `missing_identity_total`.
 - **Bounded replay after a hub restart, no gap after a crash.** Writes are batched into one
@@ -338,8 +345,9 @@ staleness). Per-source detail is in `federation_sources`, which a consumer can w
 
 `/metrics` adds `htcondordb_federate_*`: `events_applied_total`, `identical_skips_total`,
 `resets_total`, `dedup_hits_total`, `missing_identity_total`, `phantom_deletes_total`,
-`undecodable_total`, `below_retention_total`, `too_deep_total` (by table; archive records holding
-a value nested deeper than the hub can store, skipped), `rejected_spokes_total` (by reason:
+`undecodable_total`, `below_retention_total`, `too_deep_total` (each by `table` and `schedd`, the
+source AP -- sum by `table` for the whole federation; `too_deep_total` counts archive records
+holding a value nested deeper than the hub can store, skipped), `rejected_spokes_total` (by reason:
 `host_mismatch`, `ha_tie`), `retired_total`, `source_staleness_seconds` (by schedd), and `sources`
 (by state). The series are registered on every htcondordb, so a daemon can become a hub on
 reconfig; on one that is not a hub they stay at zero or absent.

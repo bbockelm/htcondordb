@@ -121,10 +121,10 @@ func TestResetReconcileNoPhantoms(t *testing.T) {
 	if ups != 2 || dels != 1 {
 		t.Errorf("reconcile wrote %d upserts and %d deletes, want 2 (3.0 changed, 4.0 new) and 1 (2.0)", ups, dels)
 	}
-	if v := val(m.PhantomDeletes.WithLabelValues(TableJobs)); v != 1 {
+	if v := tableTotal(m.PhantomDeletes, TableJobs); v != 1 {
 		t.Errorf("phantom_deletes = %v, want 1", v)
 	}
-	if v := val(m.IdenticalSkips.WithLabelValues(TableJobs)); v != 1 {
+	if v := tableTotal(m.IdenticalSkips, TableJobs); v != 1 {
 		t.Errorf("identical_skips = %v, want 1 (1.0)", v)
 	}
 }
@@ -147,7 +147,7 @@ func TestResetUnchangedSourceWritesNothing(t *testing.T) {
 	}
 	replay("c1")
 	a.EndSession()
-	appliedBefore := val(m.EventsApplied.WithLabelValues(TableJobs, "upsert"))
+	appliedBefore := tableTotal(m.EventsApplied, TableJobs, "upsert")
 
 	wc := countWrites(t, jobs)
 	a.BeginSession()
@@ -156,10 +156,10 @@ func TestResetUnchangedSourceWritesNothing(t *testing.T) {
 	if ups != 0 || dels != 0 {
 		t.Fatalf("replay of an unchanged source wrote %d upserts and %d deletes, want 0 and 0", ups, dels)
 	}
-	if after := val(m.EventsApplied.WithLabelValues(TableJobs, "upsert")); after != appliedBefore {
+	if after := tableTotal(m.EventsApplied, TableJobs, "upsert"); after != appliedBefore {
 		t.Errorf("events_applied grew from %v to %v on an unchanged replay", appliedBefore, after)
 	}
-	if v := val(m.IdenticalSkips.WithLabelValues(TableJobs)); v != 50 {
+	if v := tableTotal(m.IdenticalSkips, TableJobs); v != 50 {
 		t.Errorf("identical_skips = %v, want 50", v)
 	}
 	if n := countWhere(t, jobs, `ScheddName == "ap1.example.org"`); n != 50 {
@@ -370,7 +370,7 @@ func TestUndecodableReplayRowKept(t *testing.T) {
 	if got := jobKeysOf(t, cat, "ap1.example.org"); !sameKeys(got, 1, 2) {
 		t.Errorf("rows after a replay with an undecodable 2.0 and no 3.0 = %v, want 1.0 and 2.0", got)
 	}
-	if v := val(m.Undecodable.WithLabelValues(TableJobs)); v != 1 {
+	if v := tableTotal(m.Undecodable, TableJobs); v != 1 {
 		t.Errorf("undecodable_total = %v, want 1", v)
 	}
 
