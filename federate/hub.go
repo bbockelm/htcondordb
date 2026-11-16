@@ -823,6 +823,7 @@ func (h *Hub) refreshState() {
 	h.resetMu.Unlock()
 
 	var rows []pendingRow
+	streams := map[streamKey]cedarsyncStatus{}
 	for schedd, s := range h.sources {
 		if t, ok := resets[schedd]; ok && t.After(s.lastReset) {
 			s.lastReset = t
@@ -838,7 +839,9 @@ func (h *Hub) refreshState() {
 		// row agree.
 		statuses := make(map[string]cedarsync.Status, len(s.runners))
 		for t, rh := range s.runners {
-			statuses[t] = rh.runner.Status()
+			st := rh.runner.Status()
+			statuses[t] = st
+			streams[streamKey{table: t, schedd: s.schedd}] = cedarsyncStatus{connected: st.Connected, synced: st.Synced}
 		}
 		state, reason := h.stateOf(s, statuses, stale, staleKnown, fresh)
 		h.logSourceState(s, state, reason)
@@ -866,6 +869,7 @@ func (h *Hub) refreshState() {
 	}
 	// Summary and metrics before the rows: a reader that sees a row change sees a summary at least
 	// as new.
+	h.metrics.setStreams(streams)
 	for st, n := range byState {
 		h.metrics.SourcesByState.WithLabelValues(st).Set(n)
 	}
