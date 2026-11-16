@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -81,27 +82,81 @@ type startupTimer struct {
 	lastDoneAt time.Time
 	progStop   chan struct{}
 	progDone   chan struct{}
+	// entries is every table and archive the open has to get through, with its segment count;
+	// doneNames is the ones that have finished. The difference is what a beat reports as still
+	// open -- the question "what is it doing" that a count of finished tables cannot answer.
+	entries   []catalogEntry
+	doneNames map[string]bool
 }
 
-// countCatalogEntries returns how many tables and archives the catalog directory holds, so the
-// heartbeat below can report a denominator rather than a bare count. Best effort on purpose: a
-// catalog that does not exist yet is a new database with nothing to open, and a directory that
-// cannot be read is not worth failing a startup over -- the heartbeat just omits the total.
-func countCatalogEntries(dir string) (tables, archives int) {
-	count := func(sub string) int {
-		ents, err := os.ReadDir(filepath.Join(dir, sub))
-		if err != nil {
-			return 0
+// outstanding is the entries not yet opened, largest first, and their total segments. Caller holds
+// tblMu.
+func (t *startupTimer) outstanding() (open []catalogEntry, segs int) {
+	for _, e := range t.entries {
+		if !t.doneNames[e.label()] {
+			open = append(open, e)
+			segs += e.segs
 		}
-		n := 0
-		for _, e := range ents {
-			if e.IsDir() {
-				n++
-			}
-		}
-		return n
 	}
-	return count("tables"), count("archives")
+	sort.Slice(open, func(i, j int) bool { return open[i].segs > open[j].segs })
+	return open, segs
+}
+
+// catalogEntry is one table or archive the open has to get through, and how much of it there is.
+// segs is its sealed segment files: the unit the open's cost scales with, and the only measure of
+// remaining work available before anything is opened.
+type catalogEntry struct {
+	kind string // "table" or "archive", matching recordTableOpen
+	name string
+	segs int
+}
+
+func (e catalogEntry) label() string { return e.kind + " " + e.name }
+
+// openSegmentsPerSecond is roughly how fast an open gets through sealed segments -- mapping each
+// one and reading its sidecar. From the CHTC hub: history 5,278 segments in 7m49s and
+// epoch_history 7,007 in 11m40s, the two opening concurrently. It is a planning figure for the
+// estimate the heartbeat prints, not a promise: it moves with the storage, with how much of the
+// sidecar each segment carries, and with whether the key directory is restored or rebuilt.
+const openSegmentsPerSecond = 10
+
+// scanCatalogEntries lists what the catalog directory holds and how many sealed segments each one
+// carries, so the heartbeat can name what is still outstanding and size it rather than print a
+// bare count. Best effort on purpose: a catalog that does not exist yet is a new database with
+// nothing to open, and a directory that cannot be read is not worth failing a startup over -- the
+// heartbeat just omits what it could not learn.
+func scanCatalogEntries(dir string) []catalogEntry {
+	var out []catalogEntry
+	for _, sub := range []struct{ dir, kind string }{{"tables", "table"}, {"archives", "archive"}} {
+		ents, err := os.ReadDir(filepath.Join(dir, sub.dir))
+		if err != nil {
+			continue
+		}
+		for _, e := range ents {
+			if !e.IsDir() {
+				continue
+			}
+			out = append(out, catalogEntry{kind: sub.kind, name: e.Name(),
+				segs: countSegmentFiles(filepath.Join(dir, sub.dir, e.Name()))})
+		}
+	}
+	return out
+}
+
+// countSegmentFiles counts the sealed segment files under a table's directory, shard
+// subdirectories included. Best effort: an unreadable directory contributes nothing.
+func countSegmentFiles(dir string) int {
+	n := 0
+	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // unreadable subtree: skip it, do not fail the walk
+		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".dat") {
+			n++
+		}
+		return nil
+	})
+	return n
 }
 
 // startProgress logs what the catalog open is doing every progressEvery until stopProgress is
@@ -114,14 +169,39 @@ func countCatalogEntries(dir string) (tables, archives int) {
 // process; an orchestrator with a liveness probe draws the obvious conclusion and kills it, and the
 // restart begins the same silent open again.
 //
-// So the useful signal is not "what is it doing" but "is it still getting anywhere": each beat
-// reports what finished since the last one. A beat that reports nothing finished is the honest
-// shape of a daemon that may be stuck, and says so.
+// Each beat reports what finished since the last one AND what is still open, by name and by
+// sealed segment count. "Nothing finished since the last report" on its own reads as a stall even
+// when it is the normal shape of a catalog whose tail is one large archive: the archives open
+// concurrently, so once the small tables are done the only thing left to finish is the slowest of
+// them, and a counter of completions necessarily sits still until it does. Naming the outstanding
+// entry and its size is what tells those apart.
 func (t *startupTimer) startProgress(dir string) {
 	if t == nil || t.log == nil {
 		return
 	}
-	tables, archives := countCatalogEntries(dir)
+	entries := scanCatalogEntries(dir)
+	t.tblMu.Lock()
+	t.entries = entries
+	if t.doneNames == nil {
+		t.doneNames = map[string]bool{}
+	}
+	t.tblMu.Unlock()
+	if len(entries) > 0 {
+		segs, biggest := 0, entries[0]
+		for _, e := range entries {
+			segs += e.segs
+		}
+		for _, e := range entries {
+			if e.segs > biggest.segs {
+				biggest = e
+			}
+		}
+		// The archives open concurrently, so the wall clock is the slowest one, not the sum.
+		t.log.Info(logging.DestinationGeneral, "opening the catalog",
+			"entries", len(entries), "segments", segs, "largest", biggest.label(),
+			"largest_segments", biggest.segs, "estimate", estimateOpen(biggest.segs).String(),
+			"note", "estimate is the largest entry at ~"+fmt.Sprint(openSegmentsPerSecond)+" segments/s; entries open concurrently")
+	}
 	t.progStop, t.progDone = make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(t.progDone)
@@ -135,20 +215,29 @@ func (t *startupTimer) startProgress(dir string) {
 			case <-tick.C:
 				t.tblMu.Lock()
 				done, last, lastAt := t.tblCount, t.lastDone, t.lastDoneAt
+				open, segs := t.outstanding()
+				total := len(t.entries)
 				t.tblMu.Unlock()
 
 				fields := []any{"elapsed", time.Since(t.start).Round(time.Second).String(),
 					"opened", done, "since_last_beat", done - lastCount}
-				if total := tables + archives; total > 0 {
+				if total > 0 {
 					fields = append(fields, "of", total)
 				}
+				if len(open) > 0 {
+					fields = append(fields, "open", openLabels(open), "open_segments", segs,
+						"estimate_remaining", estimateOpen(open[0].segs).String())
+				}
 				if last != "" {
+					// Time since a table last FINISHED -- not time spent doing nothing. Named for
+					// what it measures: on a catalog whose tail is one large archive it rises for
+					// the whole of that archive's open, which is the normal case, not a stall.
 					fields = append(fields, "last", last,
-						"idle", time.Since(lastAt).Round(time.Second).String())
+						"since_last_table", time.Since(lastAt).Round(time.Second).String())
 				}
 				if done == lastCount {
-					// Not an error: a single large archive legitimately takes minutes. But it is
-					// the one case an operator needs named, because it is also what stuck looks like.
+					// Not an error: a single large archive legitimately takes minutes. The open
+					// list above says which one and how much of it is left.
 					t.log.Info(logging.DestinationGeneral,
 						"still opening the catalog; nothing finished since the last report", fields...)
 				} else {
@@ -158,6 +247,57 @@ func (t *startupTimer) startProgress(dir string) {
 			}
 		}
 	}()
+}
+
+// estimateOpen is how long openSegmentsPerSecond says that many segments take. Rounded to the
+// second, and only ever an order-of-magnitude aid: see openSegmentsPerSecond.
+func estimateOpen(segs int) time.Duration {
+	if segs <= 0 {
+		return 0
+	}
+	return (time.Duration(segs) * time.Second / openSegmentsPerSecond).Round(time.Second)
+}
+
+// openLabels renders the outstanding entries for a log field, largest first, capped so one line
+// stays readable on a catalog with hundreds of tables.
+func openLabels(open []catalogEntry) string {
+	const maxShown = 4
+	parts := make([]string, 0, maxShown+1)
+	for i, e := range open {
+		if i == maxShown {
+			parts = append(parts, fmt.Sprintf("+%d more", len(open)-maxShown))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s(%d segs)", e.label(), e.segs))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// statusLine is the heartbeat's state as one line, for the observability listener's /startupz --
+// the same facts the log beat carries, available to anything that can make an HTTP request while
+// the open is still running.
+func (t *startupTimer) statusLine() string {
+	if t == nil {
+		return "opening the catalog"
+	}
+	t.tblMu.Lock()
+	done, last, lastAt := t.tblCount, t.lastDone, t.lastDoneAt
+	open, segs := t.outstanding()
+	total := len(t.entries)
+	t.tblMu.Unlock()
+
+	b := fmt.Sprintf("opening the catalog: elapsed=%s opened=%d", time.Since(t.start).Round(time.Second), done)
+	if total > 0 {
+		b += fmt.Sprintf(" of=%d", total)
+	}
+	if len(open) > 0 {
+		b += fmt.Sprintf(" open=%q open_segments=%d estimate_remaining=%s",
+			openLabels(open), segs, estimateOpen(open[0].segs))
+	}
+	if last != "" {
+		b += fmt.Sprintf(" last=%q since_last_table=%s", last, time.Since(lastAt).Round(time.Second))
+	}
+	return b
 }
 
 // stopProgress ends the heartbeat and waits for it, so no beat can be emitted after the daemon has
@@ -245,6 +385,10 @@ func (t *startupTimer) recordTableOpen(kind, name string, d time.Duration) {
 	}
 	t.lastDone = kind + " " + name
 	t.lastDoneAt = time.Now()
+	if t.doneNames == nil {
+		t.doneNames = map[string]bool{}
+	}
+	t.doneNames[t.lastDone] = true
 	log := t.log
 	t.tblMu.Unlock()
 
