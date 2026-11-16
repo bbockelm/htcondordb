@@ -590,12 +590,38 @@ func (e *Executor) execCreateTable(st *Statement) (*Result, error) {
 		if err := e.c.CreateTableInMemory(e.opCtx(), st.Table); err != nil {
 			return nil, err
 		}
-		return &Result{Note: "CREATE TABLE " + st.Table + " MEMORY"}, nil
+		if err := e.applyPrimaryKey(st); err != nil {
+			return nil, err
+		}
+		return &Result{Note: "CREATE TABLE " + st.Table + " MEMORY" + primaryKeyNote(st)}, nil
 	}
 	if err := e.c.CreateTable(e.opCtx(), st.Table); err != nil {
 		return nil, err
 	}
-	return &Result{Note: "CREATE TABLE " + st.Table}, nil
+	if err := e.applyPrimaryKey(st); err != nil {
+		return nil, err
+	}
+	return &Result{Note: "CREATE TABLE " + st.Table + primaryKeyNote(st)}, nil
+}
+
+// applyPrimaryKey declares the table's key, if the statement named one.
+//
+// It runs as a second call after the table exists rather than riding CREATE TABLE, because
+// the declaration is a property a table can also gain later -- and because CREATE TABLE
+// returns the existing table when one is already there, so folding the two together would
+// make "create if absent" quietly re-declare the key of a table someone else set up.
+func (e *Executor) applyPrimaryKey(st *Statement) error {
+	if len(st.PrimaryKey) == 0 {
+		return nil
+	}
+	return e.c.SetPrimaryKey(e.opCtx(), st.Table, st.PrimaryKey)
+}
+
+func primaryKeyNote(st *Statement) string {
+	if len(st.PrimaryKey) == 0 {
+		return ""
+	}
+	return " PRIMARY KEY (" + strings.Join(st.PrimaryKey, ", ") + ")"
 }
 
 func (e *Executor) execDropTable(st *Statement) (*Result, error) {
@@ -2721,6 +2747,11 @@ func (e *Executor) starColumns(ads []*classad.ClassAd) []string {
 }
 
 func (e *Executor) execInsert(st *Statement) (*Result, error) {
+	// INSERT ... SELECT is a different operation from INSERT ... VALUES and runs entirely
+	// on the server; see repl/insertselect.go.
+	if st.Source != nil {
+		return e.execInsertSelect(st)
+	}
 	// Build the ad text and resolve the key.
 	var sb strings.Builder
 	key := ""

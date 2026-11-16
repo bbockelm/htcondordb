@@ -220,6 +220,19 @@ type Statement struct {
 	Columns []string // target columns
 	Values  []string // ClassAd-literal value expressions, aligned with Columns
 
+	// Source is the SELECT of an INSERT ... SELECT (nil for INSERT ... VALUES).
+	//
+	// The two forms share Kind and Table and nothing else: VALUES carries literals in
+	// Values, this carries a query whose every row becomes a row of Table. They are kept on
+	// one Kind because they are one statement in SQL and the target side -- the table, the
+	// optional column list -- is parsed identically.
+	Source *Statement
+
+	// PrimaryKey is the attribute list of CREATE TABLE ... PRIMARY KEY (a, b): the columns
+	// whose values derive each row's storage key. Empty declares none, which is the
+	// behaviour every existing table has.
+	PrimaryKey []string
+
 	// Update fields.
 	Assignments []Assignment
 
@@ -788,7 +801,25 @@ func (p *parser) parseCreate() (*Statement, error) {
 		}
 		// Optional MEMORY: create the table as RAM-only (non-persistent).
 		inMemory := p.takeKeyword("MEMORY")
-		return &Statement{Kind: StmtCreateTable, Table: name, InMemory: inMemory}, nil
+		// Optional PRIMARY KEY (a, b): the columns a row's storage key is derived from.
+		// Declaring it is what lets INSERT ... SELECT give derived rows a key, and what
+		// makes re-running one replace its own previous rows rather than duplicate them.
+		var pk []string
+		if p.takeKeyword("PRIMARY") {
+			if err := p.expectKeyword("KEY"); err != nil {
+				return nil, fmt.Errorf("expected KEY after PRIMARY")
+			}
+			if err := p.expectPunct("("); err != nil {
+				return nil, fmt.Errorf("PRIMARY KEY requires a column list: %w", err)
+			}
+			if pk, err = p.parseIdentList(); err != nil {
+				return nil, err
+			}
+			if len(pk) == 0 {
+				return nil, fmt.Errorf("PRIMARY KEY requires at least one column")
+			}
+		}
+		return &Statement{Kind: StmtCreateTable, Table: name, InMemory: inMemory, PrimaryKey: pk}, nil
 	}
 	// Optional index kind before INDEX; default value.
 	kind := "value"
@@ -1528,14 +1559,39 @@ func (p *parser) parseInsert() (*Statement, error) {
 		return nil, err
 	}
 	st.Table = table
-	if err := p.expectPunct("("); err != nil {
-		return nil, fmt.Errorf("INSERT requires a column list: %w", err)
+
+	// The column list is REQUIRED before VALUES (a bare list of literals says nothing
+	// about which attribute each one is) and OPTIONAL before SELECT, where the SELECT's
+	// own column names serve. So it is parsed when present and its absence is only an
+	// error once we know VALUES follows.
+	if p.atPunct("(") {
+		if err := p.expectPunct("("); err != nil {
+			return nil, err
+		}
+		cols, err := p.parseIdentList()
+		if err != nil {
+			return nil, err
+		}
+		st.Columns = cols
 	}
-	cols, err := p.parseIdentList()
-	if err != nil {
-		return nil, err
+
+	// INSERT ... SELECT: the rows come from a query rather than a literal list.
+	if p.takeKeyword("SELECT") {
+		sel, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		st.Source = sel
+		if len(st.Columns) > 0 && len(st.Columns) != len(sel.Items) {
+			return nil, fmt.Errorf("INSERT names %d columns but the SELECT returns %d",
+				len(st.Columns), len(sel.Items))
+		}
+		return st, nil
 	}
-	st.Columns = cols
+
+	if len(st.Columns) == 0 {
+		return nil, fmt.Errorf("INSERT requires a column list")
+	}
 	if err := p.expectKeyword("VALUES"); err != nil {
 		return nil, err
 	}
