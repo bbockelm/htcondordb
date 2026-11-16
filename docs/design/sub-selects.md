@@ -217,23 +217,23 @@ of the three paths. The one case that reply still answers is the one the members
 cannot — a key set past the inlining cap — and there it is retried, because slow beats
 refusing.
 
-**It needs a `classad` release to be worth taking at all.** The third column above is this
+**It is only worth taking on the wire reply.** The third column above is this
 same store arm on the text reply, which is what a server without the fix below serves: 2.4× to
 3.1× *slower* than the membership arm at every size, because every joined row is rendered at
 one end and parsed at the other — about 35 ms for 20,000 rows, more than the whole query. On
 the text path the store arm is a pessimization.
 
- `db.JoinWire` refuses a redacted
-wire-form join unless every side carries a projection, and a semi join's tested side must
-carry none — `refuseSemiSideRefs` rejects a spec that projects from a side contributing no
-member. The two rules are each sound alone and contradict together, so every redacted semi
+ `db.JoinWire` refused a redacted
+wire-form join unless every side carried a projection, while a semi join's tested side must
+carry none — `refuseSemiSideRefs` rejected a spec that projects from a side contributing no
+member. The two rules were each sound alone and contradicted together, so every redacted semi
 join fell back to the text row stream, which is the render-and-reparse path the wire op
 exists to avoid. A connection is redacted unless privileged, which for the daemon means
-DAEMON level, so that is every ordinary user. The one-line fix is prepared on `classad`'s
-`semi-wire-redact` branch (skip a side that contributes no member); with it in place the
-store arm sends `JoinWire`, no row is rendered or parsed, and the numbers above are the wire
-column. **Until it is released, the store arm runs on the text reply and is slower than the
-membership arm** — which is an argument for releasing it, not for preferring the text path.
+DAEMON level, so that is every ordinary user. The one-line fix (skip a side that contributes no
+member) is in `classad` v0.40.2, which is the floor this repo pins: the store arm sends
+`JoinWire`, no row is rendered or parsed, and the numbers above are the wire column. **An
+older server serves the text reply, and the arm ordering sends the predicate to the
+membership arm there instead.**
 
 Several predicates in one statement go as the **chain** spelling, one step each, which
 `dbrpc` routes to its own opcode when `Spec.Steps` is set. Past the first step the equality's
@@ -243,11 +243,8 @@ that row still holds exactly the left side. Prefixing its alias is sound for a b
 name; a predicate past the first that correlates on an expression falls to the membership arm
 rather than having every reference in it rewritten.
 
-What it still needs:
-
-- `JoinAggregate` for `GROUP BY` over a predicate, which today falls to the membership arm
-  (where the single-table aggregate still runs server-side, so this is a smaller gap than it
-  looks).
+A `GROUP BY` over a predicate is reduced in the store rather than streamed through either
+arm; see §6.4.
 
 ### 6.3 The arms must be held to the same answer
 
@@ -376,10 +373,6 @@ And a derived table that *is* the answer ships to a Flight client with no conver
 
 ### Still open
 
-- **Land the `classad` fix** (§6.2) — `PelicanPlatform/classad#692`, open. Until it is released
-  the store arm cannot serve wire rows for a semi join, so the membership arm answers nearly
-  every UNGROUPED statement and the cap is the real ceiling. A grouped one is unaffected: its
-  reply is groups rather than rows, so it never asks for the wire form (§6.4).
 - A set operation's branches take the membership arm only.
 - Derived tables and CTEs, and correlated scalar subqueries — each a separate design. §9 is
   the standing constraint on the first of them.
