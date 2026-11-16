@@ -500,9 +500,19 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 	if err := e.applyDialect(st); err != nil {
 		return nil, err
 	}
-	// Subquery predicates are answered and folded into the WHERE clause before anything
-	// else reads it, so every path below -- the scan, the aggregate, EXPLAIN, a set
-	// operation's branch -- sees one constraint and need not know a subquery was there.
+	// Subquery predicates are answered first, so every path below -- the scan, the
+	// aggregate, EXPLAIN, a set operation's branch -- sees one constraint and need not know
+	// a subquery was there. The store arm answers the predicate by pairing the two tables
+	// and returns the rows directly; the membership arm folds it into the WHERE clause.
+	if st.Kind == StmtSelect && !st.IsSetOp() && len(st.Subqueries) > 0 {
+		res, ok, err := e.trySubqueryStoreArm(st)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return res, nil
+		}
+	}
 	if err := e.resolveAllSubqueries(st); err != nil {
 		return nil, err
 	}
@@ -1266,6 +1276,11 @@ func parseProjectedAds(texts []string) ([]*classad.ClassAd, error) {
 // explainTrace collects EXPLAIN ANALYZE execution stats for a row-scan SELECT: how long the
 // server fetch and the client-side sort took, and how many rows were fetched vs returned.
 type explainTrace struct {
+	// subqueryArm names which arm answered a subquery predicate -- the store's semi or anti
+	// join, or the membership constraint -- and, when it was the membership arm, why the
+	// store did not take it. An arm that was not taken for a reason reads exactly like an
+	// arm that was never available, unless the reason is printed.
+	subqueryArm  string
 	fetchDur     time.Duration
 	sortDur      time.Duration
 	rowsFetched  int

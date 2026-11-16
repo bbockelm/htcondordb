@@ -1,6 +1,6 @@
 # Design sketch: sub-selects
 
-**Status:** draft; the membership arm is implemented, the store arm is not.
+**Status:** draft; both arms are implemented for a single correlated predicate.
 **Problem owner:** the `repl` SQL frontend (and every surface built on it: `htcondordb-cli`,
 the Python DB-API driver, the Grafana datasource).
 
@@ -83,9 +83,21 @@ answered the other way round. One lowering, four spellings.
 **Undefined follows ClassAd, not SQL's three-valued logic — and this is forced, not chosen.**
 The two arms must agree, and neither can produce SQL's answer: `literalOf` has no literal for
 undefined, so such an inner row contributes nothing to the key set; on the join arm a ClassAd
-equality against undefined does not hold, so such a row matches nothing. The visible
-consequence is that `NOT IN` over a set containing an undefined **keeps** the row, where SQL
-would drop every row. This is the reading the language has everywhere else.
+equality against undefined does not hold, so such a row matches nothing.
+
+Two consequences, both measured and pinned by
+`TestAnUndefinedCorrelationKeyIsInNeitherHalf`:
+
+- **On the inner side**, an undefined value contributes nothing to the set, so `NOT IN` keeps
+  the rows that are not in what remains — where SQL would return no rows at all, because the
+  set contains a NULL.
+- **On the outer side**, a row whose own correlation key is undefined matches nothing, which
+  drops it from `EXISTS` as expected *and* from `NOT EXISTS`, where the membership constraint
+  `!member(undefined, {...})` is itself undefined. **`EXISTS` and `NOT EXISTS` therefore do
+  not partition the table.** `NOT EXISTS` reads as "has a key, and nothing matches it", not
+  "does not appear" — a job with no `ClusterId` is not reported as a job that never ran. The
+  two arms reach this by different routes and agree, which is the only reason it can be
+  stated as a rule rather than as an artifact of one implementation.
 
 **Duplicates do not multiply.** A semi join emits each outer row once however many inner rows
 match. This is the property that makes the construct safe: no statement can grow its own
@@ -139,7 +151,7 @@ size the outer read degrades to a full scan carrying a very large constraint. He
 a store arm to measure it against; the number to ship is the one where the two arms cross,
 and that measurement is unmade.
 
-### 6.2 The store arm (not implemented)
+### 6.2 The store arm
 
 Send the predicate as `db.JoinSpec{Kind: JoinSemi | JoinAnti}`, with the outer table as
 `Left` carrying the residual `WHERE` and the projection, and the subquery's table as `Right`
