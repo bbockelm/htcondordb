@@ -373,6 +373,5 @@ And a derived table that *is* the answer ships to a Flight client with no conver
 
 ### Still open
 
-- A set operation's branches take the membership arm only.
 - Derived tables and CTEs, and correlated scalar subqueries — each a separate design. §9 is
   the standing constraint on the first of them.

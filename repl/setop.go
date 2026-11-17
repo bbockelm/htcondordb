@@ -157,6 +157,51 @@ func isStarSelect(st *Statement) bool {
 	return len(st.Items) == 1 && st.Items[0].Star && st.Items[0].Col == ""
 }
 
+// describeSetOpPlan describes every branch of a set operation, each under its own heading.
+//
+// Describing only the statement the operation hangs off -- which is what a plain SELECT
+// description does, since branch 1 IS that statement -- reported one branch and silently
+// omitted the rest. That mattered little while every branch was answered the same way. It
+// matters now that a branch chooses its own arm: a UNION whose second branch pairs in the
+// store and whose first merely scans printed the scan alone, so the half of the query doing
+// the work was the half the plan did not mention.
+func (e *Executor) describeSetOpPlan(st *Statement) []string {
+	branches := st.setBranchStmts()
+	op := "UNION"
+	if st.SetBranches[0].All {
+		op = "UNION ALL"
+	}
+	out := []string{fmt.Sprintf("%s of %d branches", op, len(branches))}
+	for i, b := range branches {
+		// The same trimming execSetOp does before running a branch, so the plan describes
+		// the statement that will actually run rather than the one the parser produced:
+		// the operation's ORDER BY and LIMIT belong to the combined rows, not to a branch.
+		sub := *b
+		sub.SetBranches = nil
+		sub.OrderBy = nil
+		sub.Limit = 0
+		out = append(out, fmt.Sprintf("  branch %d:", i+1))
+		for _, l := range e.describePlan(&sub) {
+			out = append(out, "    "+l)
+		}
+	}
+	if len(st.OrderBy) > 0 {
+		out = append(out, "  order: applied to the combined rows, after every branch has run")
+	}
+	if st.Limit > 0 {
+		if len(st.OrderBy) == 0 && st.SetBranches[0].All {
+			out = append(out, fmt.Sprintf("  limit: %d, pushed into the branches in order "+
+				"(UNION ALL with no ordering concatenates, so a branch may stop early)", st.Limit))
+		} else {
+			out = append(out, fmt.Sprintf("  limit: %d, applied to the combined rows", st.Limit))
+		}
+	}
+	if !st.SetBranches[0].All {
+		out = append(out, "  de-duplication: over the combined rows (bare UNION)")
+	}
+	return out
+}
+
 // --- execution ---
 
 // execSetOp runs each branch and combines the results.
