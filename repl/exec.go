@@ -2806,6 +2806,32 @@ func numOf(v classad.Value) (float64, bool) {
 	return 0, false
 }
 
+// isIntText reports whether s has the shape ParseInt accepts in base 10: an optional sign and
+// then digits, nothing else.
+//
+// It exists to keep ParseInt off the strings that cannot be integers, because a FAILED ParseInt
+// allocates -- a NumError and a copy of the string, two allocations it builds only to have the
+// error thrown away. compareCells runs inside a sort, so on a column of owners that was two
+// allocations per comparison and O(n log n) of them per ORDER BY.
+//
+// A value that passes this and still fails ParseInt -- an integer too large for int64 -- costs
+// the allocation it always did and falls through to the float path, as before.
+func isIntText(s string) bool {
+	i := 0
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		i = 1
+	}
+	if i == len(s) {
+		return false
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // compareCells orders two rendered cells: numerically when both parse as numbers, else
 // lexically.
 //
@@ -2817,15 +2843,17 @@ func numOf(v classad.Value) (float64, bool) {
 // It is the same rule db.topKWorse follows for the same reason, so a ranking computed here and
 // one pushed to the server agree about which rows are tied.
 func compareCells(a, b string) int {
-	if ia, ea := strconv.ParseInt(a, 10, 64); ea == nil {
-		if ib, eb := strconv.ParseInt(b, 10, 64); eb == nil {
-			switch {
-			case ia < ib:
-				return -1
-			case ia > ib:
-				return 1
-			default:
-				return 0
+	if isIntText(a) && isIntText(b) {
+		if ia, ea := strconv.ParseInt(a, 10, 64); ea == nil {
+			if ib, eb := strconv.ParseInt(b, 10, 64); eb == nil {
+				switch {
+				case ia < ib:
+					return -1
+				case ia > ib:
+					return 1
+				default:
+					return 0
+				}
 			}
 		}
 	}
