@@ -407,7 +407,9 @@ The literal column is the SQL idiom for saying which branch a row came from.
   may not be mixed in one chain.
 - **`ORDER BY` and `LIMIT` apply to the whole union**, not to the branch they follow, and
   may not appear on an earlier branch.
-- Each branch is an ordinary `SELECT` with its own pushdowns, and may itself be a `JOIN`.
+- Each branch is an ordinary `SELECT` with its own pushdowns, and may itself be a `JOIN` or
+  carry a subquery predicate. A branch chooses its own arm, so one branch may pair in the
+  store while another scans; `EXPLAIN` describes each branch under its own heading.
 
 `INTERSECT` and `EXCEPT` are not supported.
 

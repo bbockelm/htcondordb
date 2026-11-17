@@ -539,10 +539,19 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 		return nil, err
 	}
 	// Subquery predicates are answered first, so every path below -- the scan, the
-	// aggregate, EXPLAIN, a set operation's branch -- sees one constraint and need not know
-	// a subquery was there. The store arm answers the predicate by pairing the two tables
-	// and returns the rows directly; the membership arm folds it into the WHERE clause.
-	if st.Kind == StmtSelect && !st.IsSetOp() && len(st.Subqueries) > 0 {
+	// aggregate, EXPLAIN -- sees one constraint and need not know a subquery was there.
+	// The store arm answers the predicate by pairing the two tables and returns the rows
+	// directly; the membership arm folds it into the WHERE clause.
+	//
+	// A set operation answers NOTHING here. execSetOp runs each branch back through this
+	// function with SetBranches cleared, so every branch reaches both arms on its own
+	// terms. Resolving here instead would walk into each branch (walkStatements descends
+	// SetBranches) and settle it with the membership arm alone -- which turns a predicate
+	// past the inlining cap from one the store arm serves into a hard failure, for no
+	// reason except that the branch sits inside a UNION.
+	switch {
+	case st.Kind == StmtSelect && st.IsSetOp():
+	case st.Kind == StmtSelect && len(st.Subqueries) > 0:
 		res, ok, err := e.trySubqueryStoreArm(st, e.storeArmTakesRenderedReply)
 		if err != nil {
 			return nil, err
@@ -570,8 +579,10 @@ func (e *Executor) Exec(st *Statement) (*Result, error) {
 			}
 			return res, nil
 		}
-	} else if err := e.resolveAllSubqueries(st); err != nil {
-		return nil, err
+	default:
+		if err := e.resolveAllSubqueries(st); err != nil {
+			return nil, err
+		}
 	}
 	switch st.Kind {
 	case StmtSelect:
@@ -1573,6 +1584,9 @@ func roundDur(d time.Duration) string {
 // read path, whether the projection and LIMIT are pushed to the server, and whether ordering
 // happens client-side. It mirrors execSelect's routing so the report matches what will run.
 func (e *Executor) describePlan(st *Statement) []string {
+	if st.IsSetOp() {
+		return e.describeSetOpPlan(st)
+	}
 	if st.IsJoin() {
 		return e.describeJoinPlan(st)
 	}
