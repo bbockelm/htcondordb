@@ -67,4 +67,17 @@ const (
 	// table and claiming a word in the query language are not the same privilege, and WRITE is
 	// where the analysts are.
 	DBUserFuncControl = Base + 6 // 74006
+
+	// DBBackupControl takes a snapshot on demand and verifies snapshots already on disk, via a
+	// ClassAd request/response protocol like DBSyncControl.
+	//
+	// Periodic snapshots are driven by a timer, so without this the only way to get a backup at a
+	// chosen moment -- before an upgrade, before a configuration change, after an incident -- was
+	// to wait for the next tick. Verification is served here too because the snapshot directory
+	// belongs to the daemon, not to the operator: its files may be unreadable to them, and on a
+	// remote host they are not reachable at all.
+	//
+	// DAEMON-level: taking a backup reads every mutable table including private attributes, and
+	// writes a file owned by the daemon's identity.
+	DBBackupControl = Base + 7 // 74007
 )

@@ -249,6 +249,10 @@ type Service struct {
 	lastArchiveRetrain  map[string]time.Time
 	archiveRetrainEvery time.Duration
 	archiveRetrainSeed  time.Time
+
+	// backups records the outcome of every snapshot this daemon takes, for the metrics endpoint
+	// and for an operator asking when the last one succeeded.
+	backups backupStatsRecorder
 }
 
 // New opens the table catalog and builds the service. The caller owns the

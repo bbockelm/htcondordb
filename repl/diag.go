@@ -94,6 +94,10 @@ func (s *session) runDiagMeta(console io.Writer, cmd, arg string) bool {
 		s.showExporter(console, arg)
 	case ".resync":
 		s.resync(console, arg)
+	case ".backup":
+		s.backup(console, arg)
+	case ".verify":
+		s.verify(console, arg)
 	case ".retire":
 		s.retire(console, arg)
 	default:
@@ -118,6 +122,39 @@ func (s *session) resync(console io.Writer, arg string) {
 		return
 	}
 	fmt.Fprintf(console, "resync requested for %q\n", target)
+}
+
+// backup asks the daemon to write a snapshot now, rather than waiting for the next tick of the
+// periodic timer. With no argument it writes a timestamped file into the daemon's configured
+// snapshot directory, so an on-demand backup sorts and prunes alongside the periodic ones; with a
+// path it writes exactly there and prunes nothing.
+//
+// The snapshot holds the MUTABLE tables only -- archives are not in it -- so the report names the
+// archives that were skipped. DAEMON-authorized; delivered over the DBBackupControl command.
+func (s *session) backup(console io.Writer, arg string) {
+	path := strings.TrimSpace(arg)
+	out, err := s.exec.Backup(path)
+	if err != nil {
+		fmt.Fprintln(console, "error:", err.Error())
+		return
+	}
+	fmt.Fprint(console, out)
+}
+
+// verify checks snapshots against the sidecar manifests written beside them: size first, then a
+// sha256 over the whole file. With no argument it checks every snapshot in the daemon's configured
+// snapshot directory.
+//
+// A snapshot with no manifest is reported as unverifiable rather than as damage -- one written
+// before manifests existed is intact, it simply cannot be checked this way.
+func (s *session) verify(console io.Writer, arg string) {
+	path := strings.TrimSpace(arg)
+	out, err := s.exec.Verify(path)
+	if err != nil {
+		fmt.Fprintln(console, "error:", err.Error())
+		return
+	}
+	fmt.Fprint(console, out)
 }
 
 // retire asks a federation hub to retire a source now: delete its rows from the hub's mutable

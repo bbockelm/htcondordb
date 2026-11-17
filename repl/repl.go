@@ -481,6 +481,13 @@ CompletionDate); with none, the current table:
   .resync <jobs|history|epoch|exporter>        re-read/re-export a sync source from the start
                                                (needs DAEMON, non-destructive: heals a mirror
                                                or re-exports without wiping the target)
+  .backup [path]                               write a snapshot now instead of waiting for
+                                               the periodic timer (needs DAEMON); no path
+                                               means the configured snapshot directory.
+                                               Mutable tables only -- archives are not in it
+  .verify [path]                               check snapshots against their manifests
+                                               (size, then sha256); no path checks every
+                                               snapshot in the configured directory
   .retire <schedd>                             federation hub: delete that AP's rows from
                                                jobs/syncstatus/federation_sources now (needs
                                                DAEMON; archives age out with retention)
