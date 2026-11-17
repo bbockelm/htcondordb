@@ -6,7 +6,8 @@ to that package by default (`-pgo=auto`, Go 1.21 and later), so every way the
 daemon is built uses it with no extra flags: `make build`/`make daemon`,
 `make rpm`, the release workflow's tarballs, `capstone-e2e`, and
 `grafana/e2e/Dockerfile.htcondordb`. The other main packages (`htcondordb-cli`,
-`history-import`, `changefeed-toysink`) and the C client library (`./capi`)
+`htcondordb-history-import`, `htcondordb-restore-dropbox`, `changefeed-toysink`)
+and the C client library (`./capi`)
 have no profile and are built as before.
 
 To check a binary, `go version -m bin/htcondordb | grep pgo` prints the

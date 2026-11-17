@@ -14,7 +14,7 @@ table you created yourself.
 |---|---|---|
 | Mutable table ads (incl. private attributes) | **yes** | snapshot |
 | Internal sync idempotency markers | **yes** | snapshot |
-| **Archive tables** (`history`, `epoch_history`, any append-only table) | **no** | file-level copy — see [Backing up archives](#backing-up-archives) |
+| **Archive tables** (`history`, `epoch_history`, any append-only table) | **no** | a continuous export — see [Backing up archives](#backing-up-archives) |
 | Per-table index config, hot set, encrypted-attribute policy, time-travel and delta settings | no | file-level copy of the database directory |
 | Materialized view definitions | no | file-level copy (view *data* is rebuilt from the base table at startup, so it never needs backing up) |
 | Exporter definitions and their resume cursors | no | file-level copy |
@@ -36,7 +36,8 @@ from the same catalog snapshot, so a node that joins a raft cluster and restores
 from a leader snapshot comes up with the mutable tables and an empty history. In
 every replicated mode, archive data is node-local and is never replicated.
 
-Archives need their own procedure. See [Backing up archives](#backing-up-archives).
+Archives need their own procedure, and it does not involve downtime: run a
+continuous export. See [Backing up archives](#backing-up-archives).
 
 ## Configuration
 
@@ -100,7 +101,8 @@ across two tables while the snapshot runs can come back half-present, and a
 single table can mix pre- and post-write state across shards. Treat a `.cadb` as
 a crash-consistent image of a moving database — the same class of guarantee you
 get from restoring after a power loss — not as a transactional one. If you need
-a true point-in-time copy, stop the daemon or take a filesystem snapshot.
+a true point-in-time copy, take a filesystem snapshot (or, failing that, stop the
+daemon).
 
 Copy finished snapshots off the machine as part of the same job that would copy
 any other spool data. A snapshot sitting next to the database it came from
@@ -161,8 +163,136 @@ restore into a throwaway daemon described under [Verifying](#verifying).
 
 ### Backing up archives
 
-Archives are backed up by copying their directories. They live under the
-database directory (`HTCONDORDB_DIR`, by default `$(SPOOL)/htcondordb`):
+Archives are not in snapshots, so they need their own regime. There are two
+kinds of archive backup and they answer different questions:
+
+| | What it is | Downtime | Restores by |
+|---|---|---|---|
+| **Continuous export** (below) | every record, streamed out as it arrives | none | replaying records |
+| **Directory copy** | a point-in-time image of the archive's files | none to full, depending on method | putting the files back |
+
+**Run the continuous export.** It is the only archive backup that needs no
+downtime, and the only one that cannot be ruined by damage to the store's own
+structure: every record in it is an independent ClassAd in text, with each
+attribute written out in full and no reference to a shared compression
+dictionary. If a dictionary goes missing and strands a run of segments, a
+directory copy taken afterwards faithfully preserves the damage; an exported
+record has nothing to lose.
+
+Add a directory copy on top if you want to be able to restore an archive in one
+move, with its indexes and configuration intact, rather than paying for an
+ingest.
+
+#### Continuous export: the primary path
+
+**1. Let the daemon manage exporters.** It does by default. The binary is found
+on `PATH`; point at it explicitly if it is not there, and give it an
+unprivileged account to run as:
+
+```
+# HTCONDORDB_MANAGE_EXPORTERS = true     # the default; false disables all exporters
+# HTCONDORDB_EXPORTER_DROPBOX_BINARY = /usr/libexec/condor/htcondordb-plugin-dropbox
+HTCONDORDB_EXPORTER_DROPBOX_USER = condor
+```
+
+**2. Create one exporter per archive.** This registers it in the database; the
+daemon notices and starts it, with no restart needed:
+
+```
+htcondordb-plugin-dropbox create -name history-backup -table history \
+    -dir /var/spool/htcondordb-dropbox/history \
+    -container frames -max-bytes 8GiB
+
+htcondordb-plugin-dropbox create -name epoch-backup -table epoch_history \
+    -dir /var/spool/htcondordb-dropbox/epoch_history \
+    -container frames -max-bytes 8GiB
+```
+
+`-container frames` is worth setting here even though it is not the default:
+nothing but `htcondordb-restore-dropbox` reads these directories, and a framed batch loses
+one frame to a bad byte where a tarball loses the rest of the batch. Leave it off
+only if something else of yours consumes the dropbox and expects `.tar.gz`.
+
+`-max-bytes` is the backpressure ceiling — see step 4, which is the step people
+skip.
+
+**3. Check it is running.**
+
+```
+htcondordb-cli -e '.exporters'
+htcondordb-cli -e '.exporter history-backup'
+```
+
+Batches appear in the dropbox as `batch-<seq>-<time>.cadf` (or `.tar.gz`), each
+with a `.manifest` beside it. A batch is rolled every 2000 records or every 10
+minutes, whichever comes first, so a record is durable in the dropbox within
+about ten minutes of being written. `-roll-jobs` and `-roll-interval` change
+that.
+
+**4. Drain the dropbox. This is not optional.**
+
+The dropbox is a staging area, not the backup. Nothing in htcondordb removes
+batches from it — that is the consumer's job, and if you do not write one, the
+dropbox fills to `-max-bytes`, the exporter stops advancing, and records
+eventually age out of the archive's retention **before they are ever exported**.
+You get a `loss-*.ad` report saying which window was lost, after the fact.
+
+A cron job moving finished batches to wherever your backups actually live is
+enough:
+
+```
+# every 15 minutes
+rsync -a --remove-source-files --exclude='.*' \
+    /var/spool/htcondordb-dropbox/history/ \
+    backup-host:/backups/htcondordb/history/
+```
+
+`--exclude='.*'` is what matters: a dot-prefixed file is a batch the exporter is
+still writing. Finished batches and their manifests are never dot-prefixed, so
+this moves whole, complete batches and leaves partial ones alone.
+
+Watch the dropbox size. A dropbox that is growing is a consumer that has stopped:
+
+```
+du -sh /var/spool/htcondordb-dropbox/*
+ls /var/spool/htcondordb-dropbox/history/loss-*.ad 2>/dev/null   # any file here means lost records
+```
+
+**5. Verify the backup.** Each batch carries a manifest naming the records it
+holds and a digest of its bytes, so the backup can be checked where it lives,
+without a database:
+
+```
+htcondordb-restore-dropbox -verify -dir /backups/htcondordb/history
+```
+
+It writes nothing and exits non-zero if any batch is damaged or yields fewer
+records than it declares, so it belongs in cron next to the drain job.
+
+**6. Restore.**
+
+```
+htcondordb-restore-dropbox -dir /backups/htcondordb/history -table history
+```
+
+Re-runnable: records dedup on `GlobalJobId`, so the exporter's at-least-once
+duplicates and a re-run of a restore that died halfway are both harmless.
+`-dry-run` reports what would be written without needing the database reachable
+at all. Read the top of its report — `DATA LOSS`, `INCOMPLETE`, `DAMAGED BATCH`
+and `SHORT READ` each mean records you do not have, and the totals below them
+will not tell you.
+
+**What this gives you, and what it does not.** No downtime, every record, and an
+artifact that survives damage to the store. What it is not is an image of the
+archive: restoring replays records into a table, so it costs an ingest and it
+does not bring back that archive's indexes, hot set, retention bounds or
+encrypted-attribute policy. Those live in the database directory — back that up
+too, or be ready to re-apply them.
+
+#### Directory copy: a point-in-time image
+
+Archives live under the database directory (`HTCONDORDB_DIR`, by default
+`$(SPOOL)/htcondordb`):
 
 ```
 $(SPOOL)/htcondordb/
@@ -180,28 +310,12 @@ indexes, the compression dictionaries, the persisted archive configuration, and
 its own wrapped master key. The only thing it needs from outside is the pool
 signing keys that unwrap that master key.
 
-**Cold copy (recommended).** Stop the daemon, copy, restart:
-
-```
-condor_off -daemon HTCONDORDB
-# wait for the process to exit; the daemon logs "store closed" when it is done
-tar -C $(SPOOL)/htcondordb -cf - archives/ | ...
-condor_on -daemon HTCONDORDB
-```
-
-Shutdown waits for any in-flight maintenance pass to reach a safe boundary. On a
-large archive this is not instantaneous — wait for `store closed` in the daemon
-log rather than for the command to return, and do not start copying until the
-process is gone.
-
-A cold copy is point-in-time, internally consistent, and restores by being put
-back. It is the only archive backup with that guarantee.
-
-**Filesystem snapshot (the hot-copy answer).** If the database directory sits on
-LVM, ZFS, btrfs or anything else that can take an atomic point-in-time snapshot,
-take one and copy the archive directories out of it. That gives you a crash-
-consistent image for free and sidesteps everything below. The daemon recovers
-from such an image exactly as it recovers from a crash.
+**Filesystem snapshot — the way to do this online.** If the database directory
+sits on LVM, ZFS, btrfs or anything else that can take an atomic point-in-time
+snapshot, take one and copy the archive directories out of it. That is a
+crash-consistent image for free, with no downtime and none of the caveats below;
+the daemon recovers from it exactly as it recovers from a crash. If you want
+directory copies, arrange for this.
 
 **Plain copy of a live directory.** Without a filesystem snapshot, a copy taken
 while the daemon runs is still usable, with caveats you need to understand.
@@ -227,8 +341,7 @@ archive does not change under a copying process. Three things do move:
 **There is no configuration that quiesces archive maintenance.** Setting
 `HTCONDORDB_ARCHIVE_ROTATE_INTERVAL = 0` stops the dedicated retention sweep but
 not the general background maintenance pass, which rotates and merges on its own
-cadence and has no knob. Stopping the daemon is the only way to guarantee nothing
-moves.
+cadence and has no knob.
 
 What makes a plain hot copy acceptable in practice is that merging does not start
 until an archive holds roughly ten thousand sealed segments. Below that watermark
@@ -244,108 +357,35 @@ htcondordb_segments{table="history"}
 ```
 
 A few thousand segments: a plain hot copy is sound. Approaching or past ten
-thousand: use a filesystem snapshot or stop the daemon.
+thousand: use a filesystem snapshot.
 
 A plain hot copy guarantees: every record sealed before the copy started, minus a
 possibly truncated final segment, provided no merge ran during it. It does not
 guarantee a copy consistent with the mutable tables taken at the same time.
 
-**Logical export.** For a continuous, out-of-band copy of archive records as they
-arrive, configure a dropbox exporter on the archive. It writes completed-job
-records as `.tar.gz` batches of ClassAd files into a directory for an external
-consumer, with at-least-once delivery and a durable resume cursor. This is a good
-feed into an external long-term store, but it is not a restore path: nothing in
-htcondordb re-ingests those tarballs.
-
-That makes it the one archive copy that cannot be stranded by damage to the
-store's internal structure: each record is an independent ClassAd in text, with
-every attribute inline and no reference to a shared compression dictionary. If a
-compression dictionary goes missing and takes a run of segments with it, a
-directory copy made afterwards preserves the damage — a dropbox does not have the
-coupling to lose.
-
-**Restoring from a dropbox.** `restore-dropbox` reads the batches back into an
-archive table:
+**Stopping the daemon.** A cold copy is the only directory copy that is
+point-in-time and internally consistent by construction:
 
 ```
-restore-dropbox -dir /var/spool/htcondordb-dropbox -table history
+condor_off -daemon HTCONDORDB
+# wait for the process to exit; the daemon logs "store closed" when it is done
+tar -C $(SPOOL)/htcondordb -cf - archives/ | ...
+condor_on -daemon HTCONDORDB
 ```
 
-Use `-dry-run` first; it reads and reports without writing, and does not need the
-database reachable, so you can inspect a dropbox wherever the files are. Restores
-are re-runnable: records dedup on `GlobalJobId`, so the exporter's at-least-once
-duplicates and a re-run of a restore that died halfway are both harmless. Pass
-`-skip-dedup` only when restoring into an empty table, where the check can only
-ever answer no.
+Shutdown waits for any in-flight maintenance pass to reach a safe boundary, so on
+a large archive this is not instantaneous — wait for `store closed` in the log
+rather than for the command to return, and do not start copying until the process
+is gone.
 
-**Checking a dropbox without restoring it.** `restore-dropbox -verify -dir
-<dropbox>` reads every batch, checks it against its manifest, reports, and
-writes nothing. It exits non-zero if anything is damaged or short, so it works
-from cron or a monitoring check rather than only by eye.
+This is here for completeness, not as a recommendation. **Do not build a backup
+regime that requires taking the database down.** Use the continuous export for
+the data and a filesystem snapshot if you also want an image; reach for a cold
+copy only for a one-off, such as cloning a store before an upgrade you intend to
+be able to undo.
 
-Each batch is written with a sidecar manifest (`<batch>.manifest`) naming the
-records it holds, its size and a sha256 of its bytes, the sequence number before
-it, and which exporter and archive it came from. That is what makes a short read
-visible: a damaged batch yields fewer records, and without a declared count
-nothing notices the shortfall. A batch with no manifest — written before
-manifests existed — is reported as unverifiable, never as damaged, and restores
-normally.
-
-Read the top of the report, not the totals. Four things appear there and each
-means records you do not have:
-
-- `DATA LOSS` — the exporter reported a window where retention outran its cursor.
-  Those records were pruned before export and are not in the dropbox.
-- `INCOMPLETE` — batch sequence numbers are missing. Batches were deleted or
-  never arrived.
-- `DAMAGED BATCH` — a batch was unreadable past some point, or its bytes do not
-  match its manifest. Its readable records were still restored; the rest of that
-  batch is gone.
-- `SHORT READ` — a batch yielded fewer records than its manifest declares. The
-  difference is lost.
-
-A restore that silently succeeds over a gap is how an incomplete archive comes to
-be trusted.
-
-**Bounding what damage costs.** A `.tar.gz` batch is one gzip stream, so a
-truncation or a flipped bit loses everything after it — up to a whole
-`roll-jobs` batch, 2000 records by default. The framed container fixes that:
-
-```
-archivedropbox create -name histbackup -table history -dir /var/spool/htcondordb-dropbox     -container frames
-```
-
-Batches are then written as `batch-<seq>-<mod>.cadf`: a sequence of
-independently-compressed frames, each with its own checksum. A reader that hits
-damage skips that frame and resyncs to the next, so a bad byte costs the records
-in one frame instead of the batch. On a default batch that is about 500 records
-rather than 2000, and the file is roughly a third *smaller* than the tarball,
-because the framed container uses zstd where the tarball uses gzip.
-
-`-min-frame-bytes` tunes it (default 256 KiB). Smaller frames mean less lost to
-any one bit of damage and slightly worse compression; 64 KiB is a reasonable
-setting for a site that values recovery over space. Do not set it near or above
-a batch's worth of records — a frame that holds the whole batch bounds nothing.
-Below 4 KiB is refused, because there the framed stream is larger than the
-tarball it replaces.
-
-**`targz` remains the default, and you should leave it alone unless you control
-the consumer.** The dropbox exists for out-of-band consumers, and those read
-gzip tarballs with standard tools; a `.cadf` means nothing to them. Switch only
-once whatever drains your dropbox understands the framed format. `restore-dropbox`
-reads both, including a dropbox holding a mixture of the two, which is what one
-looks like across the switch.
-
-The design and the measurements behind these numbers are in
-[Continuous archive backup](design/archive-continuous-backup.md).
-
-**Rebuilding from source.** For the `history` archive specifically, the records
-originate in a schedd's own history file. If that file is intact, a lost archive
-can often be rebuilt — either by letting schedd-sync re-read the configured
-history file, or by running a history import job against the pool's schedds.
-Both are bounded by what the schedds still retain, so neither is a substitute for
-a backup of an archive older than the schedds' own retention.
-
+Restoring from either kind of backup is in
+[Restoring archives](#restoring-archives).
 ### Everything else
 
 The per-table index configuration, hot sets, encrypted-attribute policy,
@@ -462,7 +502,25 @@ What a restore does, precisely:
 
 ### Restoring archives
 
-Put the directory back:
+**From a dropbox**, which is the backup you should have, replay the records:
+
+```
+htcondordb-restore-dropbox -dir /backups/htcondordb/history -table history
+```
+
+The table is created if it does not exist. Records dedup on `GlobalJobId`, so
+this is safe to re-run over a dropbox that was already partly ingested, and safe
+over the duplicate batches an at-least-once exporter leaves behind after a crash.
+Run it with `-dry-run` first to see what the dropbox holds, and read the
+`DATA LOSS` / `INCOMPLETE` / `DAMAGED BATCH` / `SHORT READ` lines at the top of
+the report rather than the totals.
+
+What a replay does not restore is the archive's own configuration — its indexes,
+hot set, retention bounds and encrypted-attribute policy. A fresh table is
+created with defaults. Re-apply what you need (`.addindex`, `.retention`), or
+restore a directory copy instead if you have one.
+
+**From a directory copy**, put the directory back:
 
 ```
 condor_off -daemon HTCONDORDB
@@ -481,7 +539,15 @@ as it was rather than as the current config file describes.
 
 An archive restored onto a host whose pool keys differ from the ones it was
 sealed under will not open. This is the failure that `SEC_PASSWORD_DIRECTORY`
-backups exist to prevent.
+backups exist to prevent. A dropbox has no such dependency: its records are
+plain ClassAd text, so a replay works anywhere.
+
+**Rebuilding from source.** For the `history` archive specifically, the records
+originate in a schedd's own history file. If that file is intact, a lost archive
+can often be rebuilt — either by letting schedd-sync re-read the configured
+history file, or by running a history import job against the pool's schedds. Both
+are bounded by what the schedds still retain, so neither is a substitute for a
+backup of an archive older than the schedds' own retention.
 
 ### Replicated deployments
 
@@ -606,7 +672,7 @@ who assumes the snapshot mechanism is a database backup:
 - **Snapshots written before manifests existed cannot be verified.** They are
   reported as unverifiable, not as damaged.
 - **Nothing verifies archive copies or dropboxes.** The manifest and `.verify`
-  cover `.cadb` snapshots only. A `restore-dropbox -dry-run` is the nearest
+  cover `.cadb` snapshots only. A `htcondordb-restore-dropbox -dry-run` is the nearest
   equivalent for a dropbox.
 - **A snapshot is not point-in-time.** It is taken while writers proceed — it
   does not block them and is not consistent against them. Within a single table
@@ -639,8 +705,12 @@ who assumes the snapshot mechanism is a database backup:
   "unlimited" setting.
 - **Archive maintenance cannot be paused from configuration.** There is no knob
   that stops the background pass from rotating or merging, so a hot copy of an
-  archive directory cannot be made race-free without a filesystem snapshot or a
-  daemon stop.
+  archive *directory* cannot be made race-free without a filesystem snapshot or a
+  daemon stop. This is a limitation of directory copies, not of archive backup:
+  the continuous export is unaffected by maintenance.
+- **A dropbox needs a consumer.** Nothing removes batches from it. If yours
+  stops, the dropbox fills to its ceiling, the exporter stalls, and records age
+  out of retention before being exported.
 - In `consistent` mode, the raft snapshot that brings a joining node up to date is
   held whole in memory while it is captured, unlike the file-based snapshot, which
   streams.

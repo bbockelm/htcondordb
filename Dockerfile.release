@@ -47,7 +47,20 @@ ENV GOWORK=off \
 
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
         -ldflags "-s -w -X main.version=${VERSION}" \
-        -o /out/ ./cmd/htcondordb ./cmd/htcondordb-cli
+        -o /out/ ./cmd/htcondordb ./cmd/htcondordb-cli \
+        ./cmd/htcondordb-history-import ./cmd/htcondordb-restore-dropbox
+
+# The exporter plugins are separate modules, and the daemon resolves each by basename on PATH --
+# so a container with the daemon alone starts cleanly and then silently skips every configured
+# exporter and import job, which is the same failure the release tarballs hit before they shipped
+# these. Each is built from its own module directory.
+RUN for spec in kafkasync:htcondordb-plugin-kafka \
+                opensearchsync:htcondordb-plugin-opensearch \
+                archivedropbox:htcondordb-plugin-dropbox; do \
+        mod="${spec%%:*}"; bin="${spec##*:}"; \
+        (cd "$mod" && GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
+            -ldflags "-s -w" -o /out/"$bin" "./cmd/$bin") || exit 1; \
+    done
 
 # --- Stage 2: runtime ---
 FROM alpine:3.21
@@ -62,7 +75,7 @@ RUN apk --no-cache add ca-certificates tzdata \
  && mkdir -p /etc/htcondordb /var/lib/htcondordb /var/log/htcondordb \
  && chown -R condor:condor /etc/htcondordb /var/lib/htcondordb /var/log/htcondordb
 
-COPY --from=builder /out/htcondordb /out/htcondordb-cli /usr/local/bin/
+COPY --from=builder /out/ /usr/local/bin/
 
 USER condor
 WORKDIR /var/lib/htcondordb

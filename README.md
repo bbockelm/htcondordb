@@ -26,7 +26,9 @@ The package installs:
 |------|------|
 | `/usr/sbin/htcondordb` | The daemon, started by `condor_master`. |
 | `/usr/bin/htcondordb-cli` | The query shell. |
-| `/usr/sbin/kafkasync`, `opensearchsync`, `archivedropbox` | Optional exporters, launched by the daemon when configured. |
+| `/usr/sbin/htcondordb-plugin-kafka`, `-plugin-opensearch`, `-plugin-dropbox` | Optional exporter plugins, launched by the daemon when configured. |
+| `/usr/sbin/htcondordb-history-import` | Pulls completed-job history from a pool's schedds; launched by the daemon for each configured import job. |
+| `/usr/sbin/htcondordb-restore-dropbox` | Reads an archive dropbox back into an archive table. Run by an operator during a recovery. |
 | `/etc/condor/config.d/50-htcondordb.conf` | Configuration. Installing the package does **not** start the daemon; the lines that enable it are commented out. |
 
 The same release page has `.tar.gz` archives for Linux and macOS (amd64 and

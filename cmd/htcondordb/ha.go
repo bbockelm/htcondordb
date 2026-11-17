@@ -365,6 +365,17 @@ func configInt(cfg *config.Config, key string) int {
 	return n
 }
 
+// binOverride reads a binary-path override, preferring the current setting name and falling back
+// to the one it replaced. A config file is not rewritten by a package upgrade, so a deployment
+// that set the old name keeps working until someone edits it; the binaries themselves are replaced
+// by the upgrade, so they need no such grace.
+func binOverride(cfg *config.Config, name, legacy string) string {
+	if v := getStr(cfg, name); v != "" {
+		return v
+	}
+	return getStr(cfg, legacy)
+}
+
 func getStr(cfg *config.Config, key string) string {
 	v, _ := cfg.Get(key)
 	return v

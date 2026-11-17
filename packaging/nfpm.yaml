@@ -38,16 +38,16 @@ contents:
   # would install cleanly and then silently skip every configured exporter
   # ("not found: skip"), which is exactly what the release tarballs did
   # before they started shipping these.
-  - src: packaging/staging/kafkasync
-    dst: /usr/sbin/kafkasync
+  - src: packaging/staging/htcondordb-plugin-kafka
+    dst: /usr/sbin/htcondordb-plugin-kafka
     file_info:
       mode: 0755
-  - src: packaging/staging/opensearchsync
-    dst: /usr/sbin/opensearchsync
+  - src: packaging/staging/htcondordb-plugin-opensearch
+    dst: /usr/sbin/htcondordb-plugin-opensearch
     file_info:
       mode: 0755
-  - src: packaging/staging/archivedropbox
-    dst: /usr/sbin/archivedropbox
+  - src: packaging/staging/htcondordb-plugin-dropbox
+    dst: /usr/sbin/htcondordb-plugin-dropbox
     file_info:
       mode: 0755
 
@@ -55,8 +55,8 @@ contents:
   # on PATH or next to os.Executable() -- so leaving it out makes the daemon log
   # "history-import binary not found; leaving import jobs to an external runner"
   # and silently skip every configured import job.
-  - src: packaging/staging/history-import
-    dst: /usr/sbin/history-import
+  - src: packaging/staging/htcondordb-history-import
+    dst: /usr/sbin/htcondordb-history-import
     file_info:
       mode: 0755
 
@@ -64,8 +64,8 @@ contents:
   # spawns it -- an operator runs it, during a recovery, which is the worst time
   # to discover the tool is not installed. It ships beside the daemon because it
   # is an administrative tool, not a query shell.
-  - src: packaging/staging/restore-dropbox
-    dst: /usr/sbin/restore-dropbox
+  - src: packaging/staging/htcondordb-restore-dropbox
+    dst: /usr/sbin/htcondordb-restore-dropbox
     file_info:
       mode: 0755
 
