@@ -382,3 +382,59 @@ func progressLogger(t *testing.T) (string, *logging.Logger) {
 	}
 	return path, logger
 }
+
+func mapReport(dir string, done, total int, elapsed time.Duration) collections.OpenProgress {
+	return collections.OpenProgress{Dir: dir, Phase: collections.OpenMapSegments,
+		Done: done, Total: total, Elapsed: elapsed}
+}
+
+// TestOutstandingOrdersBySlowestNotBiggest: estimate_remaining and the printed rate both describe
+// open[0], so choosing it by segment count contradicts the premise the per-phase rates exist for.
+// A short pass in a slow phase finishes after a long pass in a fast one, and ordering by size hides
+// the entry that actually decides when the open ends.
+func TestOutstandingOrdersBySlowestNotBiggest(t *testing.T) {
+	tm, dir := timerWithEntries(t,
+		catalogEntry{kind: "archive", name: "history", segs: 5000},
+		catalogEntry{kind: "archive", name: "epoch_history", segs: 1000})
+
+	tm.tblMu.Lock()
+	tm.observeRate(string(collections.OpenLoadSidecars), 10000, 10*time.Second) // 1000 segments/s
+	tm.observeRate(string(collections.OpenMapSegments), 100, 100*time.Second)   // 1 segment/s
+	tm.tblMu.Unlock()
+
+	// history: 5000 passes, every one of them a sidecar pass -> about 5s.
+	tm.onOpenProgress(sidecarReport(filepath.Join(dir, "archives", "history", "0"), 0, 5000, 0))
+	// epoch_history: 100 map segments at 1/s, then a 1000-segment sidecar pass at 1000/s -> about 101s.
+	tm.onOpenProgress(mapReport(filepath.Join(dir, "archives", "epoch_history", "0"), 900, 1000, 0))
+
+	tm.tblMu.Lock()
+	open, remaining := tm.outstanding()
+	rate, phase, _ := tm.rateNow(open)
+	tm.tblMu.Unlock()
+
+	if open[0].name != "epoch_history" {
+		t.Errorf("head of the outstanding list = %q (est %s), want epoch_history: %d segment-passes "+
+			"in a 1 segment/s phase outlast %d in a 1000 segment/s one",
+			open[0].name, open[0].est, open[1].remaining, open[0].remaining)
+	}
+	if open[0].est <= open[1].est {
+		t.Errorf("ordering is not by estimate: open[0]=%s est=%s, open[1]=%s est=%s",
+			open[0].name, open[0].est, open[1].name, open[1].est)
+	}
+	// The rate printed is the head entry's phase, not the other one's, or a reader attributes a
+	// sidecar rate to an entry that is still mapping.
+	if phase != string(collections.OpenMapSegments) {
+		t.Errorf("printed rate phase = %q, want map_segments (the phase open[0] is in)", phase)
+	}
+	if math.Abs(rate-1) > 0.01 {
+		t.Errorf("printed rate = %.3f segments/s, want 1.0 (map_segments)", rate)
+	}
+	// segments_remaining spans both entries while the estimate covers only open[0]; estimate_of is
+	// what tells them apart, so it must name the entry and its own count.
+	if remaining != 6100 {
+		t.Errorf("segments_remaining = %d, want 6100 (5000 sidecar + 100 map + 1000 sidecar)", remaining)
+	}
+	if got, want := estimateScope(open[0]), "archive epoch_history, 1100 segments"; got != want {
+		t.Errorf("estimate_of = %q, want %q", got, want)
+	}
+}

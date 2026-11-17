@@ -183,12 +183,17 @@ type outstandingEntry struct {
 	// commensurable in cost, which is why the estimate divides each pass by its own rate
 	// rather than dividing this total by one.
 	remaining int
+	// est is how long those passes should take, each divided by its own phase's rate. It is
+	// what the entries are ordered by, because the heartbeat reports the one that will finish
+	// last and segment count does not decide that: a short pass in a slow phase outlasts a long
+	// one in a fast phase, which is the whole reason the rates are kept per phase.
+	est time.Duration
 	// detail is the in-flight phase and its counts, empty until the open reports.
 	detail string
 }
 
-// outstanding is the entries not yet opened, most work remaining first, with the total remaining.
-// Caller holds tblMu.
+// outstanding is the entries not yet opened, longest estimate first, with the total segment-passes
+// remaining across all of them. Caller holds tblMu.
 func (t *startupTimer) outstanding() (open []outstandingEntry, remaining int) {
 	for _, e := range t.entries {
 		if t.doneNames[e.label()] {
@@ -205,10 +210,16 @@ func (t *startupTimer) outstanding() (open []outstandingEntry, remaining int) {
 				o.remaining += p.total
 			}
 		}
+		o.est = t.estimateEntry(o)
 		open = append(open, o)
 		remaining += o.remaining
 	}
-	sort.Slice(open, func(i, j int) bool { return open[i].remaining > open[j].remaining })
+	sort.Slice(open, func(i, j int) bool {
+		if open[i].est != open[j].est {
+			return open[i].est > open[j].est
+		}
+		return open[i].remaining > open[j].remaining
+	})
 	return open, remaining
 }
 
@@ -351,15 +362,18 @@ func (t *startupTimer) rateFor(phase string) (float64, bool) {
 	return seedSegmentsPerSecond, false
 }
 
-// rateNow is the rate to PRINT: the phase the slowest outstanding entry is in, since that is the
-// entry the estimate is about and the one a reader is watching. Caller holds tblMu.
-func (t *startupTimer) rateNow(open []outstandingEntry) (float64, bool) {
+// rateNow is the rate to PRINT: the phase of the entry the estimate is about, which is the one a
+// reader is watching. It returns that phase too, because the rate is one phase's and the printed
+// segments_remaining spans several -- dividing the one by the other is off by whatever the phases
+// differ by, and naming the phase is what stops a reader doing it. Caller holds tblMu.
+func (t *startupTimer) rateNow(open []outstandingEntry) (rate float64, phase string, measured bool) {
 	if len(open) > 0 {
 		if p := t.prog[open[0].label()]; p != nil && p.phase != "" {
-			return t.rateFor(p.phase)
+			rate, measured = t.rateFor(p.phase)
+			return rate, p.phase, measured
 		}
 	}
-	return seedSegmentsPerSecond, false
+	return seedSegmentsPerSecond, "", false
 }
 
 // estimateEntry is how long the passes an entry has left should take, each divided by its own
@@ -557,10 +571,11 @@ func (t *startupTimer) startProgress(dir string) {
 				t.tblMu.Lock()
 				done, last, lastAt := t.tblCount, t.lastDone, t.lastDoneAt
 				open, remaining := t.outstanding()
-				rate, measured := t.rateNow(open)
+				rate, ratePhase, measured := t.rateNow(open)
 				var est time.Duration
+				var estOf string
 				if len(open) > 0 {
-					est = t.estimateEntry(open[0])
+					est, estOf = open[0].est, estimateScope(open[0])
 				}
 				total := len(t.entries)
 				t.tblMu.Unlock()
@@ -577,7 +592,8 @@ func (t *startupTimer) startProgress(dir string) {
 					fields = append(fields, "open", openLabels(open),
 						"segments_remaining", remaining,
 						"estimate_remaining", est.String(),
-						"rate", formatRate(rate), "rate_source", rateSource(measured))
+						"estimate_of", estOf,
+						"rate", formatRatePhase(rate, ratePhase), "rate_source", rateSource(measured))
 				}
 				if last != "" {
 					// Time since a table last FINISHED -- not time spent doing nothing. Named for
@@ -617,7 +633,26 @@ func formatRate(rate float64) string {
 	return fmt.Sprintf("%.1f segments/s", rate)
 }
 
-// openLabels renders the outstanding entries for a log field, most work remaining first, capped
+// formatRatePhase is formatRate with the phase the rate belongs to. The heartbeat prints one
+// phase's rate beside a segments_remaining that spans every phase still to come, so the obvious
+// division -- segments over rate -- does not give the printed estimate and is not meant to. Naming
+// the phase is what makes the rate legible as one phase's and not the catalog's.
+func formatRatePhase(rate float64, phase string) string {
+	if phase == "" {
+		return formatRate(rate)
+	}
+	return fmt.Sprintf("%s (%s)", formatRate(rate), phase)
+}
+
+// estimateScope names what estimate_remaining is about: the entry expected to finish last, and the
+// segment-passes it has left. The estimate is one entry's because entries open concurrently, so
+// the wall clock is the slowest of them rather than the sum -- without this field the estimate sits
+// beside a total it is not derived from and reads like an arithmetic error.
+func estimateScope(o outstandingEntry) string {
+	return fmt.Sprintf("%s, %d segments", o.label(), o.remaining)
+}
+
+// openLabels renders the outstanding entries for a log field, longest estimate first, capped
 // so one line stays readable on a catalog with hundreds of tables. An entry the open has reported
 // on is rendered with its phase and its counts, which is what turns "this one is big" into "this
 // one is three quarters done"; one it has not yet reached shows the size the directory scan found.
@@ -648,10 +683,11 @@ func (t *startupTimer) statusLine() string {
 	t.tblMu.Lock()
 	done, last, lastAt := t.tblCount, t.lastDone, t.lastDoneAt
 	open, remaining := t.outstanding()
-	rate, measured := t.rateNow(open)
+	rate, ratePhase, measured := t.rateNow(open)
 	var est time.Duration
+	var estOf string
 	if len(open) > 0 {
-		est = t.estimateEntry(open[0])
+		est, estOf = open[0].est, estimateScope(open[0])
 	}
 	total := len(t.entries)
 	t.tblMu.Unlock()
@@ -661,8 +697,8 @@ func (t *startupTimer) statusLine() string {
 		b += fmt.Sprintf(" of=%d", total)
 	}
 	if len(open) > 0 {
-		b += fmt.Sprintf(" open=%q segments_remaining=%d estimate_remaining=%s rate=%q rate_source=%s",
-			openLabels(open), remaining, est, formatRate(rate), rateSource(measured))
+		b += fmt.Sprintf(" open=%q segments_remaining=%d estimate_remaining=%s estimate_of=%q rate=%q rate_source=%s",
+			openLabels(open), remaining, est, estOf, formatRatePhase(rate, ratePhase), rateSource(measured))
 	}
 	if last != "" {
 		b += fmt.Sprintf(" last=%q since_last_table=%s", last, time.Since(lastAt).Round(time.Second))
