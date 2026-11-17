@@ -24,6 +24,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/bbockelm/htcondordb/dropboxframe"
 )
 
 // Kind is the exporter registry kind for this exporter.
@@ -57,6 +59,49 @@ type Config struct {
 	// Format is how each record is serialized inside the tarball: FormatClassAd (the default,
 	// old-ClassAd text, one .classad entry per record) or FormatJSON (one .json entry per record).
 	Format RecordFormat `json:"format,omitempty"`
+
+	// Container is how a batch is packaged on disk: ContainerTarGz (the default, one
+	// gzip-compressed tar per batch) or ContainerFrames (a framed zstd stream).
+	//
+	// It is orthogonal to Format, which chooses how one record is serialized. A framed stream
+	// holds exactly the same record bytes; it changes only how they are packaged.
+	//
+	// The default stays ContainerTarGz because the dropbox exists for an out-of-band consumer,
+	// and those consumers are external code reading gzip tarballs with standard tools. Switch a
+	// dropbox to ContainerFrames only once its consumer understands the framed format.
+	Container ContainerFormat `json:"container,omitempty"`
+
+	// MinFrameBytes is how many bytes of records a frame accumulates before it is closed, with
+	// ContainerFrames. 0 uses the default; anything below the floor is raised to it.
+	//
+	// This is the knob that decides what damage costs: a bad frame loses the records in that
+	// frame and nothing else. It must be meaningfully smaller than a batch to bound anything --
+	// a frame size at or above RollJobs worth of records yields one frame per batch, which is
+	// the same blast radius as a tarball.
+	MinFrameBytes int `json:"minFrameBytes,omitempty"`
+}
+
+// ContainerFormat selects how a batch is packaged on disk.
+type ContainerFormat string
+
+const (
+	// ContainerTarGz writes each batch as one gzip-compressed tar: batch-<seq>-<mod>.tar.gz.
+	// Readable with standard tools, and the default. Its weakness is that a tarball is a single
+	// gzip stream, so damage costs everything after it -- up to a whole RollJobs batch.
+	ContainerTarGz ContainerFormat = "targz"
+
+	// ContainerFrames writes each batch as a framed zstd stream: batch-<seq>-<mod>.cadf. Each
+	// frame is independently decompressible and covered by its own checksum, and a reader that
+	// hits damage resyncs to the next frame, so a bad byte costs one frame rather than the batch.
+	ContainerFrames ContainerFormat = "frames"
+)
+
+// batchExt is the file extension a container writes.
+func (c ContainerFormat) batchExt() string {
+	if c == ContainerFrames {
+		return ".cadf"
+	}
+	return ".tar.gz"
 }
 
 // RecordFormat selects the on-disk serialization of a record inside the tarball.
@@ -96,6 +141,7 @@ const (
 	DefaultMaxDropboxBytes  = ByteSize(2 * 1024 * 1024 * 1024) // 2 GiB
 	DefaultCompressionLevel = 6                                // gzip.DefaultCompression
 	DefaultFormat           = FormatClassAd
+	DefaultContainer        = ContainerTarGz
 )
 
 // Validate fills defaults and checks required fields.
@@ -130,6 +176,25 @@ func (c *Config) Validate() error {
 	case FormatClassAd, FormatJSON:
 	default:
 		return fmt.Errorf("archivedropbox: format %q is invalid (want %q or %q)", c.Format, FormatClassAd, FormatJSON)
+	}
+	if c.Container == "" {
+		c.Container = DefaultContainer
+	}
+	switch c.Container {
+	case ContainerTarGz:
+		if c.MinFrameBytes != 0 {
+			return fmt.Errorf("archivedropbox: minFrameBytes applies only to container %q", ContainerFrames)
+		}
+	case ContainerFrames:
+		if c.MinFrameBytes == 0 {
+			c.MinFrameBytes = dropboxframe.DefaultMinFrameBytes
+		}
+		if c.MinFrameBytes < dropboxframe.MinFrameBytesFloor {
+			return fmt.Errorf("archivedropbox: minFrameBytes %d is below the %d floor, where a framed stream compresses worse than a tarball",
+				c.MinFrameBytes, dropboxframe.MinFrameBytesFloor)
+		}
+	default:
+		return fmt.Errorf("archivedropbox: container %q is invalid (want %q or %q)", c.Container, ContainerTarGz, ContainerFrames)
 	}
 	return nil
 }

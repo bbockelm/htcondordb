@@ -187,7 +187,7 @@ type fakeWriter struct {
 	lossExt  string
 }
 
-func (f *fakeWriter) WriteTarball(seq uint64, recs []record) (string, error) {
+func (f *fakeWriter) WriteBatch(seq uint64, recs []record) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tarballs++
