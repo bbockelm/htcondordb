@@ -19,6 +19,8 @@ quickstart. These pages cover the details:
   catalog: discovery, sticky membership, per-AP freshness.
 - **[High availability](ha.md)** — `standalone`, `leader-follower`, and raft-based
   `consistent` modes.
+- **[Backup and restore](backup-restore.md)** — what snapshots do and do not
+  cover (archives do not), configuring them, key escrow, restoring, and verifying.
 - **[Profile-guided optimization](pgo.md)** — the daemon's PGO profile and how to
   refresh it from a production daemon.
 
@@ -28,3 +30,4 @@ Draft design sketches (not user documentation):
 
 - [Time-series over history](design/time-series.md)
 - [Continuous aggregates](design/continuous-aggregates.md)
+- [Continuous archive backup](design/archive-continuous-backup.md)

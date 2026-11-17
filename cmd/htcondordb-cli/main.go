@@ -255,6 +255,10 @@ func run() error {
 	// `.resync <target>`, `.retire <schedd>` (federation hub), and truncate/rotate/retention on a table a writer inside the daemon
 	// owns, reach the daemon's sync managers over the DBSyncControl command.
 	execCfg.SyncControl = syncControlClient(ctx, cfg, addr)
+	// `.backup [path]` and `.verify [path]` reach the daemon over DBBackupControl. A backup reads
+	// every mutable table, so it gets a much longer deadline than a control request.
+	execCfg.Backup = backupControlClient(ctx, cfg, addr, "backup", 30*time.Minute)
+	execCfg.Verify = backupControlClient(ctx, cfg, addr, "verify", 10*time.Minute)
 	exec := repl.NewExecutor(dbc, execCfg)
 	// Set before either path runs, so -dialect applies to a one-shot statement and is the
 	// starting dialect of an interactive session (where `.dialect` can still change it).
@@ -871,4 +875,89 @@ func isInteractive() bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+// backupControlClient dials the daemon's DBBackupControl command and renders the response for the
+// REPL. action is "backup" or "verify"; path may be empty.
+//
+// The timeout is generous because a snapshot of a large database is not a quick request -- it
+// reads every mutable table -- and the operator asking for one before an upgrade would rather wait
+// than be told the connection timed out while the daemon is still writing the file.
+func backupControlClient(ctx context.Context, cfg *config.Config, addr string, action string, timeout time.Duration) func(path string) (string, error) {
+	return func(path string) (string, error) {
+		sec, err := htcondor.GetSecurityConfig(cfg, command.DBBackupControl, "CLIENT")
+		if err != nil {
+			return "", err
+		}
+		sec.Command = command.DBBackupControl
+		dctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		cl, err := cedarclient.ConnectAndAuthenticate(dctx, addr, sec)
+		if err != nil {
+			return "", fmt.Errorf("connecting to %s: %w", addr, err)
+		}
+		defer func() { _ = cl.Close() }()
+		s := cl.GetStream()
+		req := classad.New()
+		req.InsertAttrString("Action", action)
+		if path != "" {
+			req.InsertAttrString("Path", path)
+		}
+		out := message.NewMessageForStream(s)
+		if err := out.PutClassAd(dctx, req); err != nil {
+			return "", err
+		}
+		if err := out.FinishMessage(dctx); err != nil {
+			return "", err
+		}
+		respAd, err := message.NewMessageFromStream(s).GetClassAd(dctx)
+		if err != nil {
+			return "", err
+		}
+		if ok, _ := respAd.EvaluateAttrBool("Ok"); !ok {
+			msg, _ := respAd.EvaluateAttrString("Error")
+			// A verify that found damage answers Ok=false with no Error: the detail is the report.
+			if detail, _ := respAd.EvaluateAttrString("Detail"); msg == "" && detail != "" {
+				return "", fmt.Errorf("%s", strings.TrimRight(detail, "\n"))
+			}
+			if msg == "" {
+				msg = action + " failed"
+			}
+			return "", fmt.Errorf("%s", msg)
+		}
+		return renderBackupResponse(action, respAd), nil
+	}
+}
+
+// renderBackupResponse turns the daemon's response ad into the lines the REPL prints.
+func renderBackupResponse(action string, respAd *classad.ClassAd) string {
+	var b strings.Builder
+	if action == "verify" {
+		checked, _ := respAd.EvaluateAttrInt("Checked")
+		good, _ := respAd.EvaluateAttrInt("Good")
+		bad, _ := respAd.EvaluateAttrInt("Bad")
+		unver, _ := respAd.EvaluateAttrInt("Unverifiable")
+		if detail, _ := respAd.EvaluateAttrString("Detail"); detail != "" {
+			b.WriteString(detail)
+		}
+		fmt.Fprintf(&b, "%d checked, %d ok, %d damaged, %d unverifiable\n", checked, good, bad, unver)
+		return b.String()
+	}
+	file, _ := respAd.EvaluateAttrString("File")
+	bytes, _ := respAd.EvaluateAttrInt("Bytes")
+	secs, _ := respAd.EvaluateAttrReal("DurationSeconds")
+	sum, _ := respAd.EvaluateAttrString("SHA256")
+	fmt.Fprintf(&b, "wrote %s (%d bytes) in %.1fs\n", file, bytes, secs)
+	if sum != "" {
+		fmt.Fprintf(&b, "sha256 %s\n", sum)
+	}
+	if tables, _ := respAd.EvaluateAttrString("Tables"); tables != "" {
+		fmt.Fprintf(&b, "tables: %s\n", tables)
+	}
+	// The snapshot holds mutable tables only. Saying so in the artifact's own report is the point
+	// at which an operator learns their history is not in this file.
+	if skipped, _ := respAd.EvaluateAttrString("SkippedArchives"); skipped != "" {
+		fmt.Fprintf(&b, "NOT in this snapshot (archives -- back these up separately): %s\n", skipped)
+	}
+	return b.String()
 }

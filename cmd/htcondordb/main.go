@@ -407,7 +407,8 @@ func run() error {
 	// timestamped snapshot to HTCONDORDB_SNAPSHOT_DIR, keeping the most recent
 	// HTCONDORDB_SNAPSHOT_KEEP (default 7). Disabled when either is unset/zero. A
 	// follower snapshots its own (independently encrypted) copy.
-	if snapDir := getStr(cfg, "HTCONDORDB_SNAPSHOT_DIR"); snapDir != "" {
+	snapDir := getStr(cfg, "HTCONDORDB_SNAPSHOT_DIR")
+	if snapDir != "" {
 		if secs := configInt(cfg, "HTCONDORDB_SNAPSHOT_INTERVAL"); secs > 0 {
 			keep := configInt(cfg, "HTCONDORDB_SNAPSHOT_KEEP")
 			if keep <= 0 {
@@ -596,6 +597,12 @@ func run() error {
 		owners: svc.Owners(), cat: svc.Catalog(),
 	})
 
+	// On-demand backup and snapshot verification (DBBackupControl): `.backup` writes a snapshot
+	// now rather than at the next tick of the periodic timer, and `.verify` checks snapshots
+	// against their manifests. Registered in every mode, and usable with no snapshot directory
+	// configured as long as the caller names an absolute path.
+	registerBackupControl(srv, svc, snapDir)
+
 	// Advertise a discovery/monitoring ClassAd to the collector: agents (and the htcondor-api
 	// MCP) discover this database and its command address here, and the ad doubles as a metrics
 	// sink carrying per-table storage gauges and per-source sync health -- scrapable via the
@@ -639,7 +646,15 @@ func run() error {
 		defer stopFlight()
 	}
 
-	obs.SetMetrics(metrics.Handler(ctx, svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, fedMgr.Metrics()))
+	backupMetrics := metrics.NewBackupCollector(func() metrics.BackupStats {
+		b := svc.BackupStats()
+		return metrics.BackupStats{
+			Total: b.Total, Failures: b.Failures,
+			LastSuccess: b.LastSuccess, LastFailure: b.LastFailure,
+			LastBytes: b.LastBytes, LastDuration: b.LastDuration,
+		}
+	})
+	obs.SetMetrics(metrics.Handler(ctx, svc.Catalog(), syncSources, expMgr.Statuses, impMgr.Statuses, fedMgr.Metrics(), backupMetrics))
 
 	// Everything a client finds this daemon through is published HERE, with every manager
 	// started and the accept loop next: the address file, and the ClassAd the collector hands

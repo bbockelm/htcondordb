@@ -147,6 +147,12 @@ there.
 | `HTCONDORDB_ARCHIVE_MAX_BYTES` | — | Default on-disk size cap applied to **both** schedd-sync archives (`history`, `epoch_history`). Oldest whole segments are dropped past the cap on the retention sweep. Accepts a unit suffix (`10 GB`, `500MiB`) or plain bytes; unset/`0` = no limit. |
 | `HTCONDORDB_HISTORY_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for the `history` archive; overrides the shared default (set to `0` to uncap this table while the default caps the other). |
 | `HTCONDORDB_EPOCH_HISTORY_MAX_BYTES` | `$(HTCONDORDB_ARCHIVE_MAX_BYTES)` | Size cap for the `epoch_history` archive; overrides the shared default. |
+| `HTCONDORDB_SNAPSHOT_DIR` | — | Directory for periodic snapshots of the mutable tables. Unset disables them. See [Backup and restore](backup-restore.md). |
+| `HTCONDORDB_SNAPSHOT_INTERVAL` | — | Seconds between periodic snapshots; unset or `0` disables them. |
+| `HTCONDORDB_SNAPSHOT_KEEP` | `7` | Snapshot files retained in that directory. |
+| `HTCONDORDB_RESTORE_FILE` | — | One-shot restore-on-startup trigger: a snapshot loaded before clients are served, then renamed aside. |
+| `HTCONDORDB_ENCRYPT_AT_REST` | `false` | Encrypt the store and its snapshots under the pool signing keys (`SEC_PASSWORD_DIRECTORY`). |
+| `HTCONDORDB_ENCRYPT_ATTRS` | — | Extra attributes encrypted at rest, beyond the always-encrypted private ones. |
 | `HTCONDORDB_JOB_METRICS` | `false` | Sample running jobs' resource usage (memory/CPU/disk/IO/GPU) into the `job_metrics` archive, off the same `job_queue.log` stream. See [Schedd sync](schedd-sync.md#job-resource-metrics). |
 | `HTCONDORDB_JOB_METRICS_ATTRS` | — | Additional job attributes copied onto every sample — an `AccountingGroup`, a `ProjectName`, or a metric the job publishes with `condor_chirp` (all already flow through `job_queue.log`). |
 | `HTCONDORDB_JOB_METRICS_DERIVED` | — | Names computed columns, each evaluated once per sample from `HTCONDORDB_JOB_METRICS_DERIVED_<NAME>`. Use this for a dimension you will `GROUP BY`: a computed group key is evaluated client-side, so every matching row crosses the wire, while a stored column groups server-side and can carry a categorical index. |

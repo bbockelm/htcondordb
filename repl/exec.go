@@ -51,6 +51,15 @@ type ExecConfig struct {
 	// and reports it is unavailable when both are nil.
 	Resync func(target string) error
 
+	// Backup, if set, backs `.backup [path]`: it asks the daemon to write a snapshot now rather
+	// than at the next tick of the periodic timer. It returns the daemon's rendered report. The
+	// CLI wires it to a DBBackupControl dial. When nil, `.backup` reports it is unavailable.
+	Backup func(path string) (string, error)
+
+	// Verify, if set, backs `.verify [path]`: it asks the daemon to check snapshots against their
+	// sidecar manifests. An empty path checks every snapshot in the configured snapshot directory.
+	Verify func(path string) (string, error)
+
 	// SyncControl, if set, sends one DBSyncControl request (Action, Target, space-joined Args)
 	// to the daemon and returns its Note. It is how the session reaches a table's owner: the
 	// data-removing admin actions on an owned table (truncate, rotate, retention.set), which the
@@ -138,6 +147,8 @@ type Executor struct {
 	genKey     func() string
 	applyBatch func([]WriteOp) error
 	resync     func(target string) error
+	backup     func(path string) (string, error)
+	verify     func(path string) (string, error)
 	syncCtl    func(action, target string, args []string) (string, error)
 	retire     func(schedd string) error
 	// maxInList caps the values a subquery predicate inlines (see ExecConfig.MaxInListValues).
@@ -271,7 +282,7 @@ func NewExecutor(c *dbrpc.Client, cfg ExecConfig) *Executor {
 		var seq atomic.Uint64
 		genKey = func() string { return fmt.Sprintf("row-%d", seq.Add(1)) }
 	}
-	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps, attrNDV: cfg.AttrNDV, maxInList: cfg.MaxInListValues}
+	return &Executor{c: c, keyAttr: keyAttr, genKey: genKey, applyBatch: cfg.ApplyBatch, resync: cfg.Resync, backup: cfg.Backup, verify: cfg.Verify, syncCtl: cfg.SyncControl, retire: cfg.Retire, serverJoin: cfg.ServerSideJoin, placement: cfg.JoinPlacement, linkMbps: cfg.LinkCapacityMbps, attrNDV: cfg.AttrNDV, maxInList: cfg.MaxInListValues}
 }
 
 // SyncControl sends one DBSyncControl request to the daemon (see ExecConfig.SyncControl).
@@ -284,6 +295,24 @@ func (e *Executor) SyncControl(action, target string, args ...string) (string, e
 
 // HasSyncControl reports whether SyncControl has a transport.
 func (e *Executor) HasSyncControl() bool { return e.syncCtl != nil }
+
+// Backup asks the daemon to write a snapshot now. An empty path puts a timestamped file in the
+// daemon's configured snapshot directory, alongside the periodic ones.
+func (e *Executor) Backup(path string) (string, error) {
+	if e.backup == nil {
+		return "", fmt.Errorf("on-demand backup is not available on this connection")
+	}
+	return e.backup(path)
+}
+
+// Verify asks the daemon to check snapshots against their manifests. An empty path checks every
+// snapshot in the configured snapshot directory.
+func (e *Executor) Verify(path string) (string, error) {
+	if e.verify == nil {
+		return "", fmt.Errorf("snapshot verification is not available on this connection")
+	}
+	return e.verify(path)
+}
 
 // Resync asks the daemon to re-read/re-export the named sync source ("jobs", "history", or an
 // exporter name) from the start. Returns an error if no resync transport is configured.
