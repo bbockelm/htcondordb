@@ -232,7 +232,7 @@ module too, so every format change would need a tag and two `go.mod` bumps — r
 release choreography for a package with exactly two callers in one repo.
 
 The objection to the dependency — that it drags the daemon's tree into the
-exporter — turned out not to hold. Measured, building `cmd/archivedropbox`
+exporter — turned out not to hold. Measured, building `archivedropbox/cmd/htcondordb-plugin-dropbox`
 before and after:
 
 | | before | after |

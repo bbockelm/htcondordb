@@ -71,15 +71,16 @@ func TestCapstoneE2E(t *testing.T) {
 	broker, saslUser, saslPass := startSASLBrokerE2E(t)
 
 	// 3. The real binaries -- resolved AFTER the harness/broker skip checks so a skipped run
-	// never builds. Use pre-built paths from HTCONDORDB_BIN / KAFKASYNC_BIN when set (CI
-	// builds them once as the normal user and reuses them for both the unprivileged and root
-	// runs, so `go` never runs privileged), else build them here.
+	// never builds. Use pre-built paths from HTCONDORDB_BIN / HTCONDORDB_PLUGIN_KAFKA_BIN when
+	// set (CI
+	// builds them once as the normal user and reuses them for both the unprivileged and
+	// root runs, so `go` never runs privileged), else build them here.
 	_, thisFile, _, _ := runtime.Caller(0)
 	kafkasyncModDir := filepath.Dir(thisFile) // .../htcondordb/kafkasync
 	htcondordbModDir := filepath.Dir(kafkasyncModDir)
 	binDir := t.TempDir()
 	htcondordbBin := binaryE2E(t, "HTCONDORDB_BIN", htcondordbModDir, "./cmd/htcondordb", filepath.Join(binDir, "htcondordb"))
-	kafkasyncBin := binaryE2E(t, "KAFKASYNC_BIN", kafkasyncModDir, "./cmd/kafkasync", filepath.Join(binDir, "kafkasync"))
+	kafkasyncBin := binaryE2E(t, "HTCONDORDB_PLUGIN_KAFKA_BIN", kafkasyncModDir, "./cmd/htcondordb-plugin-kafka", filepath.Join(binDir, "htcondordb-plugin-kafka"))
 
 	// 4. The SASL password on disk, 0600, owned by the invoking user (the exporter runs as
 	// that user here). The credential is referenced by path, never stored in the exporter's
@@ -237,6 +238,13 @@ func binaryE2E(t *testing.T, envVar, moduleDir, pkg, out string) string {
 
 func buildBinaryE2E(t *testing.T, moduleDir, pkg, out string) string {
 	t.Helper()
+	// A package that is not there is a repo bug -- a command renamed without this caller --
+	// while everything below skips, so check it separately and fail. That is how the stale
+	// ./cmd/kafkasync path outlived the binary rename: CI passes the built path in through
+	// the env var, so only a local run ever reached the build, and it skipped.
+	if fi, err := os.Stat(filepath.Join(moduleDir, filepath.FromSlash(strings.TrimPrefix(pkg, "./")))); err != nil || !fi.IsDir() {
+		t.Fatalf("package %s does not exist in %s", pkg, moduleDir)
+	}
 	// -buildvcs=false: the CI checkout layout (repo in a subdirectory) can make the VCS
 	// stamp fail the build; the binary needs no version stamp here.
 	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, pkg)
