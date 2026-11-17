@@ -106,6 +106,59 @@ Copy finished snapshots off the machine as part of the same job that would copy
 any other spool data. A snapshot sitting next to the database it came from
 protects you against nothing except operator error.
 
+### On demand
+
+`.backup` in `htcondordb-cli` writes a snapshot immediately, instead of waiting
+for the next tick of the periodic timer. Take one before an upgrade, before a
+configuration change, and after an incident.
+
+```
+htcondordb-cli -e '.backup'
+wrote /var/lib/condor/spool/htcondordb-backups/htcondordb-20261116T143012Z.cadb (48213504 bytes) in 3.2s
+sha256 9f2c...e41a
+tables: jobs, users, syncstatus
+NOT in this snapshot (archives -- back these up separately): history, epoch_history
+```
+
+With no argument it writes into `HTCONDORDB_SNAPSHOT_DIR`, using the same naming
+as the periodic snapshots, so it sorts and prunes alongside them. Pass an
+absolute path to write somewhere else; that file is outside retention and is
+never pruned for you.
+
+Needs `DAEMON`. One backup runs at a time: a second request while one is in
+flight is refused rather than queued.
+
+### Verifying a snapshot
+
+Every snapshot written from this version on gets a sidecar manifest beside it
+(`<name>.cadb.manifest`) holding its size, a sha256 over the whole file, the
+tables it contains and the archives it does not. `.verify` checks a snapshot
+against it — size first, which catches a truncated copy immediately, then the
+digest, which catches everything else.
+
+```
+htcondordb-cli -e '.verify'
+ok           htcondordb-20261116T143012Z.cadb (48213504 bytes)
+DAMAGED      htcondordb-20261116T130012Z.cadb: checksum mismatch: the file's contents are not what was written
+unverifiable htcondordb-20261115T000000Z.cadb: no manifest beside this snapshot
+3 checked, 1 ok, 1 damaged, 1 unverifiable
+```
+
+With no argument it checks every snapshot in the configured directory; pass an
+absolute path to check one.
+
+**Unverifiable is not damaged.** A snapshot written before manifests existed is
+intact — it simply cannot be checked this way. Only `DAMAGED` means the bytes on
+disk are not the bytes that were written.
+
+The manifest is a sidecar rather than part of the `.cadb` on purpose: the
+snapshot format is unchanged in both directions, so a snapshot written here still
+restores on an older daemon.
+
+A verify is not a test restore. It proves the file is the file that was written;
+it does not prove the daemon can load it. For anything you are relying on, do the
+restore into a throwaway daemon described under [Verifying](#verifying).
+
 ### Backing up archives
 
 Archives are backed up by copying their directories. They live under the
@@ -204,11 +257,42 @@ consumer, with at-least-once delivery and a durable resume cursor. This is a goo
 feed into an external long-term store, but it is not a restore path: nothing in
 htcondordb re-ingests those tarballs.
 
-That makes it, today, the one archive copy that cannot be stranded by damage to
-the store's internal structure — each record is an independent ClassAd in text,
-with every attribute inline and no reference to a shared compression dictionary —
-and also the one you cannot restore from. Closing that gap, and the stream
-hardening it implies, is designed in
+That makes it the one archive copy that cannot be stranded by damage to the
+store's internal structure: each record is an independent ClassAd in text, with
+every attribute inline and no reference to a shared compression dictionary. If a
+compression dictionary goes missing and takes a run of segments with it, a
+directory copy made afterwards preserves the damage — a dropbox does not have the
+coupling to lose.
+
+**Restoring from a dropbox.** `restore-dropbox` reads the batches back into an
+archive table:
+
+```
+restore-dropbox -dir /var/spool/htcondordb-dropbox -table history
+```
+
+Use `-dry-run` first; it reads and reports without writing, and does not need the
+database reachable, so you can inspect a dropbox wherever the files are. Restores
+are re-runnable: records dedup on `GlobalJobId`, so the exporter's at-least-once
+duplicates and a re-run of a restore that died halfway are both harmless. Pass
+`-skip-dedup` only when restoring into an empty table, where the check can only
+ever answer no.
+
+Read the top of the report, not the totals. Three things appear there and each
+means records you do not have:
+
+- `DATA LOSS` — the exporter reported a window where retention outran its cursor.
+  Those records were pruned before export and are not in the dropbox.
+- `INCOMPLETE` — batch sequence numbers are missing. Batches were deleted or
+  never arrived.
+- `DAMAGED BATCH` — a tarball was unreadable past some point. Its readable
+  records were still restored; the rest of that batch is gone.
+
+A restore that silently succeeds over a gap is how an incomplete archive comes to
+be trusted.
+
+The design, including the framed stream format that bounds damage at a few
+hundred records instead of a whole batch, is in
 [Continuous archive backup](design/archive-continuous-backup.md).
 
 **Rebuilding from source.** For the `history` archive specifically, the records
@@ -406,6 +490,35 @@ library but has no CLI.
 
 ### What you can monitor
 
+The daemon exports its own backup history on the metrics endpoint:
+
+| Metric | Meaning |
+|---|---|
+| `htcondordb_backup_last_success_timestamp_seconds` | Unix time of the last successful snapshot; 0 if none since start |
+| `htcondordb_backup_last_failure_timestamp_seconds` | Unix time of the last failed snapshot; 0 if none |
+| `htcondordb_backup_attempts_total` | Snapshots attempted since start |
+| `htcondordb_backup_failures_total` | Snapshots that returned an error |
+| `htcondordb_backup_last_bytes` | Size of the last successful snapshot |
+| `htcondordb_backup_last_duration_seconds` | How long it took |
+
+**Alert on the age of the last success, not on the failure counter.** A backup
+regime fails silently: the snapshot that never happens produces no artifact and
+at most a log line nobody reads, so a failure count of zero is exactly what both
+a healthy daemon and a disabled one report.
+
+```
+time() - htcondordb_backup_last_success_timestamp_seconds > 2 * <your interval>
+```
+
+A value of 0 means no snapshot has succeeded since the daemon started, which is
+also what a daemon with backups unconfigured reports — so pair the alert with the
+knowledge that you configured them. `htcondordb_backup_last_bytes` is worth a
+second look after a schema or configuration change: a sharp drop means tables
+stopped being included.
+
+These cover snapshots only. Nothing here reports on archive directory copies or
+on a dropbox, because the daemon does not make them.
+
 There are **no metrics for backups** — nothing reports the age of the last
 successful snapshot, and nothing counts failures. The only signal is the daemon
 log:
@@ -444,11 +557,13 @@ who assumes the snapshot mechanism is a database backup:
   the data. Back up `archives/` separately, by directory copy.
 - **No scheduled backups by default.** Snapshots happen only if you configure
   them.
-- **No on-demand backup command.** No CLI, REPL command, signal or
-  catalog-level RPC.
-- **No verify command, no checksums, no manifest.** A test restore is the only
-  verification.
-- **No backup metrics.** Monitor the directory from outside.
+- **A verify is not a test restore.** `.verify` proves a snapshot is the file
+  that was written; only restoring it into a throwaway daemon proves it loads.
+- **Snapshots written before manifests existed cannot be verified.** They are
+  reported as unverifiable, not as damaged.
+- **Nothing verifies archive copies or dropboxes.** The manifest and `.verify`
+  cover `.cadb` snapshots only. A `restore-dropbox -dry-run` is the nearest
+  equivalent for a dropbox.
 - **A snapshot is not point-in-time.** It is taken while writers proceed — it
   does not block them and is not consistent against them. Within a single table
   it is consistent per internal shard, not across the table; across tables it is
@@ -461,8 +576,12 @@ who assumes the snapshot mechanism is a database backup:
 - **Escrowed backup keys are per-table and unreachable from the shipped tools**,
   and the catalog restore path ignores them. Pool keys are what you must retain.
 - **No offline archive checker or repair tool** is exposed.
-- **The dropbox exporter has no restore path.** It is the most damage-resistant
-  archive copy available and nothing shipped re-ingests it. See
+- **A dropbox restore rebuilds records, not an archive.** It replays ads into a
+  table; it does not restore that archive's indexes or configuration, which come
+  from a directory copy. Expect an ingest, not a file move.
+- **The dropbox still bounds damage at a whole batch.** A tarball is one gzip
+  stream, so a bad byte costs up to `RollJobs` records. The framed format that
+  fixes this is implemented but not yet emitted by the exporter — see
   [Continuous archive backup](design/archive-continuous-backup.md).
 - **Retention prunes by filename.** Any file matching `htcondordb-*.cadb` in the
   snapshot directory is eligible for deletion; `HTCONDORDB_SNAPSHOT_KEEP` has no
