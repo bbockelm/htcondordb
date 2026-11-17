@@ -107,7 +107,7 @@ func (m *importerManager) JobsFor(table string) []string {
 // target table belongs to another writer (dbrpc.ErrTableReadOnly). Restarting cannot fix that --
 // only a configuration change can -- so the supervisor stops relaunching the job until its
 // configuration changes (or the daemon restarts) instead of retrying it forever. Keep in sync
-// with cmd/history-import.
+// with cmd/htcondordb-history-import.
 const exitTableReadOnly = 3
 
 func newImporterManager(ctx context.Context, logger *slog.Logger, daemonAddr string, owners *server.TableOwners) *importerManager {
