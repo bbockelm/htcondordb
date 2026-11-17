@@ -64,6 +64,9 @@ type Result struct {
 	Unverifiable int
 	// Checksums counts batches whose bytes matched their manifest's digest.
 	Checksums int
+	// DryRun records whether anything was actually written, so the report does not claim a
+	// restore that did not happen.
+	DryRun bool
 }
 
 // Restore reads every batch in a dropbox, in sequence order, into the destination table.
@@ -73,7 +76,7 @@ type Result struct {
 // independent is that one damaged region costs only itself.
 func Restore(ctx context.Context, w Writer, opt Options) (Result, error) {
 	started := time.Now()
-	res := Result{}
+	res := Result{DryRun: opt.DryRun}
 
 	listing, err := List(opt.Dir)
 	if err != nil {
@@ -168,8 +171,12 @@ func (r Result) Report(w io.Writer) {
 	if len(r.MissingSeqs) > 0 {
 		fmt.Fprintf(w, "INCOMPLETE: %d batch sequence number(s) are missing from this dropbox: %v\n", len(r.MissingSeqs), r.MissingSeqs)
 	}
+	kept := " (its readable records were still restored)"
+	if r.DryRun {
+		kept = ""
+	}
 	for _, b := range r.BadBatches {
-		fmt.Fprintf(w, "DAMAGED BATCH: %s (its readable records were still restored)\n", b)
+		fmt.Fprintf(w, "DAMAGED BATCH: %s%s\n", b, kept)
 	}
 	for _, s := range r.ShortReads {
 		fmt.Fprintf(w, "SHORT READ: %s\n", s)
