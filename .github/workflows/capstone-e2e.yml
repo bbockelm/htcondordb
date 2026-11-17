@@ -63,13 +63,13 @@ jobs:
           GOPRIVATE: github.com/bbockelm,github.com/PelicanPlatform
         run: |
           go build -buildvcs=false -o /tmp/htcondordb ./cmd/htcondordb
-          ( cd kafkasync && go build -buildvcs=false -o /tmp/kafkasync ./cmd/kafkasync )
+          ( cd kafkasync && go build -buildvcs=false -o /tmp/htcondordb-plugin-kafka ./cmd/htcondordb-plugin-kafka )
           ( cd kafkasync && go test -buildvcs=false -c -o /tmp/capstone.test -run TestCapstoneE2E . )
 
       - name: Run capstone E2E (unprivileged)
         env:
           HTCONDORDB_BIN: /tmp/htcondordb
-          KAFKASYNC_BIN: /tmp/kafkasync
+          KAFKASYNC_BIN: /tmp/htcondordb-plugin-kafka
         run: /tmp/capstone.test -test.run '^TestCapstoneE2E$' -test.v -test.timeout 15m
 
       # Run the same pre-built test binary as root: the harness runs the pool root->condor,
@@ -78,5 +78,5 @@ jobs:
       - name: Run capstone E2E (as root, privilege-drop path)
         run: |
           sudo -E env "PATH=$PATH" \
-            HTCONDORDB_BIN=/tmp/htcondordb KAFKASYNC_BIN=/tmp/kafkasync \
+            HTCONDORDB_BIN=/tmp/htcondordb KAFKASYNC_BIN=/tmp/htcondordb-plugin-kafka \
             /tmp/capstone.test -test.run '^TestCapstoneE2E$' -test.v -test.timeout 15m

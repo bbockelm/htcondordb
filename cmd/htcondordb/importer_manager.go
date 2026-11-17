@@ -156,7 +156,7 @@ func resolveImporterSettings(cfg *config.Config) importerSettings {
 	return importerSettings{
 		enabled:         true,
 		user:            user,
-		binOverride:     getStr(cfg, "HISTORY_IMPORT"),
+		binOverride:     binOverride(cfg, "HTCONDORDB_HISTORY_IMPORT_BINARY", "HISTORY_IMPORT"),
 		logDir:          logDir,
 		jobs:            names,
 		targets:         targets,
@@ -181,7 +181,7 @@ func (m *importerManager) apply(cfg *config.Config) error {
 	}
 	bin := ""
 	if next.enabled {
-		bin = resolveBinary(next.binOverride, "history-import")
+		bin = resolveBinary(next.binOverride, "htcondordb-history-import")
 	}
 	if bin != "" {
 		// Claim the new targets while the running jobs hold the old: refused, leaving them

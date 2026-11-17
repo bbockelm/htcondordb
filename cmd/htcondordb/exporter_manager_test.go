@@ -213,3 +213,49 @@ func waitFor2(t *testing.T, cond func() bool, d time.Duration) {
 	}
 	t.Fatal("condition not met within timeout")
 }
+
+// TestExporterDefaultBinaryNames pins the basenames the daemon looks for when no override is set.
+//
+// This is the failure these names cause when they are wrong: resolveBinary returns "" for a
+// binary it cannot find, and the manager logs "not found: skip" and carries on. The daemon starts
+// cleanly, every exporter is silently inert, and nothing in the configuration looks wrong. A
+// rename that misses one of these produces exactly that, so the expected names are written down
+// here rather than left implicit in a switch.
+func TestExporterDefaultBinaryNames(t *testing.T) {
+	dir := t.TempDir()
+	// Put look-alikes on PATH so resolveBinary finds them by basename.
+	want := map[string]string{
+		"kafka":      "htcondordb-plugin-kafka",
+		"opensearch": "htcondordb-plugin-opensearch",
+		"dropbox":    "htcondordb-plugin-dropbox",
+	}
+	for _, name := range want {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+
+	var s exporterSettings
+	for kind, name := range want {
+		got := s.binaryFor(kind)
+		if got != filepath.Join(dir, name) {
+			t.Errorf("kind %q resolved to %q, want the %q on PATH -- a wrong default name makes the daemon skip this exporter silently", kind, got, name)
+		}
+	}
+}
+
+// TestHistoryImportDefaultBinaryName is the same guarantee for the importer, which fails the same
+// way: "history-import binary not found; leaving import jobs to an external runner".
+func TestHistoryImportDefaultBinaryName(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "htcondordb-history-import")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	if got := resolveBinary("", "htcondordb-history-import"); got != p {
+		t.Errorf("resolved %q, want %q", got, p)
+	}
+}

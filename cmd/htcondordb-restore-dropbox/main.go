@@ -35,7 +35,7 @@ import (
 
 func main() {
 	dir := flag.String("dir", "", "dropbox directory to restore from (required)")
-	table := flag.String("table", "", "destination archive table (required)")
+	table := flag.String("table", "", "destination archive table (required unless -verify)")
 	addr := flag.String("addr", "", "htcondordb address HOST:PORT (default: discover)")
 	dryRun := flag.Bool("dry-run", false, "read and report without writing anything")
 	verify := flag.Bool("verify", false, "check the dropbox against its manifests and report; implies -dry-run")
@@ -43,8 +43,9 @@ func main() {
 	quiet := flag.Bool("quiet", false, "suppress progress output")
 	flag.Parse()
 
-	if *dir == "" || *table == "" {
-		fmt.Fprintln(os.Stderr, "restore-dropbox: -dir and -table are required")
+	// -verify reads and checks; it never writes, so it needs no destination table.
+	if *dir == "" || (*table == "" && !*verify) {
+		fmt.Fprintln(os.Stderr, "restore-dropbox: -dir is required, and -table unless -verify")
 		flag.Usage()
 		os.Exit(2)
 	}

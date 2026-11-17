@@ -63,7 +63,7 @@ jobs:
             mkdir -p "${stage}"
             GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w -X main.version=${version}" \
               -o "${stage}/" ./cmd/htcondordb ./cmd/htcondordb-cli \
-                 ./cmd/history-import ./cmd/restore-dropbox
+                 ./cmd/htcondordb-history-import ./cmd/htcondordb-restore-dropbox
             # The exporter launchers ship in the SAME directory as the daemon, because that is
             # where the daemon looks for them: exporter_manager.go resolves each Kind's binary by
             # basename on PATH, else next to os.Executable(). Shipping the daemon alone meant a
@@ -74,9 +74,12 @@ jobs:
             # run in the same shell and each exporter links classad/collections/vm too. No
             # -X main.version: these have no version var, and a silently-ignored linker flag is
             # worse than none.
-            for exp in kafkasync opensearchsync archivedropbox; do
-              (cd "${exp}" && GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w" \
-                -o "${GITHUB_WORKSPACE}/${stage}/" "./cmd/${exp}")
+            for spec in kafkasync:htcondordb-plugin-kafka \
+                        opensearchsync:htcondordb-plugin-opensearch \
+                        archivedropbox:htcondordb-plugin-dropbox; do
+              mod="${spec%%:*}"; bin="${spec##*:}"
+              (cd "${mod}" && GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w" \
+                -o "${GITHUB_WORKSPACE}/${stage}/${bin}" "./cmd/${bin}")
             done
             cp README.md "${stage}/" 2>/dev/null || true
             tar -czf "dist/${name}.tar.gz" -C dist "${name}"

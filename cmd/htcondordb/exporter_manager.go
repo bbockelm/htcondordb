@@ -176,9 +176,9 @@ func resolveExporterSettings(cfg *htconfig.Config) exporterSettings {
 	}
 	return exporterSettings{
 		enabled:         true,
-		kafkaBin:        getStr(cfg, "KAFKASYNC"),
-		opensearchBin:   getStr(cfg, "OPENSEARCHSYNC"),
-		dropboxBin:      getStr(cfg, "ARCHIVEDROPBOX"),
+		kafkaBin:        binOverride(cfg, "HTCONDORDB_EXPORTER_KAFKA_BINARY", "KAFKASYNC"),
+		opensearchBin:   binOverride(cfg, "HTCONDORDB_EXPORTER_OPENSEARCH_BINARY", "OPENSEARCHSYNC"),
+		dropboxBin:      binOverride(cfg, "HTCONDORDB_EXPORTER_DROPBOX_BINARY", "ARCHIVEDROPBOX"),
 		runAsUser:       runAs,
 		dropboxUser:     dropboxUser,
 		pollInterval:    poll,
@@ -585,11 +585,11 @@ func (m *exporterManager) forwardLog(name, stream string, r io.Reader) {
 func (s exporterSettings) binaryFor(kind string) string {
 	switch kind {
 	case "kafka":
-		return resolveBinary(s.kafkaBin, "kafkasync")
+		return resolveBinary(s.kafkaBin, "htcondordb-plugin-kafka")
 	case "opensearch":
-		return resolveBinary(s.opensearchBin, "opensearchsync")
+		return resolveBinary(s.opensearchBin, "htcondordb-plugin-opensearch")
 	case "dropbox":
-		return resolveBinary(s.dropboxBin, "archivedropbox")
+		return resolveBinary(s.dropboxBin, "htcondordb-plugin-dropbox")
 	default:
 		return ""
 	}
