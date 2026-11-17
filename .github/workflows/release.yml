@@ -62,7 +62,8 @@ jobs:
             stage="dist/${name}"
             mkdir -p "${stage}"
             GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w -X main.version=${version}" \
-              -o "${stage}/" ./cmd/htcondordb ./cmd/htcondordb-cli
+              -o "${stage}/" ./cmd/htcondordb ./cmd/htcondordb-cli \
+                 ./cmd/history-import ./cmd/restore-dropbox
             # The exporter launchers ship in the SAME directory as the daemon, because that is
             # where the daemon looks for them: exporter_manager.go resolves each Kind's binary by
             # basename on PATH, else next to os.Executable(). Shipping the daemon alone meant a

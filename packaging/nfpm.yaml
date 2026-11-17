@@ -51,6 +51,24 @@ contents:
     file_info:
       mode: 0755
 
+  # history-import is resolved the same way the exporters are -- by basename,
+  # on PATH or next to os.Executable() -- so leaving it out makes the daemon log
+  # "history-import binary not found; leaving import jobs to an external runner"
+  # and silently skip every configured import job.
+  - src: packaging/staging/history-import
+    dst: /usr/sbin/history-import
+    file_info:
+      mode: 0755
+
+  # restore-dropbox reads an archive dropbox back into an archive table. Nothing
+  # spawns it -- an operator runs it, during a recovery, which is the worst time
+  # to discover the tool is not installed. It ships beside the daemon because it
+  # is an administrative tool, not a query shell.
+  - src: packaging/staging/restore-dropbox
+    dst: /usr/sbin/restore-dropbox
+    file_info:
+      mode: 0755
+
   # The query shell is for people, so it goes where people's PATH looks.
   - src: packaging/staging/htcondordb-cli
     dst: /usr/bin/htcondordb-cli
