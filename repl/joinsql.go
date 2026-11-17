@@ -45,6 +45,11 @@ func (k JoinKind) String() string {
 type TableRef struct {
 	Table string
 	Alias string
+
+	// Derived is the statement of a derived table -- `FROM (SELECT ...) alias`. It is set
+	// only between parsing and flattening: flattenDerivedTables merges it into the
+	// statement that reads it and clears this, so nothing downstream ever sees one.
+	Derived *Statement
 }
 
 // JoinClause is one joined table and the condition joining it.
@@ -52,6 +57,9 @@ type JoinClause struct {
 	Kind  JoinKind
 	Table string
 	Alias string
+
+	// Derived is a derived table used as this join's side. See TableRef.Derived.
+	Derived *Statement
 
 	// On is the translated ClassAd join condition, over BOTH sides' aliases. Empty for a
 	// CROSS JOIN, which has no condition by definition.
@@ -113,13 +121,9 @@ func (s *Statement) tableRefs() []TableRef {
 // follows it: `AS OF '<ts>'` is time travel, `AS j` is an alias. Without that lookahead
 // `FROM jobs AS OF '-1h'` would bind OF as the table's alias and then fail on the literal.
 func (p *parser) parseTableRef(st *Statement) (TableRef, error) {
-	// A '(' here is a derived table. Caught before parseIdent so the reader is told what
-	// the construct is called and what to write instead, rather than that an identifier
-	// was expected -- which describes the parser's state, not their query.
+	// A '(' here opens a derived table rather than naming a table.
 	if p.atPunct("(") {
-		return TableRef{}, fmt.Errorf("a derived table (FROM (SELECT ...)) is not supported; " +
-			"write the inner statement's columns and filter directly in this one, or, when it " +
-			"groups, define it as a materialized view and select from that")
+		return p.parseDerivedTableRef()
 	}
 	name, err := p.parseIdent()
 	if err != nil {
@@ -177,6 +181,35 @@ func (p *parser) parseAsOf(st *Statement) error {
 	return nil
 }
 
+// parseDerivedTableRef consumes `( SELECT ... ) [AS] alias`.
+//
+// The alias is REQUIRED, unlike a named table's. A derived table has no name of its own, so
+// without one there is nothing to qualify its columns by, and the error asking for it is more
+// useful than inventing a name the reader would have to guess at.
+func (p *parser) parseDerivedTableRef() (TableRef, error) {
+	inner, err := p.parseSubquerySelect("a derived table")
+	if err != nil {
+		return TableRef{}, err
+	}
+	ref := TableRef{Derived: inner}
+	if p.takeKeyword("AS") {
+		alias, aerr := p.parseIdent()
+		if aerr != nil {
+			return TableRef{}, fmt.Errorf("a derived table's AS: %w", aerr)
+		}
+		ref.Alias = alias
+	} else if t := p.peek(); t.kind == tIdent && !isClauseKeyword(t.text) {
+		p.pos++
+		ref.Alias = t.text
+	}
+	if ref.Alias == "" {
+		return TableRef{}, fmt.Errorf("a derived table needs a name: write " +
+			"`FROM (SELECT ...) AS <name>` and refer to its columns through it")
+	}
+	ref.Table = ref.Alias
+	return ref, nil
+}
+
 // parseJoins consumes every JOIN clause following the FROM table.
 func (p *parser) parseJoins(st *Statement) error {
 	for {
@@ -198,7 +231,7 @@ func (p *parser) parseJoins(st *Statement) error {
 		if err != nil {
 			return err
 		}
-		jc := JoinClause{Kind: kind, Table: ref.Table, Alias: ref.Alias}
+		jc := JoinClause{Kind: kind, Table: ref.Table, Alias: ref.Alias, Derived: ref.Derived}
 		if p.isKeyword("USING") {
 			return fmt.Errorf("JOIN ... USING is not supported; name the condition with " +
 				"ON, e.g. `ON a.ClusterId == b.ClusterId`")

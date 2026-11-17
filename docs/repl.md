@@ -352,9 +352,9 @@ anything but one equality; a condition inside a negated subquery that reads only
 row (`NOT EXISTS (... AND jobs.Owner == 'alice')` means "`Owner` is not alice **or** nothing
 matched", so write it outside the subquery where it says what it looks like); a correlated
 scalar subquery; a subquery in a projection or in an
-`UPDATE`/`DELETE`; an `EXISTS`/`IN` as one arm of an `OR`;
-`FROM (SELECT ...)` and `WITH`. Each is refused with the reason and, where there is one, the
-spelling to use instead.
+`UPDATE`/`DELETE`; an `EXISTS`/`IN` as one arm of an `OR`; and `WITH`. Each is refused with
+the reason and, where there is one, the spelling to use instead. For `FROM (SELECT ...)` see
+[derived tables](#derived-tables--a-select-in-the-from-clause) below.
 
 ### Where it runs
 
@@ -371,6 +371,46 @@ per group comes back and the cap never applies: the key set is not shipped at al
 every group column and aggregate argument to be a plain attribute, since the store evaluates
 them against the joined row; an expression, or a `FILTER (WHERE ...)` on an aggregate, falls
 back to the inlined constraint and the single-table aggregate, which is capped as above.
+
+## Derived tables — a SELECT in the FROM clause
+
+```
+FROM ( SELECT ... ) [AS] <name>
+```
+
+A derived table is a `SELECT` used where a table name goes, named so the outer statement can
+refer to its columns. The name is required: a derived table has none of its own.
+
+```sql
+SELECT Owner FROM (SELECT Owner, JobStatus FROM jobs WHERE JobStatus == 5) recent
+  WHERE Owner == 'alice';
+
+SELECT j.Owner FROM jobs j
+  JOIN (SELECT ClusterId FROM epochs WHERE Restarts > 0) restarted
+    ON j.ClusterId == restarted.ClusterId;
+```
+
+- **It is merged into the statement that reads it**, rather than run separately: the two
+  filters are combined, the columns renamed, and what runs is the single query you would have
+  written by hand. Nothing is held in memory, and `EXPLAIN` shows the merged plan because that
+  is what executes. A derived table used as a join side reaches the store exactly as a plain
+  joined table does.
+- **It exposes only the columns it selects.** Naming anything else is an error where you wrote
+  it, rather than an undefined value in the output. `SELECT *` exposes whatever the inner
+  table carries.
+- **A column that is not a plain attribute needs `AS`**, since the outer statement refers to it
+  by name: write `SELECT ClusterId * 2 AS doubled`, not the expression alone.
+- **Its own `ORDER BY` is dropped**, because a derived table is a relation and the outer
+  statement's ordering is what survives. Order the outer statement instead.
+- **On the nullable side of a `LEFT JOIN`**, its filter applies before the pairing, so outer
+  rows that match nothing are still returned — the same as writing the condition in `ON`.
+
+A derived table that **aggregates, groups, is `DISTINCT`, has a `LIMIT` or a window function,
+is itself a join or a `UNION`, carries a subquery predicate, or reads `AS OF`** cannot be
+merged, because its row set depends on its own boundary: combining the outer filter into it
+would filter a different set of rows than you wrote. Each is refused by naming the clause
+responsible. Run it as its own statement, or define it as a materialized view and select from
+that.
 
 ## UNION — stacking two results
 

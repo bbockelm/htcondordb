@@ -220,7 +220,10 @@ The specific pairings worth standing up early, because each is a place two paths
    replacement is now true of these two rather than needing to be withdrawn.
 2. Parse `FROM (SELECT ...) alias` into a `TableRef` that can carry a statement, and implement
    **flattening only**, refusing everything else with the reason. This alone covers the join and
-   subquery-predicate cases, and reaches the store with no new opcode.
+   subquery-predicate cases, and reaches the store with no new opcode. **Done** — with one rule
+   the design did not anticipate: a joined side's filter goes into that join's `ON`, not the
+   outer `WHERE`, or a `LEFT JOIN` silently becomes an inner one. Expression items are refused
+   for now rather than requalified, so §4's `AS` rule is enforced but not yet exercised.
 3. `WITH`, as sugar over step 2: the same node, the name bound in the statement's scope, single
    reference only.
 4. **Streaming**, which makes grouped CTEs work and is where most of the remaining value is.

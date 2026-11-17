@@ -1208,6 +1208,11 @@ func (p *parser) parseSelect() (*Statement, error) {
 		}
 		st.Limit = lim
 	}
+	// Last, because flattening rewrites every clause that can name a derived column and so
+	// needs them all parsed. After this the statement holds no derived table at all.
+	if err := flattenDerivedTables(st); err != nil {
+		return nil, err
+	}
 	return st, nil
 }
 
