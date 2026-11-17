@@ -184,12 +184,17 @@ PKG_STAGE := packaging/staging
 PKG_MAINTAINER ?= Brian Bockelman <bbockelman@morgridge.org>
 PKG_VENDOR     ?= HTCondor / PATh
 EXPORTERS := kafkasync opensearchsync archivedropbox
+# Every main-module binary that ships. The daemon resolves history-import by
+# basename, and restore-dropbox is the archive recovery tool, so both belong
+# beside the daemon rather than only in a source build. Keep this in step with
+# packaging/nfpm.yaml and the same list in .github/workflows/release.yml.
+PKG_CMDS := ./cmd/htcondordb ./cmd/htcondordb-cli ./cmd/history-import ./cmd/restore-dropbox
 
 rpm-build: ## Cross-build every packaged binary into $(PKG_STAGE) for PKG_ARCH
 	@rm -rf $(PKG_STAGE) && mkdir -p $(PKG_STAGE)
 	@echo "Building htcondordb $(VERSION) for linux/$(PKG_ARCH)..."
 	@GOOS=linux GOARCH=$(PKG_ARCH) CGO_ENABLED=0 $(GOENV) $(GO) build -trimpath \
-		-ldflags '-s -w $(LDFLAGS)' -o $(PKG_STAGE)/ ./cmd/htcondordb ./cmd/htcondordb-cli
+		-ldflags '-s -w $(LDFLAGS)' -o $(PKG_STAGE)/ $(PKG_CMDS)
 	@for exp in $(EXPORTERS); do \
 		echo "Building $$exp..."; \
 		(cd $$exp && GOOS=linux GOARCH=$(PKG_ARCH) CGO_ENABLED=0 GOWORK=off \
