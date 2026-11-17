@@ -48,6 +48,12 @@ SELECT DISTINCT Owner FROM jobs ORDER BY Owner;
 SELECT COUNT(*), AVG(Cpus), MAX(Memory) FROM machines WHERE State == "Unclaimed";
 SELECT Owner, COUNT(*), SUM(RequestCpus) FROM jobs GROUP BY Owner ORDER BY COUNT(*) DESC;
 INSERT INTO jobs (Key, Owner, RequestCpus) VALUES ('1.0', 'alice', 4);
+
+CREATE TABLE daily_summaries PRIMARY KEY (Day, Owner);
+INSERT INTO daily_summaries
+  SELECT time_bucket(EnteredHistoryTime, '1d') AS Day, Owner,
+         COUNT(*) AS Jobs, SUM(RemoteWallClockTime) AS WallSec
+  FROM history GROUP BY Day, Owner;        -- re-running replaces these rows
 UPDATE jobs SET JobStatus = 2 WHERE Owner == "alice";
 DELETE FROM jobs WHERE JobStatus == 4;
 ```
@@ -75,6 +81,45 @@ DELETE FROM jobs WHERE JobStatus == 4;
   sums stay exact, an int+real mix promotes to real, booleans coerce to 0/1,
   undefined is skipped, an error propagates, and `MIN`/`MAX` are numeric (a string
   argument yields `error`).
+- **`PRIMARY KEY`**: `CREATE TABLE t PRIMARY KEY (a, b)` declares the attributes whose
+  values derive each row's storage key. It is optional and no existing table has one;
+  without it nothing changes, and `INSERT … VALUES` keeps generating keys as before.
+  Declaring one is what gives `INSERT … SELECT` a key to write rows under. A private
+  attribute is refused, because storage keys are not private data.
+
+  An existing table gains one with `ALTER TABLE t ADD PRIMARY KEY (a, b)`, and
+  `ALTER TABLE t DROP PRIMARY KEY` removes it. `ADD` refuses to overwrite a declaration
+  that is already there (re-declaring the *same* one is accepted, so setup scripts stay
+  re-runnable), so changing a key is `DROP` then `ADD` — two deliberate statements, because
+  the key decides which writes are the same row. `CREATE TABLE` likewise refuses to change
+  the key of a table that already exists, and points here.
+
+  **A declaration governs later writes only — it never rekeys what is already stored.** A
+  row's key is its address, so the rule cannot move rows written under the old one. On a
+  populated table that matters: the stored rows keep their existing keys, and a roll-up run
+  afterwards derives new keys and writes *beside* them rather than replacing them.
+  `ALTER TABLE … ADD PRIMARY KEY` says how many rows it is leaving behind when the table is
+  not empty.
+- **`INSERT … SELECT`** runs a **roll-up entirely on the server**: the scan, the
+  grouping and the write all happen where the data is, and only a row count comes back.
+  The target must declare a `PRIMARY KEY` whose columns the SELECT produces.
+
+  Because each row's key is derived from its own values, **re-running converges**: the
+  same group lands on the same key and replaces its previous row instead of adding a
+  copy. That is what makes it usable as a scheduled roll-up — run it hourly over an
+  open-ended window and the summary table stays correct rather than growing duplicates.
+
+  Every column needs a name that can be a ClassAd attribute, so aggregates must be
+  aliased (`COUNT(*) AS Jobs`) — `COUNT(*)` is a fine column header and cannot be an
+  attribute. The source may be a table, a view or an **archive** (`history`), and the
+  aggregate takes whatever fast path it normally would, including the archive's
+  zone-map-pruned grouped counts.
+
+  It serves the grouped shape only. A plain row copy (`INSERT INTO t2 SELECT a, b FROM
+  t1`) is refused rather than served by grouping on every column, which would silently
+  collapse duplicate rows. `DISTINCT`, `HAVING`, `QUALIFY`, `ORDER BY`, `LIMIT`,
+  `AS OF`, window functions and computed columns are each refused with a message saying
+  which it was; writing into the table being read is refused too.
 - **`DISTINCT`** over explicit columns is `GROUP BY` those columns. Plain columns
   de-duplicate server-side (only the distinct values cross the wire); a computed
   column has no attribute the server can group by, so such a query is grouped

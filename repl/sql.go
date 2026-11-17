@@ -137,6 +137,7 @@ const (
 	StmtUpdate
 	StmtDelete
 	StmtCreateTable
+	StmtAlterTable
 	StmtDropTable
 	StmtCreateIndex
 	StmtDropIndex
@@ -219,6 +220,22 @@ type Statement struct {
 	// Insert fields.
 	Columns []string // target columns
 	Values  []string // ClassAd-literal value expressions, aligned with Columns
+
+	// Source is the SELECT of an INSERT ... SELECT (nil for INSERT ... VALUES).
+	//
+	// The two forms share Kind and Table and nothing else: VALUES carries literals in
+	// Values, this carries a query whose every row becomes a row of Table. They are kept on
+	// one Kind because they are one statement in SQL and the target side -- the table, the
+	// optional column list -- is parsed identically.
+	Source *Statement
+
+	// PrimaryKey is the attribute list of CREATE TABLE ... PRIMARY KEY (a, b) and of
+	// ALTER TABLE ... ADD PRIMARY KEY (a, b): the columns whose values derive each row's
+	// storage key. Empty declares none, which is the behaviour every existing table has.
+	PrimaryKey []string
+
+	// AlterAction is what an ALTER TABLE does: "add-primary-key" or "drop-primary-key".
+	AlterAction string
 
 	// Update fields.
 	Assignments []Assignment
@@ -629,6 +646,8 @@ func (p *parser) parseStatement() (*Statement, error) {
 		return p.parseDelete()
 	case p.takeKeyword("CREATE"):
 		return p.parseCreate()
+	case p.takeKeyword("ALTER"):
+		return p.parseAlter()
 	case p.takeKeyword("DROP"):
 		return p.parseDrop()
 	case p.takeKeyword("MATCH"):
@@ -642,7 +661,7 @@ func (p *parser) parseStatement() (*Statement, error) {
 	case p.takeKeyword("ROLLBACK"), p.takeKeyword("ABORT"):
 		return p.parseTransaction(StmtRollback)
 	default:
-		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, MATCH, WATCH, BEGIN, COMMIT, or ROLLBACK)", p.peek().text)
+		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, MATCH, WATCH, BEGIN, COMMIT, or ROLLBACK)", p.peek().text)
 	}
 }
 
@@ -788,7 +807,25 @@ func (p *parser) parseCreate() (*Statement, error) {
 		}
 		// Optional MEMORY: create the table as RAM-only (non-persistent).
 		inMemory := p.takeKeyword("MEMORY")
-		return &Statement{Kind: StmtCreateTable, Table: name, InMemory: inMemory}, nil
+		// Optional PRIMARY KEY (a, b): the columns a row's storage key is derived from.
+		// Declaring it is what lets INSERT ... SELECT give derived rows a key, and what
+		// makes re-running one replace its own previous rows rather than duplicate them.
+		var pk []string
+		if p.takeKeyword("PRIMARY") {
+			if err := p.expectKeyword("KEY"); err != nil {
+				return nil, fmt.Errorf("expected KEY after PRIMARY")
+			}
+			if err := p.expectPunct("("); err != nil {
+				return nil, fmt.Errorf("PRIMARY KEY requires a column list: %w", err)
+			}
+			if pk, err = p.parseIdentList(); err != nil {
+				return nil, err
+			}
+			if len(pk) == 0 {
+				return nil, fmt.Errorf("PRIMARY KEY requires at least one column")
+			}
+		}
+		return &Statement{Kind: StmtCreateTable, Table: name, InMemory: inMemory, PrimaryKey: pk}, nil
 	}
 	// Optional index kind before INDEX; default value.
 	kind := "value"
@@ -856,6 +893,61 @@ func (p *parser) parseViewOptions() (grace, retention int64, err error) {
 }
 
 // parseDrop parses DROP TABLE <name> or DROP INDEX ON <table> (<attr>, ...).
+// parseAlter parses ALTER TABLE <t> ADD PRIMARY KEY (a, b) and
+// ALTER TABLE <t> DROP PRIMARY KEY.
+//
+// ADD and DROP rather than a single "SET", because that is how SQL spells it and because
+// the asymmetry is useful here: ADD refuses to overwrite a declaration that already exists,
+// so changing one is DROP then ADD -- two statements, which is the point. A table's key
+// decides which writes are the same row, and replacing it in one step is the kind of change
+// that should not be a typo away from a declaration that was already right.
+func (p *parser) parseAlter() (*Statement, error) {
+	if err := p.expectKeyword("TABLE"); err != nil {
+		return nil, fmt.Errorf("expected TABLE after ALTER")
+	}
+	name, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	st := &Statement{Kind: StmtAlterTable, Table: name}
+	switch {
+	case p.takeKeyword("ADD"):
+		if err := p.expectPrimaryKey(); err != nil {
+			return nil, err
+		}
+		if err := p.expectPunct("("); err != nil {
+			return nil, fmt.Errorf("ADD PRIMARY KEY requires a column list: %w", err)
+		}
+		cols, err := p.parseIdentList()
+		if err != nil {
+			return nil, err
+		}
+		if len(cols) == 0 {
+			return nil, fmt.Errorf("ADD PRIMARY KEY requires at least one column")
+		}
+		st.AlterAction, st.PrimaryKey = "add-primary-key", cols
+		return st, nil
+	case p.takeKeyword("DROP"):
+		if err := p.expectPrimaryKey(); err != nil {
+			return nil, err
+		}
+		st.AlterAction = "drop-primary-key"
+		return st, nil
+	}
+	return nil, fmt.Errorf("ALTER TABLE supports ADD PRIMARY KEY (...) and DROP PRIMARY KEY")
+}
+
+// expectPrimaryKey consumes the two words PRIMARY KEY.
+func (p *parser) expectPrimaryKey() error {
+	if !p.takeKeyword("PRIMARY") {
+		return fmt.Errorf("expected PRIMARY KEY")
+	}
+	if err := p.expectKeyword("KEY"); err != nil {
+		return fmt.Errorf("expected KEY after PRIMARY")
+	}
+	return nil
+}
+
 func (p *parser) parseDrop() (*Statement, error) {
 	if p.takeKeyword("MATERIALIZED") {
 		if err := p.expectKeyword("VIEW"); err != nil {
@@ -1528,14 +1620,39 @@ func (p *parser) parseInsert() (*Statement, error) {
 		return nil, err
 	}
 	st.Table = table
-	if err := p.expectPunct("("); err != nil {
-		return nil, fmt.Errorf("INSERT requires a column list: %w", err)
+
+	// The column list is REQUIRED before VALUES (a bare list of literals says nothing
+	// about which attribute each one is) and OPTIONAL before SELECT, where the SELECT's
+	// own column names serve. So it is parsed when present and its absence is only an
+	// error once we know VALUES follows.
+	if p.atPunct("(") {
+		if err := p.expectPunct("("); err != nil {
+			return nil, err
+		}
+		cols, err := p.parseIdentList()
+		if err != nil {
+			return nil, err
+		}
+		st.Columns = cols
 	}
-	cols, err := p.parseIdentList()
-	if err != nil {
-		return nil, err
+
+	// INSERT ... SELECT: the rows come from a query rather than a literal list.
+	if p.takeKeyword("SELECT") {
+		sel, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		st.Source = sel
+		if len(st.Columns) > 0 && len(st.Columns) != len(sel.Items) {
+			return nil, fmt.Errorf("INSERT names %d columns but the SELECT returns %d",
+				len(st.Columns), len(sel.Items))
+		}
+		return st, nil
 	}
-	st.Columns = cols
+
+	if len(st.Columns) == 0 {
+		return nil, fmt.Errorf("INSERT requires a column list")
+	}
 	if err := p.expectKeyword("VALUES"); err != nil {
 		return nil, err
 	}
