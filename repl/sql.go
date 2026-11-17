@@ -660,6 +660,13 @@ func (p *parser) parseStatement() (*Statement, error) {
 		return p.parseTransaction(StmtCommit)
 	case p.takeKeyword("ROLLBACK"), p.takeKeyword("ABORT"):
 		return p.parseTransaction(StmtRollback)
+	case p.isKeyword("WITH"):
+		// Named separately from the list below: WITH is a construct this language does not
+		// have, not a word the reader mistyped, and the two deserve different answers.
+		return nil, fmt.Errorf("a common table expression (WITH ... AS (SELECT ...)) is not " +
+			"supported; write the inner statement directly in the query that uses it, or, when " +
+			"it groups or is used more than once, define it as a materialized view and select " +
+			"from that")
 	default:
 		return nil, fmt.Errorf("unsupported statement %q (expected SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, MATCH, WATCH, BEGIN, COMMIT, or ROLLBACK)", p.peek().text)
 	}

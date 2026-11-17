@@ -24,10 +24,10 @@ WITH t AS (SELECT Owner FROM jobs) SELECT ...  ->  unsupported statement "WITH"
 ```
 
 `repl.md` says each unsupported construct is "refused with the reason and, where there is one,
-the spelling to use instead". For these two that is not true: both fall out of the generic
-parser, and the second reads as though `WITH` were a typo. **That is worth fixing on its own,
-before any of the rest is built** — a reader who writes a CTE should be told it is not supported
-and what to write instead, which today is a view or a temporary table.
+the spelling to use instead", and for these two it was not true: both fell out of the generic
+parser, and the second read as though `WITH` were a typo. Both now name the construct and point
+at the spelling to use instead — inlining the inner statement, or a materialized view when it
+groups or is read more than once. Nothing else here depends on that, which is why it went first.
 
 One piece of grammar luck worth recording: a **leading** `WITH` is unclaimed. The `WITH` already
 in the language is the trailing option list on `CREATE MATERIALIZED VIEW ... WITH (grace = ...,
@@ -215,8 +215,9 @@ The specific pairings worth standing up early, because each is a place two paths
 
 ## 9. Staging
 
-1. **Refuse both spellings properly**, naming the construct and the spelling to use instead. No
-   other work depends on this and it removes a wrong claim from `repl.md`.
+1. **Refuse both spellings properly**, naming the construct and the spelling to use instead.
+   **Done** — and `repl.md`'s claim that every unsupported construct names a reason and a
+   replacement is now true of these two rather than needing to be withdrawn.
 2. Parse `FROM (SELECT ...) alias` into a `TableRef` that can carry a statement, and implement
    **flattening only**, refusing everything else with the reason. This alone covers the join and
    subquery-predicate cases, and reaches the store with no new opcode.

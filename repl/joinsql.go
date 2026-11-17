@@ -113,6 +113,14 @@ func (s *Statement) tableRefs() []TableRef {
 // follows it: `AS OF '<ts>'` is time travel, `AS j` is an alias. Without that lookahead
 // `FROM jobs AS OF '-1h'` would bind OF as the table's alias and then fail on the literal.
 func (p *parser) parseTableRef(st *Statement) (TableRef, error) {
+	// A '(' here is a derived table. Caught before parseIdent so the reader is told what
+	// the construct is called and what to write instead, rather than that an identifier
+	// was expected -- which describes the parser's state, not their query.
+	if p.atPunct("(") {
+		return TableRef{}, fmt.Errorf("a derived table (FROM (SELECT ...)) is not supported; " +
+			"write the inner statement's columns and filter directly in this one, or, when it " +
+			"groups, define it as a materialized view and select from that")
+	}
 	name, err := p.parseIdent()
 	if err != nil {
 		return TableRef{}, err
