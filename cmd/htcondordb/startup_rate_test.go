@@ -88,10 +88,17 @@ func TestProgressCountsSegmentsRemaining(t *testing.T) {
 	}
 }
 
-// TestMapSegmentsPhaseDoesNotCountDownTheWork: mapping is the prologue and every mapped segment
-// still has its sidecar to load, so counting the mapping down would report an entry as nearly
-// finished at the moment its expensive phase starts.
-func TestMapSegmentsPhaseDoesNotCountDownTheWork(t *testing.T) {
+// TestMapSegmentsPhaseCountsDownAndFeedsItsOwnRate: every phase is one pass over the entry's
+// segments, so the mapping pass counts down like the others and the passes still ahead of it are
+// counted too. An entry 900 of 1000 segments into the first of two passes has 100 + 1000 left.
+//
+// This replaces a test that pinned the opposite -- the mapping pass counting down nothing, and
+// feeding no rate -- on the premise that mapping is a cheap prologue next to the sidecar load.
+// Measured on a production hub whose sidecars adopted cleanly, one archive's open was
+// mapSegments=1m1.664s against loadSidecars=34.396s. With the rate and the remaining count both
+// sourced only from the sidecar pass, every number in the heartbeat froze for minutes at a time
+// whenever the entries in flight were mapping.
+func TestMapSegmentsPhaseCountsDownAndFeedsItsOwnRate(t *testing.T) {
 	tm, dir := timerWithEntries(t, catalogEntry{kind: "archive", name: "history", segs: 1000})
 	shard := filepath.Join(dir, "archives", "history", "0")
 	tm.onOpenProgress(collections.OpenProgress{Dir: shard, Phase: collections.OpenMapSegments,
@@ -99,16 +106,57 @@ func TestMapSegmentsPhaseDoesNotCountDownTheWork(t *testing.T) {
 
 	tm.tblMu.Lock()
 	open, remaining := tm.outstanding()
-	_, measured := tm.rateNow()
+	mapRate, mapMeasured := tm.rateFor(string(collections.OpenMapSegments))
+	_, sidecarMeasured := tm.rateFor(string(collections.OpenLoadSidecars))
 	tm.tblMu.Unlock()
-	if remaining != 1000 {
-		t.Errorf("remaining during map_segments = %d, want the whole entry (1000)", remaining)
+
+	// 100 left in this pass, plus the whole sidecar pass still to come. rebuild_dir is not
+	// counted: it has not been reported, and a clean close skips it entirely.
+	if want := 100 + 1000; remaining != want {
+		t.Errorf("remaining during map_segments = %d, want %d (this pass's remainder plus the "+
+			"sidecar pass still ahead)", remaining, want)
 	}
 	if want := "map_segments 900/1000"; open[0].detail != want {
-		t.Errorf("detail = %q, want %q -- the phase is still worth showing", open[0].detail, want)
+		t.Errorf("detail = %q, want %q", open[0].detail, want)
 	}
-	if measured {
-		t.Error("the mapping pass must not feed the rate: it is not the phase the estimate is denominated in")
+	// 900 segments in 10s is 90/s, and it belongs to the mapping pass alone.
+	if !mapMeasured || math.Abs(mapRate-90) > 0.01 {
+		t.Errorf("map_segments rate = %v measured=%v, want 90 and true", mapRate, mapMeasured)
+	}
+	if sidecarMeasured {
+		t.Error("a mapping sample reached the sidecar pass's average; the two costs must not blend")
+	}
+}
+
+// TestRebuildDirPassIsCountedOnlyOnceObserved: the directory replay is skipped when a clean close
+// left a snapshot, so counting it before it reports would overstate every healthy open -- the
+// common case, and the one an operator reads the beat during.
+func TestRebuildDirPassIsCountedOnlyOnceObserved(t *testing.T) {
+	tm, dir := timerWithEntries(t, catalogEntry{kind: "archive", name: "history", segs: 1000})
+	shard := filepath.Join(dir, "archives", "history", "0")
+
+	tm.onOpenProgress(collections.OpenProgress{Dir: shard, Phase: collections.OpenMapSegments,
+		Done: 1000, Total: 1000, Elapsed: 10 * time.Second})
+	tm.tblMu.Lock()
+	_, beforeReplay := tm.outstanding()
+	tm.tblMu.Unlock()
+	if want := 0 + 1000; beforeReplay != want {
+		t.Errorf("remaining after mapping, before any replay report = %d, want %d (the sidecar "+
+			"pass only; the replay may never run)", beforeReplay, want)
+	}
+
+	tm.onOpenProgress(collections.OpenProgress{Dir: shard, Phase: collections.OpenRebuildDir,
+		Done: 200, Total: 1000, Elapsed: 5 * time.Second})
+	tm.tblMu.Lock()
+	_, duringReplay := tm.outstanding()
+	replayRate, replayMeasured := tm.rateFor(string(collections.OpenRebuildDir))
+	tm.tblMu.Unlock()
+	if want := 800 + 1000; duringReplay != want {
+		t.Errorf("remaining during the replay = %d, want %d (this pass's remainder plus the "+
+			"sidecar pass)", duringReplay, want)
+	}
+	if !replayMeasured || math.Abs(replayRate-40) > 0.01 {
+		t.Errorf("rebuild_dir rate = %v measured=%v, want 40 and true", replayRate, replayMeasured)
 	}
 }
 
@@ -119,7 +167,7 @@ func TestRateIsLearnedFromObservedProgress(t *testing.T) {
 	shard := filepath.Join(dir, "archives", "history", "0")
 
 	tm.tblMu.Lock()
-	rate, measured := tm.rateNow()
+	rate, measured := tm.rateFor(string(collections.OpenLoadSidecars))
 	tm.tblMu.Unlock()
 	if measured || rate != seedSegmentsPerSecond {
 		t.Fatalf("before any observation: rate=%v measured=%v, want the seeded prior %v and measured=false",
@@ -133,7 +181,7 @@ func TestRateIsLearnedFromObservedProgress(t *testing.T) {
 	// times the seed. It must REPLACE the prior, not be averaged with it.
 	tm.onOpenProgress(sidecarReport(shard, 2000, 6000, 20*time.Second))
 	tm.tblMu.Lock()
-	rate, measured = tm.rateNow()
+	rate, measured = tm.rateFor(string(collections.OpenLoadSidecars))
 	tm.tblMu.Unlock()
 	if !measured {
 		t.Fatal("rate still reads as seeded after an observation")
@@ -146,7 +194,7 @@ func TestRateIsLearnedFromObservedProgress(t *testing.T) {
 	// EMA must move toward it rather than jump to it.
 	tm.onOpenProgress(sidecarReport(shard, 2500, 6000, 30*time.Second))
 	tm.tblMu.Lock()
-	rate, _ = tm.rateNow()
+	rate, _ = tm.rateFor(string(collections.OpenLoadSidecars))
 	tm.tblMu.Unlock()
 	if rate >= 100 || rate <= 50 {
 		t.Errorf("rate after a slower sample = %v, want it between the new sample (50) and the old average (100)", rate)
@@ -168,7 +216,7 @@ func TestRateIgnoresSamplesCarryingNoInformation(t *testing.T) {
 	tm.onOpenProgress(sidecarReport(shard, 2000, 6000, 40*time.Second))
 
 	tm.tblMu.Lock()
-	rate, _ := tm.rateNow()
+	rate, _ := tm.rateFor(string(collections.OpenLoadSidecars))
 	est := estimateOpen(4000, rate)
 	tm.tblMu.Unlock()
 	if math.Abs(rate-100) > 0.01 {
@@ -190,7 +238,7 @@ func TestCompletedEntryFeedsTheRate(t *testing.T) {
 	// A two-segment table's open is fixed costs, not throughput; it must not become a rate.
 	tm.recordTableOpen("table", "tiny", 2*time.Second)
 	tm.tblMu.Lock()
-	_, measured := tm.rateNow()
+	_, measured := tm.rateFor(string(collections.OpenLoadSidecars))
 	tm.tblMu.Unlock()
 	if measured {
 		t.Errorf("a %d-segment table fed the EMA; entries below %d segments must not",
@@ -200,7 +248,7 @@ func TestCompletedEntryFeedsTheRate(t *testing.T) {
 	// 200 segments in 4s is 50/s and is worth having.
 	tm.recordTableOpen("table", "jobs", 4*time.Second)
 	tm.tblMu.Lock()
-	rate, measured := tm.rateNow()
+	rate, measured := tm.rateFor(string(collections.OpenLoadSidecars))
 	tm.tblMu.Unlock()
 	if !measured || math.Abs(rate-50) > 0.01 {
 		t.Errorf("after a completed 200-segment table: rate=%v measured=%v, want 50 and true", rate, measured)
@@ -234,7 +282,7 @@ func TestProgressAfterStopIsDropped(t *testing.T) {
 
 	tm.tblMu.Lock()
 	open, remaining := tm.outstanding()
-	_, measured := tm.rateNow()
+	_, measured := tm.rateFor(string(collections.OpenLoadSidecars))
 	tm.tblMu.Unlock()
 	if remaining != 5000 || open[0].detail != "" {
 		t.Errorf("a post-stop report changed the start's numbers: remaining=%d detail=%q",

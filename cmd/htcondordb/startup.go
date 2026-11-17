@@ -96,12 +96,15 @@ type startupTimer struct {
 	// inside the open. It is what makes "how many segments remain" answerable for an entry that
 	// has not finished -- the count a beat could not previously reach.
 	prog map[string]*entryProgress
-	// rate is the exponential moving average of observed throughput, in segments per second of
-	// the sidecar pass, and rateObs counts the samples folded into it. rateObs == 0 means rate
-	// still holds the seeded prior and nothing measured on this machine has reached it yet, which
-	// is a distinction the beat prints rather than papers over.
-	rate    float64
-	rateObs int
+	// rates is the exponential moving average of observed throughput, in segments per second,
+	// kept PER PHASE.
+	//
+	// One average across all phases would be an average of unlike things: mapping a segment is
+	// an mmap, replaying one is a walk of every record it holds, and loading its sidecar is
+	// adopting an index or rebuilding it. A combined figure would be whichever phase happened
+	// to be running weighted by how long it ran, and would lurch every time an entry crossed a
+	// phase boundary. Per phase, each rate divides into the work denominated in its own pass.
+	rates map[string]*phaseRate
 	// stopped is set when the heartbeat stops. The storage layer's progress hook is a process
 	// global set once at start, so it stays installed and a maintenance pass that reopens a
 	// collection hours later still calls it; those reports are dropped rather than folded into a
@@ -122,6 +125,33 @@ type entryProgress struct {
 	done   int
 	total  int
 	shards map[string]shardProgress
+	// seen is every phase this entry has reported, so the passes it still has ahead of it can
+	// be counted without assuming a phase that may not run (see openPhaseOrder).
+	seen map[string]bool
+}
+
+// phaseRate is one phase's throughput EMA. obs == 0 means nothing on this machine has measured
+// this phase yet and rate still holds the seeded prior, a distinction the beat prints rather
+// than papers over.
+type phaseRate struct {
+	rate float64
+	obs  int
+}
+
+// openPhaseOrder is the order a persistent open runs its phases in, which is what lets a beat
+// say how much work an entry has LEFT rather than only how far it is into the pass in flight.
+// Each phase is one pass over the entry's segments, so an entry partway through the first of
+// three still has the best part of three passes to go.
+//
+// rebuild_dir is conditional: a clean previous close leaves a directory snapshot and the replay
+// is skipped entirely. It is therefore counted only once an entry has actually reported it,
+// which makes a beat's remaining count a lower bound on the unclean path -- the number rises by
+// one pass when the replay starts. Assuming it instead would overstate every healthy open,
+// which is the common case and the one an operator reads the beat during.
+var openPhaseOrder = []string{
+	string(collections.OpenMapSegments),
+	string(collections.OpenRebuildDir),
+	string(collections.OpenLoadSidecars),
 }
 
 // shardProgress is one shard's last progress report, kept so the next report from the same shard
@@ -142,11 +172,16 @@ type shardProgress struct {
 // open itself has since said about it.
 type outstandingEntry struct {
 	catalogEntry
-	// remaining is segments still to get through. Before the open reports anything it is the
-	// whole entry; during the sidecar pass it is that pass's remainder. During map_segments it
-	// stays the whole entry on purpose: mapping is the cheap prologue, and every one of those
-	// segments still has its sidecar to load afterwards, so counting the mapping down would
-	// report an entry as nearly finished at the moment its expensive phase is about to start.
+	// remaining is segment-PASSES still to get through: the remainder of the pass in flight,
+	// plus one whole pass for each phase still ahead of it (see openPhaseOrder). Before the
+	// open reports anything it is one pass, the entry's own segment count.
+	//
+	// Counting only the pass in flight would report an entry as nearly finished at the moment
+	// its next pass is about to start; counting only one chosen pass, as this once did, leaves
+	// the number frozen for the whole of every other one. A pass is the unit because every
+	// phase walks the same segments, so they are commensurable -- in count. They are not
+	// commensurable in cost, which is why the estimate divides each pass by its own rate
+	// rather than dividing this total by one.
 	remaining int
 	// detail is the in-flight phase and its counts, empty until the open reports.
 	detail string
@@ -162,8 +197,12 @@ func (t *startupTimer) outstanding() (open []outstandingEntry, remaining int) {
 		o := outstandingEntry{catalogEntry: e, remaining: e.segs}
 		if p := t.prog[e.label()]; p != nil && p.total > 0 {
 			o.detail = fmt.Sprintf("%s %d/%d", p.phase, p.done, p.total)
-			if p.phase == string(collections.OpenLoadSidecars) {
-				o.remaining = p.total - p.done
+			o.remaining = p.total - p.done
+			for _, later := range phasesAfter(p.phase) {
+				if later == string(collections.OpenRebuildDir) && !p.seen[later] {
+					continue // conditional, and not observed: see openPhaseOrder
+				}
+				o.remaining += p.total
 			}
 		}
 		open = append(open, o)
@@ -229,10 +268,11 @@ func (t *startupTimer) onOpenProgress(p collections.OpenProgress) {
 	}
 	e := t.prog[label]
 	if e == nil {
-		e = &entryProgress{shards: map[string]shardProgress{}}
+		e = &entryProgress{shards: map[string]shardProgress{}, seen: map[string]bool{}}
 		t.prog[label] = e
 	}
 	phase := string(p.Phase)
+	e.seen[phase] = true
 	prev, seen := e.shards[p.Dir]
 	e.shards[p.Dir] = shardProgress{phase: phase, done: p.Done, total: p.Total, elapsed: p.Elapsed}
 	e.phase = phase
@@ -244,21 +284,20 @@ func (t *startupTimer) onOpenProgress(p collections.OpenProgress) {
 		}
 	}
 
-	// Only the sidecar pass feeds the rate. It is the phase a large open is made of -- mapping a
-	// segment is an mmap, loading its sidecar is the index work that dominates -- so a rate
-	// measured over both would be an average of two different costs weighted by whichever phase
-	// happened to be running, and the estimate it divides into is denominated in sidecar passes.
-	if p.Phase != collections.OpenLoadSidecars {
-		return
-	}
+	// Every phase feeds a rate, into its OWN average. Which phase dominates depends on the
+	// store: a segment whose sidecar cannot be adopted has its index rebuilt by decoding every
+	// record, and then the sidecar pass is nearly all of the open; when sidecars adopt -- the
+	// healthy case -- it is cheap and the mmap pass and the directory replay are the cost. A
+	// rate collected from one chosen phase goes stale for the whole of every other one, which
+	// leaves the estimate it divides into frozen exactly when an operator is watching it.
 	if seen && prev.phase == phase {
-		t.observeRate(float64(p.Done-prev.done), p.Elapsed-prev.elapsed)
+		t.observeRate(phase, float64(p.Done-prev.done), p.Elapsed-prev.elapsed)
 		return
 	}
-	// First report of this shard's sidecar pass. Done and Elapsed are both measured from the
-	// phase's own start, so it is already a complete sample and there is no need to wait for a
-	// second report to have a measured rate.
-	t.observeRate(float64(p.Done), p.Elapsed)
+	// First report of this shard's pass. Done and Elapsed are both measured from the phase's
+	// own start, so it is already a complete sample and there is no need to wait for a second
+	// report to have a measured rate.
+	t.observeRate(phase, float64(p.Done), p.Elapsed)
 }
 
 // observeRate folds one throughput observation into the EMA. Caller holds tblMu.
@@ -272,26 +311,91 @@ func (t *startupTimer) onOpenProgress(p collections.OpenProgress) {
 // The first measured sample REPLACES the seeded prior instead of being blended with it: the prior
 // came off a different machine with different storage, and there is no reason to let it drag an
 // actual measurement of this one for the next several beats.
-func (t *startupTimer) observeRate(segs float64, d time.Duration) {
+func (t *startupTimer) observeRate(phase string, segs float64, d time.Duration) {
 	if segs <= 0 || d <= 0 {
 		return
 	}
-	sample := segs / d.Seconds()
-	if t.rateObs == 0 {
-		t.rate = sample
-	} else {
-		t.rate = rateEMAAlpha*sample + (1-rateEMAAlpha)*t.rate
+	if t.rates == nil {
+		t.rates = map[string]*phaseRate{}
 	}
-	t.rateObs++
+	r := t.rates[phase]
+	if r == nil {
+		r = &phaseRate{}
+		t.rates[phase] = r
+	}
+	sample := segs / d.Seconds()
+	if r.obs == 0 {
+		r.rate = sample
+	} else {
+		r.rate = rateEMAAlpha*sample + (1-rateEMAAlpha)*r.rate
+	}
+	r.obs++
 }
 
-// rateNow is the rate the estimate should use and whether anything measured it. Caller holds
-// tblMu.
-func (t *startupTimer) rateNow() (float64, bool) {
-	if t.rateObs == 0 {
-		return seedSegmentsPerSecond, false
+// wholeEntryPhase buckets the coarse per-entry samples recordTableOpen takes (see there). They
+// span every phase of an entry's open at once, so they belong to none of them and would skew any
+// real phase's average. They are the fallback instead: better than a prior measured on somebody
+// else's hardware, worse than a measurement of the phase actually being estimated.
+const wholeEntryPhase = "entry"
+
+// rateFor is the rate the estimate should use for one phase and whether anything measured it.
+// Caller holds tblMu. A phase nothing has measured yet falls back to the whole-entry samples,
+// then to the seeded prior.
+func (t *startupTimer) rateFor(phase string) (float64, bool) {
+	if r := t.rates[phase]; r != nil && r.obs > 0 {
+		return r.rate, true
 	}
-	return t.rate, true
+	if r := t.rates[wholeEntryPhase]; r != nil && r.obs > 0 {
+		return r.rate, true
+	}
+	return seedSegmentsPerSecond, false
+}
+
+// rateNow is the rate to PRINT: the phase the slowest outstanding entry is in, since that is the
+// entry the estimate is about and the one a reader is watching. Caller holds tblMu.
+func (t *startupTimer) rateNow(open []outstandingEntry) (float64, bool) {
+	if len(open) > 0 {
+		if p := t.prog[open[0].label()]; p != nil && p.phase != "" {
+			return t.rateFor(p.phase)
+		}
+	}
+	return seedSegmentsPerSecond, false
+}
+
+// estimateEntry is how long the passes an entry has left should take, each divided by its own
+// phase's rate. Caller holds tblMu.
+//
+// Summing passes and dividing once by a single rate is what the per-phase averages exist to
+// avoid: the passes cost different amounts per segment, so one divisor would be wrong for all
+// but one of them.
+func (t *startupTimer) estimateEntry(o outstandingEntry) time.Duration {
+	p := t.prog[o.label()]
+	if p == nil || p.total <= 0 {
+		rate, _ := t.rateFor(string(collections.OpenMapSegments))
+		return estimateOpen(o.remaining, rate)
+	}
+	rate, _ := t.rateFor(p.phase)
+	total := estimateOpen(p.total-p.done, rate)
+	for _, later := range phasesAfter(p.phase) {
+		if later == string(collections.OpenRebuildDir) && !p.seen[later] {
+			continue // conditional, and not observed: see openPhaseOrder
+		}
+		lrate, _ := t.rateFor(later)
+		total += estimateOpen(p.total, lrate)
+	}
+	return total
+}
+
+// phasesAfter is the phases that run after the named one, in order. An unrecognised phase has
+// nothing known to follow it, so it contributes only its own remainder -- a new phase added to
+// the storage layer makes the beat conservative, not wrong.
+func phasesAfter(phase string) []string {
+	for i, p := range openPhaseOrder {
+		if p == phase {
+			return openPhaseOrder[i+1:]
+		}
+	}
+	return nil
 }
 
 // segsFor is the scanned segment count of one entry, or 0 if the scan did not see it. Caller
@@ -418,7 +522,8 @@ func (t *startupTimer) startProgress(dir string) {
 	if t.doneNames == nil {
 		t.doneNames = map[string]bool{}
 	}
-	rate, measured := t.rateNow()
+	// Nothing is open yet, so the banner's estimate is the first pass at the first pass's rate.
+	rate, measured := t.rateFor(string(collections.OpenMapSegments))
 	t.tblMu.Unlock()
 	if len(entries) > 0 {
 		segs, biggest := 0, entries[0]
@@ -452,7 +557,11 @@ func (t *startupTimer) startProgress(dir string) {
 				t.tblMu.Lock()
 				done, last, lastAt := t.tblCount, t.lastDone, t.lastDoneAt
 				open, remaining := t.outstanding()
-				rate, measured := t.rateNow()
+				rate, measured := t.rateNow(open)
+				var est time.Duration
+				if len(open) > 0 {
+					est = t.estimateEntry(open[0])
+				}
 				total := len(t.entries)
 				t.tblMu.Unlock()
 
@@ -467,7 +576,7 @@ func (t *startupTimer) startProgress(dir string) {
 					// because it never moved until an entry finished outright.
 					fields = append(fields, "open", openLabels(open),
 						"segments_remaining", remaining,
-						"estimate_remaining", estimateOpen(open[0].remaining, rate).String(),
+						"estimate_remaining", est.String(),
 						"rate", formatRate(rate), "rate_source", rateSource(measured))
 				}
 				if last != "" {
@@ -539,7 +648,11 @@ func (t *startupTimer) statusLine() string {
 	t.tblMu.Lock()
 	done, last, lastAt := t.tblCount, t.lastDone, t.lastDoneAt
 	open, remaining := t.outstanding()
-	rate, measured := t.rateNow()
+	rate, measured := t.rateNow(open)
+	var est time.Duration
+	if len(open) > 0 {
+		est = t.estimateEntry(open[0])
+	}
 	total := len(t.entries)
 	t.tblMu.Unlock()
 
@@ -549,7 +662,7 @@ func (t *startupTimer) statusLine() string {
 	}
 	if len(open) > 0 {
 		b += fmt.Sprintf(" open=%q segments_remaining=%d estimate_remaining=%s rate=%q rate_source=%s",
-			openLabels(open), remaining, estimateOpen(open[0].remaining, rate), formatRate(rate), rateSource(measured))
+			openLabels(open), remaining, est, formatRate(rate), rateSource(measured))
 	}
 	if last != "" {
 		b += fmt.Sprintf(" last=%q since_last_table=%s", last, time.Since(lastAt).Round(time.Second))
@@ -663,7 +776,7 @@ func (t *startupTimer) recordTableOpen(kind, name string, d time.Duration) {
 	// none of them open for the several seconds it takes the storage layer to report once, where
 	// the EMA would otherwise never leave the seeded prior no matter how long the start ran.
 	if segs := t.segsFor(label); segs >= minRateSampleSegments {
-		t.observeRate(float64(segs), d)
+		t.observeRate(wholeEntryPhase, float64(segs), d)
 	}
 	log := t.log
 	t.tblMu.Unlock()
