@@ -11,6 +11,8 @@ Status: partly implemented.
   reader, and the sizing measurements below — **and the exporter emits it** when
   a dropbox is configured with `container = frames`. The default is still
   `targz`; see [Adopting the framed format](#adopting-the-framed-format).
+- **Per-batch manifests ship as `dropboxmanifest`**, written by the exporter and
+  checked by `restore-dropbox -verify`.
 
 ## The problem
 
@@ -111,10 +113,20 @@ Against the bar:
    stream. A truncation or bit flip costs the remainder of that member, so up to
    `RollJobs` records — far more than the data physically damaged. Bar 5 is met
    only coarsely.
-4. **No manifest and no set-level verification.** Nothing records which batch
-   sequence numbers should exist, so a dropbox missing `batch-00000047` is
-   indistinguishable from one that never had it. Verification today means
-   decompressing everything.
+4. ~~**No manifest and no set-level verification.**~~ **Closed for the batch,
+   open for the set.** Each batch now carries a sidecar manifest with its record
+   count, size, digest and predecessor, and `restore-dropbox -verify` checks a
+   dropbox against them without writing. The record count is the part that
+   mattered: a damaged batch yields fewer records, and before this nothing knew
+   how many there should have been, so a short read was silent.
+
+   What is still not provable is the *set*. A consumer drains a dropbox from the
+   front, so a low sequence number being absent is the normal case rather than a
+   loss, and nothing in the directory says how far the exporter has got. Holes
+   between batches that are present are detected; batches missing from either end
+   are not. Closing that needs a mutable head pointer in the dropbox, which
+   trades the directory's append-only character for the guarantee — worth doing
+   only if a deployment actually needs it.
 5. **Backpressure can become loss.** Backpressure stalls the cursor; retention
    keeps pruning regardless. A consumer that stops draining for long enough turns
    a full dropbox into lost records. This is reported after the fact by a loss
@@ -183,10 +195,18 @@ The format ships as `dropboxframe`. Raises bar 4 and 5 from partial to met:
   The floor is 4 KiB and is enforced. Below roughly 64 KiB the compressor has too
   little history to work with, and at 4 KiB the framed stream is *worse* than the
   gzip tarball it replaces — the one row in the table where the idea does not pay.
-- **A per-batch manifest.** A `manifest.ad` carrying the batch sequence, record
-  count, frame count and frame size, first and last record time, and per-frame
-  checksums — so a dropbox can be verified, and gaps in it detected, without a
-  database and without decompressing the payload.
+- **A per-batch manifest.** *Done.* `<batch>.manifest` carries the sequence and
+  the sequence before it, the record count, first and last record time, the size
+  and a sha256 of the batch's bytes, the container, and the exporter and archive
+  it came from. A batch is checkable without a database and without decompressing
+  it, and the digest is compared before the batch is decoded so byte-level damage
+  explains a short read rather than looking like an empty batch.
+
+  It is a sidecar for the same reason the snapshot manifest is: the batch format
+  stays exactly what an external consumer already reads, and a batch written
+  before manifests is unverifiable rather than damaged. It is excluded from the
+  backpressure accounting, since that measures undelivered data against the
+  operator's ceiling and a manifest describes data already counted.
 
 #### Adopting the framed format
 
@@ -248,8 +268,8 @@ mixture — which is what a dropbox looks like across the switch.
 
 **A before B**, which is how it went: A converted a shipped-but-unusable artifact
 into a recoverable one, and B raised the floor under a mechanism that only became
-load-bearing once A existed. What is left of B is the per-batch manifest. C can
-land alongside it.
+load-bearing once A existed. B is now done. What is left is C, and the set-level
+completeness question in gap 4.
 
 ## Relationship to the other mechanisms
 

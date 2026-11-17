@@ -329,7 +329,7 @@ func runOnce(ctx context.Context, addrFlag, name string, log *slog.Logger) error
 	if err != nil {
 		return fmt.Errorf("exporter %q: %w", name, err)
 	}
-	w, err := archivedropbox.NewWriter(cfg)
+	w, err := archivedropbox.NewNamedWriter(cfg, name)
 	if err != nil {
 		return err
 	}

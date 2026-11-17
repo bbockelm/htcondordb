@@ -26,6 +26,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 
 	"github.com/bbockelm/htcondordb/dropboxframe"
+	"github.com/bbockelm/htcondordb/dropboxmanifest"
 )
 
 // batchPattern matches the exporter's finished batches in either container:
@@ -52,6 +53,9 @@ type Batch struct {
 	Seq       uint64
 	Mod       int64
 	Container Container
+	// Manifest is the batch's sidecar, nil when it has none (written before manifests existed,
+	// or the manifest was lost). Without it a batch can be read but not checked.
+	Manifest *dropboxmanifest.Manifest
 }
 
 // LossReport is one loss ClassAd the exporter dropped when retention outran its cursor. These are
@@ -92,6 +96,9 @@ func List(dir string) (*Listing, error) {
 			l.Partial = append(l.Partial, name)
 			continue
 		}
+		if strings.HasSuffix(name, dropboxmanifest.Suffix) {
+			continue // a batch's sidecar, read with its batch
+		}
 		if m := batchPattern.FindStringSubmatch(name); m != nil {
 			seq, _ := strconv.ParseUint(m[1], 10, 64)
 			mod, _ := strconv.ParseInt(m[2], 10, 64)
@@ -99,7 +106,11 @@ func List(dir string) (*Listing, error) {
 			if m[3] == "cadf" {
 				cont = ContainerFrames
 			}
-			l.Batches = append(l.Batches, Batch{Path: filepath.Join(dir, name), Seq: seq, Mod: mod, Container: cont})
+			b := Batch{Path: filepath.Join(dir, name), Seq: seq, Mod: mod, Container: cont}
+			if m, err := dropboxmanifest.Read(b.Path); err == nil {
+				b.Manifest = m
+			}
+			l.Batches = append(l.Batches, b)
 			continue
 		}
 		if m := lossPattern.FindStringSubmatch(name); m != nil {
@@ -118,8 +129,11 @@ func List(dir string) (*Listing, error) {
 }
 
 // missingSeqs reports the sequence numbers absent between the lowest and highest batch present.
-// Nothing outside that range is knowable: a dropbox that was drained from the front looks exactly
-// like one that started late.
+//
+// Nothing outside that range is knowable from the sequence numbers alone, and that is not a
+// defect: a consumer drains a dropbox from the front, so a low batch being gone is the normal
+// case rather than a loss. What IS knowable is a hole between two batches that are still here,
+// which is what this reports; the manifests confirm it by naming each batch's predecessor.
 func missingSeqs(bs []Batch) []uint64 {
 	if len(bs) < 2 {
 		return nil

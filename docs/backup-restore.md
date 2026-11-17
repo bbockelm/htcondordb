@@ -278,15 +278,31 @@ duplicates and a re-run of a restore that died halfway are both harmless. Pass
 `-skip-dedup` only when restoring into an empty table, where the check can only
 ever answer no.
 
-Read the top of the report, not the totals. Three things appear there and each
+**Checking a dropbox without restoring it.** `restore-dropbox -verify -dir
+<dropbox>` reads every batch, checks it against its manifest, reports, and
+writes nothing. It exits non-zero if anything is damaged or short, so it works
+from cron or a monitoring check rather than only by eye.
+
+Each batch is written with a sidecar manifest (`<batch>.manifest`) naming the
+records it holds, its size and a sha256 of its bytes, the sequence number before
+it, and which exporter and archive it came from. That is what makes a short read
+visible: a damaged batch yields fewer records, and without a declared count
+nothing notices the shortfall. A batch with no manifest — written before
+manifests existed — is reported as unverifiable, never as damaged, and restores
+normally.
+
+Read the top of the report, not the totals. Four things appear there and each
 means records you do not have:
 
 - `DATA LOSS` — the exporter reported a window where retention outran its cursor.
   Those records were pruned before export and are not in the dropbox.
 - `INCOMPLETE` — batch sequence numbers are missing. Batches were deleted or
   never arrived.
-- `DAMAGED BATCH` — a tarball was unreadable past some point. Its readable
-  records were still restored; the rest of that batch is gone.
+- `DAMAGED BATCH` — a batch was unreadable past some point, or its bytes do not
+  match its manifest. Its readable records were still restored; the rest of that
+  batch is gone.
+- `SHORT READ` — a batch yielded fewer records than its manifest declares. The
+  difference is lost.
 
 A restore that silently succeeds over a gap is how an incomplete archive comes to
 be trusted.
@@ -611,9 +627,13 @@ who assumes the snapshot mechanism is a database backup:
   `.tar.gz` is one gzip stream, so a bad byte costs up to `roll-jobs` records.
   `-container frames` reduces that to one frame, but it is not the default
   because external consumers read tarballs.
-- **No manifest for a dropbox.** Nothing records which batch sequence numbers
-  should exist, so a `restore-dropbox` can report the gaps it can see between the
-  batches present and not the ones missing from either end.
+- **A dropbox cannot be proven complete at its ends.** A consumer drains a
+  dropbox from the front, so a low sequence number being absent is the normal
+  case, not a loss, and nothing in the directory records how far the exporter has
+  got. Holes *between* batches that are present are detected; batches missing
+  from either end are not.
+- **Manifests are per batch, not per dropbox.** A batch can be checked against
+  its own manifest; there is no directory-level record to check the set against.
 - **Retention prunes by filename.** Any file matching `htcondordb-*.cadb` in the
   snapshot directory is eligible for deletion; `HTCONDORDB_SNAPSHOT_KEEP` has no
   "unlimited" setting.

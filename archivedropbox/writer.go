@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/bbockelm/htcondordb/dropboxmanifest"
 )
 
 // tmpPrefix marks a file the exporter is still writing (or a loss report being staged). A consumer
@@ -30,6 +32,16 @@ type dropboxWriter struct {
 	compress  int // gzip level, for ContainerTarGz
 	container ContainerFormat
 	minFrame  int // for ContainerFrames
+
+	// exporter and table are recorded in each batch's manifest so a dropbox is self-describing:
+	// an operator holding only the directory can see what wrote it and where it came from.
+	exporter string
+	table    string
+	// prevSeq is the sequence number of the last batch written, carried into the next batch's
+	// manifest. A consumer drains a dropbox from the front, so the lowest sequence present is
+	// arbitrary and a low gap is normal; PrevSeq is what distinguishes an ordinary drain from a
+	// batch that went missing between two that are still here.
+	prevSeq uint64
 }
 
 func newDropboxWriter(dir string, compressLevel int) (*dropboxWriter, error) {
@@ -49,6 +61,20 @@ func NewWriter(cfg Config) (Writer, error) {
 		w.container = cfg.Container
 	}
 	w.minFrame = cfg.MinFrameBytes
+	w.table = cfg.Table
+	return w, nil
+}
+
+// NewNamedWriter is NewWriter plus the exporter's name, which goes into each batch's manifest so
+// a dropbox says what wrote it. Prefer it wherever the name is known.
+func NewNamedWriter(cfg Config, name string) (Writer, error) {
+	w, err := NewWriter(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if dw, ok := w.(*dropboxWriter); ok {
+		dw.exporter = name
+	}
 	return w, nil
 }
 
@@ -63,10 +89,48 @@ func (w *dropboxWriter) WriteBatch(seq uint64, recs []record) (string, error) {
 	if len(recs) == 0 {
 		return "", nil
 	}
+	var path string
+	var err error
 	if w.container == ContainerFrames {
-		return w.writeFramed(seq, recs)
+		path, err = w.writeFramed(seq, recs)
+	} else {
+		path, err = w.writeTarGz(seq, recs)
 	}
-	return w.writeTarGz(seq, recs)
+	if err != nil {
+		return "", err
+	}
+	w.writeBatchManifest(path, seq, recs)
+	w.prevSeq = seq
+	return path, nil
+}
+
+// writeBatchManifest records what the batch holds, beside it.
+//
+// Best effort, and deliberately so: the batch is already durable and renamed into place by the
+// time this runs, and the caller is about to advance its cursor on the strength of that. Losing
+// the manifest must not lose or re-export the batch, so a failure here leaves the batch
+// unverifiable -- exactly how a batch written before manifests existed is treated -- rather than
+// turning a metadata problem into a data one.
+func (w *dropboxWriter) writeBatchManifest(path string, seq uint64, recs []record) {
+	sum, n, err := dropboxmanifest.HashFile(path)
+	if err != nil {
+		return
+	}
+	m := &dropboxmanifest.Manifest{
+		Format:    dropboxmanifest.Format,
+		File:      filepath.Base(path),
+		Seq:       seq,
+		PrevSeq:   w.prevSeq,
+		Records:   len(recs),
+		FirstTime: recs[0].modUnix,
+		LastTime:  recs[len(recs)-1].modUnix,
+		Bytes:     n,
+		SHA256:    sum,
+		Container: string(w.container),
+		Exporter:  w.exporter,
+		Table:     w.table,
+	}
+	_ = dropboxmanifest.Write(path, m, fsyncDir)
 }
 
 // writeTarGz is the original container: one gzip-compressed tar per batch.
@@ -181,6 +245,12 @@ func (w *dropboxWriter) DirSize() (int64, error) {
 	var total int64
 	for _, e := range entries {
 		if e.IsDir() || strings.HasPrefix(e.Name(), tmpPrefix) {
+			continue
+		}
+		// Backpressure measures undelivered DATA against the operator's ceiling. A batch's
+		// manifest is metadata about data already counted, so charging it too would quietly
+		// shrink the ceiling that was configured -- by a larger fraction the smaller the batches.
+		if strings.HasSuffix(e.Name(), dropboxmanifest.Suffix) {
 			continue
 		}
 		fi, err := e.Info()

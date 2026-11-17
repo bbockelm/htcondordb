@@ -38,6 +38,7 @@ func main() {
 	table := flag.String("table", "", "destination archive table (required)")
 	addr := flag.String("addr", "", "htcondordb address HOST:PORT (default: discover)")
 	dryRun := flag.Bool("dry-run", false, "read and report without writing anything")
+	verify := flag.Bool("verify", false, "check the dropbox against its manifests and report; implies -dry-run")
 	skipDedup := flag.Bool("skip-dedup", false, "append without checking for existing records (faster, correct only into an empty table)")
 	quiet := flag.Bool("quiet", false, "suppress progress output")
 	flag.Parse()
@@ -46,6 +47,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "restore-dropbox: -dir and -table are required")
 		flag.Usage()
 		os.Exit(2)
+	}
+	if *verify {
+		*dryRun = true
 	}
 	if err := run(*dir, *table, *addr, *dryRun, *skipDedup, *quiet); err != nil {
 		fmt.Fprintln(os.Stderr, "restore-dropbox:", err)
@@ -95,6 +99,11 @@ func run(dir, table, addrFlag string, dryRun, skipDedup, quiet bool) error {
 	res.Report(os.Stdout)
 	if dryRun {
 		fmt.Fprintln(os.Stdout, "(dry run -- nothing was written)")
+	}
+	// A verify that found damage must fail the process, so it is usable from cron and from a
+	// monitoring check rather than only by eye.
+	if err == nil && (len(res.BadBatches) > 0 || len(res.ShortReads) > 0) {
+		return fmt.Errorf("%d damaged batch(es), %d short read(s)", len(res.BadBatches), len(res.ShortReads))
 	}
 	return err
 }
