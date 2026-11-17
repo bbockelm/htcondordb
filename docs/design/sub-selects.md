@@ -319,6 +319,10 @@ table; that is what decides the plan it is reporting.
 
 ## 9. If a derived table is ever materialized
 
+> The rest of that design is in [derived-tables.md](derived-tables.md). This section is the
+> constraint it builds on: materializing is the fallback mode there, not the default.
+
+
 Every construct in this design pushes its inner statement somewhere: a predicate lowers to a
 filter the store evaluates, or to a key set shipped as literals. A derived table or a CTE is
 the first one that cannot. It is a *relation* the outer statement reads, so when the server
@@ -373,5 +377,6 @@ And a derived table that *is* the answer ships to a Flight client with no conver
 
 ### Still open
 
-- Derived tables and CTEs, and correlated scalar subqueries — each a separate design. §9 is
-  the standing constraint on the first of them.
+- Derived tables and CTEs — designed in [derived-tables.md](derived-tables.md), which takes §9
+  as its constraint on holding rows and settles the rest around it. Nothing is built yet.
+- Correlated scalar subqueries — a separate design.
