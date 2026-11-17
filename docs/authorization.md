@@ -56,7 +56,7 @@ every client — DAEMON included:
 | schedd sync | `syncstatus` (the heartbeat); `jobs`, `users`, `jobsets`, `clusters`, `header`, `clusterprivate`, `logmeta` (job_queue.log); `job_metrics` (`HTCONDORDB_JOB_METRICS`); `history`; `epoch_history` | `HTCONDORDB_SYNC_SCHEDD` is on (`syncstatus`), and the source file is configured (the rest) |
 | federation hub | `federation_sources` and each table in `HTCONDORDB_FEDERATE_TABLES` (`jobs`, `history`, `syncstatus`, `epoch_history`) | `HTCONDORDB_FEDERATE_SCHEDD_CONSTRAINT` or `HTCONDORDB_FEDERATE_SPOKES` is set |
 | replication (cedar-sync) | each `HTCONDORDB_REPLICATE_<NAME>_TARGET` | the source is listed in `HTCONDORDB_REPLICATE_SOURCES` |
-| history import | each managed `HTCONDORDB_HISTORY_IMPORT_<NAME>_TABLE` | the job is configured and the daemon runs the importer (not with `HTCONDORDB_MANAGE_HISTORY_IMPORT = false` or no `history-import` binary) |
+| history import | each managed `HTCONDORDB_HISTORY_IMPORT_<NAME>_TABLE` | the job is configured and the daemon runs the importer (not with `HTCONDORDB_MANAGE_HISTORY_IMPORT = false` or no `htcondordb-history-import` binary) |
 
 Ownership follows configuration: it is re-evaluated on every reconfigure, and a
 table is an ordinary table again once its writer is disabled. Names match
