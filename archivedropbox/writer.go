@@ -26,29 +26,51 @@ type record struct {
 // atomically renames it into place, and fsyncs the directory so the rename itself is durable
 // before the caller advances its resume cursor.
 type dropboxWriter struct {
-	dir      string
-	compress int // gzip level
+	dir       string
+	compress  int // gzip level, for ContainerTarGz
+	container ContainerFormat
+	minFrame  int // for ContainerFrames
 }
 
 func newDropboxWriter(dir string, compressLevel int) (*dropboxWriter, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("archivedropbox: creating dropbox %q: %w", dir, err)
 	}
-	return &dropboxWriter{dir: dir, compress: compressLevel}, nil
+	return &dropboxWriter{dir: dir, compress: compressLevel, container: ContainerTarGz}, nil
 }
 
 // NewWriter builds the production dropbox Writer from a (validated) Config.
 func NewWriter(cfg Config) (Writer, error) {
-	return newDropboxWriter(cfg.Directory, cfg.CompressionLevel)
+	w, err := newDropboxWriter(cfg.Directory, cfg.CompressionLevel)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Container != "" {
+		w.container = cfg.Container
+	}
+	w.minFrame = cfg.MinFrameBytes
+	return w, nil
 }
 
-// WriteTarball writes recs as a gzip-compressed tar to a temp file, fsyncs it, atomically renames
-// it to batch-<seq>-<firstModUnix>.tar.gz, and fsyncs the directory. It returns the final path.
-// On any error the temp file is removed so a partial tarball never lingers in the dropbox.
-func (w *dropboxWriter) WriteTarball(seq uint64, recs []record) (string, error) {
+// WriteBatch writes recs as one batch file in the configured container, to a temp file, fsyncs
+// it, atomically renames it into place, and fsyncs the directory. It returns the final path. On
+// any error the temp file is removed so a partial batch never lingers in the dropbox.
+//
+// The durability dance is the same for both containers and is what makes delivery at-least-once:
+// the data reaches disk before the rename, and the rename reaches disk before the caller is told
+// it may advance its cursor.
+func (w *dropboxWriter) WriteBatch(seq uint64, recs []record) (string, error) {
 	if len(recs) == 0 {
 		return "", nil
 	}
+	if w.container == ContainerFrames {
+		return w.writeFramed(seq, recs)
+	}
+	return w.writeTarGz(seq, recs)
+}
+
+// writeTarGz is the original container: one gzip-compressed tar per batch.
+func (w *dropboxWriter) writeTarGz(seq uint64, recs []record) (string, error) {
 	final := filepath.Join(w.dir, fmt.Sprintf("batch-%08d-%d.tar.gz", seq, recs[0].modUnix))
 	f, err := os.CreateTemp(w.dir, tmpPrefix+"batch-*.tmp")
 	if err != nil {

@@ -39,11 +39,18 @@ const HeaderLen = 4 + 4 + 4 + 4 + 4
 
 // DefaultMinFrameBytes is how many bytes of records a frame accumulates before it is closed.
 //
-// It is measured on the records as written, not on the compressed result, so the bound is
-// predictable: at 1 MiB a frame holds a few hundred typical job ClassAds, which is what a damaged
-// frame costs. The compressed frame on disk is considerably smaller. 256 KiB is the other
-// sensible setting -- roughly a quarter of the blast radius for a few percent of ratio.
-const DefaultMinFrameBytes = 1 << 20
+// It is measured on the records as handed in, not on the compressed result, so the bound is one
+// an operator can reason about: this many records is what a damaged frame costs.
+//
+// 256 KiB, not 1 MiB, and the reason is the batch size. The exporter's default batch is 2000
+// records, which is only ~823 KB of typical job ClassAds -- so a 1 MiB frame swallows a whole
+// batch and leaves one frame per file, the same blast radius as the gzip tarball it replaces, for
+// about 3% less space than 256 KiB. A frame size only bounds damage if it is meaningfully smaller
+// than a batch. At 256 KiB a default batch is four frames of ~500 records, and the file is still
+// ~37% smaller than the tarball because the comparison is zstd against gzip. Sites that value
+// recovery over space should set 64 KiB (thirteen frames, ~153 records each, still ~32% smaller
+// than a tarball).
+const DefaultMinFrameBytes = 256 << 10
 
 // MinFrameBytesFloor is the smallest configurable frame size. Below this the format degenerates
 // towards per-record frames and the compression ratio collapses.

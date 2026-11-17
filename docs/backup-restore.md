@@ -291,8 +291,36 @@ means records you do not have:
 A restore that silently succeeds over a gap is how an incomplete archive comes to
 be trusted.
 
-The design, including the framed stream format that bounds damage at a few
-hundred records instead of a whole batch, is in
+**Bounding what damage costs.** A `.tar.gz` batch is one gzip stream, so a
+truncation or a flipped bit loses everything after it — up to a whole
+`roll-jobs` batch, 2000 records by default. The framed container fixes that:
+
+```
+archivedropbox create -name histbackup -table history -dir /var/spool/htcondordb-dropbox     -container frames
+```
+
+Batches are then written as `batch-<seq>-<mod>.cadf`: a sequence of
+independently-compressed frames, each with its own checksum. A reader that hits
+damage skips that frame and resyncs to the next, so a bad byte costs the records
+in one frame instead of the batch. On a default batch that is about 500 records
+rather than 2000, and the file is roughly a third *smaller* than the tarball,
+because the framed container uses zstd where the tarball uses gzip.
+
+`-min-frame-bytes` tunes it (default 256 KiB). Smaller frames mean less lost to
+any one bit of damage and slightly worse compression; 64 KiB is a reasonable
+setting for a site that values recovery over space. Do not set it near or above
+a batch's worth of records — a frame that holds the whole batch bounds nothing.
+Below 4 KiB is refused, because there the framed stream is larger than the
+tarball it replaces.
+
+**`targz` remains the default, and you should leave it alone unless you control
+the consumer.** The dropbox exists for out-of-band consumers, and those read
+gzip tarballs with standard tools; a `.cadf` means nothing to them. Switch only
+once whatever drains your dropbox understands the framed format. `restore-dropbox`
+reads both, including a dropbox holding a mixture of the two, which is what one
+looks like across the switch.
+
+The design and the measurements behind these numbers are in
 [Continuous archive backup](design/archive-continuous-backup.md).
 
 **Rebuilding from source.** For the `history` archive specifically, the records
@@ -579,10 +607,13 @@ who assumes the snapshot mechanism is a database backup:
 - **A dropbox restore rebuilds records, not an archive.** It replays ads into a
   table; it does not restore that archive's indexes or configuration, which come
   from a directory copy. Expect an ingest, not a file move.
-- **The dropbox still bounds damage at a whole batch.** A tarball is one gzip
-  stream, so a bad byte costs up to `RollJobs` records. The framed format that
-  fixes this is implemented but not yet emitted by the exporter — see
-  [Continuous archive backup](design/archive-continuous-backup.md).
+- **The dropbox bounds damage at a whole batch unless you opt into frames.** A
+  `.tar.gz` is one gzip stream, so a bad byte costs up to `roll-jobs` records.
+  `-container frames` reduces that to one frame, but it is not the default
+  because external consumers read tarballs.
+- **No manifest for a dropbox.** Nothing records which batch sequence numbers
+  should exist, so a `restore-dropbox` can report the gaps it can see between the
+  batches present and not the ones missing from either end.
 - **Retention prunes by filename.** Any file matching `htcondordb-*.cadb` in the
   snapshot directory is eligible for deletion; `HTCONDORDB_SNAPSHOT_KEEP` has no
   "unlimited" setting.

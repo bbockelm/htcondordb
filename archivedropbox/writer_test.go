@@ -51,13 +51,13 @@ func readTarball(t *testing.T, path string) map[string]string {
 	return out
 }
 
-func TestWriteTarballAtomicAndComplete(t *testing.T) {
+func TestWriteBatchAtomicAndComplete(t *testing.T) {
 	w, dir := newTestWriter(t)
 	recs := []record{
 		{name: "000000-ap40_12.0.classad", body: "GlobalJobId = \"ap40#12.0\"\nJobStatus = 4\n", modUnix: 1_700_000_100},
 		{name: "000001-ap40_13.0.classad", body: "GlobalJobId = \"ap40#13.0\"\nJobStatus = 4\n", modUnix: 1_700_000_200},
 	}
-	path, err := w.WriteTarball(1, recs)
+	path, err := w.WriteBatch(1, recs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,9 +85,9 @@ func TestWriteTarballAtomicAndComplete(t *testing.T) {
 	}
 }
 
-func TestWriteTarballEmptyIsNoop(t *testing.T) {
+func TestWriteBatchEmptyIsNoop(t *testing.T) {
 	w, dir := newTestWriter(t)
-	path, err := w.WriteTarball(1, nil)
+	path, err := w.WriteBatch(1, nil)
 	if err != nil || path != "" {
 		t.Fatalf("empty batch: path=%q err=%v, want empty/nil", path, err)
 	}
@@ -100,7 +100,7 @@ func TestWriteTarballEmptyIsNoop(t *testing.T) {
 func TestDirSizeExcludesTempFiles(t *testing.T) {
 	w, dir := newTestWriter(t)
 	// A finished tarball counts.
-	if _, err := w.WriteTarball(1, []record{{name: "a.classad", body: strings.Repeat("x", 500), modUnix: 1}}); err != nil {
+	if _, err := w.WriteBatch(1, []record{{name: "a.classad", body: strings.Repeat("x", 500), modUnix: 1}}); err != nil {
 		t.Fatal(err)
 	}
 	// A dangling temp file (a crash mid-write) must NOT count toward backpressure.

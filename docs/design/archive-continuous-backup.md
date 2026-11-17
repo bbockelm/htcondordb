@@ -8,8 +8,9 @@ Status: partly implemented.
   command, gap 1 below. That was the blocking gap: the exporter produced a
   correct artifact nothing could read back.
 - **The framed stream format ships as `dropboxframe`** — writer, resyncing
-  reader, and the sizing measurements below. What is *not* yet wired is the
-  exporter emitting it; see [Adopting the framed format](#adopting-the-framed-format).
+  reader, and the sizing measurements below — **and the exporter emits it** when
+  a dropbox is configured with `container = frames`. The default is still
+  `targz`; see [Adopting the framed format](#adopting-the-framed-format).
 
 ## The problem
 
@@ -189,28 +190,51 @@ The format ships as `dropboxframe`. Raises bar 4 and 5 from partial to met:
 
 #### Adopting the framed format
 
-The format, its writer and its resyncing reader are implemented and tested. What
-remains is a decision, not code: `archivedropbox` is a separate Go module that
-deliberately does **not** depend on the main module, so that the exporter binary
-stays out of the core daemon build. The frame format currently lives in the main
-module, where the restore path needs it. Three ways to close that:
+`archivedropbox` is a separate Go module that deliberately does not depend on the
+main module, so that the exporter binary stays out of the core daemon build. The
+frame format lives in the main module, where the restore path needs it. Three
+ways to bridge that were available: vendor a copy of the format into the
+exporter, make `dropboxframe` its own module, or let `archivedropbox` depend on
+the main module.
 
-1. **Vendor the format into the exporter.** A copy of one small file in two
-   modules. Cheapest, and the usual cost of duplicated format code: the two can
-   drift, so whichever side changes first silently breaks the other.
-2. **Make `dropboxframe` its own module.** Clean dependency-wise and matches how
-   this repo already splits modules, at the price of another module to tag and
-   release in step.
-3. **Let `archivedropbox` depend on the main module.** No duplication, but it
-   pulls the daemon's dependency tree into the exporter binary, which is the
-   thing the module split exists to prevent.
+**The dependency won**, via a relative `replace` — the pattern `grafana/go.mod`
+already uses in this repo:
 
-Until one is chosen the exporter keeps writing `batch-*.tar.gz`, and the restore
-path reads that format. Whatever is chosen, **the writer must keep emitting
-tar.gz as the default for at least one release**: the dropbox's whole purpose is
-an out-of-band consumer, and those consumers are external code reading gzip
-tarballs with standard tools. The framed format arrives as an opt-in setting and
-becomes the default only after consumers have had a release to follow.
+```
+require github.com/bbockelm/htcondordb v0.0.0
+replace github.com/bbockelm/htcondordb => ../
+```
+
+Vendoring was rejected because duplicated format code drifts, and the two sides
+of a wire format drifting is precisely the failure that costs data. A separate
+module was rejected because `dropboxframe` would then be external to the *main*
+module too, so every format change would need a tag and two `go.mod` bumps — real
+release choreography for a package with exactly two callers in one repo.
+
+The objection to the dependency — that it drags the daemon's tree into the
+exporter — turned out not to hold. Measured, building `cmd/archivedropbox`
+before and after:
+
+| | before | after |
+|---|---|---|
+| binary | 14,755,314 B | 14,772,050 B (**+0.11%**) |
+| `archivedropbox/go.sum` | 111 lines | 111 lines (**unchanged**) |
+
+Module-graph pruning plus the local `replace` adds no `go.sum` entries, and the
+linker pulls in only `dropboxframe` itself, whose one dependency
+(`klauspost/compress`) the exporter already had.
+
+Two constraints come with it. The `replace` is relative, so `archivedropbox` is
+not independently consumable from outside the repo — already true of `grafana`.
+And the dependency runs one way: **nothing in the main module may import
+`archivedropbox`**, or the two become a cycle.
+
+**The default stays `targz`.** The dropbox exists for an out-of-band consumer,
+and those consumers are external code reading gzip tarballs with standard tools.
+`container = frames` is opt-in, writes `.cadf` instead of `.tar.gz` so the two
+are never confused, and becomes the default only after consumers have had a
+release to follow. The restore path reads both, including a dropbox holding a
+mixture — which is what a dropbox looks like across the switch.
 
 ### C. Operational
 
@@ -223,9 +247,9 @@ becomes the default only after consumers have had a release to follow.
 ## Ordering
 
 **A before B**, which is how it went: A converted a shipped-but-unusable artifact
-into a recoverable one, and B raises the floor under a mechanism that only became
-load-bearing once A existed. What is left of B is the module-dependency decision
-above, plus the manifest. C can land alongside either.
+into a recoverable one, and B raised the floor under a mechanism that only became
+load-bearing once A existed. What is left of B is the per-batch manifest. C can
+land alongside it.
 
 ## Relationship to the other mechanisms
 
