@@ -24,20 +24,38 @@ import (
 	"strings"
 
 	"github.com/PelicanPlatform/classad/classad"
+
+	"github.com/bbockelm/htcondordb/dropboxframe"
+	"github.com/bbockelm/htcondordb/dropboxmanifest"
 )
 
-// batchPattern matches the exporter's finished tarballs: batch-<seq>-<firstModUnix>.tar.gz. A
-// dot-prefixed file is one the exporter is still writing and is deliberately not matched.
-var batchPattern = regexp.MustCompile(`^batch-(\d+)-(-?\d+)\.tar\.gz$`)
+// batchPattern matches the exporter's finished batches in either container:
+// batch-<seq>-<firstModUnix>.tar.gz or .cadf. A dot-prefixed file is one the exporter is still
+// writing and is deliberately not matched.
+var batchPattern = regexp.MustCompile(`^batch-(\d+)-(-?\d+)\.(tar\.gz|cadf)$`)
 
 // lossPattern matches the exporter's data-loss reports: loss-<detectedUnix>.ad.
 var lossPattern = regexp.MustCompile(`^loss-(-?\d+)\.ad$`)
 
-// Batch is one tarball in a dropbox.
+// Container is how a batch is packaged on disk.
+type Container string
+
+const (
+	// ContainerTarGz is one gzip-compressed tar per batch.
+	ContainerTarGz Container = "targz"
+	// ContainerFrames is a framed zstd stream: damage costs one frame, not the batch.
+	ContainerFrames Container = "frames"
+)
+
+// Batch is one batch file in a dropbox.
 type Batch struct {
-	Path string
-	Seq  uint64
-	Mod  int64
+	Path      string
+	Seq       uint64
+	Mod       int64
+	Container Container
+	// Manifest is the batch's sidecar, nil when it has none (written before manifests existed,
+	// or the manifest was lost). Without it a batch can be read but not checked.
+	Manifest *dropboxmanifest.Manifest
 }
 
 // LossReport is one loss ClassAd the exporter dropped when retention outran its cursor. These are
@@ -78,10 +96,21 @@ func List(dir string) (*Listing, error) {
 			l.Partial = append(l.Partial, name)
 			continue
 		}
+		if strings.HasSuffix(name, dropboxmanifest.Suffix) {
+			continue // a batch's sidecar, read with its batch
+		}
 		if m := batchPattern.FindStringSubmatch(name); m != nil {
 			seq, _ := strconv.ParseUint(m[1], 10, 64)
 			mod, _ := strconv.ParseInt(m[2], 10, 64)
-			l.Batches = append(l.Batches, Batch{Path: filepath.Join(dir, name), Seq: seq, Mod: mod})
+			cont := ContainerTarGz
+			if m[3] == "cadf" {
+				cont = ContainerFrames
+			}
+			b := Batch{Path: filepath.Join(dir, name), Seq: seq, Mod: mod, Container: cont}
+			if m, err := dropboxmanifest.Read(b.Path); err == nil {
+				b.Manifest = m
+			}
+			l.Batches = append(l.Batches, b)
 			continue
 		}
 		if m := lossPattern.FindStringSubmatch(name); m != nil {
@@ -100,8 +129,11 @@ func List(dir string) (*Listing, error) {
 }
 
 // missingSeqs reports the sequence numbers absent between the lowest and highest batch present.
-// Nothing outside that range is knowable: a dropbox that was drained from the front looks exactly
-// like one that started late.
+//
+// Nothing outside that range is knowable from the sequence numbers alone, and that is not a
+// defect: a consumer drains a dropbox from the front, so a low batch being gone is the normal
+// case rather than a loss. What IS knowable is a hole between two batches that are still here,
+// which is what this reports; the manifests confirm it by naming each batch's predecessor.
 func missingSeqs(bs []Batch) []uint64 {
 	if len(bs) < 2 {
 		return nil
@@ -126,13 +158,50 @@ type Record struct {
 	Ad    *classad.ClassAd
 }
 
-// ReadBatch decodes every record in one tarball.
+// ReadBatch decodes every record in one batch, in whichever container it is written.
 //
 // A damaged batch returns the records it managed to read along with the error, rather than
-// nothing: gzip is a single stream per tarball, so damage costs the tail from the damage point,
-// and the records before it are still good. Throwing them away because the end of the file is bad
-// would turn a partial loss into a total one.
+// nothing. For a tarball that matters a great deal: gzip is a single stream, so damage costs the
+// tail from the damage point, and throwing away the good records before it would turn a partial
+// loss into a total one. For a framed stream it matters less, because the reader resyncs past
+// damage and keeps going -- which is the whole reason the framed container exists.
 func ReadBatch(b Batch) ([]Record, error) {
+	if b.Container == ContainerFrames {
+		return readFramedBatch(b)
+	}
+	return readTarGzBatch(b)
+}
+
+// readFramedBatch decodes a framed zstd stream. Damage inside it costs one frame: the reader
+// scans forward to the next frame magic and carries on, so the error returned here describes what
+// was skipped rather than what stopped the read.
+func readFramedBatch(b Batch) ([]Record, error) {
+	raw, err := os.ReadFile(b.Path)
+	if err != nil {
+		return nil, err
+	}
+	var out []Record
+	res, err := dropboxframe.Read(raw, func(rec []byte) error {
+		ad, perr := classad.ParseOld(string(rec))
+		if perr != nil {
+			// One unparseable record does not cost the frame, let alone the batch.
+			return nil
+		}
+		out = append(out, Record{Batch: b, Entry: fmt.Sprintf("frame record %d", len(out)), Ad: ad})
+		return nil
+	})
+	if err != nil {
+		return out, fmt.Errorf("%s: %w", filepath.Base(b.Path), err)
+	}
+	if len(res.Problems) > 0 {
+		return out, fmt.Errorf("%s: recovered %d records across %d frames; %d frame(s) damaged: %s",
+			filepath.Base(b.Path), res.Records, res.Frames, res.Damaged, strings.Join(res.Problems, "; "))
+	}
+	return out, nil
+}
+
+// readTarGzBatch decodes the original gzip tarball container.
+func readTarGzBatch(b Batch) ([]Record, error) {
 	f, err := os.Open(b.Path)
 	if err != nil {
 		return nil, err

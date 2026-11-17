@@ -168,7 +168,9 @@ func cmdCreate(args []string) error {
 	rollInterval := fs.Duration("roll-interval", 0, "roll a partial tarball at least this often (0=default 10m)")
 	maxBytes := fs.String("max-bytes", "", "backpressure ceiling, e.g. 2GiB (0=default 2GiB)")
 	level := fs.Int("compression-level", 0, "gzip level -1..9 (0=default 6)")
-	format := fs.String("format", "", "record format inside the tarball: classad (default) or json")
+	format := fs.String("format", "", "record format inside the batch: classad (default) or json")
+	container := fs.String("container", "", "batch container: targz (default, one gzip tar per batch) or frames (framed zstd; damage costs one frame, not the batch)")
+	minFrame := fs.Int("min-frame-bytes", 0, "with -container frames, bytes of records per frame (0=default 256KiB); must be well under a batch to bound damage")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -182,6 +184,8 @@ func cmdCreate(args []string) error {
 		RollInterval:     archivedropbox.Duration(*rollInterval),
 		CompressionLevel: *level,
 		Format:           archivedropbox.RecordFormat(strings.ToLower(strings.TrimSpace(*format))),
+		Container:        archivedropbox.ContainerFormat(strings.ToLower(strings.TrimSpace(*container))),
+		MinFrameBytes:    *minFrame,
 	}
 	if *maxBytes != "" {
 		bs, err := archivedropbox.ParseByteSize(*maxBytes)
@@ -207,7 +211,11 @@ func cmdCreate(args []string) error {
 	if err := c.CreateExporter(ctx, db.ExporterDef{Name: *name, Kind: archivedropbox.Kind, Config: raw}); err != nil {
 		return err
 	}
-	fmt.Printf("created dropbox exporter %q (archive %q -> %q, format %s)\n", *name, *table, cfg.Directory, cfg.Format)
+	fmt.Printf("created dropbox exporter %q (archive %q -> %q, format %s, container %s)\n",
+		*name, *table, cfg.Directory, cfg.Format, cfg.Container)
+	if cfg.Container == archivedropbox.ContainerFrames {
+		fmt.Printf("  batches are written as .cadf framed streams (%d byte frames); a consumer reading .tar.gz will not understand them\n", cfg.MinFrameBytes)
+	}
 	return nil
 }
 
@@ -321,7 +329,7 @@ func runOnce(ctx context.Context, addrFlag, name string, log *slog.Logger) error
 	if err != nil {
 		return fmt.Errorf("exporter %q: %w", name, err)
 	}
-	w, err := archivedropbox.NewWriter(cfg)
+	w, err := archivedropbox.NewNamedWriter(cfg, name)
 	if err != nil {
 		return err
 	}

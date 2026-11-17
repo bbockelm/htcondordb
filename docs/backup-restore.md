@@ -278,21 +278,65 @@ duplicates and a re-run of a restore that died halfway are both harmless. Pass
 `-skip-dedup` only when restoring into an empty table, where the check can only
 ever answer no.
 
-Read the top of the report, not the totals. Three things appear there and each
+**Checking a dropbox without restoring it.** `restore-dropbox -verify -dir
+<dropbox>` reads every batch, checks it against its manifest, reports, and
+writes nothing. It exits non-zero if anything is damaged or short, so it works
+from cron or a monitoring check rather than only by eye.
+
+Each batch is written with a sidecar manifest (`<batch>.manifest`) naming the
+records it holds, its size and a sha256 of its bytes, the sequence number before
+it, and which exporter and archive it came from. That is what makes a short read
+visible: a damaged batch yields fewer records, and without a declared count
+nothing notices the shortfall. A batch with no manifest — written before
+manifests existed — is reported as unverifiable, never as damaged, and restores
+normally.
+
+Read the top of the report, not the totals. Four things appear there and each
 means records you do not have:
 
 - `DATA LOSS` — the exporter reported a window where retention outran its cursor.
   Those records were pruned before export and are not in the dropbox.
 - `INCOMPLETE` — batch sequence numbers are missing. Batches were deleted or
   never arrived.
-- `DAMAGED BATCH` — a tarball was unreadable past some point. Its readable
-  records were still restored; the rest of that batch is gone.
+- `DAMAGED BATCH` — a batch was unreadable past some point, or its bytes do not
+  match its manifest. Its readable records were still restored; the rest of that
+  batch is gone.
+- `SHORT READ` — a batch yielded fewer records than its manifest declares. The
+  difference is lost.
 
 A restore that silently succeeds over a gap is how an incomplete archive comes to
 be trusted.
 
-The design, including the framed stream format that bounds damage at a few
-hundred records instead of a whole batch, is in
+**Bounding what damage costs.** A `.tar.gz` batch is one gzip stream, so a
+truncation or a flipped bit loses everything after it — up to a whole
+`roll-jobs` batch, 2000 records by default. The framed container fixes that:
+
+```
+archivedropbox create -name histbackup -table history -dir /var/spool/htcondordb-dropbox     -container frames
+```
+
+Batches are then written as `batch-<seq>-<mod>.cadf`: a sequence of
+independently-compressed frames, each with its own checksum. A reader that hits
+damage skips that frame and resyncs to the next, so a bad byte costs the records
+in one frame instead of the batch. On a default batch that is about 500 records
+rather than 2000, and the file is roughly a third *smaller* than the tarball,
+because the framed container uses zstd where the tarball uses gzip.
+
+`-min-frame-bytes` tunes it (default 256 KiB). Smaller frames mean less lost to
+any one bit of damage and slightly worse compression; 64 KiB is a reasonable
+setting for a site that values recovery over space. Do not set it near or above
+a batch's worth of records — a frame that holds the whole batch bounds nothing.
+Below 4 KiB is refused, because there the framed stream is larger than the
+tarball it replaces.
+
+**`targz` remains the default, and you should leave it alone unless you control
+the consumer.** The dropbox exists for out-of-band consumers, and those read
+gzip tarballs with standard tools; a `.cadf` means nothing to them. Switch only
+once whatever drains your dropbox understands the framed format. `restore-dropbox`
+reads both, including a dropbox holding a mixture of the two, which is what one
+looks like across the switch.
+
+The design and the measurements behind these numbers are in
 [Continuous archive backup](design/archive-continuous-backup.md).
 
 **Rebuilding from source.** For the `history` archive specifically, the records
@@ -579,10 +623,17 @@ who assumes the snapshot mechanism is a database backup:
 - **A dropbox restore rebuilds records, not an archive.** It replays ads into a
   table; it does not restore that archive's indexes or configuration, which come
   from a directory copy. Expect an ingest, not a file move.
-- **The dropbox still bounds damage at a whole batch.** A tarball is one gzip
-  stream, so a bad byte costs up to `RollJobs` records. The framed format that
-  fixes this is implemented but not yet emitted by the exporter — see
-  [Continuous archive backup](design/archive-continuous-backup.md).
+- **The dropbox bounds damage at a whole batch unless you opt into frames.** A
+  `.tar.gz` is one gzip stream, so a bad byte costs up to `roll-jobs` records.
+  `-container frames` reduces that to one frame, but it is not the default
+  because external consumers read tarballs.
+- **A dropbox cannot be proven complete at its ends.** A consumer drains a
+  dropbox from the front, so a low sequence number being absent is the normal
+  case, not a loss, and nothing in the directory records how far the exporter has
+  got. Holes *between* batches that are present are detected; batches missing
+  from either end are not.
+- **Manifests are per batch, not per dropbox.** A batch can be checked against
+  its own manifest; there is no directory-level record to check the set against.
 - **Retention prunes by filename.** Any file matching `htcondordb-*.cadb` in the
   snapshot directory is eligible for deletion; `HTCONDORDB_SNAPSHOT_KEEP` has no
   "unlimited" setting.

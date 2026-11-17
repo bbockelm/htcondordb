@@ -14,6 +14,7 @@ require (
 	github.com/PelicanPlatform/classad/dbrpc v0.41.1
 	github.com/bbockelm/cedar v0.7.14
 	github.com/bbockelm/golang-htcondor v0.22.1
+	github.com/bbockelm/htcondordb v0.0.0
 )
 
 require (
@@ -40,3 +41,9 @@ require (
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
+
+// dropboxframe, the framed batch format, is shared with the restore path in the main module.
+// A relative replace (the same pattern grafana/go.mod uses) keeps one copy of the format with no
+// tag to hold in step. The dependency runs one way only: nothing in the main module may import
+// this one.
+replace github.com/bbockelm/htcondordb => ../

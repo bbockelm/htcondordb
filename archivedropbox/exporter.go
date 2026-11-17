@@ -33,7 +33,7 @@ const (
 // Writer is the durable sink the Runner drops tarballs and loss reports into. It is an interface
 // so tests can substitute a fake; the production implementation is dropboxWriter.
 type Writer interface {
-	WriteTarball(seq uint64, recs []record) (string, error)
+	WriteBatch(seq uint64, recs []record) (string, error)
 	WriteLossReport(body string, detectedUnix int64, ext string) (string, error)
 	DirSize() (int64, error)
 }
@@ -169,7 +169,7 @@ func (r *Runner) session(ctx context.Context, st *State) error {
 		if err := r.awaitDropboxSpace(ctx, writeStatus); err != nil {
 			return err
 		}
-		path, err := r.w.WriteTarball(st.TarballSeq+1, pending)
+		path, err := r.w.WriteBatch(st.TarballSeq+1, pending)
 		if err != nil {
 			return err
 		}
