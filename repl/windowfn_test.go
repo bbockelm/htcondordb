@@ -260,3 +260,53 @@ func TestExplainWindowPlan(t *testing.T) {
 		t.Errorf("plan claims the limit pushed down under a window:\n%s", plan)
 	}
 }
+
+// TestRankDoesNotTieDistinctLargeIntegers is the end-to-end form of the compareCells rounding
+// bug: three job ids one apart, all past 2^53, where every pair shares a float64.
+//
+// Ranking compared the rendered cells as float64, so sameOrderKey reported all three TIED and
+// RANK gave them 1,1,1 -- three distinct rows under one rank, which no amount of reading the
+// output would reveal as wrong unless you knew the ids differed. ROW_NUMBER hid it entirely,
+// since it numbers 1,2,3 whatever ties.
+func TestRankDoesNotTieDistinctLargeIntegers(t *testing.T) {
+	e, cleanup := newCatalogExec(t)
+	defer cleanup()
+	mustExec(t, e, "CREATE TABLE jobs")
+	// 2^53 = 9007199254740992. These three are consecutive and none of the upper two has an
+	// exact float64.
+	ids := []string{"9007199254740992", "9007199254740993", "9007199254740994"}
+	for i, id := range ids {
+		mustExec(t, e, fmt.Sprintf(
+			"INSERT INTO jobs (Key, Owner, JobId) VALUES ('k%d', 'alice', %s)", i, id))
+	}
+	for _, tc := range []struct {
+		fn   string
+		want []string
+	}{
+		{"RANK", []string{"1", "2", "3"}},
+		{"DENSE_RANK", []string{"1", "2", "3"}},
+	} {
+		r := mustExec(t, e, `SELECT JobId, `+tc.fn+`() OVER (PARTITION BY Owner ORDER BY JobId) AS r `+
+			`FROM jobs ORDER BY JobId`)
+		var got []string
+		for _, row := range r.Rows {
+			got = append(got, row[1])
+		}
+		if !eqStrs(got, tc.want) {
+			t.Errorf("%s over three consecutive ids past 2^53 = %v, want %v -- distinct "+
+				"values were reported tied", tc.fn, got, tc.want)
+		}
+	}
+
+	// And ORDER BY must put them in the right order, which the float comparison could not:
+	// all three compared equal, so the sort left them in whatever order they arrived.
+	r := mustExec(t, e, `SELECT JobId FROM jobs ORDER BY JobId DESC`)
+	want := []string{ids[2], ids[1], ids[0]}
+	var got []string
+	for _, row := range r.Rows {
+		got = append(got, row[0])
+	}
+	if !eqStrs(got, want) {
+		t.Errorf("ORDER BY over ids past 2^53 = %v, want %v", got, want)
+	}
+}

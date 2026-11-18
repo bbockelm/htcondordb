@@ -2731,6 +2731,22 @@ func compareValues(a, b classad.Value) int {
 	}
 	switch ra {
 	case rankNumber:
+		// Two INTEGERS compare as integers. Past 2^53 an int64 has no exact float64, so
+		// comparing the floats reports two different job ids equal -- the same rounding
+		// compareCells had, at the other site that orders rows. Anything else compares as
+		// floats, which is what a mixed int/real column means by order anyway.
+		if ia, aok := intOf(a); aok {
+			if ib, bok := intOf(b); bok {
+				switch {
+				case ia < ib:
+					return -1
+				case ia > ib:
+					return 1
+				default:
+					return 0
+				}
+			}
+		}
 		fa, _ := numOf(a)
 		fb, _ := numOf(b)
 		switch {
@@ -2767,6 +2783,17 @@ func valueRank(v classad.Value) int {
 	}
 }
 
+// intOf reports an INTEGER value exactly, for the comparisons where a float64 would lose
+// digits. A real is not accepted even when integral: 2.0 and 2 are different ClassAd values
+// and the float path already orders them together.
+func intOf(v classad.Value) (int64, bool) {
+	if !v.IsInteger() {
+		return 0, false
+	}
+	i, err := v.IntValue()
+	return i, err == nil
+}
+
 func numOf(v classad.Value) (float64, bool) {
 	if v.IsInteger() {
 		i, _ := v.IntValue()
@@ -2779,9 +2806,57 @@ func numOf(v classad.Value) (float64, bool) {
 	return 0, false
 }
 
-// compareCells orders two rendered cells: numerically when both parse as numbers,
-// else lexically.
+// isIntText reports whether s has the shape ParseInt accepts in base 10: an optional sign and
+// then digits, nothing else.
+//
+// It exists to keep ParseInt off the strings that cannot be integers, because a FAILED ParseInt
+// allocates -- a NumError and a copy of the string, two allocations it builds only to have the
+// error thrown away. compareCells runs inside a sort, so on a column of owners that was two
+// allocations per comparison and O(n log n) of them per ORDER BY.
+//
+// A value that passes this and still fails ParseInt -- an integer too large for int64 -- costs
+// the allocation it always did and falls through to the float path, as before.
+func isIntText(s string) bool {
+	i := 0
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		i = 1
+	}
+	if i == len(s) {
+		return false
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// compareCells orders two rendered cells: numerically when both parse as numbers, else
+// lexically.
+//
+// TWO INTEGERS COMPARE AS INTEGERS, and that is not a refinement. Past 2^53 an int64 has no
+// exact float64, so comparing the floats reported two DIFFERENT job ids equal -- which this
+// does not only order by: sameOrderKey asks it whether two rows tie, so RANK and DENSE_RANK
+// handed distinct values the same rank. A wrong number, not a reordering of equals.
+//
+// It is the same rule db.topKWorse follows for the same reason, so a ranking computed here and
+// one pushed to the server agree about which rows are tied.
 func compareCells(a, b string) int {
+	if isIntText(a) && isIntText(b) {
+		if ia, ea := strconv.ParseInt(a, 10, 64); ea == nil {
+			if ib, eb := strconv.ParseInt(b, 10, 64); eb == nil {
+				switch {
+				case ia < ib:
+					return -1
+				case ia > ib:
+					return 1
+				default:
+					return 0
+				}
+			}
+		}
+	}
 	fa, ea := strconv.ParseFloat(a, 64)
 	fb, eb := strconv.ParseFloat(b, 64)
 	if ea == nil && eb == nil {
