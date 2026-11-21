@@ -159,7 +159,7 @@ func TestBoundaryBatchStillCountsRepeatedIdentities(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 	ep := hubArchive(t, cat, TableEpochHistory)
 	m := NewMetrics()
-	s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, m, discard, nil)
+	s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, m, discard, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,15 +294,17 @@ func TestCatchupBatchIsBoundedByBytes(t *testing.T) {
 }
 
 // TestIdentitySetLoadAbandonedWhenTooBig: a full replay loads the AP's identity counts to avoid a
-// query per record, but a hub holding tens of millions of rows cannot materialise one AP's share
-// of them per sink. Past the limit the load is abandoned and the replay goes back to probing --
-// slow, where running out of memory would be fatal -- and it still deduplicates exactly.
+// query per record, but a hub holding tens of millions of rows cannot materialise every AP's share
+// of them at once. Past the hub's pooled budget the load is abandoned and the replay goes back to
+// probing -- slow, where running out of memory would be fatal -- and it still deduplicates
+// exactly.
 func TestIdentitySetLoadAbandonedWhenTooBig(t *testing.T) {
 	cat := openCatalog(t, t.TempDir())
 	t.Cleanup(func() { _ = cat.Close() })
 	hist := hubArchive(t, cat, TableHistory)
 	s := newHistSink(t, hist, "ap1", &replicate.MemCursorStore{}, NewMetrics())
-	s.identityLimit = 10
+	// A budget this sink can fill: ten identities, taken one at a time.
+	s.budget, s.identityChunk = newIdentityBudget(10), 1
 	n := probeBudget + 20
 
 	replay := func(cur string) {

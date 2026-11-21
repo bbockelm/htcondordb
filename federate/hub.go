@@ -105,6 +105,10 @@ type Hub struct {
 
 	resetMu    sync.Mutex
 	resetTimes map[string]time.Time // schedd -> last Reset received (written by runner goroutines)
+
+	// identities is the ceiling every archive sink's dedup identity set shares. Pooled rather than
+	// per sink: see identityBudget.
+	identities *identityBudget
 }
 
 // source is the hub's state for one schedd.
@@ -171,6 +175,7 @@ func New(cfg Config) (*Hub, error) {
 		sources: map[string]*source{}, retireReq: make(chan retireReq), discoverNow: make(chan struct{}, 1),
 		exited:     make(chan struct{}),
 		resetTimes: map[string]time.Time{},
+		identities: newIdentityBudget(defaultIdentityBudget),
 	}
 	if h.log == nil {
 		h.log = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -562,7 +567,7 @@ func (h *Hub) startRunner(s *source, table string) error {
 	}
 	var sink replicate.Sink
 	if isArchiveTable(table) {
-		sink, err = newArchiveSink(h.ht.archives[table], table, schedd, store, h.metrics, h.log, onReset)
+		sink, err = newArchiveSink(h.ht.archives[table], table, schedd, store, h.metrics, h.log, onReset, h.identities)
 	} else {
 		sink, err = newTableSink(h.ht.mutable[table], table, schedd, store, h.metrics, h.now, onReset)
 	}

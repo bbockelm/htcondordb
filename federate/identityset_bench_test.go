@@ -35,7 +35,7 @@ func BenchmarkJobMetricsIdentitySet(b *testing.B) {
 	b.Logf("appended %d samples in %s", n, time.Since(t0).Round(time.Millisecond))
 	b.ResetTimer()
 	for range b.N {
-		s, err := newArchiveSink(jm, TableJobMetrics, "ap1", &replicate.MemCursorStore{}, NewMetrics(), discard, nil)
+		s, err := newArchiveSink(jm, TableJobMetrics, "ap1", &replicate.MemCursorStore{}, NewMetrics(), discard, nil, nil)
 		if err != nil {
 			b.Fatal(err)
 		}

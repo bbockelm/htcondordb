@@ -39,7 +39,7 @@ func metricsArchive(t *testing.T, cat *db.Catalog) *db.ArchiveTable {
 
 func newMetricsSink(t *testing.T, a *db.ArchiveTable, schedd string, store replicate.CursorStore, m *Metrics) *archiveSink {
 	t.Helper()
-	s, err := newArchiveSink(a, TableJobMetrics, schedd, store, m, discard, nil)
+	s, err := newArchiveSink(a, TableJobMetrics, schedd, store, m, discard, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

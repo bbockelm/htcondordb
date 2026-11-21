@@ -87,10 +87,15 @@ type archiveSink struct {
 	batch       []replicate.Change
 	batchBytes  int
 	batchProbes int // batch-tail probes made this catch-up (for tests)
-	// batchLimit and identityLimit are catchupBatchBytes and maxLoadedIdentities. Seams: the tests
-	// that show the two bounds hold drive them at a size a test can fill.
-	batchLimit    int
-	identityLimit int
+	// batchLimit is catchupBatchBytes. A seam: the test that shows the bound holds drives it at a
+	// size a test can fill.
+	batchLimit int
+	// budget is the hub-wide ceiling on identity sets (see identityBudget); identityHeld is what
+	// this sink has reserved from it and identityChunk how much it takes at a time. Seams: a test
+	// gives the sink a budget and a chunk it can fill.
+	budget        *identityBudget
+	identityHeld  int
+	identityChunk int
 	// pastBoundary is set once a resume's catch-up has met a record the hub does not hold. Every
 	// record after it is new, and is appended without a probe -- see drainBatch.
 	pastBoundary bool
@@ -105,13 +110,17 @@ type archiveSink struct {
 
 var _ cedarsync.UndecodableSink = (*archiveSink)(nil)
 
-func newArchiveSink(arch *db.ArchiveTable, table, schedd string, store replicate.CursorStore, m *Metrics, log *slog.Logger, onReset func()) (*archiveSink, error) {
+func newArchiveSink(arch *db.ArchiveTable, table, schedd string, store replicate.CursorStore, m *Metrics, log *slog.Logger, onReset func(), budget *identityBudget) (*archiveSink, error) {
 	cur, err := store.Load()
 	if err != nil {
 		return nil, err
 	}
+	if budget == nil {
+		budget = newIdentityBudget(defaultIdentityBudget)
+	}
 	s := &archiveSink{arch: arch, table: table, schedd: schedd, store: store, metrics: m, log: log, onReset: onReset,
-		syncData: archiveSync(arch), cur: cur, batchLimit: catchupBatchBytes, identityLimit: maxLoadedIdentities}
+		syncData: archiveSync(arch), cur: cur, batchLimit: catchupBatchBytes, budget: budget,
+		identityChunk: identityReserveChunk}
 	s.startCatchup() // a sink starts in catch-up, as after BeginSession
 	return s, nil
 }
@@ -149,14 +158,6 @@ const catchupBatchBytes = 4 << 20
 // 58-77 bytes per entry for the map alone.
 const bytesPerIdentity = 80
 
-// maxLoadedIdentities bounds loadIdentities. A hub holding 14.7M history rows and 31.6M epoch rows
-// across its APs cannot materialise one AP's share of that per sink: at bytesPerIdentity the set
-// is hundreds of MiB to more than a gigabyte, against a 16 GiB GOMEMLIMIT, for every (schedd,
-// table) sink that is replaying at once. 64 MiB is about 840k identities; past them the load is
-// abandoned and the replay goes back to one query per record, because running out of memory kills
-// the daemon while probing only makes it slow.
-const maxLoadedIdentities = (64 << 20) / bytesPerIdentity
-
 // BeginSession starts from the committed cursor: a cursor a failed session left uncommitted is
 // discarded, since the session re-delivers what it covers. (appended is kept: those appends still
 // need their sync before any cursor that follows them.)
@@ -179,6 +180,7 @@ func (s *archiveSink) fail(err error) error {
 // startCatchup arms the catch-up checks. It starts in skip-ahead: a session begins by resuming
 // from the committed cursor, and only a Reset that arrives afterwards turns it into a full replay.
 func (s *archiveSink) startCatchup() {
+	s.releaseIdentities()
 	s.catchup, s.full, s.probes, s.remaining, s.setLoaded = true, false, 0, map[[16]byte]int{}, false
 	s.setGaveUp, s.floorOK = false, false
 	s.skipAhead, s.pastBoundary = true, false
@@ -189,6 +191,7 @@ func (s *archiveSink) startCatchup() {
 // caller drains the batch first (the drain is what appends them, and no cursor covering them is
 // committed until it has: see flush).
 func (s *archiveSink) endCatchup() {
+	s.releaseIdentities()
 	s.catchup, s.full, s.probes, s.remaining, s.setLoaded = false, false, 0, nil, false
 	s.setGaveUp, s.floorOK = false, false
 	s.skipAhead, s.pastBoundary = false, false
@@ -519,9 +522,10 @@ func (s *archiveSink) countMatching(constraint string) (int, error) {
 // is spent), so setting them aside is cheap, and the sink never holds a second copy of the whole
 // set to copy out of.
 //
-// The load is bounded by maxLoadedIdentities. Past it the set is abandoned -- s.remaining goes
-// back to what it was and the replay returns to one query per record, for this catch-up -- rather
-// than grown until the daemon is killed.
+// The load is bounded by the hub-wide identityBudget, reserved a chunk at a time as the set grows.
+// When the budget refuses, the set is abandoned -- what this sink reserved is returned,
+// s.remaining goes back to what it was, and the replay returns to one query per record for this
+// catch-up -- rather than grown until the daemon is killed.
 func (s *archiveSink) loadIdentities() error {
 	seq, err := s.arch.QueryProject(scheddConstraint(s.schedd), identityAttrs(s.table))
 	if err != nil {
@@ -536,11 +540,12 @@ func (s *archiveSink) loadIdentities() error {
 			continue
 		}
 		loaded[id.digest()]++
-		if len(loaded) > s.identityLimit {
+		if len(loaded) > s.identityHeld && !s.reserveIdentities() {
+			s.releaseIdentities()
 			s.remaining, s.setGaveUp = met, true
-			s.log.Warn("federate: too many identities held for this AP to check a full replay in memory; probing instead",
-				"table", s.table, "schedd", s.schedd, "limit", s.identityLimit,
-				"approx_bytes_per_identity", bytesPerIdentity)
+			s.log.Warn("federate: the hub's identity budget cannot hold this AP's set; probing the replay instead",
+				"table", s.table, "schedd", s.schedd, "loaded", len(loaded),
+				"budget_identities", s.budget.limit, "approx_bytes_per_identity", bytesPerIdentity)
 			return nil
 		}
 	}
@@ -552,6 +557,22 @@ func (s *archiveSink) loadIdentities() error {
 	s.log.Info("federate: catch-up is a full replay; loaded the hub's identities for it",
 		"table", s.table, "schedd", s.schedd, "identities", len(loaded))
 	return nil
+}
+
+// reserveIdentities takes another chunk of the hub's budget for this sink's set.
+func (s *archiveSink) reserveIdentities() bool {
+	if !s.budget.reserve(s.identityChunk) {
+		return false
+	}
+	s.identityHeld += s.identityChunk
+	return true
+}
+
+// releaseIdentities returns this sink's whole reservation. Idempotent: the sink's set is dropped
+// at both ends of a catch-up and on give-up, and only the first call gives anything back.
+func (s *archiveSink) releaseIdentities() {
+	s.budget.release(s.identityHeld)
+	s.identityHeld = 0
 }
 
 // floorAttr is the time attribute a replayed record is compared to the hub's retained floor by.
