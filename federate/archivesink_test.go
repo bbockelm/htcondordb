@@ -31,7 +31,7 @@ func histRecord(t *testing.T, schedd string, cluster int) *classad.ClassAd {
 
 func newHistSink(t *testing.T, a *db.ArchiveTable, schedd string, store replicate.CursorStore, m *Metrics) *archiveSink {
 	t.Helper()
-	s, err := newArchiveSink(a, TableHistory, schedd, store, m, discard, nil)
+	s, err := newArchiveSink(a, TableHistory, schedd, store, m, discard, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestArchiveIdentity(t *testing.T) {
 	}
 
 	ep := hubArchive(t, cat, TableEpochHistory)
-	es, err := newArchiveSink(ep, TableEpochHistory, "ap1.example.org", &replicate.MemCursorStore{}, m, discard, nil)
+	es, err := newArchiveSink(ep, TableEpochHistory, "ap1.example.org", &replicate.MemCursorStore{}, m, discard, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestArchiveLargeReplayUsesIdentitySet(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 	m := NewMetrics()
 	ep := hubArchive(t, cat, TableEpochHistory)
-	s, err := newArchiveSink(ep, TableEpochHistory, "ap1.example.org", &replicate.MemCursorStore{}, m, discard, nil)
+	s, err := newArchiveSink(ep, TableEpochHistory, "ap1.example.org", &replicate.MemCursorStore{}, m, discard, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestEpochReplayKeepsRepeatedIdentity(t *testing.T) {
 	cat := openCatalog(t, t.TempDir())
 	t.Cleanup(func() { _ = cat.Close() })
 	ep := hubArchive(t, cat, TableEpochHistory)
-	s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, NewMetrics(), discard, nil)
+	s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, NewMetrics(), discard, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +283,7 @@ func TestReplayCountsRepeatedIdentity(t *testing.T) {
 				t.Cleanup(func() { _ = cat.Close() })
 				ep := hubArchive(t, cat, TableEpochHistory)
 				metrics := NewMetrics()
-				s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, metrics, discard, nil)
+				s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, metrics, discard, nil, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -361,7 +361,7 @@ func TestResumeCatchupProbesWithoutLoadingSet(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 	ep := hubArchive(t, cat, TableEpochHistory)
 	m := NewMetrics()
-	s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, m, discard, nil)
+	s, err := newArchiveSink(ep, TableEpochHistory, "ap1", &replicate.MemCursorStore{}, m, discard, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +494,7 @@ func TestArchiveForgedScheddNameOverwritten(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 	for _, table := range []string{TableHistory, TableEpochHistory} {
 		a := hubArchive(t, cat, table)
-		s, err := newArchiveSink(a, table, "ap1.example.org", &replicate.MemCursorStore{}, NewMetrics(), discard, nil)
+		s, err := newArchiveSink(a, table, "ap1.example.org", &replicate.MemCursorStore{}, NewMetrics(), discard, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
