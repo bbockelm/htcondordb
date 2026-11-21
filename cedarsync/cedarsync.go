@@ -9,6 +9,7 @@
 package cedarsync
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -115,11 +116,24 @@ type Status struct {
 	// SyncedAt is when a session last reached Synced (zero if none has). It is kept after Synced
 	// turns false.
 	SyncedAt time.Time
+	// StalledSessions counts consecutive sessions that ended having made no DURABLE progress:
+	// neither reaching Synced nor advancing the sink's committed cursor. Such a session's work is
+	// re-delivered in full by the next one, so a stream whose sessions all end this way replicates
+	// nothing however many records it applies. Reset by the first session that does make progress.
+	StalledSessions int
+	// LastProgress is when a session last reached Synced or advanced the cursor (zero if none
+	// has).
+	LastProgress time.Time
 }
 
 const (
 	initialBackoff = 500 * time.Millisecond
 	maxBackoff     = 30 * time.Second
+	// stallLogEvery is how often a stream that keeps ending its sessions without committing
+	// anything repeats the warning. The first one is always logged; after that one in
+	// stallLogEvery, so a wedged stream stays visible without filling the log at the reconnect
+	// rate.
+	stallLogEvery = 10
 )
 
 // errStreamClosed signals the watch stream ended (server close / connection drop); reconnect from
@@ -179,12 +193,24 @@ func (r *Runner) Run(ctx context.Context) error {
 	backoff := initialBackoff
 	fails := 0
 	for ctx.Err() == nil {
-		err := r.session(ctx)
+		progressed, err := r.session(ctx)
 		switch {
 		case ctx.Err() != nil:
 			return nil
+		case errors.Is(err, errStreamClosed) && progressed:
+			backoff, fails = initialBackoff, 0 // clean reconnect, and it committed something
 		case errors.Is(err, errStreamClosed):
-			backoff, fails = initialBackoff, 0 // clean reconnect (made progress)
+			// The stream closed cleanly but the session neither reached Synced nor advanced the
+			// cursor, so the next one re-delivers everything it just applied. Treating that as a
+			// clean reconnect -- resetting the backoff, logging nothing -- is what lets a stream
+			// reconnect forever while replicating nothing: a hub ran 78 of these in an hour on one
+			// table while the only visible symptom was a Synced gauge nobody was watching. Hold
+			// the backoff and say so.
+			stalls := r.noteStall()
+			if stalls == 1 || stalls%stallLogEvery == 0 {
+				r.log.Warn("cedarsync: the session ended without committing anything; it will be replayed",
+					"src", r.cfg.Src, "table", r.cfg.Source, "consecutive", stalls)
+			}
 		case errors.Is(err, ErrSourceMissing):
 			fails++
 			was := r.Status().SourceMissing
@@ -229,19 +255,25 @@ func isNoSuchTable(err error) bool {
 // session runs one watch connection: it maps each event to a Change, applies the client-side
 // constraint, and feeds the sink (which checkpoints its resume cursor on WatchSynced, or on Flush
 // for a Flusher).
-func (r *Runner) session(ctx context.Context) (err error) {
+func (r *Runner) session(ctx context.Context) (progressed bool, err error) {
 	c, cleanup, err := r.dial(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer cleanup()
 
-	events, stop, wireForm, err := watchfeed.Watch(ctx, c, r.cfg.Source, r.sink.Cursor())
+	// What the session starts from, to tell at the end whether it got anywhere. A cursor that has
+	// not moved and a Synced that has not happened mean the next session re-delivers all of this
+	// one's work: see Run.
+	startCur := bytes.Clone(r.sink.Cursor())
+	startSynced := r.Status().SyncedAt
+
+	events, stop, wireForm, err := watchfeed.Watch(ctx, c, r.cfg.Source, startCur)
 	if err != nil {
 		if r.cfg.MissingRetry > 0 && isNoSuchTable(err) {
-			return fmt.Errorf("%w: %s", ErrSourceMissing, r.cfg.Source)
+			return false, fmt.Errorf("%w: %s", ErrSourceMissing, r.cfg.Source)
 		}
-		return err
+		return false, err
 	}
 	defer stop()
 	r.log.Debug("cedarsync: change feed open", "src", r.cfg.Src, "wire", wireForm)
@@ -267,7 +299,15 @@ func (r *Runner) session(ctx context.Context) (err error) {
 		if sa != nil {
 			sa.EndSession()
 		}
-		r.setStatus(func(s *Status) { s.Connected, s.Synced = false, false })
+		// After the final flush, which is where a Flusher sink commits the cursor this session
+		// earned.
+		progressed = !bytes.Equal(startCur, r.sink.Cursor()) || r.Status().SyncedAt.After(startSynced)
+		r.setStatus(func(s *Status) {
+			s.Connected, s.Synced = false, false
+			if progressed {
+				s.StalledSessions, s.LastProgress = 0, time.Now()
+			}
+		})
 	}()
 
 	var flushC <-chan time.Time
@@ -285,20 +325,29 @@ func (r *Runner) session(ctx context.Context) (err error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return false, nil
 		case <-flushC:
 			if err := flusher.Flush(); err != nil {
-				return err
+				return false, err
 			}
 		case ev, ok := <-events:
 			if !ok {
-				return errStreamClosed
+				return false, errStreamClosed
 			}
 			if err := r.deliver(ev, &ver); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
+}
+
+// noteStall counts one session that ended without durable progress and returns the new consecutive
+// count.
+func (r *Runner) noteStall() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.status.StalledSessions++
+	return r.status.StalledSessions
 }
 
 // deliver hands one watch event to the sink.

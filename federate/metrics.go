@@ -25,6 +25,7 @@ type Metrics struct {
 	SourcesByState   *prometheus.GaugeVec // labels: state
 	StreamConnected  *prometheus.GaugeVec // labels: table, schedd -- a watch session is open
 	StreamSynced     *prometheus.GaugeVec // labels: table, schedd -- that session finished its catch-up
+	StreamStalled    *prometheus.GaugeVec // labels: table, schedd -- consecutive sessions that committed nothing
 	stalenessMu      sync.Mutex
 	stalenessSchedds map[string]bool
 	streamsMu        sync.Mutex
@@ -71,6 +72,8 @@ func NewMetrics() *Metrics {
 			Help: "1 while a watch session is open for this table of this AP, 0 otherwise."}, []string{"table", "schedd"}),
 		StreamSynced: prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: ns, Subsystem: sub, Name: "stream_synced",
 			Help: "1 while this table's stream has finished its catch-up and is live, 0 while it is catching up or not connected. A stream stuck at 0 is replicating nothing durably, however many records it applies, because an archive commits its cursor only once catch-up completes; source_staleness_seconds cannot see this, and neither can the source's state, which is measured on the mutable streams alone."}, []string{"table", "schedd"}),
+		StreamStalled: prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: ns, Subsystem: sub, Name: "stream_stalled_sessions",
+			Help: "Consecutive watch sessions for this table of this AP that ended having neither reached Synced nor advanced the cursor, so the next session replays their work. 0 is healthy; a number that keeps climbing is a stream that reconnects forever and replicates nothing durably."}, []string{"table", "schedd"}),
 		stalenessSchedds: map[string]bool{},
 		streams:          map[streamKey]bool{},
 	}
@@ -93,7 +96,7 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 func (m *Metrics) collectors() []prometheus.Collector {
 	return []prometheus.Collector{m.EventsApplied, m.IdenticalSkips, m.Resets, m.DedupHits, m.MissingIdentity,
 		m.PhantomDeletes, m.Undecodable, m.BelowRetention, m.TooDeep, m.RejectedSpokes, m.Retired, m.SourceStaleness, m.SourcesByState,
-		m.StreamConnected, m.StreamSynced}
+		m.StreamConnected, m.StreamSynced, m.StreamStalled}
 }
 
 // setStaleness publishes the per-source staleness gauges, dropping sources no longer present or
@@ -122,19 +125,24 @@ func (m *Metrics) setStreams(now map[streamKey]cedarsyncStatus) {
 		if _, ok := now[k]; !ok {
 			m.StreamConnected.DeleteLabelValues(k.table, k.schedd)
 			m.StreamSynced.DeleteLabelValues(k.table, k.schedd)
+			m.StreamStalled.DeleteLabelValues(k.table, k.schedd)
 			delete(m.streams, k)
 		}
 	}
 	for k, st := range now {
 		m.StreamConnected.WithLabelValues(k.table, k.schedd).Set(b2f(st.connected))
 		m.StreamSynced.WithLabelValues(k.table, k.schedd).Set(b2f(st.synced))
+		m.StreamStalled.WithLabelValues(k.table, k.schedd).Set(float64(st.stalled))
 		m.streams[k] = true
 	}
 }
 
 // cedarsyncStatus is the part of a stream's status the gauges carry, so metrics.go does not
 // depend on the runner type.
-type cedarsyncStatus struct{ connected, synced bool }
+type cedarsyncStatus struct {
+	connected, synced bool
+	stalled           int
+}
 
 func b2f(v bool) float64 {
 	if v {
