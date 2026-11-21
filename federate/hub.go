@@ -113,24 +113,29 @@ type Hub struct {
 
 // source is the hub's state for one schedd.
 type source struct {
-	schedd            string
-	spokeAddress      string
-	spokeName         string
-	static            bool // configured in HTCONDORDB_FEDERATE_SPOKES now
-	droppedStatic     bool // was static, is no longer, and has not been matched since
-	inSet             bool // matched by the last discovery with a known match set
-	untrusted         string
-	declined          string
-	unverified        string   // why a restored spoke address is not dialed until discovery pairs it
-	spellings         []string // every spelling of the name seen, for cursors kept by spelling
-	lastCollectorSeen time.Time
-	lastContact       time.Time
-	lastReset         time.Time
-	retiringSince     time.Time
-	rows              map[string]int64
-	runners           map[string]*runnerHandle
-	lastStable        *classad.ClassAd // the last written row without its volatile fields
-	lastWrite         time.Time        // when it was written (hub clock)
+	schedd       string
+	spokeAddress string
+	spokeName    string
+	// spokeVersion and spokeClassAdVersion are the spoke's build, as its last heartbeat reported
+	// it. Empty for a spoke too old to send them -- which is itself the answer to "has this one
+	// been upgraded", so they are written to the row only when known rather than as "".
+	spokeVersion        string
+	spokeClassAdVersion string
+	static              bool // configured in HTCONDORDB_FEDERATE_SPOKES now
+	droppedStatic       bool // was static, is no longer, and has not been matched since
+	inSet               bool // matched by the last discovery with a known match set
+	untrusted           string
+	declined            string
+	unverified          string   // why a restored spoke address is not dialed until discovery pairs it
+	spellings           []string // every spelling of the name seen, for cursors kept by spelling
+	lastCollectorSeen   time.Time
+	lastContact         time.Time
+	lastReset           time.Time
+	retiringSince       time.Time
+	rows                map[string]int64
+	runners             map[string]*runnerHandle
+	lastStable          *classad.ClassAd // the last written row without its volatile fields
+	lastWrite           time.Time        // when it was written (hub clock)
 	// The state and reason last reported for this source, so a change is logged once rather than
 	// every pass. loggedState is "" until the first pass, which is what makes a start name every
 	// source it knows.
@@ -838,6 +843,12 @@ func (h *Hub) refreshState() {
 		if hb != nil {
 			if row, ok := hb.lookup(HubKey(s.schedd, syncstatus.Key)); ok {
 				stale, staleKnown = staleness(row, now)
+				if v, ok := row.EvaluateAttrString(syncstatus.AttrSpokeVersion); ok {
+					s.spokeVersion = v
+				}
+				if v, ok := row.EvaluateAttrString(syncstatus.AttrSpokeClassAdVersion); ok {
+					s.spokeClassAdVersion = v
+				}
 			}
 		}
 		// One read of each stream's status per pass, so State and the per-table fields of the
@@ -1120,6 +1131,12 @@ func (h *Hub) writeSourceRow(s *source, statuses map[string]cedarsync.Status, st
 		}
 		if s.spokeName != "" {
 			ad.InsertAttrString("SpokeName", s.spokeName)
+		}
+		if s.spokeVersion != "" {
+			ad.InsertAttrString(syncstatus.AttrSpokeVersion, s.spokeVersion)
+		}
+		if s.spokeClassAdVersion != "" {
+			ad.InsertAttrString(syncstatus.AttrSpokeClassAdVersion, s.spokeClassAdVersion)
 		}
 		ad.InsertAttrBool("Static", s.static)
 		for _, t := range tables {

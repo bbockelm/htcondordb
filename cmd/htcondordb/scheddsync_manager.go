@@ -1227,12 +1227,15 @@ func (m *scheddSyncManager) launch(ctx context.Context, s scheddSyncSettings) ([
 	// The heartbeat row a federation hub reads freshness from. Written by this process only, from
 	// the same live status the collector ad reports.
 	statusSources := append([]dbad.StatusSource(nil), sources...)
+	self, classadVer := buildIdentity()
 	w := &syncstatus.Writer{
-		Table:    hb,
-		Sources:  func() []dbad.StatusSource { return statusSources },
-		Mirrored: s.mirrored.current,
-		Interval: s.syncStatusInterval,
-		Logger:   m.logger,
+		Table:          hb,
+		Sources:        func() []dbad.StatusSource { return statusSources },
+		Mirrored:       s.mirrored.current,
+		Interval:       s.syncStatusInterval,
+		Logger:         m.logger,
+		Version:        self,
+		ClassAdVersion: classadVer,
 	}
 	wg.Add(1)
 	go func() { defer wg.Done(); w.Run(ctx) }()

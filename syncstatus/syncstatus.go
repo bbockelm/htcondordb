@@ -51,6 +51,18 @@ const (
 	// AttrHeartbeatInterval is the cadence in seconds, so a hub can bound how old a received
 	// heartbeat may be without knowing the spoke's configuration.
 	AttrHeartbeatInterval = "HeartbeatIntervalSeconds"
+	// AttrSpokeVersion and AttrSpokeClassAdVersion are the spoke daemon's own version and the
+	// classad version it was built against.
+	//
+	// They are here because "which spokes are running the build with the fix in them?" was not
+	// answerable from the hub. Several replication defects are fixed in the SPOKE -- a catch-up
+	// cursor is minted by whichever daemon serves the watch, so upgrading the hub alone changes
+	// nothing -- and an un-upgraded spoke looks exactly like a slow one: connected, applying
+	// records, never reaching Synced. Telling them apart meant reading cursor file sizes and
+	// mtimes in a shell on the hub's pod, per spoke, per table. A version on the heartbeat makes
+	// it a column.
+	AttrSpokeVersion        = "SpokeVersion"
+	AttrSpokeClassAdVersion = "SpokeClassAdVersion"
 	// AttrSpokeLagSeconds is the largest per-source lag below (see LagSeconds). Absent when any
 	// source whose file exists has no known lag -- not yet seen caught up by this process -- or
 	// when the job_queue.log does not exist: an unknown lag must not read as zero. A history or
@@ -114,10 +126,14 @@ func LagSeconds(st scheddsync.SyncStatus, caughtUpAt, now time.Time) (int64, boo
 type Row struct {
 	ScheddName    string
 	ScheddAddress string
-	Seq           int64
-	Now           time.Time
-	Interval      time.Duration
-	Sources       []scheddsync.SyncStatus
+	// Version and ClassAdVersion identify the spoke's build; empty is omitted, so a spoke too old
+	// to send them simply has no such attribute at the hub.
+	Version        string
+	ClassAdVersion string
+	Seq            int64
+	Now            time.Time
+	Interval       time.Duration
+	Sources        []scheddsync.SyncStatus
 	// Missing marks, by index into Sources, a source whose file does not exist.
 	Missing map[int]bool
 	// CaughtUpAt is, by index into Sources, the last time the source was seen caught up (its
@@ -133,6 +149,12 @@ func BuildAd(r Row) *classad.ClassAd {
 	}
 	if r.ScheddAddress != "" {
 		ad.InsertAttrString(AttrMirroredScheddAddress, r.ScheddAddress)
+	}
+	if r.Version != "" {
+		ad.InsertAttrString(AttrSpokeVersion, r.Version)
+	}
+	if r.ClassAdVersion != "" {
+		ad.InsertAttrString(AttrSpokeClassAdVersion, r.ClassAdVersion)
 	}
 	ad.InsertAttr(AttrHeartbeatSeq, r.Seq)
 	ad.InsertAttr(AttrHeartbeatTime, r.Now.Unix())
@@ -187,6 +209,8 @@ type Writer struct {
 	Mirrored func() (name, address string)
 	// Interval is the cadence; <= 0 means DefaultInterval.
 	Interval time.Duration
+	// Version and ClassAdVersion identify this build (see AttrSpokeVersion). Empty is omitted.
+	Version, ClassAdVersion string
 	// Logger receives write failures. Nil discards.
 	Logger *slog.Logger
 
@@ -281,7 +305,8 @@ func (w *Writer) WriteOnce() error {
 		caughtUpAt[i] = w.caughtUpAt[st.Kind]
 	}
 	ad := BuildAd(Row{
-		ScheddName: name, ScheddAddress: addr, Seq: w.seq, Now: w.now(),
+		ScheddName: name, ScheddAddress: addr, Version: w.Version, ClassAdVersion: w.ClassAdVersion,
+		Seq: w.seq, Now: w.now(),
 		Interval: w.interval(), Sources: sources, Missing: missing, CaughtUpAt: caughtUpAt,
 	})
 	tx := w.Table.Begin()
