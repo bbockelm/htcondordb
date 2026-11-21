@@ -12,7 +12,9 @@ import (
 
 // Index sets of the hub's tables. ScheddName is on every one: per-AP reads and the Reset sweep
 // select on it. GlobalJobId is categorical, not a value index: value indexes are numeric, and the
-// archive dedup probe is a string equality on it.
+// archive dedup probe is a string equality on it. Measured, on an archive of 50k records in 256
+// KiB segments: 0.148 ms per probe with the categorical index, 9.5 ms with none -- and 19.7 ms
+// with a VALUE index on the same attribute, which is worse than having none at all.
 var (
 	jobsCategorical    = []string{ScheddNameAttr, "User"}
 	jobsValue          = []string{"JobStatus"}
@@ -24,6 +26,22 @@ var (
 	// (MaxAgeAttr must be zone-mapped).
 	jobMetricsZones = []string{"SampleTime"}
 )
+
+// archiveCategoricals is the categorical index set of a federated archive.
+//
+// job_metrics adds Key. Its dedup identity leads with Key where history's and epoch_history's lead
+// with GlobalJobId (see identitySpecs), and an identity attribute nothing indexes makes every
+// probe of a replay too large to hold in memory a scan of the archive: 1.15 ms against 0.168 ms on
+// the benchmark's 50k records, and the gap grows with the archive, because one is a scan and the
+// other is not. On the CHTC hub that scan was 0.09 records/s against 13.5 GB, which is why
+// job_metrics was the one table that never caught up. ScheddName being indexed does not help: it
+// has one value per AP, so narrowing to the AP still leaves every sample it ever sent.
+func archiveCategoricals(table string) []string {
+	if table == TableJobMetrics {
+		return append(append([]string{}, archiveCategorical...), "Key")
+	}
+	return archiveCategorical
+}
 
 // archiveZones is the zone-map set of a federated archive.
 func archiveZones(table string) []string {
@@ -119,7 +137,7 @@ func ensureTables(cat *db.Catalog, tables []string, opts ArchiveOptions, log *sl
 			st := opts.storage(t)
 			vals := union(archiveValue, st.ExtraValue)
 			// An attribute may carry one kind of index, not both (the store panics on overlap).
-			cats := slices.DeleteFunc(union(archiveCategorical, st.ExtraCategorical), func(c string) bool {
+			cats := slices.DeleteFunc(union(archiveCategoricals(t), st.ExtraCategorical), func(c string) bool {
 				return slices.ContainsFunc(vals, func(v string) bool { return strings.EqualFold(c, v) })
 			})
 			// job_metrics is excluded: the sampler writes a fixed attribute set on every sample,
