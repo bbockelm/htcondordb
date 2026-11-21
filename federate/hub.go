@@ -841,7 +841,8 @@ func (h *Hub) refreshState() {
 		for t, rh := range s.runners {
 			st := rh.runner.Status()
 			statuses[t] = st
-			streams[streamKey{table: t, schedd: s.schedd}] = cedarsyncStatus{connected: st.Connected, synced: st.Synced}
+			streams[streamKey{table: t, schedd: s.schedd}] = cedarsyncStatus{
+				connected: st.Connected, synced: st.Synced, stalled: st.StalledSessions}
 		}
 		state, reason := h.stateOf(s, statuses, stale, staleKnown, fresh)
 		h.logSourceState(s, state, reason)
